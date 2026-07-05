@@ -1,0 +1,123 @@
+# 設計 00: 全体アーキテクチャ
+
+ステータス: v1(2026-07-05)/ 上位文書: [../PROPOSAL.md](../PROPOSAL.md)(齟齬時は PROPOSAL が優先)
+
+## 1. コンポーネント図
+
+```text
+                    ┌─────────────────────────────────────────────┐
+                    │ Mac mini(launchd 管理・ローカルファースト)      │
+                    │                                             │
+ [X API]──────────▶ │ ■ 朝バッチ  intel run(StartCalendarInterval) │
+ [RSS 5〜10本]─────▶ │   collect → extract → analyze → digest      │
+                    │      │        │         │         │         │
+                    │   sources   documents  analyses  digests    │
+                    │   items ────────┴─────────┴─────────┘        │
+                    │            SQLite(正本)                     │
+                    │                 │              export ───────┼──▶ [Obsidian Vault]
+                    │                 │              deliver ──────┼──▶ [Telegram Bot API]
+                    │                                             │
+ [Telegram 更新]───▶ │ ■ 受信デーモン  intel poll                    │
+  (ボタン/URL/       │   (KeepAlive 常駐・long polling)             │
+   夜アンケート)      │   → signals / items(manual) に記録            │
+                    │   内蔵タイマー: 夜アンケート送信・watchdog      │
+                    └─────────────────────────────────────────────┘
+```
+
+- SQLite が唯一の正本。Obsidian は export 先であり DB にしない(理由: 正本の分裂が plan-c 不採用の主因であり、同じ轍を踏まない)。
+- 外部との接続は「X API・RSS の読み取り」「Telegram の送受信(long polling)」「Vault へのファイル書き込み」の3種のみ。受信ポートは一切開けない(理由: 自宅常設機に外部公開面を作らない)。
+
+## 2. プロセスモデル
+
+### 比較: Telegram 反応の受信方式
+
+| 観点 | 常駐ロングポーラー | バッチ時取込(getUpdates を朝バッチ等で周期実行) |
+|---|---|---|
+| callback 応答 UX | ボタン押下に即 answerCallbackQuery でき、スピナーが即消える | callback query は約10秒で失効するため、周期実行では**構造的に応答不能**(ボタンが押しても反応しない見た目になる) |
+| 手動 URL 投入 | 投入後すぐ ACK を返せる | 次回バッチまで無反応 |
+| 夜アンケート | 回答を即時記録 | 同上の遅延 |
+| 実装・運用コスト | プロセスが1本増える(launchd KeepAlive) | 追加プロセス不要 |
+
+**採用: 常駐ロングポーラー(2プロセス構成)**。理由: 反応ボタンは KPI 測定の根幹であり、callback 失効で「押せないボタン」になる方式は UX 以前に企画要件を満たさない。
+
+### 2プロセスの責務分離
+
+- **朝バッチ** `intel run`: **collect → extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload 削除)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
+- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 即 answerCallbackQuery 後に signals へ記録 (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
+- 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
+
+## 3. モジュール構成と依存方向
+
+```text
+app/
+  cli.py          # Typer。intel collect/extract/analyze/digest/deliver/poll/run/doctor
+                  #   poll = 受信デーモン(long polling 常駐+内蔵タイマー)
+                  #   doctor は --purge(期限切れ削除の単独実行)/ --cost(コスト集計の単発表示)を持つ
+  config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
+  db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
+  models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
+  connectors/     # x.py, rss.py, manual.py — items を produce(カーソル・冪等)
+  extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
+  analysis/       # llm.py(LLMEngine 抽象層)+ analyzer.py — analyses を produce
+  ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
+  digest/         # digests(日本語 Markdown)を produce
+  delivery/telegram.py  # Bot API 直叩き(httpx)。配信+受信デーモン
+  export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し
+migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
+prompts/          # バージョン付き .md(analyses.prompt_ver で追跡)
+tests/
+```
+
+依存方向の規則(理由: 差し替え点を外周に置き、正本ロジックを守る):
+
+- `cli.py` → 各処理モジュール → `db.py`/`models.py`/`config.py` の一方向のみ。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。
+- 外部 I/O(httpx・feedparser・trafilatura・LLM CLI)は connectors/extraction/analysis/delivery の内側に閉じ込め、models の語彙(items, documents, …)に変換してから外へ出す。
+- パイプラインはソース非依存: connectors が items さえ作れば、X を止めても RSS+手動 URL だけで全段が動く(撤退・縮退シナリオの前提)。
+
+## 4. 設定・secrets 管理
+
+- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。ソース定義(RSS URL 群・X 日次取得上限)、配信時刻・夜アンケート時刻、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限。
+- **secrets**: `~/.config/intel/.env`(chmod 600)に X API キー・Telegram bot token。launchd の plist には secrets を書かない(plist は誰でも読めるため)。
+- **ANTHROPIC_API_KEY は launchd 実行環境に載せない**(理由: claude -p が API 課金へ無自覚フォールバックするのを設定で遮断)。API エンジンを明示使用する場合のみ .env に別名キーで持ち、AnthropicApiEngine 内でだけ環境へ渡す。
+- `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コスト見込みとクォータ消費率。
+
+## 5. LLM 抽象層
+
+```python
+class LLMEngine(Protocol):
+    name: str
+    def complete_structured(self, prompt: str, schema: type[BaseModel],
+                            timeout_s: int = 120) -> BaseModel: ...
+```
+
+- **MVP のスコープ**: LLMEngine Protocol +**第一候補エンジン1本**(Week 1 の安定性検証で codex-cli / claude-cli から選定)のみ実装する。複数エンジンの優先順リスト(`llm.engines`)・エンジンフォールバック・残り2実装(もう片方の CLI と `AnthropicApiEngine`)は**拡張点に降格**し、必要になった時点で追加する(理由: 1〜1.5週の工期に3実装+フォールバック網はテスト面と doctor 検査を3倍にする過剰装備。Protocol があるので後付けコストは低く、PROPOSAL の「API SDK へ1日で差し替え可能」要件は Protocol で満たす)。
+- **切替**: config.toml の `llm.engine = "codex-cli"`(単一指定。値は `codex-cli` / `claude-cli` / `anthropic-api`。01 の analyses.engine enum と同一語彙)。コード変更なしで差し替え可能。推論専用モードを設定できないエンジンは起動時に doctor が fail させる(理由: 「LLM に書込・送信権限を与えない」を宣言でなく構成で担保)。
+- **呼び出しの隔離仕様(推論専用モードの実体)**。「ツール disallow」の宣言だけでは、ユーザーの設定・MCP 由来ツールが生き残りうるため、以下を構成で強制する:
+  1. `claude -p` は**専用の設定分離**で起動する: 専用 CONFIG DIR/HOME を指定し、ユーザーの `~/.claude/CLAUDE.md`・settings.json を読み込ませない。`--strict-mcp-config` で MCP を空指定し、許可ツールを空にする(設定側 allowlist や MCP サーバー由来ツールの残存を遮断)。
+  2. `codex exec` は**作業ディレクトリを空の専用ディレクトリに固定**し、ネットワーク遮断サンドボックスで起動する(read-only でもファイル読み取りは可能なため、`.env`・SSH 鍵等が summary 経由で出力に流出する経路を作業ディレクトリ隔離で塞ぐ)。
+  3. doctor の推論専用モード検査は設定値の確認でなく**動的検査**とする: 実際にツール呼び出し・ファイル読み取りを試みるプロンプトを流し、拒否されることを確認する(設計 05 §2 #6)。
+  4. プロンプトは **argv でなく stdin 渡し**(ps でのプロンプト露出防止と、シェル解釈の事故防止を兼ねる)。
+- **呼び出し規約**: 1呼び出し10〜20件のバッチ判定。subprocess 実行、timeout 120s。出力は Pydantic でスキーマ検証(フィールド allowlist・スコア値域・理由の長さ上限)。
+- **失敗時**: 検証失敗またはタイムアウト → 同一エンジンで1リトライ(失敗はチャンク単位に局所化し、該当チャンクのみ再実行)→ なお失敗ならタイトルのみの degraded ダイジェストへ直行(理由: 無配信より劣化配信。黙って止まらない)。エンジンフォールバックは複数エンジン導入時の拡張点。
+- 外部本文はプロンプト内で明示フェンス(ランダム nonce 区切り。設計 03 §3.2)で囲み、data として扱う旨を毎回指示。title・author 等のメタデータも未検証データとしてサニタイズする(同 §3.2)。配信・ノートに載せる URL は LLM 出力でなく DB 上の正規 URL のみ。
+
+## 6. エラーハンドリング方針
+
+原則: **段ごとに局所化し、進めるものは進め、止まったことは必ず通知する**。
+
+| 障害 | 挙動 |
+|---|---|
+| 単一ソースの collect 失敗 | sources に失敗時刻を記録し他ソースは続行。連続失敗は doctor が警告 |
+| 本文抽出失敗 | extraction_status=failed のままタイトル+メタで degraded 分析に回す(黙って脱落させない) |
+| LLM 失敗 | §5 のリトライ→degraded ダイジェスト |
+| Telegram 送信失敗 | 指数バックオフで3回。export は deliver より前段(§2 の順序)なので Obsidian への蓄積は完了済み。全滅時は `delivery_status='failed'` のまま終了し、再走時に digest_messages 台帳で未送信のみ再送(SQLite が正本なので再送可能) |
+| 朝バッチ全体の異常終了 | watchdog(受信デーモン `intel poll` の内蔵タイマー。7:15 JST に digests の当日行を確認)が未生成を検知し Telegram に通知 |
+| 受信デーモン死亡 | launchd KeepAlive が再起動。getUpdates は offset カーソルで再開(取りこぼしなし) |
+
+冪等性: collect はソース別カーソル+content_hash 重複排除で再実行安全。`intel run` の再実行は当日 digest を再生成せず、**未配信(`delivery_status ≠ 'sent'`)の場合のみ送信し、配信済みなら skip する**(理由: 二重配信で KPI 分母を汚さない)。送信途中失敗時の「未送信アイテムのみ再送」は設計 04 §2(digest_messages 台帳)に従う。
+
+## 7. 拡張点(設計はしない、口だけ確保)
+
+- **フェーズ2 `research_tasks`**: 🔖 signal を入力に research_tasks テーブル(新規マイグレーション)を追加し、受信デーモンがキュー投入、別プロセスが消化する形を想定。既存テーブルへの変更は不要になるよう、signals は item_id+種別+記録日時を正規化済み。
+- **ランキング自動調整**: analyses(プロンプト ver・入力 hash)と signals が揃っているため、将来のフィードバックループは読み取り専用の新モジュール追加で足りる。
+- **サーバー移行**: launchd への依存は plist 2枚に閉じており、cron/systemd への置換で済む。SQLite・ファイル設定・long polling はそのまま可搬。Obsidian export だけがローカルパス前提のため、移行時は Vault 同期方式の再検討が必要——それ以上の抽象化は今はしない(理由: YAGNI、Mac mini 運用が当面の正)。
