@@ -149,3 +149,16 @@ def test_load_env_rejects_malformed_line(tmp_path: Path) -> None:
     write_env(tmp_path, "JUST_A_KEY\n")
     with pytest.raises(ConfigError, match="KEY=VALUE"):
         load_env(tmp_path)
+
+
+def test_telegram_timer_times_validated(tmp_path: Path) -> None:
+    write_config(tmp_path, '[telegram]\nsurvey_time = "21:30"\nwatchdog_time = "07:15"\n')
+    config = load_config(tmp_path)
+    assert config.telegram.survey_time == "21:30"
+    assert config.telegram.watchdog_time == "07:15"
+    write_config(tmp_path, '[telegram]\nsurvey_time = "25:00"\n')
+    with pytest.raises(ConfigError, match="HH:MM"):
+        load_config(tmp_path)
+    write_config(tmp_path, '[telegram]\nwatchdog_time = "7時"\n')
+    with pytest.raises(ConfigError, match="HH:MM"):
+        load_config(tmp_path)

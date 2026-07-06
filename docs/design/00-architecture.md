@@ -61,7 +61,8 @@ app/
   analysis/       # llm.py(LLMEngine 抽象層)+ analyzer.py — analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
   digest/         # digests(日本語 Markdown)を produce
-  delivery/telegram.py  # Bot API 直叩き(httpx)。配信+受信デーモン
+  delivery/       # telegram.py(Bot API 直叩き・配信)、poller.py(受信デーモン)、
+                  #   surveys.py(夜アンケート・watchdog・失敗通知)、state.py(telegram_state KV)
   export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
 prompts/          # バージョン付き .md(analyses.prompt_ver で追跡)

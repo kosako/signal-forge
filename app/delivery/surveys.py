@@ -1,0 +1,201 @@
+"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知(設計 04 §4 / 05 §1.2, §4)。
+
+- 起動は受信デーモン(intel poll)の内蔵タイマー(送信経路をポーラーに集約)。
+  時刻は config([telegram].survey_time / watchdog_time。JST)
+- 送信済み管理は telegram_state の日付キー。**送信前に記録する**(部分送信の再送で
+  同じ質問を連打するより、失敗日は未送信 = 未回答の fail-closed 集計(PROPOSAL)に
+  倒す。Telegram 送信自体のリトライは TelegramApi が3回行う)
+- 通知のレート制限: 同一種別1日1通(設計 05 §4)
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from datetime import datetime, time, timedelta
+
+from app.config import Config
+from app.delivery.state import get_state, set_state
+from app.delivery.telegram import TelegramApi, escape_text
+from app.digest.builder import JST, today_jst
+
+STATE_SURVEY_SENT = "survey_sent_date"
+STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
+STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
+
+READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
+
+
+def _mark(text: str, is_selected: bool) -> str:
+    return f"{text} ✓" if is_selected else text
+
+
+def q1_keyboard(date_compact: str, *, selected: str | None = None) -> dict:
+    """質問1(巡回した?)。selected は y|n(✓ 反映用。設計 04 §3)。"""
+    return {
+        "inline_keyboard": [[
+            {"text": _mark("はい", selected == "y"), "callback_data": f"q1:{date_compact}:y"},
+            {"text": _mark("いいえ", selected == "n"), "callback_data": f"q1:{date_compact}:n"},
+        ]]
+    }
+
+
+def q2_keyboard(date_compact: str, *, selected: str | None = None) -> dict:
+    """質問2(読了時間)。selected は分数文字列。"""
+    return {
+        "inline_keyboard": [[
+            {
+                "text": _mark(f"{minutes}分", selected == minutes),
+                "callback_data": f"q2:{date_compact}:{minutes}",
+            }
+            for minutes in READ_MIN_CHOICES
+        ]]
+    }
+
+
+def followup_keyboard(item_id: int, *, selected: str | None = None) -> dict:
+    """🔖追い掛け(深掘りした?)。selected は y|n。"""
+    return {
+        "inline_keyboard": [[
+            {"text": _mark("はい", selected == "y"), "callback_data": f"f:{item_id}:y"},
+            {"text": _mark("いいえ", selected == "n"), "callback_data": f"f:{item_id}:n"},
+        ]]
+    }
+
+
+def run_due_timers(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """期限が来たタイマー(夜アンケート・watchdog)を実行する。poll ループから毎周期呼ぶ。
+
+    now は JST aware。ポーラー停止中に時刻を跨いだ場合は次の起動周期で送る(遅延送信)。
+    日付を跨いだ分は送らない(昨日の夜アンケートを今日送っても回答が汚れるだけ)。
+    """
+    today = now.strftime("%Y-%m-%d")
+    if _is_due(now, config.telegram.survey_time) and get_state(conn, STATE_SURVEY_SENT) != today:
+        set_state(conn, STATE_SURVEY_SENT, today)
+        send_evening_survey(conn, config, api, logger, now)
+    if (
+        _is_due(now, config.telegram.watchdog_time)
+        and get_state(conn, STATE_WATCHDOG_NOTIFIED) != today
+    ):
+        problem = _watchdog_problem(conn, today)
+        if problem is not None:
+            # 通知系は送信成功後に state を立てる(失敗した日に沈黙しない。夜アンケートの
+            # 送信前記録とは目的が逆: 通知は届くまで再試行してよい)
+            api.send_message(
+                _require_chat_id(config), f"⚠️ watchdog: {problem}。`intel run` で再走できます"
+            )
+            set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
+            logger.warning(f"watchdog 通知: {problem}", extra={"stage": "poll"})
+
+
+def send_evening_survey(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """質問1・質問2、続けて 🔖追い掛けを送る(設計 04 §4)。"""
+    chat_id = _require_chat_id(config)
+    date_compact = now.strftime("%Y%m%d")
+    api.send_message(
+        chat_id, "📝 今日、情報収集目的の巡回をした?", reply_markup=q1_keyboard(date_compact)
+    )
+    api.send_message(
+        chat_id, "📝 今日の読了時間は?", reply_markup=q2_keyboard(date_compact)
+    )
+    followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    for row in followups:
+        title = escape_text(row["title"] or "(タイトルなし)")
+        api.send_message(
+            chat_id,
+            f"🔖 深掘りした?\n{title}",
+            reply_markup=followup_keyboard(row["item_id"]),
+        )
+    logger.info(
+        "夜アンケート送信",
+        extra={"stage": "poll", "extra": {"followups": len(followups)}},
+    )
+
+
+def notify_run_failure(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    failures: list[str],
+    run_id: str,
+    logger: logging.Logger,
+) -> None:
+    """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。"""
+    today = today_jst()
+    if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
+        return
+    try:
+        api.send_message(
+            _require_chat_id(config),
+            f"⚠️ 朝バッチ失敗(段: {', '.join(failures)} / run_id={run_id})。"
+            "`intel run` で再走してください",
+        )
+        # 送信成功後に記録(失敗した日は次の再走で再通知できる)
+        set_state(conn, STATE_RUN_FAILURE_NOTIFIED, today)
+    except Exception as e:
+        # 通知の失敗で run の終了コードを汚さない(フォールバック経路は作らない)
+        logger.error(f"失敗通知の送信に失敗: {type(e).__name__}: {e}", extra={"stage": "run"})
+
+
+def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.Row]:
+    """dig_date の最新 reaction が 🔖 で、followup_dig 未記録のアイテム(設計 04 §4)。"""
+    return conn.execute(
+        """
+        SELECT items.id AS item_id, items.title
+        FROM signals AS s
+        JOIN items ON items.id = s.item_id
+        WHERE s.kind = 'reaction' AND s.signal_date = ? AND s.value = 'dig'
+          AND s.id = (
+            SELECT id FROM signals AS s2
+            WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
+              AND s2.signal_date = s.signal_date
+            ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM signals AS f
+            WHERE f.kind = 'followup_dig' AND f.item_id = s.item_id
+          )
+        ORDER BY items.id
+        """,
+        (dig_date,),
+    ).fetchall()
+
+
+def _watchdog_problem(conn: sqlite3.Connection, today: str) -> str | None:
+    row = conn.execute(
+        "SELECT delivery_status FROM digests WHERE digest_date = ?", (today,)
+    ).fetchone()
+    if row is None:
+        return "今朝のダイジェストが未生成です"
+    if row["delivery_status"] != "sent":
+        return "今朝のダイジェストが未配信です"
+    return None
+
+
+def _require_chat_id(config: Config) -> int:
+    if config.telegram.owner_chat_id is None:
+        raise ValueError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
+    return config.telegram.owner_chat_id
+
+
+def _is_due(now: datetime, hhmm: str) -> bool:
+    hour, minute = hhmm.split(":")
+    return now.timetz().replace(tzinfo=None) >= time(int(hour), int(minute))
+
+
+def survey_deadline(target_date_compact: str) -> datetime:
+    """遅延回答の締切: 質問対象日の翌日 12:00 JST(設計 04 §4)。"""
+    target = datetime.strptime(target_date_compact, "%Y%m%d").replace(tzinfo=JST)
+    return target.replace(hour=12) + timedelta(days=1)
