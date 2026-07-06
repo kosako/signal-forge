@@ -79,7 +79,7 @@ def _collect_source(
         _record_failure(conn, source, run_row_id, e)
         log = logger.warning if isinstance(e, RetryableError | FatalError) else logger.error
         log(
-            f"collect 失敗({type(e).__name__})。ソースをスキップ: {e}",
+            f"collect 失敗。ソースをスキップ: {_safe_error_text(e)}",
             extra=log_ctx,
             exc_info=not isinstance(e, RetryableError | FatalError),
         )
@@ -203,10 +203,18 @@ def _iso(raw: RawItem) -> str | None:
     return raw.published_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _safe_error_text(error: Exception) -> str:
+    """例外の __str__ 自体が壊れていても隔離を崩さない(分類外例外も扱うため)。"""
+    try:
+        return f"{type(error).__name__}: {error}"
+    except Exception:
+        return type(error).__name__
+
+
 def _record_failure(
     conn: sqlite3.Connection, source: Source, run_row_id: int, error: Exception
 ) -> None:
-    message = f"{type(error).__name__}: {error}"
+    message = _safe_error_text(error)
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(

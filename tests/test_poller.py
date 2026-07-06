@@ -498,9 +498,12 @@ def test_reaction_keyboard_selected_marks_only_one() -> None:
     assert json.dumps(markup)  # シリアライズ可能
 
 
-def test_run_poller_backs_off_on_db_error_instead_of_crashing(conn, tmp_path) -> None:
-    # VACUUM/backup 競合等の sqlite3.OperationalError でプロセスを落とさず待って再開
-    conn.execute("DROP TABLE telegram_state")  # OperationalError を誘発
+def test_run_poller_backs_off_on_db_lock_instead_of_crashing(conn, tmp_path) -> None:
+    # VACUUM/backup 競合の "database is locked" は一過性 → プロセスを落とさず待って再開
+    class LockedApi(FakeApi):
+        def get_updates(self, offset):
+            raise sqlite3.OperationalError("database is locked")
+
     sleeps: list[float] = []
     calls = {"n": 0}
 
@@ -509,7 +512,14 @@ def test_run_poller_backs_off_on_db_error_instead_of_crashing(conn, tmp_path) ->
         return calls["n"] > 2
 
     run_poller(
-        conn, make_config(tmp_path), FakeApi([[], []]), logger,
+        conn, make_config(tmp_path), LockedApi(), logger,
         sleep=sleeps.append, should_stop=should_stop,
     )
     assert sleeps == [RECONNECT_BACKOFF_S, RECONNECT_BACKOFF_S]
+
+
+def test_run_poller_fails_fast_on_permanent_db_error(conn, tmp_path) -> None:
+    # スキーマ破損等の恒久エラーは 30s ループせず落とす(KeepAlive → doctor #3 で検知)
+    conn.execute("DROP TABLE telegram_state")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        run_poller(conn, make_config(tmp_path), FakeApi([[]]), logger)

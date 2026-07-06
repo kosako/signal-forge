@@ -84,8 +84,13 @@ def run_poller(
             sleep(RECONNECT_BACKOFF_S)
         except sqlite3.OperationalError as e:
             # 朝バッチの VACUUM・backup と重なると busy_timeout(5s)超過で
-            # "database is locked" が出うる。プロセスを落とさず待って再開する
-            # (クラッシュ→KeepAlive 再起動のループより穏当)
+            # "database is locked/busy" が出うる。これは一過性なので待って再開する
+            # (クラッシュ→KeepAlive 再起動のループより穏当)。
+            # それ以外(no such table 等のスキーマ破損)は恒久エラーなので握らず落とす
+            # (KeepAlive が再起動し、doctor #3 で検知できる)
+            message = str(e)
+            if "locked" not in message and "busy" not in message:
+                raise
             logger.error(f"DB ロック競合(30s 後に再開): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
 
