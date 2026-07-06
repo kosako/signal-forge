@@ -85,10 +85,12 @@ def run_due_timers(
     ):
         problem = _watchdog_problem(conn, today)
         if problem is not None:
-            set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
+            # 通知系は送信成功後に state を立てる(失敗した日に沈黙しない。夜アンケートの
+            # 送信前記録とは目的が逆: 通知は届くまで再試行してよい)
             api.send_message(
                 _require_chat_id(config), f"⚠️ watchdog: {problem}。`intel run` で再走できます"
             )
+            set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
             logger.warning(f"watchdog 通知: {problem}", extra={"stage": "poll"})
 
 
@@ -135,12 +137,13 @@ def notify_run_failure(
     if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
         return
     try:
-        set_state(conn, STATE_RUN_FAILURE_NOTIFIED, today)
         api.send_message(
             _require_chat_id(config),
             f"⚠️ 朝バッチ失敗(段: {', '.join(failures)} / run_id={run_id})。"
             "`intel run` で再走してください",
         )
+        # 送信成功後に記録(失敗した日は次の再走で再通知できる)
+        set_state(conn, STATE_RUN_FAILURE_NOTIFIED, today)
     except Exception as e:
         # 通知の失敗で run の終了コードを汚さない(フォールバック経路は作らない)
         logger.error(f"失敗通知の送信に失敗: {type(e).__name__}: {e}", extra={"stage": "run"})

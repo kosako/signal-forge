@@ -198,6 +198,31 @@ def test_notify_run_failure_swallows_send_error(conn, tmp_path) -> None:
     notify_run_failure(
         conn, make_config(tmp_path), FailingApi(), ["deliver"], "01RUN", logger
     )  # 例外が漏れない
+    # 送信できなかった日は通知枠を消費しない(次の再走で再通知できる)
+    assert get_state(conn, STATE_RUN_FAILURE_NOTIFIED) is None
+
+
+def test_watchdog_retries_after_send_failure(conn, tmp_path) -> None:
+    class FailOnceApi(FakeApi):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def send_message(self, chat_id, text, *, reply_markup=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise DeliveryError("送信失敗")
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    api = FailOnceApi()
+    config = make_config(tmp_path)
+    with pytest.raises(DeliveryError):
+        run_due_timers(conn, config, api, logger, jst_now("07:15"))
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) is None  # 枠を消費しない
+
+    run_due_timers(conn, config, api, logger, jst_now("07:16"))  # 次周期で成功
+    assert len(api.sent) == 1
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) is not None
 
 
 # --- callback: 夜アンケート回答(q1/q2) ---
@@ -283,6 +308,47 @@ def test_followup_without_dig_rejected(conn, tmp_path) -> None:
 
     assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 0
     assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
+
+
+def test_followup_after_dig_corrected_to_noise_rejected(conn, tmp_path) -> None:
+    # 追い掛け送信後に digest ボタンで dig → noise に訂正 → 古い追い掛けボタンの回答は
+    # 記帳しない(送信側と同じ「その日の最新 reaction が dig」判定。followup_dig 率の汚染防止)
+    item = add_item(conn, "https://a/1")
+    dig_date = (datetime.now(JST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    add_dig_reaction(conn, item, dig_date)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'noise', ?)",
+        (item, dig_date),
+    )
+    api = FakeApi([[make_callback_update(0, data=f"f:{item}:y")]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert (
+        conn.execute("SELECT count(*) FROM signals WHERE kind='followup_dig'").fetchone()[0]
+        == 0
+    )
+    assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
+
+
+def test_survey_deadline_boundary(conn, tmp_path) -> None:
+    # 対象日の翌日 12:00 JST ちょうどは受理、12:00 を過ぎたら破棄(設計 04 §4)
+    target = datetime(2026, 7, 6, tzinfo=JST)
+    date_compact = target.strftime("%Y%m%d")
+    at_noon = datetime(2026, 7, 7, 12, 0, 0, tzinfo=JST)
+
+    api = FakeApi([[make_callback_update(0, data=f"q1:{date_compact}:y")]])
+    poll_once(conn, make_config(tmp_path), api, logger, now_fn=lambda: at_noon)
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 1
+
+    api = FakeApi([[make_callback_update(0, data=f"q2:{date_compact}:10", update_id=2)]])
+    poll_once(
+        conn, make_config(tmp_path), api, logger,
+        now_fn=lambda: at_noon + timedelta(seconds=1),
+    )
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 1  # 増えない
+    assert api.answered == [("cb2", "⚠️ 回答期限(翌日12:00)を過ぎています")]
 
 
 # --- run_poller 統合 ---

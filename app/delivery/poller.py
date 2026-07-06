@@ -78,14 +78,19 @@ def run_poller(
     while not should_stop():
         try:
             run_due_timers(conn, config, api, logger, now_fn())
-            poll_once(conn, config, api, logger)
+            poll_once(conn, config, api, logger, now_fn=now_fn)
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
 
 
 def poll_once(
-    conn: sqlite3.Connection, config: Config, api: TelegramApi, logger: logging.Logger
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
 ) -> int:
     """getUpdates 1回分を処理し、処理した update 数を返す。"""
     offset = _load_offset(conn)
@@ -98,7 +103,7 @@ def poll_once(
         # 個別 update の処理失敗は poller を殺さず、offset を進めて次へ
         # (poison update を無限再処理しない。プロセス終了は launchd KeepAlive の責務)
         try:
-            handle_update(conn, config, api, update, logger)
+            handle_update(conn, config, api, update, logger, now_fn=now_fn)
         except Exception as e:
             logger.error(
                 f"update 処理失敗: {type(e).__name__}: {e}",
@@ -115,10 +120,12 @@ def handle_update(
     api: TelegramApi,
     update: dict,
     logger: logging.Logger,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
 ) -> None:
     callback = update.get("callback_query")
     if isinstance(callback, dict):
-        _handle_callback(conn, config, api, callback, logger)
+        _handle_callback(conn, config, api, callback, logger, now_fn=now_fn)
         return
     message = update.get("message")
     if isinstance(message, dict):
@@ -136,6 +143,8 @@ def _handle_callback(
     api: TelegramApi,
     callback: dict,
     logger: logging.Logger,
+    *,
+    now_fn: Callable[[], datetime],
 ) -> None:
     # 外部 API 由来のネスト値は形を仮定しない(型不正は未認可と同じ扱いで破棄)
     sender = callback.get("from")
@@ -169,10 +178,12 @@ def _handle_callback(
         if prefix == "s" and arg.isdigit() and code in _REACTION_VALUES:
             _record_reaction(conn, api, callback, callback_id, int(arg), code, logger)
             return
-        if prefix in ("q1", "q2") and re.fullmatch(r"\d{8}", arg) and _survey_value(
-            prefix, code
-        ):
-            _record_survey(conn, api, callback, callback_id, prefix, arg, code, logger)
+        survey_value = _survey_value(prefix, code) if prefix in ("q1", "q2") else None
+        if survey_value is not None and re.fullmatch(r"\d{8}", arg):
+            _record_survey(
+                conn, api, callback, callback_id, prefix, arg, code, survey_value,
+                logger, now=now_fn(),
+            )
             return
         if prefix == "f" and arg.isdigit() and code in ("y", "n"):
             _record_followup(conn, api, callback, callback_id, int(arg), code, logger)
@@ -237,7 +248,10 @@ def _record_survey(
     prefix: str,
     date_compact: str,
     code: str,
+    value: str,
     logger: logging.Logger,
+    *,
+    now: datetime,
 ) -> None:
     """夜アンケート回答。callback_data 内の日付に帰属(送信日時に依存しない)。"""
     try:
@@ -246,7 +260,7 @@ def _record_survey(
         api.answer_callback_query(callback_id)
         logger.warning("callback_data の日付が不正", extra={"stage": "poll"})
         return
-    if datetime.now(JST) > deadline:
+    if now > deadline:
         # 翌日 12:00 JST を過ぎた回答は記帳しない(設計 04 §4)
         api.answer_callback_query(callback_id, text="⚠️ 回答期限(翌日12:00)を過ぎています")
         logger.warning("期限切れの survey 回答を破棄", extra={"stage": "poll"})
@@ -254,8 +268,6 @@ def _record_survey(
 
     signal_date = f"{date_compact[:4]}-{date_compact[4:6]}-{date_compact[6:]}"
     kind = "survey_patrol" if prefix == "q1" else "survey_read_min"
-    value = _survey_value(prefix, code)
-    assert value is not None  # ディスパッチ側で検証済み
     if not _insert_signal(conn, kind, None, value, signal_date, logger):
         api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
         return
@@ -282,14 +294,28 @@ def _record_followup(
     code: str,
     logger: logging.Logger,
 ) -> None:
-    """🔖追い掛け回答。signal_date は 🔖 を付けた日(設計 01 §7)。"""
+    """🔖追い掛け回答。signal_date は 🔖 を付けた日(設計 01 §7)。
+
+    「その日の最新 reaction が dig」判定を送信側(_followup_targets)と揃える:
+    dig の後に 👎 等へ訂正された item は 🔖 対象でなくなるため、古い追い掛け
+    ボタンからの回答を記帳しない(followup_dig 率の汚染防止)。
+    """
     row = conn.execute(
-        "SELECT max(signal_date) AS dig_date FROM signals "
-        "WHERE kind = 'reaction' AND value = 'dig' AND item_id = ?",
+        """
+        SELECT max(s.signal_date) AS dig_date
+        FROM signals AS s
+        WHERE s.kind = 'reaction' AND s.item_id = ? AND s.value = 'dig'
+          AND s.id = (
+            SELECT id FROM signals AS s2
+            WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
+              AND s2.signal_date = s.signal_date
+            ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
+          )
+        """,
         (item_id,),
     ).fetchone()
     if row["dig_date"] is None:
-        # 🔖 が付いていない item への追い掛け回答は偽造・不整合として破棄
+        # 🔖 が付いていない(または訂正で外れた)item への追い掛け回答は破棄
         logger.warning(
             "🔖 記録のない item への followup を破棄",
             extra={"stage": "poll", "item_id": item_id},
