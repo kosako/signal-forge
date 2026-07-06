@@ -26,8 +26,8 @@ sqlite3 -header -column ~/.local/share/intel/intel.db < scripts/kpi/01-daily-kpi
 
 ## fail-closed の突合(SQL に出ない分の手作業)
 
-- **反応ゼロの配信日**は 01/08 の集計に現れない。08 の `delivered_days - reacted_days` が
-  正なら、その日数を**反応率 0% の無効日**として無効日数に足す。
+- 反応の KPI(01/07/08)は**配信済み digest を母集団**にしており、反応ゼロの配信日も
+  反応率 0% の無効日として SQL 内で判定される(手動補正は不要)。
 - **夜アンケート未回答の日**は 02 に現れない。暦日と突き合わせ、未回答日は
   **代替できなかった日**として数える(PROPOSAL の fail-closed 定義)。
 
