@@ -144,17 +144,65 @@ def test_regeneration_preserves_handwritten_and_user_frontmatter(conn, tmp_path)
     assert read_front(note)["score"] == 80  # 機械管理キーは更新対象
 
 
-def test_missing_marker_writes_conflict_file(conn, tmp_path) -> None:
+def test_missing_marker_writes_conflict_file_without_overwriting(conn, tmp_path) -> None:
     item = add_digested(conn, "https://a/1")
     digest_id = add_digest(conn, [item])
     config = make_config(tmp_path)
     export_digest(conn, config, digest_id, logger)
 
-    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    note = next(
+        p for p in (tmp_path / "vault" / "SignalForge" / "Items").glob("*.md")
+        if ".conflict" not in p.name
+    )
     note.write_text("マーカーを消した手書きノート")
     export_digest(conn, config, digest_id, logger)
 
     assert note.read_text() == "マーカーを消した手書きノート"  # 上書きしない
+    conflict = note.with_suffix(".conflict.md")
+    assert conflict.exists()
+
+    # 既存 conflict も上書きせず連番で退避する
+    conflict_content = conflict.read_text()
+    export_digest(conn, config, digest_id, logger)
+    assert conflict.read_text() == conflict_content
+    assert note.with_suffix(".conflict-2.md").exists()
+
+
+def test_handwriting_before_begin_marker_preserved(conn, tmp_path) -> None:
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    note = next(
+        p for p in (tmp_path / "vault" / "SignalForge" / "Items").glob("*.md")
+        if ".conflict" not in p.name
+    )
+    text = note.read_text()
+    text = text.replace("<!-- GENERATED:BEGIN -->", "BEGIN前の手書きメモ\n<!-- GENERATED:BEGIN -->")
+    note.write_text(text)
+
+    conn.execute("UPDATE analyses SET summary = '更新後の要約'")
+    export_digest(conn, config, digest_id, logger)
+    updated = note.read_text()
+    assert "BEGIN前の手書きメモ" in updated
+    assert "更新後の要約" in updated
+
+
+def test_broken_frontmatter_goes_to_conflict(conn, tmp_path) -> None:
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    note = next(
+        p for p in (tmp_path / "vault" / "SignalForge" / "Items").glob("*.md")
+        if ".conflict" not in p.name
+    )
+    broken = note.read_text().replace("---\n", "---\n: : broken yaml [\n", 1)
+    note.write_text(broken)
+    export_digest(conn, config, digest_id, logger)
+    assert note.read_text() == broken  # 元ファイルに触れない
     assert note.with_suffix(".conflict.md").exists()
 
 

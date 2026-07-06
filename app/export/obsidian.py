@@ -155,69 +155,97 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
 
 
 def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
-    """ノートを書く。マーカー欠損で退避した場合は False を返す。
+    """ノートを書く。fail-safe 退避(.conflict)した場合は False を返す。
 
-    - 新規: frontmatter + GENERATED ブロック + 手書き領域(空)
-    - 既存: GENERATED 内のみ置換、frontmatter は機械管理キーのみ更新
-    - 既存にマーカーが無い: 上書きせず .conflict.md に新版を並置
+    - 新規: frontmatter + GENERATED ブロック + 手書き領域
+    - 既存: GENERATED 内のみ置換。マーカー前後の手書きは verbatim 保持、
+      frontmatter はユーザー所有キーを保持して更新
+    - 既存の構造が判定不能(マーカー欠損/多重・frontmatter 欠落/破損): 元ファイルに
+      触れず、新版を別名の .conflict に退避する(既存 conflict も上書きしない)
     """
     generated_body = _strip_markers(generated_body)
     if not path.exists():
-        content = _render(frontmatter, generated_body, handwritten="")
-        _atomic_write(path, content)
+        _atomic_write(path, _render(frontmatter, generated_body))
         return True
 
     existing = path.read_text(encoding="utf-8")
+    fresh = _render(frontmatter, generated_body)
+
+    # 境界判定は fail-safe: BEGIN/END がちょうど1個ずつで正順のときだけ置換する
+    if existing.count(GENERATED_BEGIN) != 1 or existing.count(GENERATED_END) != 1:
+        return _write_conflict(path, fresh)
     begin = existing.find(GENERATED_BEGIN)
     end = existing.find(GENERATED_END)
-    if begin == -1 or end == -1 or end < begin:
-        conflict = path.with_suffix(".conflict.md")
-        _atomic_write(conflict, _render(frontmatter, generated_body, handwritten=""))
-        return False
+    if end < begin:
+        return _write_conflict(path, fresh)
 
-    merged_front = _merge_frontmatter(existing, frontmatter)
-    handwritten = existing[end + len(GENERATED_END) :].lstrip("\n")
-    _atomic_write(path, _render(merged_front, generated_body, handwritten=handwritten))
-    return True
+    m = _FRONT_MATTER.match(existing)
+    current = _parse_frontmatter(m.group(1)) if m else None
+    if current is None:
+        # frontmatter 欠落/破損時に {} で再構成するとユーザー追加キーが消えるため退避
+        return _write_conflict(path, fresh)
 
-
-def _merge_frontmatter(existing_text: str, new_front: dict) -> dict:
-    """既存 frontmatter に機械管理キーだけ上書き(reaction 等のユーザー編集を保持)。"""
-    m = _FRONT_MATTER.match(existing_text)
-    current: dict = {}
-    if m:
-        try:
-            parsed = yaml.safe_load(m.group(1))
-            if isinstance(parsed, dict):
-                current = parsed
-        except yaml.YAMLError:
-            current = {}  # 壊れた frontmatter は機械キーのみで再構成(手書き本文は別途保持)
     merged = dict(current)
-    for key, value in new_front.items():
+    for key, value in frontmatter.items():
         if key in _USER_OWNED_KEYS:
             merged.setdefault(key, value)  # ユーザー編集(reaction 等)を保持
         else:
             merged[key] = value  # 機械管理キーは更新
-    return merged
+
+    pre = existing[m.end() : begin]  # BEGIN より前の手書きも verbatim 保持
+    post = existing[end + len(GENERATED_END) :]
+    content = (
+        _render_frontmatter(merged)
+        + pre
+        + GENERATED_BEGIN
+        + "\n"
+        + generated_body
+        + "\n"
+        + GENERATED_END
+        + post
+    )
+    _atomic_write(path, content)
+    return True
 
 
-def _render(frontmatter: dict, generated_body: str, *, handwritten: str) -> str:
+def _write_conflict(path: Path, content: str) -> bool:
+    """新版を空いている .conflict 名に退避する(既存 conflict を上書きしない)。"""
+    candidate = path.with_suffix(".conflict.md")
+    counter = 2
+    while candidate.exists():
+        candidate = path.with_suffix(f".conflict-{counter}.md")
+        counter += 1
+    _atomic_write(candidate, content)
+    return False
+
+
+def _parse_frontmatter(text: str) -> dict | None:
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _render_frontmatter(frontmatter: dict) -> str:
     # 文字列連結で組み立てず YAML シリアライザで生成(改行・引用符入りタイトルによる
     # frontmatter 破壊や任意キー偽造を構造的に防ぐ。設計 04 §7)
     front = yaml.safe_dump(
         frontmatter, allow_unicode=True, sort_keys=False, default_flow_style=False
     )
-    parts = [
-        "---",
-        front.rstrip("\n"),
-        "---",
-        GENERATED_BEGIN,
-        generated_body,
-        GENERATED_END,
-        "",
-        handwritten.rstrip("\n"),
-    ]
-    return "\n".join(parts).rstrip("\n") + "\n"
+    return f"---\n{front.rstrip()}\n---\n"
+
+
+def _render(frontmatter: dict, generated_body: str) -> str:
+    return (
+        _render_frontmatter(frontmatter)
+        + GENERATED_BEGIN
+        + "\n"
+        + generated_body
+        + "\n"
+        + GENERATED_END
+        + "\n\n(この下は手書きメモ領域。再生成でも保持される)\n"
+    )
 
 
 def _strip_markers(content: str) -> str:
