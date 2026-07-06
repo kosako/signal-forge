@@ -332,6 +332,28 @@ def test_followup_after_dig_corrected_to_noise_rejected(conn, tmp_path) -> None:
     assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
 
 
+def test_followup_multiday_dig_with_latest_correction_rejected(conn, tmp_path) -> None:
+    # 複数日に dig があり、最新の reaction が noise に訂正されている → 過去日の dig に
+    # フォールバックして記帳しない(Codex SF36-01 再指摘の回帰テスト)
+    item = add_item(conn, "https://a/1")
+    add_dig_reaction(conn, item, "2026-07-05")
+    add_dig_reaction(conn, item, "2026-07-06")
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'noise', '2026-07-06')",
+        (item,),
+    )
+    api = FakeApi([[make_callback_update(0, data=f"f:{item}:y")]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert (
+        conn.execute("SELECT count(*) FROM signals WHERE kind='followup_dig'").fetchone()[0]
+        == 0
+    )
+    assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
+
+
 def test_survey_deadline_boundary(conn, tmp_path) -> None:
     # 対象日の翌日 12:00 JST ちょうどは受理、12:00 を過ぎたら破棄(設計 04 §4)
     target = datetime(2026, 7, 6, tzinfo=JST)

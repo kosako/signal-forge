@@ -296,34 +296,28 @@ def _record_followup(
 ) -> None:
     """🔖追い掛け回答。signal_date は 🔖 を付けた日(設計 01 §7)。
 
-    「その日の最新 reaction が dig」判定を送信側(_followup_targets)と揃える:
-    dig の後に 👎 等へ訂正された item は 🔖 対象でなくなるため、古い追い掛け
-    ボタンからの回答を記帳しない(followup_dig 率の汚染防止)。
+    item の**最新 reaction が dig のときだけ**記帳する(タイブレークは送信側と同一)。
+    dig の後に 👎 等へ訂正された item は 🔖 対象でなくなるため、古い追い掛けボタン
+    からの回答を過去の dig 日へフォールバックさせない(followup_dig 率の汚染防止)。
     """
-    row = conn.execute(
+    latest = conn.execute(
         """
-        SELECT max(s.signal_date) AS dig_date
-        FROM signals AS s
-        WHERE s.kind = 'reaction' AND s.item_id = ? AND s.value = 'dig'
-          AND s.id = (
-            SELECT id FROM signals AS s2
-            WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
-              AND s2.signal_date = s.signal_date
-            ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
-          )
+        SELECT value, signal_date FROM signals
+        WHERE kind = 'reaction' AND item_id = ?
+        ORDER BY created_at DESC, id DESC LIMIT 1
         """,
         (item_id,),
     ).fetchone()
-    if row["dig_date"] is None:
+    if latest is None or latest["value"] != "dig":
         # 🔖 が付いていない(または訂正で外れた)item への追い掛け回答は破棄
         logger.warning(
-            "🔖 記録のない item への followup を破棄",
+            "🔖 状態でない item への followup を破棄",
             extra={"stage": "poll", "item_id": item_id},
         )
         api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
         return
     value = {"y": "yes", "n": "no"}[code]
-    if not _insert_signal(conn, "followup_dig", item_id, value, row["dig_date"], logger):
+    if not _insert_signal(conn, "followup_dig", item_id, value, latest["signal_date"], logger):
         api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
         return
 
@@ -333,7 +327,7 @@ def _record_followup(
         extra={
             "stage": "poll",
             "item_id": item_id,
-            "extra": {"value": value, "signal_date": row["dig_date"]},
+            "extra": {"value": value, "signal_date": latest["signal_date"]},
         },
     )
     _edit_markup_best_effort(api, callback, followup_keyboard(item_id, selected=code), logger)
