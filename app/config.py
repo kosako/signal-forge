@@ -67,6 +67,17 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class AnalysisConfig:
+    block_domains: tuple[str, ...] = ()  # 静的 NG(設計 03 §2 規則1)
+    block_keywords: tuple[str, ...] = ()  # タイトル部分一致
+    freshness_hours: int = 72  # 規則2(manual は適用外)
+    daily_llm_limit: int = 150  # 規則4
+    batch_size: int = 15  # Stage 2 の1呼び出し件数(設計 03 §2)
+    body_max_chars: int = 2000  # Stage 2 の本文切り詰め
+    profile_path: str | None = None  # 未設定なら <config_dir>/interest-profile.md
+
+
+@dataclass(frozen=True)
 class Config:
     config_dir: Path
     x: XConfig = field(default_factory=XConfig)
@@ -77,12 +88,19 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
 
     @property
     def db_path(self) -> Path:
         if self.storage.db_path is not None:
             return Path(self.storage.db_path).expanduser()
         return Path.home() / ".local" / "share" / "intel" / "intel.db"
+
+    @property
+    def profile_path(self) -> Path:
+        if self.analysis.profile_path is not None:
+            return Path(self.analysis.profile_path).expanduser()
+        return self.config_dir / "interest-profile.md"
 
 
 _SECTIONS = {
@@ -94,6 +112,7 @@ _SECTIONS = {
     "telegram": TelegramConfig,
     "obsidian": ObsidianConfig,
     "storage": StorageConfig,
+    "analysis": AnalysisConfig,
 }
 
 
@@ -134,7 +153,11 @@ def _build_section(path: Path, name: str, cls: type, values: dict) -> object:
     for key, value in values.items():
         if not _type_ok(fields[key], value):
             raise ConfigError(f"{path}: [{name}].{key} の型が不正: {value!r}")
-    return cls(**values)
+    # TOML の配列は list で来るが、frozen dataclass の既定は不変の tuple に揃える
+    coerced = {
+        key: tuple(value) if isinstance(value, list) else value for key, value in values.items()
+    }
+    return cls(**coerced)
 
 
 def _type_ok(annotation: str, value: object) -> bool:
@@ -149,6 +172,8 @@ def _type_ok(annotation: str, value: object) -> bool:
             return isinstance(value, int | float) and not isinstance(value, bool)
         case "str" | "str | None":
             return isinstance(value, str)
+        case "tuple[str, ...]":
+            return isinstance(value, list) and all(isinstance(v, str) for v in value)
     raise ConfigError(f"内部エラー: 未対応の型注釈 {annotation}")
 
 
