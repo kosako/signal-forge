@@ -255,23 +255,45 @@ def _check_llm(
     except Exception as e:
         return CheckResult(6, "LLM", "FAIL", f"エンジン生成失敗: {e}")
 
-    try:
-        home_leak = _probe_home_isolation(engine, home)
-        if home_leak:
-            return CheckResult(6, "LLM", "FAIL", f"隔離検査 NG: {home_leak}")
-        net_leak = _probe_network_isolation(engine, server_factory)
-        if net_leak:
-            return CheckResult(6, "LLM", "FAIL", f"隔離検査 NG: {net_leak}")
-        codex_result = _probe_codex_home_isolation(config, codex_home_engine_factory)
-        if codex_result is not None and codex_result.startswith("NG:"):
-            return CheckResult(6, "LLM", "FAIL", f"隔離検査 {codex_result}")
-    except Exception as e:
-        return CheckResult(6, "LLM", "FAIL", f"complete_structured 失敗: {e}")
+    # プローブの例外は raw LLM 出力・stderr を含みうる(parse_structured は不正 JSON の
+    # 先頭を、CodexCliEngine は stderr を例外に載せる)。CODEX_HOME プローブでは canary と
+    # auth.json が同居するため、例外文字列をそのまま出すと credential 露出の恐れがある。
+    # よって detail には「どのプローブが失敗したか」と例外型名だけを載せ、本文は載せない
+    home_leak = _run_probe("HOME 隔離", lambda: _probe_home_isolation(engine, home))
+    if _is_fail(home_leak):
+        return CheckResult(6, "LLM", "FAIL", home_leak)
+    net_leak = _run_probe(
+        "ネットワーク遮断", lambda: _probe_network_isolation(engine, server_factory)
+    )
+    if _is_fail(net_leak):
+        return CheckResult(6, "LLM", "FAIL", net_leak)
+    codex_leak = _run_probe(
+        "CODEX_HOME 隔離",
+        lambda: _probe_codex_home_isolation(config, codex_home_engine_factory),
+    )
+    if _is_fail(codex_leak):
+        return CheckResult(6, "LLM", "FAIL", codex_leak)
 
-    probes = "HOME・ネットワーク" + ("・CODEX_HOME" if codex_result else "")
+    codex_ran = codex_leak == ""  # None=非 codex(未実施)/ ""=実施し漏れなし
+    probes = "HOME・ネットワーク" + ("・CODEX_HOME" if codex_ran else "")
     return CheckResult(
         6, "LLM", "PASS", f"{config.llm.engine}: 構造化応答 OK・隔離検査 OK({probes})"
     )
+
+
+def _is_fail(probe_result: str | None) -> bool:
+    return bool(probe_result)  # None / "" は成功、非空文字列は FAIL 理由
+
+
+def _run_probe(name: str, probe: Callable[[], str | None]) -> str | None:
+    """プローブを実行し、漏れ/例外なら FAIL 理由(非空)を返す。
+
+    例外の本文(LLM 出力・stderr を含みうる)は detail に載せず型名のみに縮める。
+    """
+    try:
+        return probe()
+    except Exception as e:
+        return f"隔離検査 {name} が例外で失敗: {type(e).__name__}"
 
 
 def _probe_home_isolation(engine: object, home: Path) -> str | None:
@@ -289,7 +311,9 @@ def _probe_home_isolation(engine: object, home: Path) -> str | None:
             CanaryProbe,
             timeout_s=120,
         )
-        return "canary 内容が応答に漏れた(HOME 隔離が無効)" if token in probe.content else None
+        if token in probe.content:
+            return "隔離検査 NG: canary 内容が応答に漏れた(HOME 隔離が無効)"
+        return None
     finally:
         _cleanup_dir(canary_path, canary_dir)
 
@@ -309,7 +333,7 @@ def _probe_network_isolation(
             timeout_s=120,
         )
         if server.was_hit():
-            return "ローカルサーバへの到達を観測(ネットワーク遮断が無効)"
+            return "隔離検査 NG: ローカルサーバへの到達を観測(ネットワーク遮断が無効)"
     return None
 
 
@@ -318,7 +342,7 @@ def _probe_codex_home_isolation(
 ) -> str | None:
     """CODEX_HOME(auth.json 同居)内の canary が漏れないか。codex-cli のみ実施。
 
-    戻り値: None=未実施(非 codex-cli)/ "OK"=漏れなし / "NG: ..."=漏れ。
+    戻り値: None=未実施(非 codex-cli)/ ""=実施し漏れなし / 非空=漏れ理由。
     """
     if config.llm.engine != "codex-cli":
         return None
@@ -337,8 +361,8 @@ def _probe_codex_home_isolation(
             timeout_s=120,
         )
         if token in probe.content:
-            return "NG: CODEX_HOME 内 canary が漏れた(auth 流出経路)"
-        return "OK"
+            return "隔離検査 NG: CODEX_HOME 内 canary が漏れた(auth 流出経路)"
+        return ""  # 実施し漏れなし(_run_probe の None(未実施)と区別する)
 
 
 def _codex_home_probe_engine(codex_home: str) -> object:
@@ -379,6 +403,9 @@ def _local_canary_server() -> object:
     token = secrets.token_hex(8)
 
     class _Handler(BaseHTTPRequestHandler):
+        # 接続だけ開いて request を完了しない相手で shutdown が詰まらないよう timeout
+        timeout = 5
+
         def do_GET(self) -> None:  # noqa: N802
             self.server.hit = True  # type: ignore[attr-defined]
             self.send_response(200)

@@ -323,6 +323,49 @@ def test_llm_network_probe_uses_real_local_server(config_dir, tmp_path) -> None:
     assert result.status == "PASS"
 
 
+def test_llm_probe_exception_does_not_leak_output(config_dir, tmp_path) -> None:
+    # プローブの例外(parse_structured は raw 出力を、codex は stderr を載せうる)は
+    # detail に本文を出さず型名のみ(auth 内容の露出防止。Codex must)
+    class LeakyExceptionEngine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise RuntimeError("SECRET-AUTH-abc123 が含まれる生出力")
+
+    result = by_number(
+        doctor(config_dir, tmp_path, engine_factory=lambda name: LeakyExceptionEngine()), 6
+    )
+    assert result.status == "FAIL"
+    assert "SECRET-AUTH" not in result.detail  # 本文は載せない
+    assert "RuntimeError" in result.detail  # 型名のみ
+    assert "HOME 隔離" in result.detail  # どのプローブか
+
+
+def test_llm_server_closed_on_probe_exception(config_dir, tmp_path) -> None:
+    # complete_structured が例外を投げても canary サーバの __exit__ が呼ばれる
+    closed = {"value": False}
+
+    class TrackingServer(FakeServer):
+        def __exit__(self, *exc):
+            closed["value"] = True
+            return False
+
+    class RaisingEngine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if "http://" in prompt:  # ネットワークプローブで例外
+                raise RuntimeError("boom")
+            return CanaryProbe(content="unreadable")
+
+    result = by_number(
+        doctor(
+            config_dir, tmp_path,
+            server_factory=TrackingServer,
+            engine_factory=lambda name: RaisingEngine(),
+        ),
+        6,
+    )
+    assert result.status == "FAIL"
+    assert closed["value"] is True  # server lifecycle は例外時も守られる
+
+
 def test_llm_codex_home_leak_fails(config_dir, tmp_path) -> None:
     # CODEX_HOME 内 canary を読めるエンジン → auth 流出経路として FAIL
     class CodexHomeLeakyEngine:
