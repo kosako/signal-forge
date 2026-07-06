@@ -44,6 +44,11 @@ class FakeApi:
         self.offsets: list[int | None] = []
         self.answered: list[tuple[str, str | None]] = []
         self.edited: list[tuple[int, int, dict]] = []
+        self.sent: list[tuple[int, str]] = []
+
+    def send_message(self, chat_id: int, text: str, *, reply_markup: dict | None = None) -> int:
+        self.sent.append((chat_id, text))
+        return 900 + len(self.sent)
 
     def get_updates(self, offset: int | None) -> list[dict]:
         self.offsets.append(offset)
@@ -240,12 +245,134 @@ def test_retap_appends_new_row(conn, tmp_path) -> None:
     assert values == ["useful", "noise"]  # 追記型(上書きしない。設計 01 §7)
 
 
-def test_message_update_ignored_but_offset_advances(conn, tmp_path) -> None:
-    api = FakeApi([[{"update_id": 3, "message": {"text": "https://x", "from": {"id": OWNER_ID}}}]])
+def make_message_update(
+    text: object, *, update_id: int = 1, from_id: int = OWNER_ID
+) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {"text": text, "from": {"id": from_id}, "chat": {"id": CHAT_ID}},
+    }
+
+
+def manual_items(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT items.* FROM items JOIN sources ON sources.id = items.source_id "
+        "WHERE sources.type = 'manual' ORDER BY items.id"
+    ).fetchall()
+
+
+def test_url_message_ingested_and_acked(conn, tmp_path) -> None:
+    api = FakeApi([[make_message_update("これ読みたい https://example.com/article?utm_source=x")]])
     poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = manual_items(conn)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "new"
+    assert rows[0]["canonical_url"] == "https://example.com/article"  # u1 正規化済み
+    assert api.sent == [(CHAT_ID, "✅ 1件受け付けました。明朝のダイジェストで分析します")]
+
+
+def test_two_different_urls_same_day_both_new(conn, tmp_path) -> None:
+    # plan #18 完了条件: 空 content_hash による誤 duplicate 化がない(設計 01 §5〜6)
+    api = FakeApi([[
+        make_message_update("https://example.com/a", update_id=1),
+        make_message_update("https://example.org/b", update_id=2),
+    ]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = manual_items(conn)
+    assert [r["status"] for r in rows] == ["new", "new"]
+    assert all(r["dup_of_item_id"] is None for r in rows)
+
+
+def test_existing_url_replies_already_ingested(conn, tmp_path) -> None:
+    api = FakeApi([
+        [make_message_update("https://example.com/a", update_id=1)],
+        [make_message_update("https://example.com/a?utm_source=tg", update_id=2)],  # 同一正規形
+    ])
+    config = make_config(tmp_path)
+    poll_once(conn, config, api, logger)
+    poll_once(conn, config, api, logger)
+
+    assert len(manual_items(conn)) == 1  # 冪等
+    assert api.sent[1] == (CHAT_ID, "投入済みです(1件)")
+
+
+def test_multiple_urls_in_one_message(conn, tmp_path) -> None:
+    api = FakeApi([[make_message_update(
+        "https://example.com/a と https://example.org/b と再掲 https://example.com/a"
+    )]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert len(manual_items(conn)) == 2  # メッセージ内重複は1件扱い
+    assert api.sent == [(CHAT_ID, "✅ 2件受け付けました。明朝のダイジェストで分析します")]
+
+
+def test_mixed_new_and_known_urls(conn, tmp_path) -> None:
+    api = FakeApi([
+        [make_message_update("https://example.com/a", update_id=1)],
+        [make_message_update("https://example.com/a https://example.org/b", update_id=2)],
+    ])
+    config = make_config(tmp_path)
+    poll_once(conn, config, api, logger)
+    poll_once(conn, config, api, logger)
+
+    assert len(manual_items(conn)) == 2
+    assert api.sent[1] == (
+        CHAT_ID, "✅ 1件受け付けました。明朝のダイジェストで分析します(ほか1件は投入済み)"
+    )
+
+
+@pytest.mark.parametrize("no_url_text", ["おはよう", None, 123])
+def test_message_without_url_gets_guide(conn, tmp_path, no_url_text) -> None:
+    api = FakeApi([[make_message_update(no_url_text)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == [(CHAT_ID, "URL を送ると翌朝のダイジェスト候補になります")]
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://alice:secret@example.com/a",  # userinfo(credential 漏えい防止で reject)
+        "https://example.com:99999/a",  # 不正ポート
+        "https://?x=1",  # host なし
+    ],
+)
+def test_invalid_urls_rejected_with_reply(conn, tmp_path, invalid_url) -> None:
+    api = FakeApi([[make_message_update(invalid_url)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == [(CHAT_ID, "有効な URL がありませんでした")]
+
+
+def test_channel_post_is_ignored(conn, tmp_path) -> None:
+    api = FakeApi([[{
+        "update_id": 1,
+        "channel_post": {"text": "https://example.com/a", "chat": {"id": CHAT_ID}},
+    }]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == []
+
+
+def test_non_owner_message_discarded_without_reply(conn, tmp_path) -> None:
+    api = FakeApi([[make_message_update("https://example.com/a", from_id=999)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == []  # 応答も返さない(設計 04 §6)
     assert conn.execute(
         "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
-    ).fetchone()["value"] == "4"
+    ).fetchone()["value"] == "2"
+
+
+def test_message_with_malformed_chat_still_ingests(conn, tmp_path) -> None:
+    update = make_message_update("https://example.com/a")
+    update["message"]["chat"] = "broken"
+    api = FakeApi([[update]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert len(manual_items(conn)) == 1  # 投入は成立、返信のみ skip
+    assert api.sent == []
 
 
 def test_update_failure_does_not_kill_batch(conn, tmp_path) -> None:

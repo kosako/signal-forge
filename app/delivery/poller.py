@@ -1,24 +1,35 @@
-"""受信デーモン intel poll(設計 04 §3, §6 / 00 §2)。
+"""受信デーモン intel poll(設計 04 §3, §5, §6 / 00 §2)。
 
 - getUpdates long polling(50s)。offset は telegram_state に永続化し、再起動で
   取りこぼし・二重処理しない(at-least-once。signals は追記型なので重複は集計側で吸収)
 - callback 処理順: ①認可(from.id)→ ②即 answerCallbackQuery(10秒失効対策)→
   ③検証(item 実在+digests 帰属)→ ④signals INSERT → ⑤editMessageReplyMarkup で ✓
+- message 処理(URL 投入。設計 02 §4 / 04 §5): owner の平文メッセージから http/https
+  URL を抽出し items(source=manual)へ投入して即 ACK。重複判定は canonical_url のみ
+  (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
-- 本モジュールが扱うのは反応ボタン(`s:`)のみ。URL 投入は plan #18、
-  夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)は plan #19 で拡張する
+- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)は plan #19 で拡張する
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 from app.config import Config
+from app.db import insert_item_with_dedup
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
+from app.normalize import (
+    content_hash,
+    is_dedup_eligible,
+    normalize_text_for_hash,
+    normalize_url,
+)
 
 OFFSET_KEY = "getupdates_offset"
 RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
@@ -26,6 +37,9 @@ RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
 # callback_data の code → signals.value(設計 04 §3 / 01 §7)
 _REACTION_VALUES = {"up": "useful", "dig": "dig", "knw": "known", "no": "noise"}
 _REACTION_EMOJI = {"up": "👍", "dig": "🔖", "knw": "✅", "no": "👎"}
+
+_URL_RE = re.compile(r"https?://\S+")
+NO_URL_GUIDE = "URL を送ると翌朝のダイジェスト候補になります"
 
 
 def run_poller(
@@ -88,7 +102,10 @@ def handle_update(
     if isinstance(callback, dict):
         _handle_callback(conn, config, api, callback, logger)
         return
-    # message(URL 投入)は plan #18。それ以外の update 種別は対象外
+    message = update.get("message")
+    if isinstance(message, dict):
+        _handle_message(conn, config, api, message, logger)
+        return
     logger.info(
         "未対応の update 種別を破棄",
         extra={"stage": "poll", "extra": {"keys": sorted(set(update) - {"update_id"})}},
@@ -190,6 +207,113 @@ def _handle_callback(
             "message/chat の形が不正なため ✓ 反映を skip",
             extra={"stage": "poll", "item_id": item_id},
         )
+
+
+def _handle_message(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    message: dict,
+    logger: logging.Logger,
+) -> None:
+    """owner メッセージからの URL 投入(設計 02 §4 / 04 §5)。"""
+    sender = message.get("from")
+    from_id = sender.get("id") if isinstance(sender, dict) else None
+    if not isinstance(from_id, int) or from_id != config.telegram.owner_user_id:
+        logger.warning(
+            "allowlist 外の message を破棄",
+            extra={
+                "stage": "poll",
+                "extra": {
+                    "from_id": from_id if isinstance(from_id, int) else None,
+                    "from_type": type(from_id).__name__,
+                    "kind": "message",
+                },
+            },
+        )
+        return
+
+    # 返信先は受信メッセージの chat(owner の DM。from.id 認可済み)。形不正なら返信なし
+    chat = message.get("chat")
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+
+    def reply(text: str) -> None:
+        if isinstance(chat_id, int):
+            api.send_message(chat_id, text)
+        else:
+            logger.warning("chat の形が不正なため返信を skip", extra={"stage": "poll"})
+
+    text = message.get("text")
+    urls = _URL_RE.findall(text) if isinstance(text, str) else []
+    if not urls:
+        reply(NO_URL_GUIDE)
+        return
+
+    inserted, known = _ingest_manual_urls(conn, urls, logger)
+    if inserted:
+        note = f"(ほか{known}件は投入済み)" if known else ""
+        reply(f"✅ {inserted}件受け付けました。明朝のダイジェストで分析します{note}")
+    elif known:
+        reply(f"投入済みです({known}件)")
+    else:
+        # 抽出はされたが全件が正規化 reject(userinfo・不正ポート・host なし等)
+        reply("有効な URL がありませんでした")
+
+
+def _ingest_manual_urls(
+    conn: sqlite3.Connection, urls: list[str], logger: logging.Logger
+) -> tuple[int, int]:
+    """URL 群を items(source=manual)へ投入し (新規件数, 既存件数) を返す。
+
+    重複判定は canonical_url のみ(INSERT OR IGNORE)。manual は本文が無く
+    正規化テキストが空 = dedup_eligible False で、24h 内容 dedup の親子にならない
+    (設計 01 §5〜6。空ハッシュ一致で別 URL が duplicate 化する誤爆の防止)。
+    """
+    source_id = conn.execute(
+        "SELECT id FROM sources WHERE type = 'manual' AND name = 'manual'"
+    ).fetchone()["id"]
+    empty_text = normalize_text_for_hash(None, None)
+    inserted = 0
+    known = 0
+    seen: set[str] = set()
+    for url in urls:
+        try:
+            # 短縮 URL 展開はしない(poller の外向き HTTP を Telegram API のみに保つ。
+            # 設計 01 §4 の resolver 注入を manual では使わない例外 — 同 §4 に明記)
+            canonical = normalize_url(url)
+        except Exception as e:
+            logger.warning(
+                f"URL 正規化失敗のため skip: {type(e).__name__}", extra={"stage": "poll"}
+            )
+            continue
+        if not urlsplit(canonical).hostname:
+            # `https://?x=1` 等の host なし URL は normalize を素通りするため明示拒否
+            logger.warning("host のない URL のため skip", extra={"stage": "poll"})
+            continue
+        if canonical in seen:  # 同一メッセージ内の重複は1件として扱う
+            continue
+        seen.add(canonical)
+        outcome = insert_item_with_dedup(
+            conn,
+            source_id=source_id,
+            external_id=None,
+            url=url,
+            canonical_url=canonical,
+            title=None,
+            author=None,
+            published_at=None,
+            raw_payload=None,
+            content_hash=content_hash(empty_text),
+            dedup_eligible=is_dedup_eligible(empty_text),
+        )
+        if outcome.outcome == "inserted":
+            inserted += 1
+            logger.info(
+                "manual URL 投入", extra={"stage": "poll", "item_id": outcome.item_id}
+            )
+        else:
+            known += 1
+    return inserted, known
 
 
 def _parse_reaction(data: object) -> tuple[int, str] | None:
