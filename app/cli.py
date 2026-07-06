@@ -75,6 +75,8 @@ def analyze(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """事前選別+LLM 本分析で analyses を生成する。"""
+    from app.analysis.analyzer import analyze_selected
+    from app.analysis.llm import create_engine
     from app.analysis.profile import load_interest_profile
     from app.analysis.stage1 import preselect
     from app.config import load_config
@@ -85,10 +87,11 @@ def analyze(
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
-    load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
-    preselect(conn, config, logger)
-    typer.echo("Stage 2(LLM 本分析)は未実装: plan #11 で実装予定", err=True)
-    raise typer.Exit(code=1)
+    profile = load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
+    engine = create_engine(config.llm.engine)
+    result = preselect(conn, config, logger)
+    counts = analyze_selected(conn, config, engine, profile.body, result.selected_ids, logger)
+    typer.echo(f"analyzed={counts['analyzed']} degraded={counts['degraded']}")
 
 
 @app.command()
