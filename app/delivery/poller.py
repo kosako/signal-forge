@@ -82,6 +82,17 @@ def run_poller(
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
+        except sqlite3.OperationalError as e:
+            # 朝バッチの VACUUM・backup と重なると busy_timeout(5s)超過で
+            # "database is locked/busy" が出うる。これは一過性なので待って再開する
+            # (クラッシュ→KeepAlive 再起動のループより穏当)。
+            # それ以外(no such table 等のスキーマ破損)は恒久エラーなので握らず落とす
+            # (KeepAlive が再起動し、doctor #3 で検知できる)
+            message = str(e)
+            if "locked" not in message and "busy" not in message:
+                raise
+            logger.error(f"DB ロック競合(30s 後に再開): {e}", extra={"stage": "poll"})
+            sleep(RECONNECT_BACKOFF_S)
 
 
 def poll_once(
@@ -93,7 +104,7 @@ def poll_once(
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
 ) -> int:
     """getUpdates 1回分を処理し、処理した update 数を返す。"""
-    offset = _load_offset(conn)
+    offset = _load_offset(conn, logger)
     updates = api.get_updates(offset)
     for update in updates:
         update_id = update.get("update_id")
@@ -498,9 +509,20 @@ def _digest_date_of_item(conn: sqlite3.Connection, item_id: int) -> str | None:
     return row["digest_date"]
 
 
-def _load_offset(conn: sqlite3.Connection) -> int | None:
+def _load_offset(conn: sqlite3.Connection, logger: logging.Logger) -> int | None:
     value = get_state(conn, OFFSET_KEY)
-    return int(value) if value is not None else None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        # 破損・手編集された offset で poller を落とさない。None(offset なし)で
+        # 再開すると未確認 update が再配達される(at-least-once で安全側)
+        logger.warning(
+            f"telegram_state の offset が不正なためリセット: {value[:20]!r}",
+            extra={"stage": "poll"},
+        )
+        return None
 
 
 def _save_offset(conn: sqlite3.Connection, offset: int) -> None:

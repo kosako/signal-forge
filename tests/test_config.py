@@ -162,3 +162,25 @@ def test_telegram_timer_times_validated(tmp_path: Path) -> None:
     write_config(tmp_path, '[telegram]\nwatchdog_time = "7時"\n')
     with pytest.raises(ConfigError, match="HH:MM"):
         load_config(tmp_path)
+
+
+def test_load_env_preserves_inner_and_unpaired_quotes(tmp_path: Path) -> None:
+    # 剥がすのは「対になった囲みクォート」1組のみ。値に正当に含まれる引用符は壊さない
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join([
+            "PAIRED=\"abc\"",
+            "UNPAIRED='abc",
+            "TRAILING=abc'",
+            "INNER=a'b\"c",
+            "NESTED='\"abc\"'",
+        ]),
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+    env = load_env(tmp_path)
+    assert env["PAIRED"] == "abc"
+    assert env["UNPAIRED"] == "'abc"
+    assert env["TRAILING"] == "abc'"
+    assert env["INNER"] == "a'b\"c"
+    assert env["NESTED"] == '"abc"'  # 外側の1組だけ剥がす

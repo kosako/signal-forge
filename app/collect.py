@@ -72,10 +72,16 @@ def _collect_source(
         cursor = json.loads(source.cursor) if source.cursor else {}
         result = connector.fetch(source, cursor)
         counts = _store_result(conn, source, result.items, result.next_cursor, resolve_short)
-    except (RetryableError, FatalError) as e:
+    except Exception as e:
+        # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
+        # (1本の壊れたフィード・コネクタのバグで他ソースの collect を止めない。
+        # 設計 00 §6 / 02 §1 の「他ソースは必ず継続」の保証)
         _record_failure(conn, source, run_row_id, e)
-        logger.warning(
-            f"collect 失敗({type(e).__name__})。ソースをスキップ: {e}", extra=log_ctx
+        log = logger.warning if isinstance(e, RetryableError | FatalError) else logger.error
+        log(
+            f"collect 失敗。ソースをスキップ: {_safe_error_text(e)}",
+            extra=log_ctx,
+            exc_info=not isinstance(e, RetryableError | FatalError),
         )
         return
 
@@ -197,10 +203,18 @@ def _iso(raw: RawItem) -> str | None:
     return raw.published_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _safe_error_text(error: Exception) -> str:
+    """例外の __str__ 自体が壊れていても隔離を崩さない(分類外例外も扱うため)。"""
+    try:
+        return f"{type(error).__name__}: {error}"
+    except Exception:
+        return type(error).__name__
+
+
 def _record_failure(
     conn: sqlite3.Connection, source: Source, run_row_id: int, error: Exception
 ) -> None:
-    message = f"{type(error).__name__}: {error}"
+    message = _safe_error_text(error)
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(

@@ -229,7 +229,8 @@ def test_watchdog_retries_after_send_failure(conn, tmp_path) -> None:
 
 
 def test_q1_answer_recorded_with_date_attribution(conn, tmp_path) -> None:
-    date_compact = datetime.now(JST).strftime("%Y%m%d")
+    now = datetime.now(JST)  # 日付は1回だけ取る(深夜跨ぎで date_compact とずれない)
+    date_compact = now.strftime("%Y%m%d")
     update = make_callback_update(0, data=f"q1:{date_compact}:y")
     api = FakeApi([[update]])
 
@@ -237,7 +238,7 @@ def test_q1_answer_recorded_with_date_attribution(conn, tmp_path) -> None:
 
     row = conn.execute("SELECT * FROM signals").fetchone()
     assert (row["kind"], row["value"], row["item_id"]) == ("survey_patrol", "yes", None)
-    assert row["signal_date"] == datetime.now(JST).strftime("%Y-%m-%d")
+    assert row["signal_date"] == now.strftime("%Y-%m-%d")
     assert api.answered == [("cb1", "📝 記録しました")]
     _, _, markup = api.edited[0]
     assert "はい ✓" in json.dumps(markup, ensure_ascii=False)

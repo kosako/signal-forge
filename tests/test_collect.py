@@ -153,3 +153,27 @@ def test_manual_source_not_collected(conn: sqlite3.Connection) -> None:
     connector = FakeConnector([item("https://example.com/1")])
     collect_all(conn, {"rss": connector}, logger)
     assert len(connector.seen_cursors) == 1  # manual(id=1)は対象外で rss の1回のみ
+
+
+def test_unexpected_exception_also_isolated(conn: sqlite3.Connection) -> None:
+    # 分類外の例外(コネクタのバグ等)でも他ソースの collect を止めない(設計 00 §6)
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-b', '{\"url\": \"https://b\"}')"
+    )
+    crashing = FakeConnector([], error=RuntimeError("connector bug"))
+    ok = FakeConnector([item("https://b/1")])
+
+    class Router:
+        source_type = "rss"
+
+        def fetch(self, source_row, cursor):
+            return (crashing if source_row.name == "feed-a" else ok).fetch(source_row, cursor)
+
+    collect_all(conn, {"rss": Router()}, logger)
+
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 1  # feed-b は取れている
+    run = conn.execute(
+        "SELECT status, error FROM collect_runs ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert run["status"] == "error"
+    assert "RuntimeError" in run["error"]

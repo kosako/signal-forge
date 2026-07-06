@@ -16,7 +16,7 @@ from datetime import datetime, time, timedelta
 
 from app.config import Config
 from app.delivery.state import get_state, set_state
-from app.delivery.telegram import TelegramApi, escape_text
+from app.delivery.telegram import TITLE_MAX_CHARS, TelegramApi, escape_and_truncate
 from app.digest.builder import JST, today_jst
 
 STATE_SURVEY_SENT = "survey_sent_date"
@@ -112,7 +112,9 @@ def send_evening_survey(
     )
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
-        title = escape_text(row["title"] or "(タイトルなし)")
+        title = escape_and_truncate(
+            (row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS
+        )
         api.send_message(
             chat_id,
             f"🔖 深掘りした?\n{title}",

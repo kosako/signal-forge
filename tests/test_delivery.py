@@ -346,3 +346,20 @@ def test_invalid_published_at_drops_date_but_delivers(conn, tmp_path) -> None:
 def test_escape_helpers() -> None:
     assert escape_text("a<b>&c") == "a&lt;b&gt;&amp;c"
     assert escape_attr('a"b\'c&') == "a&quot;b&#x27;c&amp;"
+
+
+def test_huge_title_is_truncated_and_delivery_succeeds(conn, tmp_path) -> None:
+    # RSS 由来の異常に長いタイトル1件で Telegram の 4096 字上限を踏んで
+    # 配信全体が failed にならない(タイトルにも上限。監査対応)
+    a = add_item(conn, "https://a/1", title="長" * 5000, summary="要約。", implication="示唆。")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+
+    sent = deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert sent == 2
+    text = recorder.texts()[1]
+    assert len(text) <= ITEM_TEXT_MAX_CHARS + 400  # タイトル上限 300 + 構造分で十分小さい
+    assert "…" in text.splitlines()[0]  # タイトルが切り詰められている
+    assert text.endswith("💡 示唆。")  # 示唆は残る
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
