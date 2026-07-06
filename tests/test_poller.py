@@ -151,6 +151,70 @@ def test_malformed_or_unsupported_callback_data(conn, tmp_path, bad_data) -> Non
     assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    "bad_from",
+    [None, "attacker", 123, {"id": "10"}, {"id": None}, {}],  # 非 dict / 非 int id
+)
+def test_malformed_from_treated_as_unauthorized(conn, tmp_path, bad_from) -> None:
+    a = add_item(conn, "https://a/1")
+    add_digest(conn, [a])
+    update = make_callback_update(a, "up")
+    update["callback_query"]["from"] = bad_from
+    api = FakeApi([[update]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert api.answered == []  # 未認可扱いで無応答破棄
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()["value"] == "2"  # offset は進む(poison update 化しない)
+
+
+@pytest.mark.parametrize(
+    "bad_message",
+    [
+        "not-a-dict",
+        {"message_id": 55, "chat": "not-a-dict"},
+        {"message_id": 55, "chat": {}},  # chat.id 欠落
+        {"message_id": 55, "chat": {"id": "77"}},  # chat.id 非 int
+        {"chat": {"id": 77}},  # message_id 欠落
+    ],
+)
+def test_malformed_message_skips_edit_but_records(conn, tmp_path, bad_message) -> None:
+    a = add_item(conn, "https://a/1")
+    add_digest(conn, [a])
+    update = make_callback_update(a, "up")
+    update["callback_query"]["message"] = bad_message
+    api = FakeApi([[update]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    # 記帳と answer は完了し、✓ 反映だけ skip(offset も進む)
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 1
+    assert api.answered == [("cb1", "👍 記録しました")]
+    assert api.edited == []
+    assert conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()["value"] == "2"
+
+
+def test_unexpected_exception_advances_offset(conn, tmp_path) -> None:
+    a = add_item(conn, "https://a/1")
+    add_digest(conn, [a])
+
+    class ExplodingApi(FakeApi):
+        def answer_callback_query(self, callback_query_id, *, text=None):
+            raise RuntimeError("想定外")
+
+    api = ExplodingApi([[make_callback_update(a, "up")]])
+    poll_once(conn, make_config(tmp_path), api, logger)  # 例外が漏れない
+
+    assert conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()["value"] == "2"  # poison update を無限再処理しない
+
+
 def test_item_without_digest_membership_not_recorded(conn, tmp_path) -> None:
     a = add_item(conn, "https://a/1")  # digest に載っていない
     api = FakeApi([[make_callback_update(a, "dig")]])

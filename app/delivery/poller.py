@@ -63,12 +63,16 @@ def poll_once(
         if not isinstance(update_id, int):
             logger.warning("update_id のない update を破棄", extra={"stage": "poll"})
             continue
-        # 個別 update の処理失敗は poller を殺さない(次の update へ)。
-        # offset は処理後に進める(クラッシュ時は at-least-once で再配達)
+        # 個別 update の処理失敗は poller を殺さず、offset を進めて次へ
+        # (poison update を無限再処理しない。プロセス終了は launchd KeepAlive の責務)
         try:
             handle_update(conn, config, api, update, logger)
-        except DeliveryError as e:
-            logger.error(f"update 処理失敗: {e}", extra={"stage": "poll"})
+        except Exception as e:
+            logger.error(
+                f"update 処理失敗: {type(e).__name__}: {e}",
+                extra={"stage": "poll"},
+                exc_info=True,
+            )
         _save_offset(conn, update_id + 1)
     return len(updates)
 
@@ -98,12 +102,22 @@ def _handle_callback(
     callback: dict,
     logger: logging.Logger,
 ) -> None:
-    from_id = (callback.get("from") or {}).get("id")
-    if from_id != config.telegram.owner_user_id:
-        # 本文ペイロードは書かない(untrusted data をログに拡散しない。設計 04 §6)
+    # 外部 API 由来のネスト値は形を仮定しない(型不正は未認可と同じ扱いで破棄)
+    sender = callback.get("from")
+    from_id = sender.get("id") if isinstance(sender, dict) else None
+    if not isinstance(from_id, int) or from_id != config.telegram.owner_user_id:
+        # 本文ペイロード・raw な異常値は書かない(untrusted data をログに拡散しない。
+        # 設計 04 §6)。from_id は int 検証済みのときだけ記録する
         logger.warning(
             "allowlist 外の callback を破棄",
-            extra={"stage": "poll", "extra": {"from_id": from_id, "kind": "callback_query"}},
+            extra={
+                "stage": "poll",
+                "extra": {
+                    "from_id": from_id if isinstance(from_id, int) else None,
+                    "from_type": type(from_id).__name__,
+                    "kind": "callback_query",
+                },
+            },
         )
         return
 
@@ -158,12 +172,23 @@ def _handle_callback(
         },
     )
 
+    # ✓ 反映は best-effort: chat/message の形が不正でも記帳と answer は完了済みなので
+    # edit だけ skip する(型不正で落とすと offset 前に例外 → 再処理で二重記帳になる)
     message = callback.get("message")
-    if isinstance(message, dict) and isinstance(message.get("message_id"), int):
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    if (
+        isinstance(message, dict)
+        and isinstance(message.get("message_id"), int)
+        and isinstance(chat_id, int)
+    ):
         api.edit_message_reply_markup(
-            (message.get("chat") or {}).get("id"),
-            message["message_id"],
-            reaction_keyboard(item_id, selected=code),
+            chat_id, message["message_id"], reaction_keyboard(item_id, selected=code)
+        )
+    else:
+        logger.warning(
+            "message/chat の形が不正なため ✓ 反映を skip",
+            extra={"stage": "poll", "item_id": item_id},
         )
 
 
