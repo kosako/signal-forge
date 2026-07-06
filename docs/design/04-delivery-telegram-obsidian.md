@@ -101,7 +101,7 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 - **GENERATED マーカーの防御**: GENERATED 領域へ書き込む前に、生成コンテンツ(LLM 出力は untrusted 本文の影響下にある)から `<!-- GENERATED:BEGIN -->` / `<!-- GENERATED:END -->` のマーカー文字列を除去してから書く(境界誤認による手書きメモ破壊の防止)。
 - **再生成ポリシー**: ファイルが存在すれば GENERATED マーカー内だけ置換、frontmatter は機械管理キーのみ更新 — 手書きメモを絶対に壊さないための境界。マーカー欠損時は上書きせず `.conflict.md` を並置して警告(fail-safe)。
 - **反応の書き戻し**: MVP では実施しない(signals は SQLite のみ、PROPOSAL のスコープ)。frontmatter `reaction` と GENERATED 領域の分離が済んでいるため、フェーズ2では「frontmatter の1キー更新」だけで実現できる — これが本設計で仕込む唯一の拡張点。
-- **保持ポリシー**: Obsidian に置くのは自作要約+メタデータ+URL+(RSS/manual のみ)抜粋。X 由来は本文・抜粋を置かない(Day 0 の Developer Agreement 確認で緩和されうる)。
+- **保持ポリシー**: Obsidian に置くのは自作要約+メタデータ+URL+(RSS/manual のみ)抜粋。X 由来は本文・抜粋を置かない — **確定(Day 0 の Developer Agreement 確認 2026-07-06、Issue #2)**。規約上は自分専用・非公開への抜粋表示自体は許諾範囲だが、Obsidian は恒久保存層であり「X 側の削除・変更との同期」義務(Policy: Content compliance)を構造的に満たせないため緩和しない。恒久保存してよいのは Post ID / URL / 自作要約(analyses.summary)+メタまで。位置情報は本文と切り離して保存しない(Agreement III.E。現設計は geo フィールドを取得自体しないので追加対応なし)。
 
 ## 8. 他コンポーネントとの境界
 
