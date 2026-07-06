@@ -53,9 +53,21 @@ def collect(
 
 
 @app.command()
-def extract() -> None:
+def extract(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
     """items から本文を抽出して documents を生成する。"""
-    _stub(8)
+    from app.config import load_config
+    from app.db import apply_migrations, connect
+    from app.extraction import extract_pending
+    from app.http import HttpClient
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    extract_pending(conn, config, HttpClient(), logger)
 
 
 @app.command()
