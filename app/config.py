@@ -70,6 +70,7 @@ class ObsidianConfig:
 @dataclass(frozen=True)
 class StorageConfig:
     db_path: str | None = None  # 未設定なら ~/.local/share/intel/intel.db(設計 01 §1)
+    backup_dir: str | None = None  # 未設定なら ~/Backups/intel(設計 05 §5)
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,12 @@ class Config:
         if self.storage.db_path is not None:
             return Path(self.storage.db_path).expanduser()
         return Path.home() / ".local" / "share" / "intel" / "intel.db"
+
+    @property
+    def backup_dir(self) -> Path:
+        if self.storage.backup_dir is not None:
+            return Path(self.storage.backup_dir).expanduser()
+        return Path.home() / "Backups" / "intel"
 
     @property
     def profile_path(self) -> Path:

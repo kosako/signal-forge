@@ -87,7 +87,51 @@ FDA を付与する:
 3. `config.toml` の `[telegram] watchdog_time` を配信時刻+15分に変更。
 4. §2 の bootout → §1 の再生成 → bootstrap で反映。
 
-## 7. secrets ローテーション(設計 05 §6)
+## 7. バックアップと復旧(設計 05 §5 / plan #23)
+
+バックアップは朝バッチ末尾(backup 段)で自動作成される:
+`~/Backups/intel/intel-YYYYMMDD.tar.gz`(chmod 600・日次14世代。置き場は
+`config.toml` の `[storage] backup_dir` で変更可)。
+
+**セットアップ時の確認(1回)**:
+
+- `~/Backups/` が iCloud 等のクラウド同期対象外であることを確認する
+  (secrets 入り tar.gz を同期経路に流さない。設計 05 §5)。
+- 手動で `uv run intel run` を1回流し、`intel doctor` #10 が PASS になること。
+
+**復旧手順**(リハーサルを1回実施すること):
+
+```sh
+# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)
+launchctl bootout "gui/$(id -u)/com.intel.morning" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.intel.poller" 2>/dev/null || true
+
+RESTORE_DIR="$(mktemp -d)"
+tar -xzf "${HOME}/Backups/intel/intel-<日付>.tar.gz" -C "${RESTORE_DIR}"
+
+# 1. 設定類を先に配置(必要な場合のみ。.env は chmod 600 を維持)
+cp -a "${RESTORE_DIR}/config/." "${HOME}/.config/intel/"
+chmod 600 "${HOME}/.config/intel/.env"
+
+# 2. 復旧先 DB パスを確認する。config.toml の [storage].db_path を設定していれば
+#    その値、未設定なら既定の ~/.local/share/intel/intel.db
+DB_PATH="${HOME}/.local/share/intel/intel.db"   # ← [storage].db_path 設定時は書き換える
+
+# 3. 既存 DB 一式を退避してから配置する。WAL/SHM を残すと、復元した本体に
+#    古い WAL が適用されて不整合になるため、必ず 3 ファイルまとめて扱う
+mkdir -p "${DB_PATH%/*}"
+for suffix in "" "-wal" "-shm"; do
+  [ -f "${DB_PATH}${suffix}" ] && mv "${DB_PATH}${suffix}" "${DB_PATH}${suffix}.pre-restore"
+done
+mv "${RESTORE_DIR}/intel.db" "${DB_PATH}"
+
+# 4. 健全性確認 → 問題なければ launchd を再 bootstrap(§2)
+uv run intel doctor
+```
+
+Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の export 段で再生成される)。
+
+## 8. secrets ローテーション(設計 05 §6)
 
 - X: Developer Portal で再発行 → `.env` 差し替え → `intel doctor`
 - Telegram: BotFather で revoke → 再発行 → `.env` 差し替え → `intel doctor`
