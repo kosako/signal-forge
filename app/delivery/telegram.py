@@ -30,6 +30,7 @@ ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
 TIMEOUT_S = 30  # 設計 05 §8
 MAX_RETRIES = 3  # 初回 + リトライ3回(同上)
 BACKOFF_S = (1.0, 2.0, 4.0)
+LONG_POLL_S = 50  # getUpdates の long polling 秒(設計 05 §8)
 
 ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸収(設計 04 §2)
 
@@ -74,21 +75,59 @@ class TelegramApi:
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
         result = self._post("sendMessage", payload)
+        if not isinstance(result, dict):
+            raise DeliveryError(f"sendMessage の応答形が不正: {type(result).__name__}")
         return int(result["message_id"])
 
-    def _post(self, method: str, payload: dict[str, object]) -> dict:
+    def get_updates(self, offset: int | None) -> list[dict]:
+        """getUpdates(long polling 50s。設計 05 §8)。update の list を返す。"""
+        payload: dict[str, object] = {"timeout": LONG_POLL_S}
+        if offset is not None:
+            payload["offset"] = offset
+        # read timeout は long poll 秒より長く取る(通常の 30s では poll 中に切れる)
+        result = self._post("getUpdates", payload, timeout=LONG_POLL_S + 10)
+        if not isinstance(result, list):
+            raise DeliveryError(f"getUpdates の応答形が不正: {type(result).__name__}")
+        return [u for u in result if isinstance(u, dict)]
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> None:
+        """answerCallbackQuery(10秒失効対策の即時応答。設計 04 §3)。"""
+        payload: dict[str, object] = {"callback_query_id": callback_query_id}
+        if text is not None:
+            payload["text"] = text
+        self._post("answerCallbackQuery", payload)
+
+    def edit_message_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: dict
+    ) -> None:
+        """editMessageReplyMarkup(選択状態 ✓ の盤面差し替え。設計 04 §3)。"""
+        self._post(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": json.dumps(reply_markup),
+            },
+        )
+
+    def _post(
+        self, method: str, payload: dict[str, object], *, timeout: float | None = None
+    ) -> object:
+        # timeout=None は httpx では「無制限」の意味になるため、未指定は client 既定に倒す
+        request_timeout = timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT
         last_error = "不明"
         for attempt in range(MAX_RETRIES + 1):
             try:
-                response = self._client.post(f"/{method}", data=payload)
+                response = self._client.post(f"/{method}", data=payload, timeout=request_timeout)
             except httpx.HTTPError as e:
                 # httpx 例外の repr は token 入り URL を含みうるため型名だけ持ち越す
                 last_error = f"transport エラー: {type(e).__name__}"
                 self._backoff(attempt)
                 continue
             body = self._parse_body(response)
-            if body.get("ok") is True and isinstance(body.get("result"), dict):
-                return body["result"]
+            if body.get("ok") is True:
+                # result の形は method 依存(dict / list / bool)。検証は呼び出し側
+                return body.get("result")
             last_error = f"HTTP {response.status_code}: {body.get('description', '(説明なし)')}"
             if response.status_code == 429:
                 self._wait_retry_after(body, attempt)
@@ -175,7 +214,7 @@ def deliver_digest(
             message_id = api.send_message(
                 chat_id,
                 _item_text(position, row),
-                reply_markup=_reaction_keyboard(row["item_id"]),
+                reply_markup=reaction_keyboard(row["item_id"]),
             )
             _record_message(conn, digest_id, row["item_id"], message_id)
             sent += 1
@@ -289,11 +328,15 @@ def _published_md(published_at: str | None) -> str | None:
     return f"{date.month}/{date.day}"
 
 
-def _reaction_keyboard(item_id: int) -> dict:
+def reaction_keyboard(item_id: int, *, selected: str | None = None) -> dict:
+    """4ボタン InlineKeyboard。selected(up|dig|knw|no)のボタンに ✓ を付ける。"""
     return {
         "inline_keyboard": [
             [
-                {"text": label, "callback_data": f"s:{item_id}:{code}"}
+                {
+                    "text": f"{label} ✓" if code == selected else label,
+                    "callback_data": f"s:{item_id}:{code}",
+                }
                 for label, code in _REACTION_BUTTONS
             ]
         ]

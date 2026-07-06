@@ -138,9 +138,21 @@ def deliver(
 
 
 @app.command()
-def poll() -> None:
+def poll(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
     """受信デーモン(long polling 常駐+内蔵タイマー)。"""
-    _stub(17)
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.delivery import create_api, run_poller
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "poller.log")
+    run_poller(conn, config, create_api(env), logger)
 
 
 @app.command()
