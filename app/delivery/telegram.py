@@ -79,6 +79,13 @@ class TelegramApi:
             raise DeliveryError(f"sendMessage の応答形が不正: {type(result).__name__}")
         return int(result["message_id"])
 
+    def get_me(self) -> dict:
+        """getMe(token 有効性検査。doctor #4)。bot 情報 dict を返す。"""
+        result = self._post("getMe", {})
+        if not isinstance(result, dict):
+            raise DeliveryError(f"getMe の応答形が不正: {type(result).__name__}")
+        return result
+
     def get_updates(self, offset: int | None) -> list[dict]:
         """getUpdates(long polling 50s。設計 05 §8)。update の list を返す。"""
         payload: dict[str, object] = {"timeout": LONG_POLL_S}
