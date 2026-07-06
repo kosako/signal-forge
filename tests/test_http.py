@@ -213,3 +213,30 @@ def test_redirect_hops_are_each_pinned() -> None:
 def test_invalid_port_is_fatal() -> None:
     with pytest.raises(FatalError, match="ポート"):
         make_client(lambda request: httpx.Response(200)).get("https://example.com:99999/")
+
+
+def test_cookies_do_not_leak_across_hosts_pinned_to_same_ip() -> None:
+    # 同一 IP に pin された別ホストへ cookie が流れない(cross-origin 状態共有の遮断)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.headers["host"] == "a.example":
+            return httpx.Response(200, headers={"set-cookie": "session=secret"})
+        return httpx.Response(200)
+
+    client = make_client(
+        handler, hosts={"a.example": ["93.184.216.34"], "b.example": ["93.184.216.34"]}
+    )
+    client.get("https://a.example/login")
+    client.get("https://b.example/feed")
+    client.get("https://a.example/again")  # 同一ホストの再訪でも毎回破棄
+
+    assert all("cookie" not in request.headers for request in seen)
+
+
+def test_keepalive_disabled_for_pinned_connections() -> None:
+    # 接続プールのキーは IP origin になるため keep-alive を切る(TLS/SNI 再利用の防止)。
+    # httpx は Limits を公開属性に持たないため、実 transport のプール設定で検証する
+    pool = HttpClient()._client._transport._pool
+    assert pool._max_keepalive_connections == 0

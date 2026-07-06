@@ -68,6 +68,10 @@ class HttpClient:
             transport=transport,
             follow_redirects=False,  # 各ホップで SSRF 再検査するため手動追跡
             trust_env=False,  # HTTP(S)_PROXY 経由だと検査済み IP と実接続先がずれるため無視
+            # IP ピン留めでは接続プールのキーが IP origin になり、同一 IP に pin された
+            # 別ホストへ前ホスト向け TLS 接続が再利用されうる(SNI/証明書検証は接続
+            # 作成時のみ)。keep-alive を切り、リクエストごとに TLS を張り直す
+            limits=httpx.Limits(max_keepalive_connections=0),
             timeout=httpx.Timeout(
                 connect=CONNECT_TIMEOUT_S,
                 read=READ_TIMEOUT_S,
@@ -166,7 +170,13 @@ class HttpClient:
         host_header = f"{host}{port_suffix}"
         request_headers = {**(headers or {}), "Host": host_header}
         extensions = {"sni_hostname": host} if split.scheme.lower() == "https" else {}
-        return self._client.get(pinned_url, headers=request_headers, extensions=extensions)
+        try:
+            return self._client.get(pinned_url, headers=request_headers, extensions=extensions)
+        finally:
+            # cookie jar は IP origin に紐づくため、同一 IP に pin された別ホストへ
+            # cookie が流れる。クライアントは cookie を契約に持たない(RSS/本文取得のみ)
+            # ので毎リクエスト破棄する
+            self._client.cookies.clear()
 
     def _check_target(self, url: str) -> str:
         """接続先を検証し、接続に使う検証済み IP を返す。"""
