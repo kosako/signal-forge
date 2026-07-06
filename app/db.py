@@ -3,14 +3,13 @@
 - 接続は autocommit モードで返す。**トランザクションは呼び出し側が明示的に張る**
   (`BEGIN IMMEDIATE` … `COMMIT`)。理由: collect の「全 INSERT + カーソル更新を
   同一トランザクション」等、境界は業務側が決める(設計 02 §1)。
-- マイグレーションは forward-only(down なし)。適用前に DB ファイルを `.bak` に
-  コピーする(設計 01 §10)。
+- マイグレーションは forward-only(down なし)。適用前に DB の一貫スナップショットを
+  `.bak` に取る(設計 01 §10。方式は backup API — 理由は _backup のコメント)。
 """
 
 from __future__ import annotations
 
 import re
-import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,8 +68,10 @@ def apply_migrations(
 
     - 台帳: schema_migrations(version PRIMARY KEY, filename, applied_at)
     - 1 ファイル = 1 トランザクション(BEGIN IMMEDIATE)
-    - 未適用があるときのみ、適用前に DB を `<name>.bak` へコピー(単一ファイル復元)
+    - 未適用があるときのみ、適用前に `<name>.bak` へ一貫スナップショット(backup API)
     """
+    # 構成検証を台帳作成より先に行う(不正構成の検出だけで DB に痕跡を残さない)
+    migrations = discover_migrations(migrations_dir)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -80,7 +81,6 @@ def apply_migrations(
         ) STRICT
         """
     )
-    migrations = discover_migrations(migrations_dir)
     applied = {
         row["version"]: row["filename"]
         for row in conn.execute("SELECT version, filename FROM schema_migrations")
@@ -117,6 +117,11 @@ def apply_migrations(
 def _backup(conn: sqlite3.Connection, db_path: Path) -> None:
     if not db_path.exists():
         return
-    # WAL の未反映分を main ファイルへ書き戻してからコピーする(コピーの一貫性)
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    shutil.copy2(db_path, db_path.with_name(db_path.name + ".bak"))
+    # 単純な file copy や wal_checkpoint 後の copy は、他プロセス(受信デーモン)稼働中に
+    # WAL 未反映分を取りこぼしうる。SQLite backup API なら並行 writer がいても一貫する
+    # (設計 05 §5 の日次バックアップと同じ理由で .backup 相当を使う)。
+    bak = sqlite3.connect(db_path.with_name(db_path.name + ".bak"))
+    try:
+        conn.backup(bak)
+    finally:
+        bak.close()

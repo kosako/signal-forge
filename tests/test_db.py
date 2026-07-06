@@ -42,6 +42,27 @@ def test_backup_created_before_apply(tmp_path: Path) -> None:
     assert (tmp_path / "intel.db.bak").exists()
 
 
+def test_backup_is_consistent_snapshot_of_pre_apply_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "intel.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://a', 'https://a', 'sha256:x')"
+    )
+    other = tmp_path / "migrations"
+    other.mkdir()
+    (other / "001_init.sql").write_text((MIGRATIONS_DIR / "001_init.sql").read_text())
+    (other / "002_extra.sql").write_text("CREATE TABLE extra (id INTEGER PRIMARY KEY) STRICT;")
+    apply_migrations(conn, db_path, other)
+
+    bak = sqlite3.connect(tmp_path / "intel.db.bak")
+    assert bak.execute("SELECT count(*) FROM items").fetchone()[0] == 1  # WAL 内容を含む
+    tables = {row[0] for row in bak.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "extra" not in tables  # 適用「前」のスナップショット
+    bak.close()
+
+
 def test_strict_rejects_wrong_type(conn: sqlite3.Connection) -> None:
     # STRICT の型強制(数値変換できない TEXT は INTEGER 列に入らない)
     with pytest.raises(sqlite3.IntegrityError, match="cannot store TEXT"):
