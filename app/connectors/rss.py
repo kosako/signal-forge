@@ -52,9 +52,10 @@ class RssConnector:
             return FetchResult(items=[], next_cursor=cursor, stats=stats)
         if response.status_code == 410:
             raise FatalError(f"410 Gone(フィード恒久消滅): {feed_url}")
-        if response.status_code in (401, 403):
-            raise FatalError(f"HTTP {response.status_code}(認可エラー): {feed_url}")
-        if response.status_code >= 400:
+        if 400 <= response.status_code < 500:
+            # 恒久 4xx はリトライ対象にしない分類(設計 02 §1 / 05 §8)
+            raise FatalError(f"HTTP {response.status_code}: {feed_url}")
+        if response.status_code >= 500:
             raise RetryableError(f"HTTP {response.status_code}: {feed_url}")
 
         feed = feedparser.parse(response.content)

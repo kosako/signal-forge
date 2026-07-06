@@ -32,7 +32,17 @@ def test_simple_get() -> None:
 
 @pytest.mark.parametrize(
     "address",
-    ["127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.1.1", "0.0.0.0", "::1", "fe80::1"],
+    [
+        "127.0.0.1",
+        "10.0.0.5",
+        "192.168.1.1",
+        "169.254.1.1",
+        "100.64.0.1",  # shared address space(CGNAT)。ブラックリスト方式では素通りする帯
+        "224.0.0.1",  # multicast
+        "0.0.0.0",
+        "::1",
+        "fe80::1",
+    ],
 )
 def test_ssrf_blocked_addresses(address: str) -> None:
     client = make_client(
@@ -120,7 +130,7 @@ def test_429_respects_retry_after() -> None:
     sleeps: list[float] = []
     fetched = make_client(handler, sleeps=sleeps).get("https://example.com/")
     assert fetched.response.status_code == 200
-    assert 7 in sleeps
+    assert sleeps == [7]  # Retry-After 優先。追加バックオフを重ねない
 
 
 def test_dns_failure_is_retryable() -> None:

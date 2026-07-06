@@ -64,6 +64,7 @@ class HttpClient:
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,  # 各ホップで SSRF 再検査するため手動追跡
+            trust_env=False,  # HTTP(S)_PROXY 経由だと検査済み IP と実接続先がずれるため無視
             timeout=httpx.Timeout(
                 connect=CONNECT_TIMEOUT_S,
                 read=READ_TIMEOUT_S,
@@ -81,25 +82,33 @@ class HttpClient:
         """
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
-            if attempt > 0:
-                self._sleep(BACKOFF_S[attempt - 1] + random.random())
             try:
                 fetched = self._follow_redirects(url, headers)
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_error = e
+                self._backoff(attempt)
                 continue
             status = fetched.response.status_code
             if status == 429:
                 last_error = RetryableError(f"HTTP 429: {url}")
+                # Retry-After 優先(追加バックオフは重ねない)。最終試行後は待たない
                 retry_after = fetched.response.headers.get("retry-after")
-                if retry_after is not None and retry_after.isdigit():
-                    self._sleep(int(retry_after))
+                if attempt < MAX_RETRIES:
+                    if retry_after is not None and retry_after.isdigit():
+                        self._sleep(int(retry_after))
+                    else:
+                        self._backoff(attempt)
                 continue
             if 500 <= status <= 599:
                 last_error = RetryableError(f"HTTP {status}: {url}")
+                self._backoff(attempt)
                 continue
             return fetched
         raise RetryableError(f"リトライ上限({MAX_RETRIES}回)到達: {url}") from last_error
+
+    def _backoff(self, attempt: int) -> None:
+        if attempt < MAX_RETRIES:
+            self._sleep(BACKOFF_S[attempt] + random.random())
 
     def resolve_short_url(self, url: str) -> str:
         """既知短縮 URL の最終 URL 解決(u1 手順1 の resolver。設計 01 §4)。"""
@@ -136,11 +145,9 @@ class HttpClient:
             raise RetryableError(f"DNS 解決結果が空: {host}")
         for address in addresses:
             ip = ipaddress.ip_address(address)
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
-                raise SsrfBlockedError(f"内部アドレスへの接続を拒否: {host} -> {address}")
+            # ブラックリスト方式は shared address space(100.64.0.0/10)等が素通りするため、
+            # is_global を基本にした allowlist 方式で判定する
+            if not ip.is_global or ip.is_multicast:
+                raise SsrfBlockedError(
+                    f"グローバルでないアドレスへの接続を拒否: {host} -> {address}"
+                )

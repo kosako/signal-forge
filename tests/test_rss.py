@@ -103,6 +103,13 @@ def test_403_is_fatal() -> None:
         connector.fetch(make_source(), {})
 
 
+def test_404_is_fatal_not_retried() -> None:
+    # 恒久 4xx はリトライ対象にしない分類(設計 02 §1 / 05 §8)
+    connector = make_connector(lambda request: httpx.Response(404))
+    with pytest.raises(FatalError, match="404"):
+        connector.fetch(make_source(), {})
+
+
 def test_garbage_body_is_retryable() -> None:
     connector = make_connector(lambda request: httpx.Response(200, content=b"\x00\x01 not xml"))
     with pytest.raises(RetryableError, match="パース失敗"):
