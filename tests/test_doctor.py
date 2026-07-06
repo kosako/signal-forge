@@ -45,7 +45,7 @@ class FakeBotApi:
 
 
 class SafeEngine:
-    """隔離が効いている(canary を読めない)エンジン。"""
+    """隔離が効いている(canary を読めず・ネットワークに出ない)エンジン。"""
 
     def complete_structured(self, prompt, schema, timeout_s=120):
         return CanaryProbe(content="unreadable")
@@ -66,10 +66,43 @@ class LeakyEngine:
         return CanaryProbe(content="unreadable")
 
 
+class FakeServer:
+    """ローカル canary サーバの偽物。prompt の URL を fetch されたら hit を立てる。"""
+
+    def __init__(self):
+        self.url = "http://127.0.0.1:0/canary"
+        self.hit = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def was_hit(self):
+        return self.hit
+
+
+def network_leaky_factory(server_holder: dict):
+    """FakeServer を hit させるエンジン factory(server は server_holder 経由で共有)。"""
+
+    class _Engine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if server_holder.get("server") is not None and "http://" in prompt:
+                server_holder["server"].hit = True
+            return CanaryProbe(content="unreadable")
+
+    return lambda name: _Engine()
+
+
 def doctor(config_dir: Path, tmp_path: Path, **overrides) -> list[CheckResult]:
     kwargs = {
         "api_factory": FakeBotApi,
         "engine_factory": lambda name: SafeEngine(),
+        # 既定は偽物(実 codex 起動・実 HTTP サーバを避けて高速化)。
+        # 実サーバ経路は test_llm_network_probe_uses_real_local_server が明示的に検証
+        "codex_home_engine_factory": lambda codex_home: SafeEngine(),
+        "server_factory": FakeServer,
         "launchctl": lambda job: True,
         "environ": {},
         "home": tmp_path / "home",
@@ -251,6 +284,125 @@ def test_llm_engine_error_fails(config_dir, tmp_path) -> None:
         doctor(config_dir, tmp_path, engine_factory=lambda name: BrokenEngine()), 6
     )
     assert result.status == "FAIL"
+
+
+def test_llm_all_probes_pass_reports_probe_names(config_dir, tmp_path) -> None:
+    result = by_number(doctor(config_dir, tmp_path), 6)
+    assert result.status == "PASS"
+    # 3プローブ(HOME・ネットワーク・CODEX_HOME)を実施したことが detail に出る
+    assert "HOME" in result.detail
+    assert "ネットワーク" in result.detail
+    assert "CODEX_HOME" in result.detail
+
+
+def test_llm_network_leak_fails(config_dir, tmp_path) -> None:
+    # ローカル canary サーバへ到達するエンジン → ネットワーク遮断が無効と判定
+    holder: dict = {}
+
+    def server_factory():
+        holder["server"] = FakeServer()
+        return holder["server"]
+
+    result = by_number(
+        doctor(
+            config_dir, tmp_path,
+            server_factory=server_factory,
+            engine_factory=network_leaky_factory(holder),
+        ),
+        6,
+    )
+    assert result.status == "FAIL"
+    assert "ネットワーク" in result.detail
+
+
+def test_llm_network_probe_uses_real_local_server(config_dir, tmp_path) -> None:
+    # 既定の server_factory(実ローカルサーバ)経由でも SafeEngine は到達せず PASS
+    result = by_number(
+        doctor(config_dir, tmp_path, server_factory=None), 6  # None → 実サーバ
+    )
+    assert result.status == "PASS"
+
+
+def test_llm_probe_exception_does_not_leak_output(config_dir, tmp_path) -> None:
+    # プローブの例外(parse_structured は raw 出力を、codex は stderr を載せうる)は
+    # detail に本文を出さず型名のみ(auth 内容の露出防止。Codex must)
+    class LeakyExceptionEngine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise RuntimeError("SECRET-AUTH-abc123 が含まれる生出力")
+
+    result = by_number(
+        doctor(config_dir, tmp_path, engine_factory=lambda name: LeakyExceptionEngine()), 6
+    )
+    assert result.status == "FAIL"
+    assert "SECRET-AUTH" not in result.detail  # 本文は載せない
+    assert "RuntimeError" in result.detail  # 型名のみ
+    assert "HOME 隔離" in result.detail  # どのプローブか
+
+
+def test_llm_server_closed_on_probe_exception(config_dir, tmp_path) -> None:
+    # complete_structured が例外を投げても canary サーバの __exit__ が呼ばれる
+    closed = {"value": False}
+
+    class TrackingServer(FakeServer):
+        def __exit__(self, *exc):
+            closed["value"] = True
+            return False
+
+    class RaisingEngine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if "http://" in prompt:  # ネットワークプローブで例外
+                raise RuntimeError("boom")
+            return CanaryProbe(content="unreadable")
+
+    result = by_number(
+        doctor(
+            config_dir, tmp_path,
+            server_factory=TrackingServer,
+            engine_factory=lambda name: RaisingEngine(),
+        ),
+        6,
+    )
+    assert result.status == "FAIL"
+    assert closed["value"] is True  # server lifecycle は例外時も守られる
+
+
+def test_llm_codex_home_leak_fails(config_dir, tmp_path) -> None:
+    # CODEX_HOME 内 canary を読めるエンジン → auth 流出経路として FAIL
+    class CodexHomeLeakyEngine:
+        def __init__(self, codex_home):
+            self._codex_home = codex_home
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            canary = Path(self._codex_home) / "canary.txt"
+            return CanaryProbe(content=canary.read_text(encoding="utf-8"))
+
+    result = by_number(
+        doctor(
+            config_dir, tmp_path,
+            codex_home_engine_factory=lambda ch: CodexHomeLeakyEngine(ch),
+        ),
+        6,
+    )
+    assert result.status == "FAIL"
+    assert "CODEX_HOME" in result.detail
+
+
+def test_llm_codex_home_probe_skipped_for_non_codex_engine(config_dir, tmp_path) -> None:
+    # 非 codex-cli エンジンでは CODEX_HOME プローブを実施しない(detail に出ない)
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + '\n[llm]\nengine = "anthropic-api"\n',
+        encoding="utf-8",
+    )
+
+    def exploding_codex_factory(codex_home):
+        raise AssertionError("非 codex では CODEX_HOME プローブを呼ばない")
+
+    result = by_number(
+        doctor(config_dir, tmp_path, codex_home_engine_factory=exploding_codex_factory), 6
+    )
+    assert result.status == "PASS"
+    assert "CODEX_HOME" not in result.detail
 
 
 def test_vault_unset_fails(config_dir, tmp_path) -> None:

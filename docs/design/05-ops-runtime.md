@@ -37,7 +37,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 3 | SQLite 接続+マイグレーション適用状態(未適用番号の検出) | FAIL |
 | 4 | Telegram: `getMe` 成功+allowlist(user_id/chat_id)設定済み | FAIL |
 | 5 | X API: 認証確認(無料エンドポイントで疎通のみ。課金読み取りはしない)。**X 無効時(config `x.enabled = false`、または sources の type='x' 全行が enabled=0)は SKIP 表示**(「RSS+手動URLのみ」縮退運用を恒久 FAIL にしない。設定はあるが無効化されている場合は WARN 1行で明示) | FAIL(X 無効時は SKIP/WARN) |
-| 6 | LLM: 設定エンジン(MVP は1本。設計 00 §5)で固定プロンプト1件の `complete_structured` 成功+推論専用モードの**動的検査**(ツール呼び出し・ファイル読み取りを試みるプロンプトを流し、拒否されることを確認する。設定値の静的確認だけでは MCP・設定側 allowlist の残存を検出できない) | FAIL |
+| 6 | LLM: 設定エンジン(MVP は1本。設計 00 §5)で固定プロンプト1件の `complete_structured` 成功+推論専用モードの**動的検査(隔離 canary 3プローブ)**。read-only sandbox はファイル読取・読取系コマンドの実行自体は許す(Issue #3 実測)ため「拒否確認」は構造的に不成立。代わりに**隔離が効いているか**を客観確認する: (1) HOME 隔離 = 実 HOME 直下の canary を `~` 相対で読ませ内容が漏れないこと (2) ネットワーク遮断 = ローカル canary サーバの URL を fetch させ到達が観測されないこと(自己申告に依存しない) (3) CODEX_HOME 隔離(codex-cli のみ)= auth.json と同居させた canary が漏れないこと(credential 流出経路の実測。auth 実内容は載せず canary で代替)。いずれか漏れ・到達で FAIL | FAIL |
 | 7 | Obsidian Vault パスへのテスト書き込み・削除(TCC/FDA 検査を兼ねる) | FAIL |
 | 8 | launchd 2ジョブのロード状態(`launchctl print`) | WARN |
 | 9 | 当月コスト見込み(analyses.estimated_cost 合算+X 読取件数×単価)と $30 比 | 超過ペースで WARN |
