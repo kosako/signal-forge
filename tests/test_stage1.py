@@ -93,7 +93,7 @@ def test_x_noise_rules(conn, tmp_path) -> None:
     )
     add_item(
         conn, "https://x.com/i/web/status/4", source_id=4,
-        title="十分に長い本文を持つ通常のポストです", published=now,
+        title="二十文字の閾値を確実に超える十分に長い本文を持つ通常のポストです", published=now,
     )
     add_item(conn, "https://rss.example/short", title="短い", published=now)  # rss は対象外
 
