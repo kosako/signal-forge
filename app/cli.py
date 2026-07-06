@@ -1,0 +1,77 @@
+"""intel CLI(Typer)。設計 00 §3。
+
+M1 完了(plan #14)までは各サブコマンドはスタブ。実装は 1 Issue = 1 コマンドで
+段階的に差し替える(スタブは「未実装」を表示して終了コード 1)。
+"""
+
+from __future__ import annotations
+
+import typer
+
+app = typer.Typer(
+    name="intel",
+    help="個人用インテリジェンスサービス。毎朝のダイジェスト生成パイプライン。",
+    no_args_is_help=True,
+)
+
+_STUB_MSG = "未実装: plan #{plan} で実装予定"
+
+
+def _stub(plan: int) -> None:
+    typer.echo(_STUB_MSG.format(plan=plan), err=True)
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def collect() -> None:
+    """全ソース(X・RSS)から items を取り込む。"""
+    _stub(7)
+
+
+@app.command()
+def extract() -> None:
+    """items から本文を抽出して documents を生成する。"""
+    _stub(8)
+
+
+@app.command()
+def analyze() -> None:
+    """事前選別+LLM 本分析で analyses を生成する。"""
+    _stub(10)
+
+
+@app.command()
+def digest() -> None:
+    """ランキングして日本語ダイジェスト(digests)を生成する。"""
+    _stub(12)
+
+
+@app.command()
+def deliver() -> None:
+    """当日ダイジェストを Telegram に配信する。"""
+    _stub(16)
+
+
+@app.command()
+def poll() -> None:
+    """受信デーモン(long polling 常駐+内蔵タイマー)。"""
+    _stub(17)
+
+
+@app.command()
+def run() -> None:
+    """朝バッチ: collect→extract→analyze→digest→export→deliver→purge を直列実行。"""
+    _stub(14)
+
+
+@app.command()
+def doctor(
+    purge: bool = typer.Option(False, "--purge", help="期限切れ削除の単独実行"),
+    cost: bool = typer.Option(False, "--cost", help="コスト集計の単発表示"),
+) -> None:
+    """構成不備・故障・コスト超過の検査(12項目)。"""
+    _stub(21)
+
+
+def main() -> None:
+    app()
