@@ -169,6 +169,12 @@ def load_env(config_dir: Path) -> dict[str, str]:
     path = config_dir / ".env"
     if not path.exists():
         return {}
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise ConfigError(
+            f"{path}: パーミッションが {mode:o}。group/other に開いた .env は読み込まない"
+            "(chmod 600 にすること。設計 00 §4)"
+        )
     env: dict[str, str] = {}
     for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()

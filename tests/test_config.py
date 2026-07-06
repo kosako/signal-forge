@@ -91,12 +91,28 @@ def test_broken_toml_fails(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+def write_env(tmp_path: Path, body: str, mode: int = 0o600) -> Path:
+    path = tmp_path / ".env"
+    path.write_text(body, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
 def test_load_env_parses_and_strips_quotes(tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text(
-        '# comment\nX_API_KEY=abc123\nTELEGRAM_BOT_TOKEN="tok:en"\n\n', encoding="utf-8"
-    )
+    write_env(tmp_path, '# comment\nX_API_KEY=abc123\nTELEGRAM_BOT_TOKEN="tok:en"\n\n')
     env = load_env(tmp_path)
     assert env == {"X_API_KEY": "abc123", "TELEGRAM_BOT_TOKEN": "tok:en"}
+
+
+def test_load_env_rejects_world_readable(tmp_path: Path) -> None:
+    write_env(tmp_path, "X_API_KEY=abc\n", mode=0o644)
+    with pytest.raises(ConfigError, match="chmod 600"):
+        load_env(tmp_path)
+
+
+def test_load_env_accepts_stricter_than_600(tmp_path: Path) -> None:
+    write_env(tmp_path, "X_API_KEY=abc\n", mode=0o400)
+    assert load_env(tmp_path) == {"X_API_KEY": "abc"}
 
 
 def test_load_env_missing_file_returns_empty(tmp_path: Path) -> None:
@@ -104,6 +120,6 @@ def test_load_env_missing_file_returns_empty(tmp_path: Path) -> None:
 
 
 def test_load_env_rejects_malformed_line(tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text("JUST_A_KEY\n", encoding="utf-8")
+    write_env(tmp_path, "JUST_A_KEY\n")
     with pytest.raises(ConfigError, match="KEY=VALUE"):
         load_env(tmp_path)
