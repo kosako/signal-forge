@@ -45,7 +45,13 @@ def extract_pending(
 
     counts = {"ok": 0, "partial": 0, "failed": 0}
     for row in rows:
-        status = _extract_item(conn, config, http, row)
+        try:
+            status = _extract_item(conn, config, http, row)
+        except Exception as e:  # 予期しない例外(壊れた raw_payload 等)も隔離して続行
+            _insert_document(
+                conn, config, row, text=None, status="failed", error=f"{type(e).__name__}: {e}"
+            )
+            status = "failed"
         counts[status] += 1
         if status == "failed":
             logger.warning(
@@ -77,7 +83,21 @@ def _extract_item(
             text = fetched_text
 
     status = ("ok" if len(text) >= MIN_OK_CHARS else "partial") if text else "failed"
+    # partial でも HTTP 失敗の経緯は記録する(「短い記事」と「取得失敗して raw_content に
+    # 劣化」を DB 上で区別できるようにする)
+    _insert_document(conn, config, row, text=text, status=status, error=error)
+    return status
 
+
+def _insert_document(
+    conn: sqlite3.Connection,
+    config: Config,
+    row: sqlite3.Row,
+    *,
+    text: str | None,
+    status: str,
+    error: str | None,
+) -> None:
     ttl_days = (
         config.retention.x_cache_ttl_days
         if row["source_type"] == "x"
@@ -89,9 +109,8 @@ def _extract_item(
                                expires_at)
         VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?))
         """,
-        (row["id"], text, status, error if status == "failed" else None, f"+{ttl_days} days"),
+        (row["id"], text, status, error, f"+{ttl_days} days"),
     )
-    return status
 
 
 def _raw_content(row: sqlite3.Row) -> str | None:
@@ -104,7 +123,7 @@ def _extract_text(html: str) -> str | None:
     # 本文抽出(boilerplate 除去)を先に試み、短い断片や平文で None になったら
     # タグ除去の全文テキスト化(html2txt)、素の平文はそのまま本文扱いにする
     # (X の full_text・短い RSS summary を黙って落とさない)
-    extracted = trafilatura.extract(html)
+    extracted = trafilatura.extract(html, include_comments=False)
     if extracted and extracted.strip():
         return extracted.strip()
     # html2txt は断片(<p>…</p> のみ等)だと空を返すため、完全な文書に包んで渡す

@@ -109,6 +109,37 @@ def test_short_result_is_partial_and_short_raw_survives_fetch_failure(conn, tmp_
     assert "短い本文" in doc["extracted_text"]
 
 
+def test_partial_from_fetch_failure_records_error(conn, tmp_path) -> None:
+    add_item(conn, raw_content="<p>フィード同梱の短い本文だけが取れたケース</p>")
+    http = make_http(lambda request: httpx.Response(500))
+    extract_pending(conn, config(tmp_path), http, logger)
+    doc = conn.execute("SELECT * FROM documents").fetchone()
+    assert doc["extraction_status"] == "partial"
+    assert doc["extraction_error"] is not None  # 「短い記事」と「取得失敗」を区別できる
+
+
+def test_broken_raw_payload_isolated_and_rest_processed(conn, tmp_path) -> None:
+    # json_valid は通るが object でない raw_payload(_raw_content で例外)
+    conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash, raw_payload) "
+        "VALUES (2, 'https://example.com/broken', 'https://example.com/broken', 'sha256:b', '[]')"
+    )
+    add_item(conn, url="https://example.com/fine")
+    http = make_http(lambda request: httpx.Response(200, text=ARTICLE_HTML))
+
+    counts = extract_pending(conn, config(tmp_path), http, logger)
+    assert counts == {"ok": 1, "partial": 0, "failed": 1}
+    rows = {
+        r["canonical_url"]: r["extraction_status"]
+        for r in conn.execute(
+            "SELECT canonical_url, extraction_status FROM documents "
+            "JOIN items ON items.id = documents.item_id"
+        )
+    }
+    assert rows["https://example.com/broken"] == "failed"
+    assert rows["https://example.com/fine"] == "ok"
+
+
 def test_expires_at_by_source_type(conn, tmp_path) -> None:
     add_item(conn, source_id=2, url="https://example.com/rss")
     add_item(conn, source_id=3, url="https://example.com/x", raw_content="ツイート全文 " * 30)
