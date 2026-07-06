@@ -34,7 +34,7 @@ def generate_digest(
     """当日ダイジェストを生成し digests.id を返す(skip 時は None)。"""
     digest_date = today_jst()
     existing = conn.execute(
-        "SELECT id FROM digests WHERE digest_date = ?", (digest_date,)
+        "SELECT id, item_ids FROM digests WHERE digest_date = ?", (digest_date,)
     ).fetchone()
     if existing and not force:
         logger.info(
@@ -43,23 +43,32 @@ def generate_digest(
         )
         return None
 
-    ranked = rank_for_digest(conn, config)
-    degraded_digest = False
-    if not ranked:
-        degraded_candidates = _all_degraded_candidates(conn, config)
-        if degraded_candidates:
-            ranked = degraded_candidates
-            degraded_digest = True
-
-    markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest)
-    item_ids = [item.item_id for item in ranked]
-
+    # 置換の準備(旧採用 item の復帰)から新 digest 確定までを同一トランザクションで行う
     conn.execute("BEGIN IMMEDIATE")
     try:
         if existing:
-            # --force 置換。配信台帳も同一トランザクションで作り直す(部分再送の基準を揃える)
+            # --force 置換: 旧 digest 採用 item を候補(analyzed)に戻してから再ランキング
+            # (戻さないと旧採用分が新 digest から黙って消える)。配信台帳も作り直す
+            old_ids = json.loads(existing["item_ids"])
+            if old_ids:
+                placeholders = ",".join("?" * len(old_ids))
+                conn.execute(
+                    f"UPDATE items SET status = 'analyzed' "
+                    f"WHERE id IN ({placeholders}) AND status = 'digested'",
+                    old_ids,
+                )
             conn.execute("DELETE FROM digest_messages WHERE digest_id = ?", (existing["id"],))
             conn.execute("DELETE FROM digests WHERE id = ?", (existing["id"],))
+
+        # 全候補の最新分析が degraded なら通常ランキングを使わない(min_score=0 等の
+        # 許容設定でも degraded 配信の契約を守る)
+        ranked = _all_degraded_candidates(conn, config)
+        degraded_digest = bool(ranked)
+        if not degraded_digest:
+            ranked = rank_for_digest(conn, config)
+
+        markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest)
+        item_ids = [item.item_id for item in ranked]
         digest_id = conn.execute(
             """
             INSERT INTO digests (digest_date, run_id, status, markdown, item_ids, item_count)

@@ -56,7 +56,10 @@ def test_second_run_skips_force_replaces(conn, tmp_path) -> None:
     assert replaced is not None
     assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 1  # 1日1行
     row = conn.execute("SELECT item_ids FROM digests").fetchone()
-    assert new_item in json.loads(row["item_ids"])  # 置換後の内容に新 item を含む
+    ids = json.loads(row["item_ids"])
+    assert new_item in ids  # 新 item を含む
+    # 旧 digest 採用 item も候補に復帰して残る(--force で黙って消えない)
+    assert len(ids) == 2
 
 
 def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
@@ -65,7 +68,6 @@ def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert row["status"] == "ok"
     assert row["item_count"] == 0
-    assert "該当" not in row["markdown"] or True  # 文言は自由。件数0の行が正
     assert json.loads(row["item_ids"]) == []
     # min_score 未満の item は digested に遷移しない(analyzed のまま)
     assert conn.execute("SELECT status FROM items").fetchone()["status"] == "analyzed"

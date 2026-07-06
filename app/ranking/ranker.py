@@ -57,8 +57,11 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
         """
     ).fetchall()
 
+    # 生スコアで合成し、clamp は全ペナルティ適用後に1回だけ(設計 03 §6 の式どおり。
+    # 途中 clamp すると novelty 係数 >1.0 等の許容設定で結果がズレる)
     scored = [(row, _base_score(row, config)) for row in rows]
     scored = _apply_topic_dup_penalty(scored, config)
+    scored = [(row, _clamp(score)) for row, score in scored]
 
     for row, score in scored:
         conn.execute(
@@ -76,12 +79,11 @@ def _base_score(row: sqlite3.Row, config: Config) -> float:
         "known": r.novelty_known,
     }[row["novelty"]]
     negative_count = len(json.loads(row["negative_labels"]))
-    score = (
+    return (
         row["relevance_score"] * novelty_factor
         - negative_count * r.negative_penalty
         - _freshness_penalty(row, config)
     )
-    return _clamp(score)
 
 
 def _freshness_penalty(row: sqlite3.Row, config: Config) -> float:
@@ -121,7 +123,7 @@ def _apply_topic_dup_penalty(
         for i in indexes:
             if i != best:
                 row, score = result[i]
-                result[i] = (row, _clamp(score - config.ranking.topic_dup_penalty))
+                result[i] = (row, score - config.ranking.topic_dup_penalty)
     return result
 
 
