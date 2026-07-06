@@ -87,7 +87,35 @@ FDA を付与する:
 3. `config.toml` の `[telegram] watchdog_time` を配信時刻+15分に変更。
 4. §2 の bootout → §1 の再生成 → bootstrap で反映。
 
-## 7. secrets ローテーション(設計 05 §6)
+## 7. バックアップと復旧(設計 05 §5 / plan #23)
+
+バックアップは朝バッチ末尾(backup 段)で自動作成される:
+`~/Backups/intel/intel-YYYYMMDD.tar.gz`(chmod 600・日次14世代。置き場は
+`config.toml` の `[storage] backup_dir` で変更可)。
+
+**セットアップ時の確認(1回)**:
+
+- `~/Backups/` が iCloud 等のクラウド同期対象外であることを確認する
+  (secrets 入り tar.gz を同期経路に流さない。設計 05 §5)。
+- 手動で `uv run intel run` を1回流し、`intel doctor` #10 が PASS になること。
+
+**復旧手順**(リハーサルを1回実施すること):
+
+```sh
+RESTORE_DIR="$(mktemp -d)"
+tar -xzf "${HOME}/Backups/intel/intel-<日付>.tar.gz" -C "${RESTORE_DIR}"
+# 1. DB を配置(既存があれば退避してから)
+mv "${RESTORE_DIR}/intel.db" "${HOME}/.local/share/intel/intel.db"
+# 2. 設定類を配置(必要な場合のみ。.env は chmod 600 を維持)
+cp -a "${RESTORE_DIR}/config/." "${HOME}/.config/intel/"
+chmod 600 "${HOME}/.config/intel/.env"
+# 3. 健全性確認
+uv run intel doctor
+```
+
+Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の export 段で再生成される)。
+
+## 8. secrets ローテーション(設計 05 §6)
 
 - X: Developer Portal で再発行 → `.env` 差し替え → `intel doctor`
 - Telegram: BotFather で revoke → 再発行 → `.env` 差し替え → `intel doctor`

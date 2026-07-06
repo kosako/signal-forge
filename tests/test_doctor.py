@@ -21,6 +21,7 @@ def config_dir(tmp_path: Path) -> Path:
             "owner_chat_id = 77",
             "[storage]",
             f'db_path = "{tmp_path}/intel.db"',
+            f'backup_dir = "{tmp_path}/backups"',
             "[obsidian]",
             f'vault_path = "{tmp_path}/vault"',
         ]),
@@ -71,7 +72,6 @@ def doctor(config_dir: Path, tmp_path: Path, **overrides) -> list[CheckResult]:
         "engine_factory": lambda name: SafeEngine(),
         "launchctl": lambda job: True,
         "environ": {},
-        "backup_dir": tmp_path / "backups",
         "home": tmp_path / "home",
     }
     (tmp_path / "home").mkdir(exist_ok=True)

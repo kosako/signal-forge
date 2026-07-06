@@ -22,7 +22,6 @@ from pydantic import BaseModel
 from app.config import Config, ConfigError, load_config, load_env
 from app.db import MIGRATIONS_DIR, connect, discover_migrations
 
-BACKUP_DIR = Path.home() / "Backups" / "intel"  # 設計 05 §5
 BACKUP_STALE_HOURS = 48
 LAUNCHD_JOBS = ("com.intel.morning", "com.intel.poller")  # 設計 05 §1
 
@@ -51,7 +50,6 @@ def run_doctor(
     engine_factory: Callable[[str], object] | None = None,
     launchctl: Callable[[str], bool] | None = None,
     environ: dict[str, str] | None = None,
-    backup_dir: Path = BACKUP_DIR,
     home: Path | None = None,
 ) -> list[CheckResult]:
     """12項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
@@ -102,7 +100,7 @@ def run_doctor(
             (7, "Obsidian Vault", lambda: _check_vault(config)),
             (8, "launchd", lambda: _check_launchd(launchctl)),
             (9, "当月コスト", lambda: _check_cost(conn, config)),
-            (10, "バックアップ", lambda: _check_backup(backup_dir)),
+            (10, "バックアップ", lambda: _check_backup(config)),
             (11, "TTL 残存", lambda: _check_ttl_leftovers(conn, config)),
             (12, "ANTHROPIC_API_KEY", lambda: _check_anthropic_key(environ)),
         ]
@@ -344,7 +342,10 @@ def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> Check
     return CheckResult(9, "当月コスト", "PASS", detail)
 
 
-def _check_backup(backup_dir: Path) -> CheckResult:
+def _check_backup(config: Config | None) -> CheckResult:
+    if config is None:
+        return CheckResult(10, "バックアップ", "WARN", _CONFIG_UNAVAILABLE)
+    backup_dir = config.backup_dir
     archives = sorted(backup_dir.glob("*.tar.gz")) if backup_dir.exists() else []
     if not archives:
         return CheckResult(10, "バックアップ", "WARN", f"{backup_dir} に世代なし(plan #23)")

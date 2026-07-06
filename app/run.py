@@ -1,6 +1,7 @@
 """intel run — 朝バッチの直列実行(設計 00 §2・§6)。
 
-順序: collect → extract → analyze → digest → export → (deliver: #16) → purge。
+順序: collect → extract → analyze → digest → export → deliver → purge → backup
+(backup は設計 05 §5 の「朝バッチ末尾」)。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
 段の失敗はその段で捕捉して記録し、後続の段は実行する。失敗が1つでもあれば
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
@@ -13,6 +14,7 @@ import sqlite3
 from collections.abc import Callable
 
 from app.analysis.llm import LLMEngine
+from app.backup import backup_daily
 from app.collect import collect_all
 from app.config import Config
 from app.connectors.base import Connector
@@ -68,6 +70,7 @@ def run_pipeline(
             extra={"run_id": run_id, "stage": "deliver"},
         )
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
+    stage("backup", lambda: backup_daily(conn, config, logger, run_id=run_id))
 
     logger.info(
         "run 完了",

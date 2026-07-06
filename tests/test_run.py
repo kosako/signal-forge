@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from app.analysis.analyzer import AnalysisBatch, ItemAnalysis
-from app.config import AnalysisConfig, Config, ObsidianConfig
+from app.config import AnalysisConfig, Config, ObsidianConfig, StorageConfig
 from app.connectors.base import FetchResult, FetchStats, RawItem
 from app.db import apply_migrations, connect
 from app.digest.builder import today_jst
@@ -79,6 +79,7 @@ def make_config(tmp_path: Path) -> Config:
         config_dir=tmp_path,
         obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault")),
         analysis=AnalysisConfig(profile_path=str(profile)),
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
     )
 
 
@@ -108,6 +109,7 @@ def test_full_pipeline_end_to_end(conn, tmp_path) -> None:
     daily = tmp_path / "vault" / "SignalForge" / "Daily" / f"{today_jst()}.md"
     assert daily.exists()
     assert list((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    assert list((tmp_path / "backups").glob("intel-*.tar.gz"))  # backup 段(設計 05 §5)
 
 
 def test_rerun_is_idempotent(conn, tmp_path) -> None:
@@ -122,7 +124,9 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
 def test_stage_failure_is_isolated_and_reported(conn, tmp_path) -> None:
     # プロファイル欠落 → analyze 段は失敗するが、digest(空)・purge まで進む
     config = Config(
-        config_dir=tmp_path, obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault"))
+        config_dir=tmp_path,
+        obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault")),
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
     )
     failures = run_pipeline(
         conn, config, {}, {"rss": StaticConnector()}, make_http(),
@@ -141,6 +145,7 @@ def test_export_failure_reported_but_purge_runs(conn, tmp_path) -> None:
     config = Config(  # vault 未設定 → export 失敗
         config_dir=tmp_path,
         analysis=AnalysisConfig(profile_path=str(profile)),
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
     )
     failures = run_pipeline(
         conn, config, {}, {"rss": StaticConnector()}, make_http(),
@@ -184,6 +189,7 @@ def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> N
         config_dir=base.config_dir,
         obsidian=base.obsidian,
         analysis=base.analysis,
+        storage=base.storage,
         telegram=TelegramConfig(owner_user_id=1, owner_chat_id=42),
     )
     failures = run_pipeline(
