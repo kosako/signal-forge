@@ -87,17 +87,23 @@ class CodexCliEngine:
     ) -> None:
         self._codex_bin = codex_bin
         self._effort = model_reasoning_effort
-        # 認証は CODEX_HOME 経由で最小限だけ見せる(実 HOME は渡さない)。
-        # 既定は auth.json への symlink のみを含む専用ディレクトリ(~/.codex を丸ごと
-        # 見せると sessions・memories 等も読める)
-        self._codex_home = codex_home if codex_home is not None else _minimal_codex_home()
+        # None なら呼び出しごとに使い捨ての最小 CODEX_HOME(auth.json symlink のみ)を作る。
+        # 恒久ディレクトリにしない理由: codex はランタイムで logs/memories/state を
+        # CODEX_HOME に書き込む(実測)ため、(a) 汚染で「auth のみ」の境界が壊れる
+        # (b) 実行間で memories が持ち越され、外部本文由来の指示が持続する経路になる
+        self._codex_home = codex_home
 
     def complete_structured(
         self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
     ) -> M:
-        # 呼び出しごとに空の作業ディレクトリを作る(隔離。使い回さない)
-        with tempfile.TemporaryDirectory(prefix="intel-llm-") as workdir:
-            out_file = Path(workdir) / "last-message.txt"
+        # 呼び出しごとに空の作業ディレクトリと使い捨て CODEX_HOME を作る(使い回さない)。
+        # codex-home は workspace の外(sibling)に置き、エージェントの作業領域から
+        # 相対パスで auth に触れない配置にする
+        with tempfile.TemporaryDirectory(prefix="intel-llm-") as tmp:
+            workdir = str(Path(tmp) / "workspace")
+            Path(workdir).mkdir()
+            codex_home = self._codex_home or _ephemeral_codex_home(Path(tmp))
+            out_file = Path(tmp) / "last-message.txt"
             command = [
                 self._codex_bin,
                 "exec",
@@ -125,7 +131,7 @@ class CodexCliEngine:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding="utf-8",  # locale 非依存(launchd 環境で UTF-8 保証がない)
-                    env=self._isolated_env(workdir),
+                    env=self._isolated_env(workdir, codex_home),
                     cwd=workdir,  # -C と二重だが、プロセス自体も隔離 dir で走らせる
                     start_new_session=True,  # timeout 時に孫プロセスごと落とすための別セッション
                 )
@@ -143,34 +149,34 @@ class CodexCliEngine:
                 raise LLMError("codex が最終応答ファイルを書かなかった")
             return parse_structured(out_file.read_text(encoding="utf-8"), schema)
 
-    def _isolated_env(self, workdir: str) -> dict[str, str]:
+    def _isolated_env(self, workdir: str, codex_home: str) -> dict[str, str]:
         """PATH + 隔離 HOME + CODEX_HOME のみの環境。
 
         実ユーザーの HOME を渡すと、read-only sandbox はファイル読み取りを防がないため
-        `~/.ssh` 等が要約経由で流出する経路が残る。HOME は空の workdir に差し替え、
+        `~/.ssh` 等が要約経由で流出する経路が残る。HOME は空の workspace に差し替え、
         codex の認証だけ CODEX_HOME で最小限見せる(auth 以外の設定は --ephemeral で遮断)。
         ANTHROPIC_API_KEY を含む他の環境変数は構造的に渡さない(設計 00 §4)。
         """
         return {
             "PATH": os.environ.get("PATH", ""),
             "HOME": workdir,
-            "CODEX_HOME": self._codex_home,
+            "CODEX_HOME": codex_home,
         }
 
 
-def _minimal_codex_home() -> str:
-    """auth.json(実体は ~/.codex/auth.json への symlink)だけを含む CODEX_HOME を返す。
+def _ephemeral_codex_home(base: Path) -> str:
+    """auth.json(~/.codex/auth.json への symlink)だけを含む使い捨て CODEX_HOME を作る。
 
     symlink なので codex 側のトークンリフレッシュは実ファイルに反映される。
+    ディレクトリごと呼び出し後に破棄されるため、codex が書くランタイムファイル
+    (logs/memories/state)による汚染・持ち越しは構造的に起きない。
     """
     real_auth = Path.home() / ".codex" / "auth.json"
-    home = Path.home() / ".local" / "state" / "intel" / "codex-home"
-    home.mkdir(parents=True, exist_ok=True)
-    link = home / "auth.json"
-    if not link.is_symlink() and not link.exists():
-        if not real_auth.exists():
-            raise LLMError("~/.codex/auth.json がない(先に codex login が必要)")
-        link.symlink_to(real_auth)
+    if not real_auth.exists():
+        raise LLMError("~/.codex/auth.json がない(先に codex login が必要)")
+    home = base / "codex-home"
+    home.mkdir()
+    (home / "auth.json").symlink_to(real_auth)
     return str(home)
 
 

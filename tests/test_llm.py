@@ -23,6 +23,16 @@ class Verdict(BaseModel):
 VALID = '{"score": 80, "reason": "ok"}'
 
 
+@pytest.fixture(autouse=True)
+def fake_user_home(tmp_path_factory, monkeypatch):
+    """既定の使い捨て CODEX_HOME が実ユーザーの ~/.codex に触れないよう HOME を差し替える。"""
+    home = tmp_path_factory.mktemp("home")
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
 def fake_codex(tmp_path: Path, script_body: str) -> str:
     """-o で渡されたファイルに応答を書く codex の偽物。"""
     path = tmp_path / "fake-codex"
@@ -108,24 +118,26 @@ def test_env_is_isolated_no_anthropic_key(tmp_path: Path, monkeypatch) -> None:
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-secret"  # 呼び出し側の環境は不変
 
 
-def test_default_codex_home_is_minimal_auth_only(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    real = tmp_path / ".codex"
-    real.mkdir()
-    (real / "auth.json").write_text("{}")
-    (real / "sessions.db").write_text("secret sessions")  # 見せてはいけない同居物
-
-    engine = CodexCliEngine(codex_bin="/bin/true")
-    home = Path(engine._codex_home)
-    assert home != real  # ~/.codex 丸ごとではない
-    assert [p.name for p in home.iterdir()] == ["auth.json"]  # auth のみ
-    assert (home / "auth.json").resolve() == (real / "auth.json").resolve()  # symlink で共有
+def test_default_codex_home_is_ephemeral_and_auth_only(
+    tmp_path: Path, fake_user_home: Path
+) -> None:
+    (fake_user_home / ".codex" / "sessions.db").write_text("secret")  # 見せてはいけない同居物
+    reply = (
+        'echo "{\\"score\\": 1, \\"reason\\": '
+        '\\"$(ls -A "$CODEX_HOME" | tr "\\n" ",")|$CODEX_HOME\\"}" > "$out"\n'
+    )
+    codex = fake_codex(tmp_path, OUT_FILE_SNIPPET + reply)
+    result = CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+    contents, home = result.reason.split("|")
+    assert contents.strip(",") == "auth.json"  # auth.json のみ(sessions 等は見えない)
+    assert "intel-llm-" in home  # 呼び出しごとの使い捨てディレクトリ
+    assert not Path(home).exists()  # 呼び出し後に破棄される(汚染・持ち越しなし)
 
 
 def test_default_codex_home_requires_login(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))  # .codex/auth.json なし
     with pytest.raises(LLMError, match="codex login"):
-        CodexCliEngine(codex_bin="/bin/true")
+        CodexCliEngine(codex_bin="/bin/true").complete_structured("p", Verdict)
 
 
 def test_codex_home_points_to_auth_dir_only(tmp_path: Path) -> None:
