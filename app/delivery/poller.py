@@ -3,16 +3,17 @@
 - getUpdates long polling(50s)。offset は telegram_state に永続化し、再起動で
   取りこぼし・二重処理しない(at-least-once。signals は追記型なので重複は集計側で吸収)
 - callback 処理順: ①認可(from.id)→ ②検証(item 実在+digests 帰属)→
-  ③signals INSERT → ④結果に応じて answerCallbackQuery(成功=記録しました /
-  DB 失敗=⚠️ 記録失敗。answer は 1 callback 1回のため記帳を先に行う。
-  ローカル SQLite はミリ秒オーダーで10秒失効に間に合う)→
+  ③signals INSERT → ④結果に応じて answerCallbackQuery(記帳成功=記録しました /
+  検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback
+  1回のため記帳を先に行う。ローカル SQLite はミリ秒オーダーで10秒失効に間に合う)→
   ⑤editMessageReplyMarkup で ✓
 - message 処理(URL 投入。設計 02 §4 / 04 §5): owner の平文メッセージから http/https
   URL を抽出し items(source=manual)へ投入して即 ACK。重複判定は canonical_url のみ
   (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
-- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)は plan #19 で拡張する
+- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)の callback も本デーモンで処理する
+  (送信は surveys.py の内蔵タイマー)
 """
 
 from __future__ import annotations

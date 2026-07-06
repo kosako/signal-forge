@@ -4,8 +4,9 @@
 - timeout: connect 10s / read 30s
 - リトライ: 2回・指数バックオフ(1s→4s)+ jitter。429 は Retry-After 尊重。
   恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)
-- SSRF ガード: DNS 解決後の接続先 IP が private / loopback / link-local 帯なら拒否。
-  リダイレクトは自動追跡せず各ホップで再検査する。
+- SSRF ガード: DNS 解決後の接続先 IP が global でなければ拒否(is_global を基本にした
+  allowlist 方式。private/loopback/link-local に加え shared address space 100.64.0.0/10 等
+  のブラックリスト漏れも遮断)。リダイレクトは自動追跡せず各ホップで再検査する。
   接続は**検証済み IP にピン留め**する(URL ホストを IP に書き換え、Host ヘッダ+SNI で
   元ホスト名を維持)。検証と接続で DNS を別々に引くと、attacker 制御の DNS が
   1回目 public・2回目 private を返す rebinding で検査を回避できるため
@@ -37,7 +38,7 @@ _PERMANENT_REDIRECTS = frozenset({301, 308})
 
 
 class SsrfBlockedError(FatalError):
-    """接続先が private / loopback / link-local 帯(設計 05 §8)。"""
+    """接続先が global でないアドレス(is_global allowlist 方式。設計 05 §8)。"""
 
 
 @dataclass(frozen=True)
