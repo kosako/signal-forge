@@ -18,7 +18,12 @@ def test_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert config.retention.x_cache_ttl_days == 7
     assert config.llm.engine == "codex-cli"
     assert config.x.enabled is False
-    assert config.db_path == tmp_path / "intel.db"
+    assert config.db_path == Path.home() / ".local" / "share" / "intel" / "intel.db"
+
+
+def test_db_path_configurable(tmp_path: Path) -> None:
+    write_config(tmp_path, f'[storage]\ndb_path = "{tmp_path}/custom.db"\n')
+    assert load_config(tmp_path).db_path == tmp_path / "custom.db"
 
 
 def test_valid_config_overrides_defaults(tmp_path: Path) -> None:
