@@ -15,10 +15,10 @@ import os
 import sqlite3
 import tarfile
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import Config
+from app.digest.builder import today_jst
 
 GENERATIONS = 14
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -35,7 +35,8 @@ def backup_daily(
     """当日世代の tar.gz を作成し、パスを返す。古い世代は14世代を超えた分を削除。"""
     backup_dir = config.backup_dir  # 置き場の正本は config(既定 ~/Backups/intel。設計 05 §5)
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = datetime.now(UTC).strftime("%Y%m%d")
+    # 世代名は JST 日付(朝バッチ・digest_date と同じ暦日。UTC だと朝バッチ時点で1日ずれる)
+    stamp = today_jst().replace("-", "")
     archive_path = backup_dir / f"intel-{stamp}.tar.gz"
 
     # アトミック置換のため、一時ファイルはアーカイブと同一ディレクトリに作る

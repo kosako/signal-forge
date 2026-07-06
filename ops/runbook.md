@@ -102,14 +102,30 @@ FDA を付与する:
 **復旧手順**(リハーサルを1回実施すること):
 
 ```sh
+# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)
+launchctl bootout "gui/$(id -u)/com.intel.morning" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.intel.poller" 2>/dev/null || true
+
 RESTORE_DIR="$(mktemp -d)"
 tar -xzf "${HOME}/Backups/intel/intel-<日付>.tar.gz" -C "${RESTORE_DIR}"
-# 1. DB を配置(既存があれば退避してから)
-mv "${RESTORE_DIR}/intel.db" "${HOME}/.local/share/intel/intel.db"
-# 2. 設定類を配置(必要な場合のみ。.env は chmod 600 を維持)
+
+# 1. 設定類を先に配置(必要な場合のみ。.env は chmod 600 を維持)
 cp -a "${RESTORE_DIR}/config/." "${HOME}/.config/intel/"
 chmod 600 "${HOME}/.config/intel/.env"
-# 3. 健全性確認
+
+# 2. 復旧先 DB パスを確認する。config.toml の [storage].db_path を設定していれば
+#    その値、未設定なら既定の ~/.local/share/intel/intel.db
+DB_PATH="${HOME}/.local/share/intel/intel.db"   # ← [storage].db_path 設定時は書き換える
+
+# 3. 既存 DB 一式を退避してから配置する。WAL/SHM を残すと、復元した本体に
+#    古い WAL が適用されて不整合になるため、必ず 3 ファイルまとめて扱う
+mkdir -p "${DB_PATH%/*}"
+for suffix in "" "-wal" "-shm"; do
+  [ -f "${DB_PATH}${suffix}" ] && mv "${DB_PATH}${suffix}" "${DB_PATH}${suffix}.pre-restore"
+done
+mv "${RESTORE_DIR}/intel.db" "${DB_PATH}"
+
+# 4. 健全性確認 → 問題なければ launchd を再 bootstrap(§2)
 uv run intel doctor
 ```
 
