@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "feedparser>=6.0.12",
     "httpx>=0.28.1",
+    "pydantic>=2.13.4",
     "trafilatura>=2.1.0",
     "typer>=0.15",
 ]
