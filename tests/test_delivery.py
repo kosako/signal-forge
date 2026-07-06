@@ -173,6 +173,41 @@ def test_long_summary_truncated_but_title_url_implication_kept(conn, tmp_path) -
     assert '<a href="https://a/1">' in text  # URL も削らない
 
 
+def test_truncation_never_splits_html_entity(conn, tmp_path) -> None:
+    # 切り詰め境界に & が来るよう、エスケープで膨らむ文字を敷き詰める
+    # (エスケープ後 slice だと末尾が「&am…」等の壊れた entity になる)
+    a = add_item(conn, "https://a/1", summary="&" * 2000, implication="示唆。")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert len(text) <= ITEM_TEXT_MAX_CHARS
+    # 出現する & はすべて完全な entity(&amp;)である
+    stripped = text.replace("&amp;", "").replace("&lt;", "").replace("&gt;", "")
+    assert "&" not in stripped
+    assert "…" in text
+
+
+@pytest.mark.parametrize("boundary_char", ["&", "<", ">"])
+def test_truncation_boundary_chars_stay_wellformed(conn, tmp_path, boundary_char) -> None:
+    # budget 境界の直前に entity 化される文字を1つ置く
+    a = add_item(
+        conn, "https://a/1",
+        summary="あ" * 890 + boundary_char + "い" * 200, implication="",
+    )
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert len(text) <= ITEM_TEXT_MAX_CHARS
+    # 要約行(タイトル・ソース行の次)は生の & < > を含まない(entity のみ)
+    summary_line = text.splitlines()[2]
+    stripped = summary_line.replace("&amp;", "").replace("&lt;", "").replace("&gt;", "")
+    assert not any(c in stripped for c in "&<>")
+
+
 def test_degraded_digest_header_has_warning(conn, tmp_path) -> None:
     a = add_item(conn, "https://a/1", summary="", implication="")
     digest_id = add_digest(conn, [a], status="degraded")

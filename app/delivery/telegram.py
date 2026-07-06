@@ -253,13 +253,30 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
     if trailer:
         budget -= len(trailer) + 1
     if summary and budget > 1:
-        escaped_summary = escape_text(summary)
-        if len(escaped_summary) > budget:
-            escaped_summary = escaped_summary[: budget - 1] + "…"
-        fixed_lines.append(escaped_summary)
+        fixed_lines.append(_escape_and_truncate(summary, budget))
     if trailer:
         fixed_lines.append(trailer)
     return "\n".join(fixed_lines)
+
+
+def _escape_and_truncate(raw: str, budget: int) -> str:
+    """raw をエスケープし、エスケープ後長が budget 内に収まるよう末尾を … で切る。
+
+    エスケープ済み文字列の任意位置 slice は HTML entity(&amp; 等)を分断し、
+    Telegram の parse_mode=HTML が 400 を返しうるため、raw 1文字単位で積む。
+    """
+    escaped = escape_text(raw)
+    if len(escaped) <= budget:
+        return escaped
+    parts: list[str] = []
+    used = 0
+    for char in raw:
+        piece = escape_text(char)
+        if used + len(piece) > budget - 1:  # 「…」1文字分を確保
+            break
+        parts.append(piece)
+        used += len(piece)
+    return "".join(parts) + "…"
 
 
 def _published_md(published_at: str | None) -> str | None:
