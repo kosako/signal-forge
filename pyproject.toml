@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "個人用インテリジェンスサービス(A-lite MVP)。X・RSS・手動URLを毎朝の日本語ダイジェストに圧縮する"
 requires-python = ">=3.12"
 dependencies = [
+    "feedparser>=6.0.12",
+    "httpx>=0.28.1",
     "typer>=0.15",
 ]
 
@@ -30,6 +32,9 @@ extend-exclude = ["scripts"]  # Day 0 の使い捨てスクリプト(vibe 品質
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/cli.py" = ["B008"]  # typer.Option を引数既定値に書くのは Typer の標準イディオム
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
