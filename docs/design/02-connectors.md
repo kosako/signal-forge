@@ -49,7 +49,7 @@ class Connector(Protocol):
 - **rate limit**: 期待値 5 req/15min。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
 - **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外(meta に記録)。理由: ノイズ率対策の最安の一手。
-- **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。Developer Agreement の Day 0 確認結果次第で TTL 短縮・抜粋方針を確定。
+- **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。**確定済み(2026-07-06、Issue #2)**: `x_cache_ttl_days=7`、X 由来の抜粋は Obsidian に置かない(詳細は 01 §6 / 04 §7)。
 - **縮退**: consecutive_failures ≥ 3 で doctor・watchdog 通知(自動 disable はしない。理由: 勝手に情報源が消えるより通知して人が `sources.enabled=0` を切る方が安全)。X 停止中もパイプラインはソース非依存で RSS+手動URLで継続。
 
 ### Day 0 テストスクリプト仕様(`scripts/day0_x_probe.py`)
