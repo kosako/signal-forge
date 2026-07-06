@@ -141,7 +141,7 @@ def test_non_owner_callback_discarded_without_response(conn, tmp_path) -> None:
         "s:abc:up",  # 非数値 item_id
         "s:1:hmm",  # 不明 code
         "s:1",  # 要素不足
-        "q1:20260707:y",  # 夜アンケート(plan #19 で対応)
+        "z:1:up",  # 不明 prefix(q1/q2/f は test_surveys 側で検証)
         "s:" + "9" * 70 + ":up",  # 64バイト超
     ],
 )

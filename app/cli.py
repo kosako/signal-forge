@@ -190,6 +190,14 @@ def run(
         force_digest=force_digest,
     )
     if failures:
+        # 朝バッチ失敗通知(設計 05 §4)。通知の失敗は notify 側でログのみに握る
+        from app.delivery import create_api, is_telegram_configured, notify_run_failure
+
+        if is_telegram_configured(config, env):
+            try:
+                notify_run_failure(conn, config, create_api(env), failures, run_id, logger)
+            except Exception as e:  # create_api の設定不備等でも終了コードを汚さない
+                logger.error(f"失敗通知を送れない: {e}", extra={"run_id": run_id, "stage": "run"})
         typer.echo(f"失敗した段: {', '.join(failures)}(run_id={run_id})", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"run 完了(run_id={run_id})")

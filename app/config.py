@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +55,10 @@ class TelegramConfig:
     # bot token は .env 側。ここは認可 allowlist(設計 04 §6)
     owner_user_id: int | None = None
     owner_chat_id: int | None = None
+    # 内蔵タイマー(JST・HH:MM)。夜アンケート(設計 04 §4)/ watchdog(設計 05 §4)。
+    # watchdog は配信時刻(宿題 H5)+15分に合わせて調整する
+    survey_time: str = "21:30"
+    watchdog_time: str = "07:15"
 
 
 @dataclass(frozen=True)
@@ -228,6 +233,12 @@ def _validate(path: Path, config: Config) -> None:
             raise ConfigError(f"{path}: [{section}].{key} は正の整数であること: {value}")
     if config.x.unit_price_usd < 0 or config.budget.monthly_cap_usd <= 0:
         raise ConfigError(f"{path}: 単価・予算上限は正の値であること")
+    for key, value in (
+        ("survey_time", config.telegram.survey_time),
+        ("watchdog_time", config.telegram.watchdog_time),
+    ):
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ConfigError(f"{path}: [telegram].{key} は HH:MM 形式であること: {value!r}")
 
 
 def load_env(config_dir: Path) -> dict[str, str]:

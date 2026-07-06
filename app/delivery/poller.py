@@ -19,11 +19,22 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
+from datetime import datetime
 from urllib.parse import urlsplit
 
 from app.config import Config
 from app.db import insert_item_with_dedup
+from app.delivery.state import get_state, set_state
+from app.delivery.surveys import (
+    READ_MIN_CHOICES,
+    followup_keyboard,
+    q1_keyboard,
+    q2_keyboard,
+    run_due_timers,
+    survey_deadline,
+)
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
+from app.digest.builder import JST
 from app.normalize import (
     content_hash,
     is_dedup_eligible,
@@ -50,16 +61,23 @@ def run_poller(
     *,
     sleep: Callable[[float], None] = time.sleep,
     should_stop: Callable[[], bool] = lambda: False,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
 ) -> None:
     """常駐ループ。失敗は即時再接続、連続失敗は30s間隔(設計 05 §8)。
 
-    プロセス生存は launchd KeepAlive の責務。should_stop はテスト用の注入点。
+    各周期で内蔵タイマー(夜アンケート・watchdog。設計 05 §1.2)→ getUpdates の順に
+    実行する。long poll は最大50sブロックするため、タイマーの発火粒度は約1分。
+    プロセス生存は launchd KeepAlive の責務。should_stop / now_fn はテスト用の注入点。
     """
     if config.telegram.owner_user_id is None:
         raise DeliveryError("config.toml の [telegram].owner_user_id が未設定(設計 04 §6)")
+    if config.telegram.owner_chat_id is None:
+        # 夜アンケート・watchdog の送信先(plan #19)。起動時に fail fast
+        raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
     logger.info("poller 起動", extra={"stage": "poll"})
     while not should_stop():
         try:
+            run_due_timers(conn, config, api, logger, now_fn())
             poll_once(conn, config, api, logger)
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
@@ -143,39 +161,50 @@ def _handle_callback(
         logger.warning("id のない callback を破棄", extra={"stage": "poll"})
         return
 
-    parsed = _parse_reaction(callback.get("data"))
-    if parsed is None:
-        # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
-        # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
-        api.answer_callback_query(callback_id)
-        logger.warning("未対応の callback_data を破棄", extra={"stage": "poll"})
-        return
-    item_id, code = parsed
+    # callback_data 種別のディスパッチ(形式の正本は設計 04 §3。64バイト以内・3要素)
+    data = callback.get("data")
+    parts = data.split(":") if isinstance(data, str) and len(data.encode()) <= 64 else []
+    if len(parts) == 3:
+        prefix, arg, code = parts
+        if prefix == "s" and arg.isdigit() and code in _REACTION_VALUES:
+            _record_reaction(conn, api, callback, callback_id, int(arg), code, logger)
+            return
+        if prefix in ("q1", "q2") and re.fullmatch(r"\d{8}", arg) and _survey_value(
+            prefix, code
+        ):
+            _record_survey(conn, api, callback, callback_id, prefix, arg, code, logger)
+            return
+        if prefix == "f" and arg.isdigit() and code in ("y", "n"):
+            _record_followup(conn, api, callback, callback_id, int(arg), code, logger)
+            return
+    # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
+    # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
+    api.answer_callback_query(callback_id)
+    logger.warning("未対応の callback_data を破棄", extra={"stage": "poll"})
 
+
+def _record_reaction(
+    conn: sqlite3.Connection,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    code: str,
+    logger: logging.Logger,
+) -> None:
     # 検証+INSERT を answer より先に行う(ローカル SQLite でミリ秒オーダー。10秒失効に
     # 対して十分速く、「DB 書込失敗時のみ ⚠️ を返す」(設計 04 §3)は answer 1回の制約上
     # 書込を先にしないと満たせない)
-    recorded = False
-    try:
-        digest_date = _digest_date_of_item(conn, item_id)
-        if digest_date is None:
-            # 古いメッセージ・偽造 data を KPI 分母に入れない(設計 04 §3)
-            logger.warning(
-                "digests 帰属のない item への reaction を破棄",
-                extra={"stage": "poll", "item_id": item_id},
-            )
-        else:
-            conn.execute(
-                "INSERT INTO signals (kind, item_id, value, signal_date) "
-                "VALUES ('reaction', ?, ?, ?)",
-                (item_id, _REACTION_VALUES[code], digest_date),
-            )
-            recorded = True
-    except sqlite3.Error as e:
-        # 記帳失敗を owner に伝える(⚠️)ため、ここでは握りつぶして answer に進む
-        logger.error(f"signals INSERT 失敗: {type(e).__name__}: {e}", extra={"stage": "poll"})
-
-    if not recorded:
+    digest_date = _digest_date_of_item(conn, item_id)
+    if digest_date is None:
+        # 古いメッセージ・偽造 data を KPI 分母に入れない(設計 04 §3)
+        logger.warning(
+            "digests 帰属のない item への reaction を破棄",
+            extra={"stage": "poll", "item_id": item_id},
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    if not _insert_signal(conn, "reaction", item_id, _REACTION_VALUES[code], digest_date, logger):
         api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
         return
 
@@ -188,7 +217,125 @@ def _handle_callback(
             "extra": {"value": _REACTION_VALUES[code], "signal_date": digest_date},
         },
     )
+    _edit_markup_best_effort(
+        api, callback, reaction_keyboard(item_id, selected=code), logger
+    )
 
+
+def _survey_value(prefix: str, code: str) -> str | None:
+    """q1/q2 の code を signals.value に写像(不正は None)。"""
+    if prefix == "q1":
+        return {"y": "yes", "n": "no"}.get(code)
+    return code if code in READ_MIN_CHOICES else None
+
+
+def _record_survey(
+    conn: sqlite3.Connection,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    prefix: str,
+    date_compact: str,
+    code: str,
+    logger: logging.Logger,
+) -> None:
+    """夜アンケート回答。callback_data 内の日付に帰属(送信日時に依存しない)。"""
+    try:
+        deadline = survey_deadline(date_compact)
+    except ValueError:
+        api.answer_callback_query(callback_id)
+        logger.warning("callback_data の日付が不正", extra={"stage": "poll"})
+        return
+    if datetime.now(JST) > deadline:
+        # 翌日 12:00 JST を過ぎた回答は記帳しない(設計 04 §4)
+        api.answer_callback_query(callback_id, text="⚠️ 回答期限(翌日12:00)を過ぎています")
+        logger.warning("期限切れの survey 回答を破棄", extra={"stage": "poll"})
+        return
+
+    signal_date = f"{date_compact[:4]}-{date_compact[4:6]}-{date_compact[6:]}"
+    kind = "survey_patrol" if prefix == "q1" else "survey_read_min"
+    value = _survey_value(prefix, code)
+    assert value is not None  # ディスパッチ側で検証済み
+    if not _insert_signal(conn, kind, None, value, signal_date, logger):
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+
+    api.answer_callback_query(callback_id, text="📝 記録しました")
+    logger.info(
+        "survey 記録",
+        extra={"stage": "poll", "extra": {"kind": kind, "signal_date": signal_date}},
+    )
+    keyboard = (
+        q1_keyboard(date_compact, selected=code)
+        if prefix == "q1"
+        else q2_keyboard(date_compact, selected=code)
+    )
+    _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+def _record_followup(
+    conn: sqlite3.Connection,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    code: str,
+    logger: logging.Logger,
+) -> None:
+    """🔖追い掛け回答。signal_date は 🔖 を付けた日(設計 01 §7)。"""
+    row = conn.execute(
+        "SELECT max(signal_date) AS dig_date FROM signals "
+        "WHERE kind = 'reaction' AND value = 'dig' AND item_id = ?",
+        (item_id,),
+    ).fetchone()
+    if row["dig_date"] is None:
+        # 🔖 が付いていない item への追い掛け回答は偽造・不整合として破棄
+        logger.warning(
+            "🔖 記録のない item への followup を破棄",
+            extra={"stage": "poll", "item_id": item_id},
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    value = {"y": "yes", "n": "no"}[code]
+    if not _insert_signal(conn, "followup_dig", item_id, value, row["dig_date"], logger):
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+
+    api.answer_callback_query(callback_id, text="🔖 記録しました")
+    logger.info(
+        "followup_dig 記録",
+        extra={
+            "stage": "poll",
+            "item_id": item_id,
+            "extra": {"value": value, "signal_date": row["dig_date"]},
+        },
+    )
+    _edit_markup_best_effort(api, callback, followup_keyboard(item_id, selected=code), logger)
+
+
+def _insert_signal(
+    conn: sqlite3.Connection,
+    kind: str,
+    item_id: int | None,
+    value: str,
+    signal_date: str,
+    logger: logging.Logger,
+) -> bool:
+    try:
+        conn.execute(
+            "INSERT INTO signals (kind, item_id, value, signal_date) VALUES (?, ?, ?, ?)",
+            (kind, item_id, value, signal_date),
+        )
+        return True
+    except sqlite3.Error as e:
+        # 記帳失敗を owner に伝える(⚠️)ため、ここでは握りつぶして answer 側で分岐する
+        logger.error(f"signals INSERT 失敗: {type(e).__name__}: {e}", extra={"stage": "poll"})
+        return False
+
+
+def _edit_markup_best_effort(
+    api: TelegramApi, callback: dict, markup: dict, logger: logging.Logger
+) -> None:
     # ✓ 反映は best-effort: chat/message の形が不正でも記帳と answer は完了済みなので
     # edit だけ skip する(型不正で落とすと offset 前に例外 → 再処理で二重記帳になる)
     message = callback.get("message")
@@ -199,13 +346,10 @@ def _handle_callback(
         and isinstance(message.get("message_id"), int)
         and isinstance(chat_id, int)
     ):
-        api.edit_message_reply_markup(
-            chat_id, message["message_id"], reaction_keyboard(item_id, selected=code)
-        )
+        api.edit_message_reply_markup(chat_id, message["message_id"], markup)
     else:
         logger.warning(
-            "message/chat の形が不正なため ✓ 反映を skip",
-            extra={"stage": "poll", "item_id": item_id},
+            "message/chat の形が不正なため ✓ 反映を skip", extra={"stage": "poll"}
         )
 
 
@@ -316,18 +460,6 @@ def _ingest_manual_urls(
     return inserted, known
 
 
-def _parse_reaction(data: object) -> tuple[int, str] | None:
-    """`s:{item_id}:{up|dig|knw|no}` を (item_id, code) に。他形式は None。"""
-    if not isinstance(data, str) or len(data.encode()) > 64:
-        return None
-    parts = data.split(":")
-    if len(parts) != 3 or parts[0] != "s" or parts[2] not in _REACTION_VALUES:
-        return None
-    if not parts[1].isdigit():
-        return None
-    return int(parts[1]), parts[2]
-
-
 def _digest_date_of_item(conn: sqlite3.Connection, item_id: int) -> str | None:
     """item が配信された digest_date(帰属検証を兼ねる。設計 04 §3 / 01 §7)。
 
@@ -347,18 +479,9 @@ def _digest_date_of_item(conn: sqlite3.Connection, item_id: int) -> str | None:
 
 
 def _load_offset(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute(
-        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
-    ).fetchone()
-    if row is None:
-        return None
-    return int(row["value"])
+    value = get_state(conn, OFFSET_KEY)
+    return int(value) if value is not None else None
 
 
 def _save_offset(conn: sqlite3.Connection, offset: int) -> None:
-    conn.execute(
-        "INSERT INTO telegram_state (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
-        "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-        (OFFSET_KEY, str(offset)),
-    )
+    set_state(conn, OFFSET_KEY, str(offset))
