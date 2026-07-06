@@ -33,8 +33,20 @@ _WHITESPACE = re.compile(r"\s+")
 HASH_RULE_PREFIX = "h1|"
 
 
-class UnsupportedSchemeError(Exception):
-    """http/https 以外の URL。アイテムごと reject(status='error')する(u1 手順0)。"""
+class UrlError(Exception):
+    """u1 で reject される URL。呼び出し側はアイテムごと `status='error'` にする。"""
+
+
+class UnsupportedSchemeError(UrlError):
+    """http/https 以外の URL(u1 手順0)。"""
+
+
+class InvalidUrlError(UrlError):
+    """構造が不正・許容しない URL(userinfo 付き・不正ポート等)。
+
+    userinfo(`user:pass@`)は無言で落とすと別リソースの誤 dedup になり、保持すると
+    canonical_url 経由で credential が配信・ノートへ漏れるため reject する。
+    """
 
 
 def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None) -> str:
@@ -54,10 +66,16 @@ def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None
             raise UnsupportedSchemeError(f"短縮 URL の解決先が http/https でない: {url[:80]}")
         split = resolved
 
+    if split.username is not None or split.password is not None:
+        raise InvalidUrlError(f"userinfo 付き URL は許容しない: {split.hostname or ''}")
+
     # 手順2: scheme・host 小文字化、デフォルトポート除去(scheme の書き換えはしない)
     scheme = split.scheme.lower()
     host = (split.hostname or "").lower()
-    port = split.port
+    try:
+        port = split.port
+    except ValueError as e:
+        raise InvalidUrlError(f"ポートが不正: {url[:80]}") from e
     if port is not None and not (
         (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     ):

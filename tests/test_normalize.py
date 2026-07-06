@@ -1,6 +1,7 @@
 import pytest
 
 from app.normalize import (
+    InvalidUrlError,
     UnsupportedSchemeError,
     content_hash,
     is_dedup_eligible,
@@ -19,6 +20,17 @@ def test_scheme_allowlist_rejects_javascript() -> None:
 def test_scheme_allowlist_rejects_ftp() -> None:
     with pytest.raises(UnsupportedSchemeError):
         normalize_url("ftp://example.com/file")
+
+
+def test_userinfo_url_rejected() -> None:
+    # 無言で落とすと誤 dedup、保持すると credential 漏えいのため reject
+    with pytest.raises(InvalidUrlError, match="userinfo"):
+        normalize_url("https://alice:secret@example.com/a")
+
+
+def test_invalid_port_rejected_as_url_error() -> None:
+    with pytest.raises(InvalidUrlError, match="ポート"):
+        normalize_url("https://example.com:bad/a")
 
 
 def test_lowercases_scheme_and_host_only() -> None:
