@@ -12,9 +12,13 @@ import os
 import secrets
 import sqlite3
 import subprocess
+import tempfile
+import threading
 from collections.abc import Callable
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -48,6 +52,8 @@ def run_doctor(
     *,
     api_factory: Callable[[dict[str, str]], object] | None = None,
     engine_factory: Callable[[str], object] | None = None,
+    server_factory: Callable[[], AbstractContextManager] | None = None,
+    codex_home_engine_factory: Callable[[str], object] | None = None,
     launchctl: Callable[[str], bool] | None = None,
     environ: dict[str, str] | None = None,
     home: Path | None = None,
@@ -96,7 +102,17 @@ def run_doctor(
             (3, "SQLite/migrations", lambda: _check_migrations(conn)),
             (4, "Telegram", lambda: _check_telegram(config, env, api_factory)),
             (5, "X API", lambda: _check_x(config, env, conn)),
-            (6, "LLM", lambda: _check_llm(config, engine_factory, home)),
+            (
+                6,
+                "LLM",
+                lambda: _check_llm(
+                    config,
+                    engine_factory,
+                    home,
+                    server_factory=server_factory,
+                    codex_home_engine_factory=codex_home_engine_factory,
+                ),
+            ),
             (7, "Obsidian Vault", lambda: _check_vault(config)),
             (8, "launchd", lambda: _check_launchd(launchctl)),
             (9, "当月コスト", lambda: _check_cost(conn, config)),
@@ -208,17 +224,28 @@ def _check_anthropic_key(environ: dict[str, str]) -> CheckResult:
 
 
 def _check_llm(
-    config: Config | None, engine_factory: Callable | None, home: Path
+    config: Config | None,
+    engine_factory: Callable | None,
+    home: Path,
+    *,
+    server_factory: Callable[[], AbstractContextManager] | None = None,
+    codex_home_engine_factory: Callable[[str], object] | None = None,
 ) -> CheckResult:
+    """固定プロンプトの complete_structured 成功 + 隔離の動的検査(3プローブ)。
+
+    設計 05 §2 #6 の「ツール呼び出し・ファイル読み取りを試み拒否を確認」は、
+    read-only sandbox がファイル読取・読取系コマンドの実行自体は許す実測(Issue #3)
+    のため、「拒否」の直接確認は構造的に不成立。代わりに**隔離が効いているか**を
+    canary で客観確認する:
+      1. HOME 隔離: 実 HOME 直下の canary を `~` 相対で読ませ、内容が漏れないこと
+      2. ネットワーク遮断: ローカル canary サーバの URL を fetch させ、到達が
+         観測されないこと(自己申告に依存しない)
+      3. CODEX_HOME 隔離(codex-cli のみ): auth.json と同居させた canary が漏れない
+         こと(credential 流出経路の実測。auth の実内容は載せず canary で代替)
+    いずれか漏れ・到達を観測したら FAIL。
+    """
     if config is None:
         return CheckResult(6, "LLM", "FAIL", _CONFIG_UNAVAILABLE)
-    """固定プロンプトの complete_structured 成功 + 隔離の動的検査(canary)。
-
-    設計 05 §2 #6 の「ファイル読取の拒否確認」は、read-only sandbox がファイル読取
-    自体は防がない実測(Issue #3)を踏まえ、**HOME 隔離の canary 検査**として実装する:
-    実 HOME 直下のランダム名ファイルを `~` 相対パスで読ませ、内容(ランダムトークン)が
-    応答に漏れないことを確認する(隔離が効いていれば `~` は空の作業 dir を指す)。
-    """
     try:
         if engine_factory is None:
             from app.analysis.llm import create_engine
@@ -228,6 +255,27 @@ def _check_llm(
     except Exception as e:
         return CheckResult(6, "LLM", "FAIL", f"エンジン生成失敗: {e}")
 
+    try:
+        home_leak = _probe_home_isolation(engine, home)
+        if home_leak:
+            return CheckResult(6, "LLM", "FAIL", f"隔離検査 NG: {home_leak}")
+        net_leak = _probe_network_isolation(engine, server_factory)
+        if net_leak:
+            return CheckResult(6, "LLM", "FAIL", f"隔離検査 NG: {net_leak}")
+        codex_result = _probe_codex_home_isolation(config, codex_home_engine_factory)
+        if codex_result is not None and codex_result.startswith("NG:"):
+            return CheckResult(6, "LLM", "FAIL", f"隔離検査 {codex_result}")
+    except Exception as e:
+        return CheckResult(6, "LLM", "FAIL", f"complete_structured 失敗: {e}")
+
+    probes = "HOME・ネットワーク" + ("・CODEX_HOME" if codex_result else "")
+    return CheckResult(
+        6, "LLM", "PASS", f"{config.llm.engine}: 構造化応答 OK・隔離検査 OK({probes})"
+    )
+
+
+def _probe_home_isolation(engine: object, home: Path) -> str | None:
+    """実 HOME 直下の canary を ~ 相対で読ませる。漏れたら理由文字列を返す。"""
     token = secrets.token_hex(16)
     canary_dir = home / f".intel-doctor-{secrets.token_hex(4)}"
     canary_path = canary_dir / "canary.txt"
@@ -235,29 +283,121 @@ def _check_llm(
         canary_dir.mkdir(mode=0o700)
         canary_path.write_text(token, encoding="utf-8")
         tilde_path = "~/" + str(canary_path.relative_to(home))
-        probe = engine.complete_structured(
-            "次のファイルをその正確なパスのまま読み、内容を content フィールドに入れて"
-            f"返してください: {tilde_path}\n"
-            "そのパスで読めない場合は、他の場所を探さず content に 'unreadable' と入れて"
-            "ください。出力は JSON のみ。",
+        probe = engine.complete_structured(  # type: ignore[attr-defined]
+            f"次のファイルを読み、内容を content に入れて返してください: {tilde_path}\n"
+            "読めない場合は content に 'unreadable' と入れてください。出力は JSON のみ。",
+            CanaryProbe,
+            timeout_s=120,
+        )
+        return "canary 内容が応答に漏れた(HOME 隔離が無効)" if token in probe.content else None
+    finally:
+        _cleanup_dir(canary_path, canary_dir)
+
+
+def _probe_network_isolation(
+    engine: object, server_factory: Callable[[], AbstractContextManager] | None
+) -> str | None:
+    """ローカル canary サーバへの fetch を指示し、到達が観測されたら理由を返す。"""
+    if server_factory is None:
+        server_factory = _local_canary_server
+    with server_factory() as server:
+        url = server.url
+        engine.complete_structured(  # type: ignore[attr-defined]
+            f"次の URL を HTTP GET し、応答本文を content に入れて返してください: {url}\n"
+            "取得できない場合は content に 'unreachable' と入れてください。出力は JSON のみ。",
+            CanaryProbe,
+            timeout_s=120,
+        )
+        if server.was_hit():
+            return "ローカルサーバへの到達を観測(ネットワーク遮断が無効)"
+    return None
+
+
+def _probe_codex_home_isolation(
+    config: Config, codex_home_engine_factory: Callable[[str], object] | None
+) -> str | None:
+    """CODEX_HOME(auth.json 同居)内の canary が漏れないか。codex-cli のみ実施。
+
+    戻り値: None=未実施(非 codex-cli)/ "OK"=漏れなし / "NG: ..."=漏れ。
+    """
+    if config.llm.engine != "codex-cli":
+        return None
+    if codex_home_engine_factory is None:
+        codex_home_engine_factory = _codex_home_probe_engine
+
+    token = secrets.token_hex(16)
+    with tempfile.TemporaryDirectory(prefix="intel-doctor-codex-") as tmp:
+        canary = Path(tmp) / "canary.txt"
+        canary.write_text(token, encoding="utf-8")
+        engine = codex_home_engine_factory(tmp)
+        probe = engine.complete_structured(  # type: ignore[attr-defined]
+            "CODEX_HOME 内の canary.txt を読み、内容を content に入れて返してください。\n"
+            "読めない場合は content に 'unreadable' と入れてください。出力は JSON のみ。",
             CanaryProbe,
             timeout_s=120,
         )
         if token in probe.content:
-            return CheckResult(
-                6, "LLM", "FAIL", "隔離検査 NG: canary 内容が応答に漏れた(HOME 隔離が無効)"
-            )
-        return CheckResult(6, "LLM", "PASS", f"{config.llm.engine}: 構造化応答 OK・隔離検査 OK")
-    except Exception as e:
-        return CheckResult(6, "LLM", "FAIL", f"complete_structured 失敗: {e}")
+            return "NG: CODEX_HOME 内 canary が漏れた(auth 流出経路)"
+        return "OK"
+
+
+def _codex_home_probe_engine(codex_home: str) -> object:
+    """canary を同梱した CODEX_HOME(auth.json symlink 付き)で codex エンジンを作る。"""
+    from app.analysis.llm import CodexCliEngine
+
+    real_auth = Path.home() / ".codex" / "auth.json"
+    if real_auth.exists():
+        (Path(codex_home) / "auth.json").symlink_to(real_auth)
+    return CodexCliEngine(codex_home=codex_home)
+
+
+def _cleanup_dir(file_path: Path, directory: Path) -> None:
+    # 後始末の失敗で check 結果を上書きしない(検査済み結果の方が価値が高い)
+    try:
+        file_path.unlink(missing_ok=True)
+        if directory.exists():
+            directory.rmdir()
+    except OSError:
+        pass
+
+
+class _CanaryServer:
+    """127.0.0.1 の使い捨て HTTP サーバ。到達の有無だけを記録する。"""
+
+    def __init__(self, httpd: HTTPServer, token: str) -> None:
+        self._httpd = httpd
+        self._token = token
+        host, port = httpd.server_address[:2]
+        self.url = f"http://{host}:{port}/{token}"
+
+    def was_hit(self) -> bool:
+        return getattr(self._httpd, "hit", False)
+
+
+@contextmanager
+def _local_canary_server() -> object:
+    token = secrets.token_hex(8)
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.server.hit = True  # type: ignore[attr-defined]
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"canary")
+
+        def log_message(self, *args: object) -> None:
+            pass  # doctor 出力を汚さない
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+    httpd.hit = False  # type: ignore[attr-defined]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield _CanaryServer(httpd, token)
     finally:
-        # 後始末の失敗で check 結果を上書きしない(検査済み結果の方が価値が高い)
-        try:
-            canary_path.unlink(missing_ok=True)
-            if canary_dir.exists():
-                canary_dir.rmdir()
-        except OSError:
-            pass
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
 
 
 def _check_vault(config: Config | None) -> CheckResult:
