@@ -6,7 +6,11 @@ M1 完了(plan #14)までは各サブコマンドはスタブ。実装は 1 Issu
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
+
+from app.config import DEFAULT_CONFIG_DIR
 
 app = typer.Typer(
     name="intel",
@@ -23,9 +27,29 @@ def _stub(plan: int) -> None:
 
 
 @app.command()
-def collect() -> None:
+def collect(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
     """全ソース(X・RSS)から items を取り込む。"""
-    _stub(7)
+    # import は実行時(スタブ含む他コマンドの --help を httpx 等に依存させない)
+    from app.collect import collect_all
+    from app.config import load_config
+    from app.connectors.rss import RssConnector
+    from app.db import apply_migrations, connect
+    from app.http import HttpClient
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)  # CLI 起動時に自動適用(設計 01 §10)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    http = HttpClient()
+    collect_all(
+        conn,
+        {"rss": RssConnector(http)},  # X コネクタは plan #15(Day 0 ゲート通過後)
+        logger,
+        resolve_short=http.resolve_short_url,
+    )
 
 
 @app.command()

@@ -1,0 +1,53 @@
+"""Connector 共通インターフェース(設計 02 §1)。
+
+fetch は読み取り専用・副作用なし(DB に触らない)。items への書き込み・URL 正規化・
+重複排除・カーソル保存はすべて `intel collect`(app/collect.py)が行う。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Protocol
+
+from app.models import Source
+
+
+class RetryableError(Exception):
+    """接続失敗・timeout・5xx・429(リトライ尽き)。そのソースを当日スキップ。"""
+
+
+class FatalError(Exception):
+    """401/403・410 Gone・設定不備。リトライせずスキップ、doctor 警告対象。"""
+
+
+@dataclass(frozen=True)
+class RawItem:
+    external_id: str | None  # ソース内の自然キー(tweet id / RSS guid)。無ければ None
+    url: str  # 正規化前 URL。正規化は collect 側で一元化
+    title: str | None
+    author: str | None
+    published_at: datetime | None  # UTC
+    raw_content: str | None  # ソースが本文を同梱する場合のみ(RSS content 等)
+    meta: dict = field(default_factory=dict)  # ソース固有情報(RT 種別など)
+
+
+@dataclass(frozen=True)
+class FetchStats:
+    items_fetched: int
+    api_reads: int  # X の課金対象読み取り件数(collect_runs へ記録)
+    http_status: int | None  # ログのみ(DB には持たない。設計 02 §1)
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    items: list[RawItem]
+    next_cursor: dict  # sources.cursor に JSON 保存する不透明な辞書
+    stats: FetchStats
+
+
+class Connector(Protocol):
+    source_type: str  # "x" | "rss"
+
+    def fetch(self, source_row: Source, cursor: dict) -> FetchResult: ...
