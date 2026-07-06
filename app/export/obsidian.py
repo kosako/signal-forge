@@ -184,6 +184,9 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
     if current is None:
         # frontmatter 欠落/破損時に {} で再構成するとユーザー追加キーが消えるため退避
         return _write_conflict(path, fresh)
+    if begin < m.end():
+        # マーカーが frontmatter 内にある等、境界が本文領域にない場合も誤接合せず退避
+        return _write_conflict(path, fresh)
 
     merged = dict(current)
     for key, value in frontmatter.items():

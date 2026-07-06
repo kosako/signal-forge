@@ -189,6 +189,27 @@ def test_handwriting_before_begin_marker_preserved(conn, tmp_path) -> None:
     assert "更新後の要約" in updated
 
 
+def test_marker_inside_frontmatter_goes_to_conflict(conn, tmp_path) -> None:
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    note = next(
+        p for p in (tmp_path / "vault" / "SignalForge" / "Items").glob("*.md")
+        if ".conflict" not in p.name
+    )
+    text = note.read_text()
+    # 本文の BEGIN を消し、frontmatter 内に紛れ込ませる(境界が本文領域にないケース)
+    text = text.replace("<!-- GENERATED:BEGIN -->\n", "", 1)
+    text = text.replace("---\n", '---\nnote: "<!-- GENERATED:BEGIN -->"\n', 1)
+    note.write_text(text)
+
+    export_digest(conn, config, digest_id, logger)
+    assert note.read_text() == text  # 誤接合せず元ファイルに触れない
+    assert note.with_suffix(".conflict.md").exists()
+
+
 def test_broken_frontmatter_goes_to_conflict(conn, tmp_path) -> None:
     item = add_digested(conn, "https://a/1")
     digest_id = add_digest(conn, [item])
