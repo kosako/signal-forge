@@ -95,9 +95,22 @@ def analyze(
 
 
 @app.command()
-def digest() -> None:
+def digest(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    force: bool = typer.Option(False, "--force", help="生成済みでも当日分を置換する"),
+) -> None:
     """ランキングして日本語ダイジェスト(digests)を生成する。"""
-    _stub(12)
+    from app.config import load_config
+    from app.db import apply_migrations, connect
+    from app.digest import generate_digest
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    digest_id = generate_digest(conn, config, logger, force=force)
+    typer.echo("skip(生成済み)" if digest_id is None else f"digest id={digest_id}")
 
 
 @app.command()

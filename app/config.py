@@ -67,6 +67,20 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class RankingConfig:
+    # スコア式 v1 の係数(設計 03 §6)。すべてコード変更なしで調整可
+    min_score: float = 40.0  # 未満は件数が余っていても載せない
+    novelty_new: float = 1.0
+    novelty_update: float = 0.9
+    novelty_known: float = 0.3
+    negative_penalty: float = 15.0  # negative ラベル1個につき
+    freshness_penalty_24_48: float = 5.0
+    freshness_penalty_48_72: float = 10.0
+    topic_dup_penalty: float = 20.0  # 当日バッチ内 topic 一致の2件目以降
+    max_per_source: int = 4  # 上位内の同一ソース上限(超過は次点繰上げ)
+
+
+@dataclass(frozen=True)
 class AnalysisConfig:
     block_domains: tuple[str, ...] = ()  # 静的 NG(設計 03 §2 規則1)
     block_keywords: tuple[str, ...] = ()  # タイトル部分一致
@@ -89,6 +103,7 @@ class Config:
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    ranking: RankingConfig = field(default_factory=RankingConfig)
 
     @property
     def db_path(self) -> Path:
@@ -113,6 +128,7 @@ _SECTIONS = {
     "obsidian": ObsidianConfig,
     "storage": StorageConfig,
     "analysis": AnalysisConfig,
+    "ranking": RankingConfig,
 }
 
 
@@ -191,7 +207,21 @@ def _validate(path: Path, config: Config) -> None:
         ("analysis", "daily_llm_limit", config.analysis.daily_llm_limit),
         ("analysis", "batch_size", config.analysis.batch_size),
         ("analysis", "body_max_chars", config.analysis.body_max_chars),
+        ("ranking", "max_per_source", config.ranking.max_per_source),
     ]
+    nonnegatives = [
+        ("ranking", "min_score", config.ranking.min_score),
+        ("ranking", "negative_penalty", config.ranking.negative_penalty),
+        ("ranking", "freshness_penalty_24_48", config.ranking.freshness_penalty_24_48),
+        ("ranking", "freshness_penalty_48_72", config.ranking.freshness_penalty_48_72),
+        ("ranking", "topic_dup_penalty", config.ranking.topic_dup_penalty),
+        ("ranking", "novelty_new", config.ranking.novelty_new),
+        ("ranking", "novelty_update", config.ranking.novelty_update),
+        ("ranking", "novelty_known", config.ranking.novelty_known),
+    ]
+    for section, key, value in nonnegatives:
+        if value < 0:
+            raise ConfigError(f"{path}: [{section}].{key} は 0 以上であること: {value}")
     for section, key, value in positives:
         if value <= 0:
             raise ConfigError(f"{path}: [{section}].{key} は正の整数であること: {value}")
