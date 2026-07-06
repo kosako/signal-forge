@@ -36,4 +36,5 @@ def load_interest_profile(path: Path) -> InterestProfile:
     updated = _UPDATED.search(m.group(1))
     if not updated:
         raise ProfileError(f"{path}: front matter に updated: YYYY-MM-DD がない")
-    return InterestProfile(updated=updated.group(1), body=text[m.end() :].strip())
+    # 本文は verbatim(設計 03 §4)。strip 等の加工もしない
+    return InterestProfile(updated=updated.group(1), body=text[m.end() :])

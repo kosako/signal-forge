@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -20,17 +21,23 @@ from app.config import Config
 X_NOISE_MIN_CHARS = 20
 
 
+@dataclass(frozen=True)
+class PreselectResult:
+    counts: dict[str, int]  # {"selected": n, "blocklist": n, ...}
+    selected_ids: list[int]  # LLM に渡す items.id(選抜集合の正本。再クエリしない)
+
+
 def preselect(
     conn: sqlite3.Connection,
     config: Config,
     logger: logging.Logger,
     *,
     run_id: str | None = None,
-) -> dict[str, int]:
-    """4規則を適用し、{採用: n, 規則名: n, ...} の件数を返す。
+) -> PreselectResult:
+    """4規則を適用し、件数と採用 items.id を返す。
 
-    採用分(LLM に渡す items.id のリスト)は selected キーとは別に呼び出し側が
-    `status='new'` を再クエリして得る(本関数は状態遷移のみ担当)。
+    採用集合は本戻り値が正本。Stage 2 が `status='new'` を再クエリすると、
+    選別後に受信デーモンが追加した manual item が規則を通らず混入するため。
     """
     rows = conn.execute(
         """
@@ -52,15 +59,16 @@ def preselect(
             survivors.append(row)
 
     selected = _rule_daily_cap(survivors, config.analysis.daily_llm_limit)
-    selected_ids = {row["id"] for row in selected}
+    selected_ids = [row["id"] for row in selected]
+    selected_id_set = set(selected_ids)
     for row in survivors:
-        if row["id"] not in selected_ids:
+        if row["id"] not in selected_id_set:
             _skip(conn, row["id"], "daily_cap")
             counts["daily_cap"] += 1
     counts["selected"] = len(selected)
 
     logger.info("事前選別 完了", extra={"run_id": run_id, "stage": "analyze", "extra": counts})
-    return counts
+    return PreselectResult(counts=counts, selected_ids=selected_ids)
 
 
 def _skip(conn: sqlite3.Connection, item_id: int, reason: str) -> None:
@@ -119,18 +127,20 @@ def _rule_x_noise(row: sqlite3.Row) -> str | None:
 
 
 def _rule_daily_cap(rows: list[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
-    """規則4: 日次上限。published_at 降順・ソース間ラウンドロビンで多様性を保って採用。"""
+    """規則4: 日次上限。published_at 降順・ソース間ラウンドロビンで多様性を保って採用。
+
+    まず全体を published_at 降順(NULL は最後)に並べ、その順でソース列とソースの
+    巡回順を作る(新しい item を持つソースから先に採用され、境界件数でも降順が保たれる)。
+    """
     if len(rows) <= limit:
         return rows
+    ordered = sorted(rows, key=lambda r: r["published_at"] or "", reverse=True)
     by_source: dict[int, list[sqlite3.Row]] = {}
-    for row in rows:
+    for row in ordered:
         by_source.setdefault(row["source_id"], []).append(row)
-    for queue in by_source.values():
-        # published_at 降順(NULL は "" 扱いで最後)
-        queue.sort(key=lambda r: r["published_at"] or "", reverse=True)
 
     selected: list[sqlite3.Row] = []
-    queues = list(by_source.values())
+    queues = list(by_source.values())  # 挿入順 = 最新 item の新しいソース順
     while len(selected) < limit and any(queues):
         for queue in queues:
             if queue and len(selected) < limit:

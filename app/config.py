@@ -187,6 +187,10 @@ def _validate(path: Path, config: Config) -> None:
         ("digest", "max_items", config.digest.max_items),
         ("retention", "cache_ttl_days", config.retention.cache_ttl_days),
         ("retention", "x_cache_ttl_days", config.retention.x_cache_ttl_days),
+        ("analysis", "freshness_hours", config.analysis.freshness_hours),
+        ("analysis", "daily_llm_limit", config.analysis.daily_llm_limit),
+        ("analysis", "batch_size", config.analysis.batch_size),
+        ("analysis", "body_max_chars", config.analysis.body_max_chars),
     ]
     for section, key, value in positives:
         if value <= 0:

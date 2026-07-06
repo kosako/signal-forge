@@ -56,9 +56,11 @@ def test_blocklist_by_domain_and_keyword(conn, tmp_path) -> None:
     add_item(conn, "https://ok.example/d", published=now)
 
     config = make_config(tmp_path, block_domains=("spam.example",), block_keywords=("宣伝",))
-    counts = preselect(conn, config, logger)
+    result = preselect(conn, config, logger)
+    counts = result.counts
     assert counts["blocklist"] == 3
     assert counts["selected"] == 1
+    assert len(result.selected_ids) == 1  # 採用集合は戻り値が正本
     rows = skip_reasons(conn)
     assert rows["https://spam.example/a"] == ("skipped", "blocklist")
     assert rows["https://sub.spam.example/b"] == ("skipped", "blocklist")
@@ -72,7 +74,7 @@ def test_stale_rule_spares_manual_and_null_published(conn, tmp_path) -> None:
     add_item(conn, "https://a.example/manual-old", source_id=1, published=old)  # manual
     add_item(conn, "https://a.example/unknown", published=None)
 
-    counts = preselect(conn, make_config(tmp_path), logger)
+    counts = preselect(conn, make_config(tmp_path), logger).counts
     assert counts["stale"] == 1
     rows = skip_reasons(conn)
     assert rows["https://a.example/old"] == ("skipped", "stale")
@@ -97,7 +99,7 @@ def test_x_noise_rules(conn, tmp_path) -> None:
     )
     add_item(conn, "https://rss.example/short", title="短い", published=now)  # rss は対象外
 
-    counts = preselect(conn, make_config(tmp_path), logger)
+    counts = preselect(conn, make_config(tmp_path), logger).counts
     assert counts["x_noise"] == 2
     rows = skip_reasons(conn)
     assert rows["https://x.com/i/web/status/1"] == ("skipped", "x_noise")
@@ -116,9 +118,9 @@ def test_daily_cap_round_robin_keeps_source_diversity(conn, tmp_path) -> None:
         published = iso(base - timedelta(hours=i))
         add_item(conn, f"https://b.example/{i}", source_id=3, published=published)
 
-    counts = preselect(conn, make_config(tmp_path, daily_llm_limit=4), logger)
-    assert counts["selected"] == 4
-    assert counts["daily_cap"] == 4
+    result = preselect(conn, make_config(tmp_path, daily_llm_limit=4), logger)
+    assert result.counts["selected"] == 4
+    assert result.counts["daily_cap"] == 4
     survivors = {
         r["canonical_url"]
         for r in conn.execute("SELECT canonical_url FROM items WHERE status='new'")
@@ -128,6 +130,19 @@ def test_daily_cap_round_robin_keeps_source_diversity(conn, tmp_path) -> None:
         "https://a.example/0", "https://a.example/1",
         "https://b.example/0", "https://b.example/1",
     }
+    assert len(result.selected_ids) == 4
+
+
+def test_daily_cap_limit_one_takes_globally_freshest(conn, tmp_path) -> None:
+    base = datetime.now(UTC)
+    add_item(conn, "https://a.example/older", source_id=2, published=iso(base - timedelta(hours=5)))
+    add_item(conn, "https://b.example/newest", source_id=3, published=iso(base))
+
+    result = preselect(conn, make_config(tmp_path, daily_llm_limit=1), logger)
+    survivor = conn.execute("SELECT canonical_url FROM items WHERE status='new'").fetchone()
+    # ソースの登録順でなく published_at 降順が優先される(境界件数でも降順維持)
+    assert survivor["canonical_url"] == "https://b.example/newest"
+    assert result.counts["selected"] == 1
 
 
 def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
@@ -138,5 +153,6 @@ def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
         "VALUES (?, 'failed', '2026-08-01T00:00:00Z')",
         (item_id,),
     )
-    counts = preselect(conn, make_config(tmp_path), logger)
-    assert counts["selected"] == 1  # degraded 分析に回る(除外しない)
+    result = preselect(conn, make_config(tmp_path), logger)
+    assert result.counts["selected"] == 1  # degraded 分析に回る(除外しない)
+    assert result.selected_ids == [item_id]
