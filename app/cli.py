@@ -1,8 +1,4 @@
-"""intel CLI(Typer)。設計 00 §3。
-
-M1 完了(plan #14)までは各サブコマンドはスタブ。実装は 1 Issue = 1 コマンドで
-段階的に差し替える(スタブは「未実装」を表示して終了コード 1)。
-"""
+"""intel CLI(Typer)。設計 00 §3。"""
 
 from __future__ import annotations
 
@@ -17,14 +13,6 @@ app = typer.Typer(
     help="個人用インテリジェンスサービス。毎朝のダイジェスト生成パイプライン。",
     no_args_is_help=True,
 )
-
-_STUB_MSG = "未実装: plan #{plan} で実装予定"
-
-
-def _stub(plan: int) -> None:
-    typer.echo(_STUB_MSG.format(plan=plan), err=True)
-    raise typer.Exit(code=1)
-
 
 @app.command()
 def collect(
@@ -205,11 +193,44 @@ def run(
 
 @app.command()
 def doctor(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
     purge: bool = typer.Option(False, "--purge", help="期限切れ削除の単独実行"),
     cost: bool = typer.Option(False, "--cost", help="コスト集計の単発表示"),
 ) -> None:
-    """構成不備・故障・コスト超過の検査(12項目)。"""
-    _stub(21)
+    """構成不備・故障・コスト超過の検査(12項目)。終了コード: FAIL あり=1。"""
+    from app.config import load_config
+    from app.doctor import has_failure, month_cost_summary, run_doctor
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    if purge or cost:
+        from app.db import apply_migrations, connect
+        from app.purge import purge_expired
+
+        config = load_config(config_dir)
+        conn = connect(config.db_path)
+        apply_migrations(conn, config.db_path)
+        if purge:
+            logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+            counts = purge_expired(conn, config, logger)
+            typer.echo(
+                f"purge 完了: documents {counts['documents_deleted']} 件削除 / "
+                f"raw_payload {counts['raw_payload_nullified']} 件 NULL 化"
+            )
+        if cost:
+            summary = month_cost_summary(conn, config)
+            typer.echo(
+                f"当月実績 ${summary['spent_usd']:.2f}"
+                f"(LLM ${summary['llm_usd']:.2f} / X ${summary['x_usd']:.2f})\n"
+                f"着地見込み ${summary['projected_usd']:.2f} / 上限 ${summary['cap_usd']:.0f}"
+            )
+        return
+
+    results = run_doctor(config_dir)
+    icons = {"PASS": "✅", "WARN": "⚠️ ", "FAIL": "❌", "SKIP": "⏭ "}
+    for r in results:
+        typer.echo(f"#{r.number:>2} {icons[r.status]} [{r.status}] {r.name}: {r.detail}")
+    if has_failure(results):
+        raise typer.Exit(code=1)
 
 
 def main() -> None:
