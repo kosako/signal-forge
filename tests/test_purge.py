@@ -72,6 +72,31 @@ def test_raw_payload_nullified_by_source_ttl(conn, tmp_path) -> None:
     assert payloads[dup_old] is None
 
 
+def test_vacuum_triggered_by_nullified_rows(conn, tmp_path, monkeypatch) -> None:
+    import app.purge as purge_module
+
+    monkeypatch.setattr(purge_module, "VACUUM_THRESHOLD_ROWS", 2)
+    for i in range(3):
+        add_item(conn, f"https://a/{i}", source_id=2, fetched_days_ago=31)
+
+    class SpyConn:
+        def __init__(self, inner):
+            self._inner = inner
+            self.sqls: list[str] = []
+
+        def execute(self, sql, *args):
+            self.sqls.append(sql)
+            return self._inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    spy = SpyConn(conn)
+    counts = purge_expired(spy, Config(config_dir=tmp_path), logger)
+    assert counts["raw_payload_nullified"] == 3
+    assert any(sql.strip() == "VACUUM" for sql in spy.sqls)  # NULL 化のみでも発動
+
+
 def test_purge_is_idempotent(conn, tmp_path) -> None:
     item = add_item(conn, "https://a/1", source_id=2, fetched_days_ago=31)
     add_document(conn, item, expires_days=-1)

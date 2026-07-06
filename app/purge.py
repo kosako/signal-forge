@@ -44,7 +44,9 @@ def purge_expired(
         (config.retention.x_cache_ttl_days, config.retention.cache_ttl_days),
     ).rowcount
 
-    if deleted > VACUUM_THRESHOLD_ROWS:
+    # 設計 01 §6 の文言は「削除行 >1,000」だが、raw_payload の NULL 化も大きな空き
+    # ページを生む(X full_text 等)ため、空き回収の意図に沿って合算で判定する
+    if deleted + nullified > VACUUM_THRESHOLD_ROWS:
         conn.execute("VACUUM")
 
     counts = {"documents_deleted": deleted, "raw_payload_nullified": nullified}

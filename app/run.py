@@ -45,6 +45,7 @@ def run_pipeline(
             logger.error(
                 f"{name} 段が失敗(後続の段は継続): {type(e).__name__}: {e}",
                 extra={"run_id": run_id, "stage": name},
+                exc_info=True,  # 障害調査用に traceback を JSON ログへ残す
             )
 
     stage("collect", lambda: collect_all(
