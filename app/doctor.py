@@ -60,7 +60,8 @@ def run_doctor(
 
     results: list[CheckResult] = []
 
-    # #1 config
+    # #1 config。読込失敗時は None のまま進み、config 依存の検査は「検査不可」の FAIL に
+    # 倒す(既定 Config で続行すると意図しない既定 DB を診断してしまう)
     config: Config | None = None
     config_path = config_dir / "config.toml"
     if not config_path.exists():
@@ -71,9 +72,6 @@ def run_doctor(
             results.append(CheckResult(1, "config.toml", "PASS", "スキーマ検証 OK"))
         except ConfigError as e:
             results.append(CheckResult(1, "config.toml", "FAIL", str(e)))
-    if config is None:
-        # 後続の大半が config 依存。既定値で続行し、少なくとも独立検査は回す
-        config = Config(config_dir=config_dir)
 
     # #2 .env
     env: dict[str, str] = {}
@@ -88,64 +86,39 @@ def run_doctor(
     except ConfigError as e:
         results.append(CheckResult(2, ".env", "FAIL", str(e)))
 
-    # #3 SQLite + migrations
     conn: sqlite3.Connection | None = None
     try:
-        conn = connect(config.db_path)
-        applied: set[int] = set()
-        if _table_exists(conn, "schema_migrations"):
-            applied = {
-                row["version"]
-                for row in conn.execute("SELECT version FROM schema_migrations")
-            }
-        pending = [
-            m.version for m in discover_migrations(MIGRATIONS_DIR) if m.version not in applied
+        if config is not None:
+            try:
+                conn = connect(config.db_path)
+            except sqlite3.Error as e:
+                results.append(CheckResult(3, "SQLite/migrations", "FAIL", f"接続失敗: {e}"))
+        # 検査内の例外はその項目の FAIL に局所化する(1つの例外で全体を落とさない)
+        checks: list[tuple[int, str, Callable[[], CheckResult]]] = [
+            (3, "SQLite/migrations", lambda: _check_migrations(conn)),
+            (4, "Telegram", lambda: _check_telegram(config, env, api_factory)),
+            (5, "X API", lambda: _check_x(config, env, conn)),
+            (6, "LLM", lambda: _check_llm(config, engine_factory, home)),
+            (7, "Obsidian Vault", lambda: _check_vault(config)),
+            (8, "launchd", lambda: _check_launchd(launchctl)),
+            (9, "当月コスト", lambda: _check_cost(conn, config)),
+            (10, "バックアップ", lambda: _check_backup(backup_dir)),
+            (11, "TTL 残存", lambda: _check_ttl_leftovers(conn, config)),
+            (12, "ANTHROPIC_API_KEY", lambda: _check_anthropic_key(environ)),
         ]
-        if pending:
-            results.append(
-                CheckResult(3, "SQLite/migrations", "FAIL", f"未適用: {pending}(intel run で適用)")
-            )
-        else:
-            results.append(
-                CheckResult(3, "SQLite/migrations", "PASS", f"適用済み {len(applied)} 件")
-            )
-    except sqlite3.Error as e:
-        results.append(CheckResult(3, "SQLite/migrations", "FAIL", f"接続失敗: {e}"))
-
-    # #4 Telegram getMe + allowlist
-    results.append(_check_telegram(config, env, api_factory))
-
-    # #5 X 疎通(無効時 SKIP/WARN。設計 05 §2 #5)
-    results.append(_check_x(config, env, conn))
-
-    # #6 LLM 動的検査
-    results.append(_check_llm(config, engine_factory, home))
-
-    # #7 Obsidian Vault 書込
-    results.append(_check_vault(config))
-
-    # #8 launchd
-    results.append(_check_launchd(launchctl))
-
-    # #9 当月コスト見込み
-    results.append(_check_cost(conn, config))
-
-    # #10 バックアップ
-    results.append(_check_backup(backup_dir))
-
-    # #11 TTL 超過残存
-    results.append(_check_ttl_leftovers(conn, config))
-
-    # #12 ANTHROPIC_API_KEY
-    if "ANTHROPIC_API_KEY" in environ:
-        results.append(
-            CheckResult(12, "ANTHROPIC_API_KEY", "WARN", "環境に存在(無自覚 API 課金の恐れ)")
-        )
-    else:
-        results.append(CheckResult(12, "ANTHROPIC_API_KEY", "PASS", "環境に存在しない"))
-
-    if conn is not None:
-        conn.close()
+        done = {r.number for r in results}
+        for number, name, check in checks:
+            if number in done:
+                continue
+            try:
+                results.append(check())
+            except Exception as e:
+                results.append(
+                    CheckResult(number, name, "FAIL", f"検査中に例外: {type(e).__name__}: {e}")
+                )
+    finally:
+        if conn is not None:
+            conn.close()
     return sorted(results, key=lambda r: r.number)
 
 
@@ -153,9 +126,30 @@ def has_failure(results: list[CheckResult]) -> bool:
     return any(r.status == "FAIL" for r in results)
 
 
+_CONFIG_UNAVAILABLE = "config 無効のため検査不可(#1 を先に解消)"
+
+
+def _check_migrations(conn: sqlite3.Connection | None) -> CheckResult:
+    if conn is None:
+        return CheckResult(3, "SQLite/migrations", "FAIL", _CONFIG_UNAVAILABLE)
+    applied: set[int] = set()
+    if _table_exists(conn, "schema_migrations"):
+        applied = {
+            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+        }
+    pending = [
+        m.version for m in discover_migrations(MIGRATIONS_DIR) if m.version not in applied
+    ]
+    if pending:
+        return CheckResult(3, "SQLite/migrations", "FAIL", f"未適用: {pending}(intel run で適用)")
+    return CheckResult(3, "SQLite/migrations", "PASS", f"適用済み {len(applied)} 件")
+
+
 def _check_telegram(
-    config: Config, env: dict[str, str], api_factory: Callable | None
+    config: Config | None, env: dict[str, str], api_factory: Callable | None
 ) -> CheckResult:
+    if config is None:
+        return CheckResult(4, "Telegram", "FAIL", _CONFIG_UNAVAILABLE)
     if config.telegram.owner_user_id is None or config.telegram.owner_chat_id is None:
         return CheckResult(4, "Telegram", "FAIL", "allowlist(owner_user_id/owner_chat_id)未設定")
     try:
@@ -169,19 +163,37 @@ def _check_telegram(
         return CheckResult(4, "Telegram", "FAIL", f"getMe 失敗: {e}")
 
 
-def _check_x(config: Config, env: dict[str, str], conn: sqlite3.Connection | None) -> CheckResult:
+def _check_x(
+    config: Config | None, env: dict[str, str], conn: sqlite3.Connection | None
+) -> CheckResult:
+    if config is None:
+        return CheckResult(5, "X API", "FAIL", _CONFIG_UNAVAILABLE)
+    sources_ok = conn is not None and _table_exists(conn, "sources")
+    has_x_sources = bool(
+        sources_ok and conn.execute("SELECT 1 FROM sources WHERE type = 'x' LIMIT 1").fetchone()
+    )
+    has_enabled_x_sources = bool(
+        sources_ok
+        and conn.execute(
+            "SELECT 1 FROM sources WHERE type = 'x' AND enabled = 1 LIMIT 1"
+        ).fetchone()
+    )
     if not config.x.enabled:
-        has_x_sources = bool(
-            conn is not None
-            and _table_exists(conn, "sources")
-            and conn.execute("SELECT 1 FROM sources WHERE type = 'x' LIMIT 1").fetchone()
-        )
         if has_x_sources:
             # 設定はあるが無効化されている(縮退運用)ことを1行で明示(設計 05 §2 #5)
             return CheckResult(
                 5, "X API", "WARN", "X ソース定義はあるが x.enabled=false で無効化中"
             )
         return CheckResult(5, "X API", "SKIP", "X 無効(RSS+手動URL 運用)")
+    if not has_enabled_x_sources:
+        # x.enabled=true でも sources 全行 enabled=0(または未登録)なら縮退運用として
+        # 恒久 FAIL にしない(設計 05 §2 #5)
+        detail = (
+            "x.enabled=true だが X ソースが全行無効化中"
+            if has_x_sources
+            else "x.enabled=true だが X ソース未登録"
+        )
+        return CheckResult(5, "X API", "WARN", detail)
     missing = [key for key in X_ENV_KEYS if key not in env]
     if missing:
         return CheckResult(5, "X API", "FAIL", f".env に X キーがない: {', '.join(missing)}")
@@ -189,7 +201,19 @@ def _check_x(config: Config, env: dict[str, str], conn: sqlite3.Connection | Non
     return CheckResult(5, "X API", "WARN", "キーは存在。疎通検査は plan #15 で実装")
 
 
-def _check_llm(config: Config, engine_factory: Callable | None, home: Path) -> CheckResult:
+def _check_anthropic_key(environ: dict[str, str]) -> CheckResult:
+    if "ANTHROPIC_API_KEY" in environ:
+        return CheckResult(
+            12, "ANTHROPIC_API_KEY", "WARN", "環境に存在(無自覚 API 課金の恐れ)"
+        )
+    return CheckResult(12, "ANTHROPIC_API_KEY", "PASS", "環境に存在しない")
+
+
+def _check_llm(
+    config: Config | None, engine_factory: Callable | None, home: Path
+) -> CheckResult:
+    if config is None:
+        return CheckResult(6, "LLM", "FAIL", _CONFIG_UNAVAILABLE)
     """固定プロンプトの complete_structured 成功 + 隔離の動的検査(canary)。
 
     設計 05 §2 #6 の「ファイル読取の拒否確認」は、read-only sandbox がファイル読取
@@ -229,12 +253,18 @@ def _check_llm(config: Config, engine_factory: Callable | None, home: Path) -> C
     except Exception as e:
         return CheckResult(6, "LLM", "FAIL", f"complete_structured 失敗: {e}")
     finally:
-        canary_path.unlink(missing_ok=True)
-        if canary_dir.exists():
-            canary_dir.rmdir()
+        # 後始末の失敗で check 結果を上書きしない(検査済み結果の方が価値が高い)
+        try:
+            canary_path.unlink(missing_ok=True)
+            if canary_dir.exists():
+                canary_dir.rmdir()
+        except OSError:
+            pass
 
 
-def _check_vault(config: Config) -> CheckResult:
+def _check_vault(config: Config | None) -> CheckResult:
+    if config is None:
+        return CheckResult(7, "Obsidian Vault", "FAIL", _CONFIG_UNAVAILABLE)
     if config.obsidian.vault_path is None:
         return CheckResult(7, "Obsidian Vault", "FAIL", "[obsidian].vault_path 未設定(宿題 H4)")
     target = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
@@ -295,9 +325,14 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
     }
 
 
-def _check_cost(conn: sqlite3.Connection | None, config: Config) -> CheckResult:
-    if conn is None or not _table_exists(conn, "analyses"):
-        return CheckResult(9, "当月コスト", "WARN", "DB 未初期化のため算出不可")
+def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> CheckResult:
+    if (
+        conn is None
+        or config is None
+        or not _table_exists(conn, "analyses")
+        or not _table_exists(conn, "collect_runs")
+    ):
+        return CheckResult(9, "当月コスト", "WARN", "config/DB 未初期化のため算出不可")
     summary = month_cost_summary(conn, config)
     detail = (
         f"実績 ${summary['spent_usd']:.2f}(LLM ${summary['llm_usd']:.2f} / "
@@ -326,9 +361,15 @@ def _check_backup(backup_dir: Path) -> CheckResult:
     return CheckResult(10, "バックアップ", "PASS", f"最新: {newest.name}({age_hours:.0f}h 前)")
 
 
-def _check_ttl_leftovers(conn: sqlite3.Connection | None, config: Config) -> CheckResult:
-    if conn is None or not _table_exists(conn, "documents"):
-        return CheckResult(11, "TTL 残存", "WARN", "DB 未初期化のため算出不可")
+def _check_ttl_leftovers(
+    conn: sqlite3.Connection | None, config: Config | None
+) -> CheckResult:
+    if (
+        conn is None
+        or config is None
+        or not all(_table_exists(conn, t) for t in ("documents", "items", "sources"))
+    ):
+        return CheckResult(11, "TTL 残存", "WARN", "config/DB 未初期化のため算出不可")
     expired_docs = conn.execute(
         "SELECT count(*) FROM documents "
         "WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')"

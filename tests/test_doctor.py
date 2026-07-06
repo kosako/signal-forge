@@ -113,6 +113,34 @@ def test_missing_config_is_fail_but_all_checks_run(tmp_path) -> None:
     assert by_number(results, 1).status == "FAIL"
     assert len(results) == 12  # 1つの失敗で残りを止めない
     assert has_failure(results)
+    # config 依存項目は既定 Config で別 DB を診断せず「検査不可」に倒す
+    assert "検査不可" in by_number(results, 3).detail
+    assert "検査不可" in by_number(results, 4).detail
+    assert by_number(results, 9).status == "WARN"
+    # config 非依存の検査は通常どおり動く
+    assert by_number(results, 8).status == "PASS"
+    assert by_number(results, 12).status == "PASS"
+
+
+def test_broken_config_toml_does_not_probe_default_db(tmp_path) -> None:
+    conf = tmp_path / "broken"
+    conf.mkdir()
+    (conf / "config.toml").write_text("[storage\n", encoding="utf-8")  # 構文エラー
+    results = doctor(conf, tmp_path)
+    assert by_number(results, 1).status == "FAIL"
+    assert "検査不可" in by_number(results, 3).detail
+
+
+def test_check_exception_is_isolated_to_its_item(config_dir, tmp_path) -> None:
+    def boom(job: str) -> bool:
+        raise RuntimeError("launchctl 爆発")
+
+    results = doctor(config_dir, tmp_path, launchctl=boom)
+    result = by_number(results, 8)
+    assert result.status == "FAIL"
+    assert "例外" in result.detail
+    assert len(results) == 12  # 他の検査は巻き添えにならない
+    assert by_number(results, 4).status == "PASS"
 
 
 def test_env_permission_and_missing_token_fail(config_dir, tmp_path) -> None:
@@ -159,11 +187,34 @@ def test_x_disabled_with_sources_is_warn(config_dir, tmp_path) -> None:
     assert "無効化中" in result.detail
 
 
+def test_x_enabled_without_enabled_sources_is_warn_not_fail(config_dir, tmp_path) -> None:
+    # 設計 05 §2 #5: sources 全行 enabled=0(または未登録)の縮退運用を恒久 FAIL にしない
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
+    )
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert result.status == "WARN"
+    assert "未登録" in result.detail
+
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-tl', 0)")
+    conn.commit()
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert result.status == "WARN"
+    assert "全行無効化中" in result.detail
+
+
 def test_x_enabled_requires_keys(config_dir, tmp_path) -> None:
     config_path = config_dir / "config.toml"
     config_path.write_text(
         config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
     )
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-tl', 1)")
+    conn.commit()
+    conn.close()
     result = by_number(doctor(config_dir, tmp_path), 5)
     assert result.status == "FAIL"
     assert "X_API_KEY" in result.detail
