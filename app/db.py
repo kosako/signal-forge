@@ -114,6 +114,83 @@ def apply_migrations(
     return [m.filename for m in pending]
 
 
+@dataclass(frozen=True)
+class InsertOutcome:
+    """items への挿入結果。outcome は 'inserted' / 'ignored' / 'duplicate'。"""
+
+    outcome: str
+    item_id: int | None  # ignored(UNIQUE 既存)のときは None
+
+
+def insert_item_with_dedup(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    external_id: str | None,
+    url: str,
+    canonical_url: str,
+    title: str | None,
+    author: str | None,
+    published_at: str | None,
+    raw_payload: str | None,
+    content_hash: str,
+    dedup_eligible: bool,
+) -> InsertOutcome:
+    """2層 dedup 付きの items 挿入(設計 01 §6)。
+
+    1層: UNIQUE(canonical_url) / UNIQUE(source_id, external_id) に INSERT OR IGNORE
+    (再実行・カーソル巻き戻し・再投入は無害に落ちる = 冪等性契約。設計 02 §1)。
+    2層: 挿入成功直後、同一 content_hash で fetched_at が直近24h内の既存アイテム
+    (status ≠ 'duplicate')があれば、新しい方を duplicate 化する。
+    dedup_eligible=False(正規化テキストが空/20字未満。manual 等)は 2層の対象外。
+
+    トランザクション境界は呼び出し側(collect / 受信デーモン)が張る。
+    """
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO items
+          (source_id, external_id, url, canonical_url, title, author, published_at,
+           raw_payload, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_id,
+            external_id,
+            url,
+            canonical_url,
+            title,
+            author,
+            published_at,
+            raw_payload,
+            content_hash,
+        ),
+    )
+    if cursor.rowcount == 0:
+        return InsertOutcome(outcome="ignored", item_id=None)
+    item_id = cursor.lastrowid
+
+    if not dedup_eligible:
+        return InsertOutcome(outcome="inserted", item_id=item_id)
+
+    parent = conn.execute(
+        """
+        SELECT id FROM items
+        WHERE content_hash = ? AND id <> ? AND status <> 'duplicate'
+          AND fetched_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day')
+        ORDER BY fetched_at, id LIMIT 1
+        """,
+        (content_hash, item_id),
+    ).fetchone()
+    if parent is None:
+        return InsertOutcome(outcome="inserted", item_id=item_id)
+
+    conn.execute(
+        "UPDATE items SET status = 'duplicate', dup_of_item_id = ? WHERE id = ?",
+        (parent["id"], item_id),
+    )
+    return InsertOutcome(outcome="duplicate", item_id=item_id)
+
+
 def _backup(conn: sqlite3.Connection, db_path: Path) -> None:
     if not db_path.exists():
         return
