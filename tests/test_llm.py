@@ -98,12 +98,24 @@ def test_env_is_isolated_no_anthropic_key(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("SOME_OTHER_SECRET", "x")
     reply = (
         'echo "{\\"score\\": 1, \\"reason\\": '
-        '\\"${ANTHROPIC_API_KEY:-ABSENT}-${SOME_OTHER_SECRET:-ABSENT}\\"}" > "$out"\n'
+        '\\"${ANTHROPIC_API_KEY:-ABSENT}-${SOME_OTHER_SECRET:-ABSENT}-${HOME}\\"}" > "$out"\n'
     )
     codex = fake_codex(tmp_path, OUT_FILE_SNIPPET + reply)
     result = CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
-    assert result.reason == "ABSENT-ABSENT"  # 環境変数が構造的に渡らない
+    absent_a, absent_b, home = result.reason.split("-", 2)
+    assert (absent_a, absent_b) == ("ABSENT", "ABSENT")  # 環境変数が構造的に渡らない
+    assert "intel-llm" in home  # HOME は実ユーザーの HOME でなく隔離 workdir
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-secret"  # 呼び出し側の環境は不変
+
+
+def test_codex_home_points_to_auth_dir_only(tmp_path: Path) -> None:
+    codex = fake_codex(
+        tmp_path,
+        OUT_FILE_SNIPPET
+        + 'echo "{\\"score\\": 1, \\"reason\\": \\"${CODEX_HOME:-ABSENT}\\"}" > "$out"\n',
+    )
+    engine = CodexCliEngine(codex_bin=codex, codex_home="/fake/codex-auth")
+    assert engine.complete_structured("p", Verdict).reason == "/fake/codex-auth"
 
 
 def test_engine_runs_in_empty_isolated_workdir(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -53,7 +54,7 @@ def complete_with_retry[M: BaseModel](
 
 
 # 出力が ```json フェンスで包まれるケースの除去(エンジン出力の揺れ対策)
-_FENCE = re.compile(r"\A\s*```(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL)
+_FENCE = re.compile(r"\A\s*```[ \t]*(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL | re.IGNORECASE)
 
 
 def parse_structured[M: BaseModel](raw: str, schema: type[M]) -> M:
@@ -77,9 +78,17 @@ class CodexCliEngine:
 
     name = "codex-cli"
 
-    def __init__(self, *, codex_bin: str = "codex", model_reasoning_effort: str = "low") -> None:
+    def __init__(
+        self,
+        *,
+        codex_bin: str = "codex",
+        model_reasoning_effort: str = "low",
+        codex_home: str | None = None,
+    ) -> None:
         self._codex_bin = codex_bin
         self._effort = model_reasoning_effort
+        # 認証は CODEX_HOME 経由で最小限だけ見せる(実 HOME は渡さない)
+        self._codex_home = codex_home or os.path.expanduser("~/.codex")
 
     def complete_structured(
         self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
@@ -91,8 +100,11 @@ class CodexCliEngine:
                 self._codex_bin,
                 "exec",
                 "--skip-git-repo-check",
+                "--ephemeral",  # ユーザーの config.toml を読まない(認証は CODEX_HOME)
                 "-s",
                 "read-only",
+                # -a/--ask-for-approval はトップレベル専用で exec では使えない(実測)。
+                # exec では config override で承認を止める
                 "-c",
                 "approval_policy=never",
                 "-c",
@@ -103,39 +115,53 @@ class CodexCliEngine:
                 str(out_file),
                 "-",  # プロンプトは stdin から
             ]
+            stderr_tail = ""
             try:
-                completed = subprocess.run(
+                process = subprocess.Popen(
                     command,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    env=_isolated_env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding="utf-8",  # locale 非依存(launchd 環境で UTF-8 保証がない)
+                    env=self._isolated_env(workdir),
                     cwd=workdir,  # -C と二重だが、プロセス自体も隔離 dir で走らせる
+                    start_new_session=True,  # timeout 時に孫プロセスごと落とすための別セッション
                 )
-            except subprocess.TimeoutExpired as e:
-                raise LLMError(f"タイムアウト({timeout_s}s)") from e
             except OSError as e:
                 raise LLMError(f"codex 起動失敗: {e}") from e
-            if completed.returncode != 0:
-                raise LLMError(
-                    f"codex 非0終了({completed.returncode}): {completed.stderr[-500:]}"
-                )
+            try:
+                _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
+            except subprocess.TimeoutExpired as e:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                process.wait()
+                raise LLMError(f"タイムアウト({timeout_s}s)") from e
+            if process.returncode != 0:
+                raise LLMError(f"codex 非0終了({process.returncode}): {stderr_tail[-500:]}")
             if not out_file.exists():
                 raise LLMError("codex が最終応答ファイルを書かなかった")
             return parse_structured(out_file.read_text(encoding="utf-8"), schema)
 
+    def _isolated_env(self, workdir: str) -> dict[str, str]:
+        """PATH + 隔離 HOME + CODEX_HOME のみの環境。
 
-def _isolated_env() -> dict[str, str]:
-    """PATH/HOME のみの環境(設計 00 §4: ANTHROPIC_API_KEY を実行環境に載せない)。
-
-    HOME は codex の認証(~/.codex)に必要。それ以外の環境変数は渡さない。
-    """
-    return {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
+        実ユーザーの HOME を渡すと、read-only sandbox はファイル読み取りを防がないため
+        `~/.ssh` 等が要約経由で流出する経路が残る。HOME は空の workdir に差し替え、
+        codex の認証だけ CODEX_HOME で最小限見せる(auth 以外の設定は --ephemeral で遮断)。
+        ANTHROPIC_API_KEY を含む他の環境変数は構造的に渡さない(設計 00 §4)。
+        """
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": workdir,
+            "CODEX_HOME": self._codex_home,
+        }
 
 
 def create_engine(engine_name: str) -> LLMEngine:
-    """config `llm.engine` からエンジンを生成する(値の検証は config 層で済んでいる)。"""
+    """config `llm.engine` からエンジンを生成する。
+
+    config は語彙(enum)の検証のみ。未実装エンジンはここで fail fast する
+    (doctor の未実装エンジン検査は #21)。
+    """
     if engine_name == "codex-cli":
         return CodexCliEngine()
     raise LLMError(
