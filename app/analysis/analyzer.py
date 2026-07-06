@@ -92,39 +92,64 @@ def _analyze_chunk(
 ) -> dict[str, int]:
     rows = _load_rows(conn, chunk_ids)
     prompt = build_prompt(config, profile_body, recent_titles, rows)
-    input_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    chunk_hash = _prompt_hash(prompt)
 
     results: dict[int, ItemAnalysis] = {}
+    hashes: dict[int, str] = {}  # 実際に LLM へ渡した入力の hash(item ごと。設計 01 §3)
+    chunk_failed = False
     try:
         batch = complete_with_retry(engine, prompt, AnalysisBatch)
         for result in batch.results:
             if result.item_id in chunk_ids:  # allowlist 外の item_id は破棄
                 results[result.item_id] = result
+                hashes[result.item_id] = chunk_hash
     except LLMError as e:
+        # チャンク失敗(リトライ済み)はチャンクごと degraded 直行(設計 03 §2。
+        # 単発再分析へ流すと呼び出しが 2+2N に増える)
+        chunk_failed = True
         logger.warning(
-            f"チャンク分析失敗(degraded 直行): {e}",
+            f"チャンク分析失敗(チャンクごと degraded 直行): {e}",
             extra={"run_id": run_id, "stage": "analyze"},
         )
 
-    # 欠落 item は単発再分析(1回)
-    for row in rows:
-        if row["id"] in results:
-            continue
-        single = _reanalyze_single(config, engine, profile_body, recent_titles, row, logger, run_id)
-        if single is not None:
-            results[row["id"]] = single
+    if not chunk_failed:
+        # スキーマ上は成功したが欠落した item のみ単発再分析(1回)
+        for row in rows:
+            if row["id"] in results:
+                continue
+            single = _reanalyze_single(
+                config, engine, profile_body, recent_titles, row, logger, run_id
+            )
+            if single is not None:
+                results[row["id"]] = single[0]
+                hashes[row["id"]] = single[1]
 
+    # 分析結果の挿入と items の状態遷移を同一トランザクションで確定する
+    # (別々だと途中クラッシュで status='new' のまま analyses だけ残り、再実行時に
+    #  nonce 違いの input_hash で重複挿入される)
     counts = {"analyzed": 0, "degraded": 0}
-    for row in rows:
-        analysis = results.get(row["id"])
-        if analysis is not None:
-            _insert_analysis(conn, row, analysis, engine, input_hash, run_id, degraded=False)
-            counts["analyzed"] += 1
-        else:
-            _insert_degraded(conn, row, engine, input_hash, run_id)
-            counts["degraded"] += 1
-        conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (row["id"],))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row in rows:
+            analysis = results.get(row["id"])
+            if analysis is not None:
+                _insert_analysis(
+                    conn, row, analysis, engine, hashes[row["id"]], run_id, degraded=False
+                )
+                counts["analyzed"] += 1
+            else:
+                _insert_degraded(conn, row, engine, chunk_hash, run_id)
+                counts["degraded"] += 1
+            conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (row["id"],))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
     return counts
+
+
+def _prompt_hash(prompt: str) -> str:
+    return "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
 def _reanalyze_single(
@@ -135,7 +160,7 @@ def _reanalyze_single(
     row: sqlite3.Row,
     logger: logging.Logger,
     run_id: str | None,
-) -> ItemAnalysis | None:
+) -> tuple[ItemAnalysis, str] | None:
     prompt = build_prompt(config, profile_body, recent_titles, [row])
     try:
         batch = complete_with_retry(engine, prompt, AnalysisBatch)
@@ -147,7 +172,7 @@ def _reanalyze_single(
         return None
     for result in batch.results:
         if result.item_id == row["id"]:
-            return result
+            return result, _prompt_hash(prompt)
     return None
 
 
@@ -166,14 +191,16 @@ def build_prompt(
     template = PROMPT_PATH.read_text(encoding="utf-8")
     titles = "\n".join(sanitize(t, MAX_TITLE, nonce) for t in recent_titles) or "(なし)"
     items = "\n".join(_item_block(row, nonce, config.analysis.body_max_chars) for row in rows)
-    schema = json.dumps(AnalysisBatch.model_json_schema(), ensure_ascii=False)
-    return (
-        template.replace("{{interest_profile}}", profile_body)
-        .replace("{{recent_titles}}", titles)
-        .replace("{{items}}", items)
-        .replace("{{schema}}", schema)
-        .replace("{{nonce}}", nonce)
-    )
+    mapping = {
+        "interest_profile": profile_body,
+        "recent_titles": titles,
+        "items": items,
+        "schema": json.dumps(AnalysisBatch.model_json_schema(), ensure_ascii=False),
+        "nonce": nonce,
+    }
+    # 単一パス置換: テンプレート上のプレースホルダだけを置き換え、置換後の値は再走査
+    # しない(逐次 .replace() だと入力由来の {{nonce}} 等が展開され nonce が漏れる)
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)
 
 
 def sanitize(value: str | None, max_length: int, nonce: str) -> str:
@@ -291,16 +318,24 @@ def _insert_degraded(
     input_hash: str,
     run_id: str | None,
 ) -> None:
-    """LLM 全滅時のタイトルのみ記録(relevance=0・summary=タイトル。設計 03 §3.3)。"""
-    fallback = ItemAnalysis(
-        item_id=row["id"],
-        summary=(row["title"] or "(タイトルなし)")[:300],
-        relevance=0,
-        category="その他",
-        negative=[],
-        novelty="new",
-        topic="",
-        reason="LLM 分析失敗のため degraded 記録",
-        implication="分析なし(タイトルのみ)",
+    """LLM 全滅時のタイトルのみ記録(relevance=0・summary=タイトル・topic NULL。設計 03 §3.3)。"""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO analyses
+          (item_id, run_id, summary, category, topic, relevance_score, novelty,
+           negative_labels, recommendation_reason, implication, degraded, engine, model,
+           prompt_version, input_hash)
+        VALUES (?, ?, ?, 'その他', NULL, 0, 'new', '[]', ?, ?, 1, ?, ?, ?, ?)
+        """,
+        (
+            row["id"],
+            run_id,
+            (row["title"] or "(タイトルなし)")[:300],
+            "LLM 分析失敗のため degraded 記録",
+            "分析なし(タイトルのみ)",
+            engine.name,
+            getattr(engine, "model", "engine-default"),
+            PROMPT_VERSION,
+            input_hash,
+        ),
     )
-    _insert_analysis(conn, row, fallback, engine, input_hash, run_id, degraded=True)
