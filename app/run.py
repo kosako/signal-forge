@@ -16,6 +16,7 @@ from app.analysis.llm import LLMEngine
 from app.collect import collect_all
 from app.config import Config
 from app.connectors.base import Connector
+from app.delivery import create_api, deliver_digest, is_telegram_configured
 from app.digest.builder import generate_digest, today_jst
 from app.export import export_digest
 from app.extraction import extract_pending
@@ -26,6 +27,7 @@ from app.purge import purge_expired
 def run_pipeline(
     conn: sqlite3.Connection,
     config: Config,
+    env: dict[str, str],
     connectors: dict[str, Connector],
     http: HttpClient,
     engine_factory: Callable[[], LLMEngine],
@@ -57,7 +59,14 @@ def run_pipeline(
         conn, config, logger, run_id=run_id, force=force_digest
     ))
     stage("export", lambda: _export_today(conn, config, logger, run_id))
-    logger.info("deliver 段は未実装(plan #16)", extra={"run_id": run_id, "stage": "deliver"})
+    if is_telegram_configured(config, env):
+        stage("deliver", lambda: _deliver_today(conn, config, env, logger, run_id))
+    else:
+        # 完全未設定 = M2a 前の未セットアップ。欠落検知は doctor #4 の責務(設計 05 §2)
+        logger.warning(
+            "Telegram 未設定のため deliver 段を skip",
+            extra={"run_id": run_id, "stage": "deliver"},
+        )
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
 
     logger.info(
@@ -92,9 +101,24 @@ def _export_today(
     conn: sqlite3.Connection, config: Config, logger: logging.Logger, run_id: str
 ) -> None:
     # digest 段が skip(生成済み)でも当日分を export する(再実行の冪等性)
+    export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id)
+
+
+def _deliver_today(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    logger: logging.Logger,
+    run_id: str,
+) -> None:
+    # 配信済みは deliver_digest 側で skip(再実行の冪等性)
+    deliver_digest(conn, config, create_api(env), _today_digest_id(conn), logger, run_id=run_id)
+
+
+def _today_digest_id(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT id FROM digests WHERE digest_date = ?", (today_jst(),)
     ).fetchone()
     if row is None:
         raise RuntimeError("当日の digest が存在しない(digest 段の失敗を参照)")
-    export_digest(conn, config, row["id"], logger, run_id=run_id)
+    return row["id"]

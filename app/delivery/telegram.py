@@ -1,0 +1,349 @@
+"""Telegram 配信(設計 04 §1〜2 / 05 §8)。
+
+- Bot API は httpx 直叩き。parse_mode=HTML。エスケープ規定: テキストノードは
+  `& < >`、属性値はさらに `"` `'`(canonical_url は外部制御可能なため属性破壊を防ぐ)
+- 構成: ヘッダ1通+アイテム最大 `digest.max_items` 通(1アイテム=1メッセージ。
+  ボタンをアイテム単位に付けるため)
+- 冪等性: `digest_messages` 台帳にある message は再送しない(部分再送)。全通完了で
+  `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を記録して例外
+- token は `.env` の TELEGRAM_BOT_TOKEN。URL に token が入るため、httpx の例外を
+  そのまま伝播させない(sanitize して再送出)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+import sqlite3
+import time
+from collections.abc import Callable
+from datetime import datetime
+
+import httpx
+
+from app.config import Config
+
+TELEGRAM_API_BASE = "https://api.telegram.org"
+ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+
+TIMEOUT_S = 30  # 設計 05 §8
+MAX_RETRIES = 3  # 初回 + リトライ3回(同上)
+BACKOFF_S = (1.0, 2.0, 4.0)
+
+ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸収(設計 04 §2)
+
+_WEEKDAYS_JA = "月火水木金土日"
+
+# 反応ボタン(callback_data 形式の正本は設計 04 §3)
+_REACTION_BUTTONS = (
+    ("👍 価値あり", "up"),
+    ("🔖 深掘り", "dig"),
+    ("✅ 既知", "knw"),
+    ("👎 不要", "no"),
+)
+
+
+class DeliveryError(Exception):
+    """配信の失敗(設定不備・API エラー・リトライ上限)。"""
+
+
+class TelegramApi:
+    """Bot API の薄いラッパ。テストは transport(httpx.MockTransport)を注入する。"""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._sleep = sleep
+        self._client = httpx.Client(
+            base_url=f"{TELEGRAM_API_BASE}/bot{token}",
+            transport=transport,
+            trust_env=False,
+            timeout=TIMEOUT_S,
+        )
+
+    def send_message(
+        self, chat_id: int, text: str, *, reply_markup: dict | None = None
+    ) -> int:
+        """sendMessage を実行し message_id を返す。リトライ規約は設計 05 §8。"""
+        payload: dict[str, object] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        result = self._post("sendMessage", payload)
+        return int(result["message_id"])
+
+    def _post(self, method: str, payload: dict[str, object]) -> dict:
+        last_error = "不明"
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = self._client.post(f"/{method}", data=payload)
+            except httpx.HTTPError as e:
+                # httpx 例外の repr は token 入り URL を含みうるため型名だけ持ち越す
+                last_error = f"transport エラー: {type(e).__name__}"
+                self._backoff(attempt)
+                continue
+            body = self._parse_body(response)
+            if body.get("ok") is True and isinstance(body.get("result"), dict):
+                return body["result"]
+            last_error = f"HTTP {response.status_code}: {body.get('description', '(説明なし)')}"
+            if response.status_code == 429:
+                self._wait_retry_after(body, attempt)
+                continue
+            if 500 <= response.status_code <= 599:
+                self._backoff(attempt)
+                continue
+            # 4xx(chat 不在・パース不能等)は恒久エラー。リトライしない
+            raise DeliveryError(f"Telegram {method} が失敗: {last_error}")
+        raise DeliveryError(f"Telegram {method} がリトライ上限で失敗: {last_error}")
+
+    @staticmethod
+    def _parse_body(response: httpx.Response) -> dict:
+        try:
+            body = response.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _wait_retry_after(self, body: dict, attempt: int) -> None:
+        if attempt >= MAX_RETRIES:
+            return
+        parameters = body.get("parameters")
+        retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+        if isinstance(retry_after, int) and retry_after >= 0:
+            self._sleep(retry_after)
+        else:
+            self._backoff(attempt)
+
+    def _backoff(self, attempt: int) -> None:
+        if attempt < MAX_RETRIES:
+            self._sleep(BACKOFF_S[attempt] + random.random())
+
+
+def create_api(env: dict[str, str]) -> TelegramApi:
+    """`.env` から TelegramApi を組み立てる(token 欠落は fail fast)。"""
+    token = env.get(ENV_BOT_TOKEN)
+    if not token:
+        raise DeliveryError(f".env に {ENV_BOT_TOKEN} がない(設計 05 §6)")
+    return TelegramApi(token)
+
+
+def deliver_digest(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    digest_id: int,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+) -> int:
+    """digest を配信し、送信した message 数を返す(送信済みは 0)。
+
+    台帳(digest_messages)に無い message のみ送る部分再送。1通送るごとに台帳へ
+    コミットし、途中失敗しても送信済み分を二重送信しない。
+    """
+    if config.telegram.owner_chat_id is None:
+        raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
+    chat_id = config.telegram.owner_chat_id
+
+    digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    if digest is None:
+        raise DeliveryError(f"digest id={digest_id} が存在しない")
+    if digest["delivery_status"] == "sent":
+        logger.info(
+            "配信済みのため skip",
+            extra={"run_id": run_id, "stage": "deliver"},
+        )
+        return 0
+
+    item_ids: list[int] = json.loads(digest["item_ids"])
+    items = _load_items(conn, item_ids)
+    sent_item_ids, header_sent = _load_ledger(conn, digest_id)
+
+    sent = 0
+    try:
+        if not header_sent:
+            message_id = api.send_message(chat_id, _header_text(digest))
+            _record_message(conn, digest_id, None, message_id)
+            sent += 1
+        for position, row in enumerate(items, start=1):
+            if row["item_id"] in sent_item_ids:
+                continue
+            message_id = api.send_message(
+                chat_id,
+                _item_text(position, row),
+                reply_markup=_reaction_keyboard(row["item_id"]),
+            )
+            _record_message(conn, digest_id, row["item_id"], message_id)
+            sent += 1
+    except DeliveryError:
+        conn.execute(
+            "UPDATE digests SET delivery_status = 'failed' WHERE id = ?", (digest_id,)
+        )
+        logger.error(
+            "配信が途中失敗(送信済み分は台帳に記録済み。再走で未送信のみ再送)",
+            extra={"run_id": run_id, "stage": "deliver", "extra": {"sent": sent}},
+        )
+        raise
+
+    conn.execute(
+        "UPDATE digests SET delivery_status = 'sent', "
+        "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+        (digest_id,),
+    )
+    logger.info(
+        "配信完了",
+        extra={"run_id": run_id, "stage": "deliver", "extra": {"messages": sent}},
+    )
+    return sent
+
+
+def is_telegram_configured(config: Config, env: dict[str, str]) -> bool:
+    """deliver 段を実行すべきかの判定(朝バッチ用。設計 00 §6 の局所化と両立)。
+
+    完全未設定(chat_id も token も無い)= 未セットアップとして False。
+    片方だけの設定は設定ミスなので True を返し、deliver 段で fail fast させる。
+    """
+    return config.telegram.owner_chat_id is not None or bool(env.get(ENV_BOT_TOKEN))
+
+
+# --- メッセージ組み立て(設計 04 §2) ---
+
+
+def escape_text(value: str) -> str:
+    """HTML テキストノード用エスケープ(& < > の3文字)。"""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def escape_attr(value: str) -> str:
+    """HTML 属性値用エスケープ(テキストノード + " ')。"""
+    return escape_text(value).replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _header_text(digest: sqlite3.Row) -> str:
+    date = datetime.strptime(digest["digest_date"], "%Y-%m-%d")
+    weekday = _WEEKDAYS_JA[date.weekday()]
+    header = (
+        f"📡 {digest['digest_date']}({weekday})のダイジェスト — {digest['item_count']}件"
+    )
+    if digest["status"] == "degraded":
+        header += "\n⚠️ 本文抽出失敗/分析縮退あり"
+    return header
+
+
+def _item_text(position: int, row: sqlite3.Row) -> str:
+    title = escape_text(row["title"] or "(タイトルなし)")
+    source_line = (
+        f'<a href="{escape_attr(row["canonical_url"])}">{escape_text(row["source_name"])}</a>'
+    )
+    published = _published_md(row["published_at"])
+    if published:
+        source_line += f" ・{published}"
+
+    fixed_lines = [f"{position}. <b>{title}</b>", source_line]
+    implication = (row["implication"] or "").strip()
+    # 💡 行は切り詰め対象外(設計 04 §2: タイトル・URL・示唆は削らない)
+    trailer = f"💡 {escape_text(implication)}" if implication else ""
+
+    summary = (row["summary"] or "").strip()
+    budget = ITEM_TEXT_MAX_CHARS - sum(len(line) + 1 for line in fixed_lines)
+    if trailer:
+        budget -= len(trailer) + 1
+    if summary and budget > 1:
+        fixed_lines.append(_escape_and_truncate(summary, budget))
+    if trailer:
+        fixed_lines.append(trailer)
+    return "\n".join(fixed_lines)
+
+
+def _escape_and_truncate(raw: str, budget: int) -> str:
+    """raw をエスケープし、エスケープ後長が budget 内に収まるよう末尾を … で切る。
+
+    エスケープ済み文字列の任意位置 slice は HTML entity(&amp; 等)を分断し、
+    Telegram の parse_mode=HTML が 400 を返しうるため、raw 1文字単位で積む。
+    """
+    escaped = escape_text(raw)
+    if len(escaped) <= budget:
+        return escaped
+    parts: list[str] = []
+    used = 0
+    for char in raw:
+        piece = escape_text(char)
+        if used + len(piece) > budget - 1:  # 「…」1文字分を確保
+            break
+        parts.append(piece)
+        used += len(piece)
+    return "".join(parts) + "…"
+
+
+def _published_md(published_at: str | None) -> str | None:
+    if not published_at:
+        return None
+    try:
+        date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None  # 不正な日付は日付表示だけ落とす(配信自体は止めない)
+    return f"{date.month}/{date.day}"
+
+
+def _reaction_keyboard(item_id: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": label, "callback_data": f"s:{item_id}:{code}"}
+                for label, code in _REACTION_BUTTONS
+            ]
+        ]
+    }
+
+
+# --- DB アクセス ---
+
+
+def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.Row]:
+    if not item_ids:
+        return []
+    placeholders = ",".join("?" * len(item_ids))
+    rows = conn.execute(
+        f"""
+        SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
+               sources.name AS source_name,
+               analyses.summary, analyses.implication
+        FROM items
+        JOIN sources ON sources.id = items.source_id
+        JOIN analyses ON analyses.id = (
+            SELECT id FROM analyses WHERE item_id = items.id
+            ORDER BY analyzed_at DESC, id DESC LIMIT 1
+        )
+        WHERE items.id IN ({placeholders})
+        """,
+        item_ids,
+    ).fetchall()
+    by_id = {row["item_id"]: row for row in rows}
+    missing = [i for i in item_ids if i not in by_id]
+    if missing:
+        raise DeliveryError(f"digest の item が items/analyses に無い: {missing}")
+    return [by_id[i] for i in item_ids]  # 配信順を維持
+
+
+def _load_ledger(conn: sqlite3.Connection, digest_id: int) -> tuple[set[int], bool]:
+    rows = conn.execute(
+        "SELECT item_id FROM digest_messages WHERE digest_id = ?", (digest_id,)
+    ).fetchall()
+    item_ids = {row["item_id"] for row in rows if row["item_id"] is not None}
+    header_sent = any(row["item_id"] is None for row in rows)
+    return item_ids, header_sent
+
+
+def _record_message(
+    conn: sqlite3.Connection, digest_id: int, item_id: int | None, message_id: int
+) -> None:
+    # 接続は autocommit(app/db.py)。1通ごとに即確定し、途中クラッシュでも
+    # 台帳と送信実績がずれない
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+        (digest_id, item_id, message_id),
+    )

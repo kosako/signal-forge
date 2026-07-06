@@ -93,7 +93,7 @@ def make_http() -> HttpClient:
 def test_full_pipeline_end_to_end(conn, tmp_path) -> None:
     config = make_config(tmp_path)
     failures = run_pipeline(
-        conn, config, {"rss": StaticConnector()}, make_http(),
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
         lambda: ScriptedEngine(conn), logger, "01RUNID",
     )
     assert failures == []
@@ -112,7 +112,7 @@ def test_full_pipeline_end_to_end(conn, tmp_path) -> None:
 
 def test_rerun_is_idempotent(conn, tmp_path) -> None:
     config = make_config(tmp_path)
-    args = (conn, config, {"rss": StaticConnector()}, make_http())
+    args = (conn, config, {}, {"rss": StaticConnector()}, make_http())
     assert run_pipeline(*args, lambda: ScriptedEngine(conn), logger, "01RUN1") == []
     assert run_pipeline(*args, lambda: ScriptedEngine(conn), logger, "01RUN2") == []
     assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 1
@@ -125,7 +125,7 @@ def test_stage_failure_is_isolated_and_reported(conn, tmp_path) -> None:
         config_dir=tmp_path, obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault"))
     )
     failures = run_pipeline(
-        conn, config, {"rss": StaticConnector()}, make_http(),
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
         lambda: ScriptedEngine(conn), logger, "01RUNID",
     )
     assert "analyze" in failures
@@ -143,10 +143,57 @@ def test_export_failure_reported_but_purge_runs(conn, tmp_path) -> None:
         analysis=AnalysisConfig(profile_path=str(profile)),
     )
     failures = run_pipeline(
-        conn, config, {"rss": StaticConnector()}, make_http(),
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
         lambda: ScriptedEngine(conn), logger, "01RUNID",
     )
     assert failures == ["export"]
+
+
+def test_deliver_skipped_when_telegram_unconfigured(conn, tmp_path) -> None:
+    config = make_config(tmp_path)
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert failures == []
+    # deliver 段は skip され、digest は未配信のまま(検知は doctor #4 の責務)
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "pending"
+
+
+def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> None:
+    import httpx
+
+    from app import run as run_module
+    from app.config import TelegramConfig
+    from app.delivery import TelegramApi
+
+    def fake_create_api(env):
+        assert env["TELEGRAM_BOT_TOKEN"] == "tok"
+        return TelegramApi(
+            "tok",
+            transport=httpx.MockTransport(
+                lambda _r: httpx.Response(
+                    200, json={"ok": True, "result": {"message_id": 1}}
+                )
+            ),
+        )
+
+    monkeypatch.setattr(run_module, "create_api", fake_create_api)
+    base = make_config(tmp_path)
+    config = Config(
+        config_dir=base.config_dir,
+        obsidian=base.obsidian,
+        analysis=base.analysis,
+        telegram=TelegramConfig(owner_user_id=1, owner_chat_id=42),
+    )
+    failures = run_pipeline(
+        conn, config, {"TELEGRAM_BOT_TOKEN": "tok"}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert failures == []
+    row = conn.execute("SELECT delivery_status, sent_at FROM digests").fetchone()
+    assert row["delivery_status"] == "sent"
+    assert row["sent_at"] is not None
 
 
 def test_run_id_in_json_log_lines(conn, tmp_path) -> None:
@@ -155,7 +202,7 @@ def test_run_id_in_json_log_lines(conn, tmp_path) -> None:
     log = setup_logging(tmp_path / "logs", "morning.log")
     config = make_config(tmp_path)
     run_pipeline(
-        conn, config, {"rss": StaticConnector()}, make_http(),
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
         lambda: ScriptedEngine(conn), log, "01RUNID",
     )
     logging.shutdown()
