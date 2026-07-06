@@ -87,8 +87,10 @@ class CodexCliEngine:
     ) -> None:
         self._codex_bin = codex_bin
         self._effort = model_reasoning_effort
-        # 認証は CODEX_HOME 経由で最小限だけ見せる(実 HOME は渡さない)
-        self._codex_home = codex_home or os.path.expanduser("~/.codex")
+        # 認証は CODEX_HOME 経由で最小限だけ見せる(実 HOME は渡さない)。
+        # 既定は auth.json への symlink のみを含む専用ディレクトリ(~/.codex を丸ごと
+        # 見せると sessions・memories 等も読める)
+        self._codex_home = codex_home if codex_home is not None else _minimal_codex_home()
 
     def complete_structured(
         self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
@@ -154,6 +156,22 @@ class CodexCliEngine:
             "HOME": workdir,
             "CODEX_HOME": self._codex_home,
         }
+
+
+def _minimal_codex_home() -> str:
+    """auth.json(実体は ~/.codex/auth.json への symlink)だけを含む CODEX_HOME を返す。
+
+    symlink なので codex 側のトークンリフレッシュは実ファイルに反映される。
+    """
+    real_auth = Path.home() / ".codex" / "auth.json"
+    home = Path.home() / ".local" / "state" / "intel" / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    link = home / "auth.json"
+    if not link.is_symlink() and not link.exists():
+        if not real_auth.exists():
+            raise LLMError("~/.codex/auth.json がない(先に codex login が必要)")
+        link.symlink_to(real_auth)
+    return str(home)
 
 
 def create_engine(engine_name: str) -> LLMEngine:

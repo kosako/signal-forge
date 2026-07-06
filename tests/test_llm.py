@@ -108,6 +108,26 @@ def test_env_is_isolated_no_anthropic_key(tmp_path: Path, monkeypatch) -> None:
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-secret"  # 呼び出し側の環境は不変
 
 
+def test_default_codex_home_is_minimal_auth_only(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / ".codex"
+    real.mkdir()
+    (real / "auth.json").write_text("{}")
+    (real / "sessions.db").write_text("secret sessions")  # 見せてはいけない同居物
+
+    engine = CodexCliEngine(codex_bin="/bin/true")
+    home = Path(engine._codex_home)
+    assert home != real  # ~/.codex 丸ごとではない
+    assert [p.name for p in home.iterdir()] == ["auth.json"]  # auth のみ
+    assert (home / "auth.json").resolve() == (real / "auth.json").resolve()  # symlink で共有
+
+
+def test_default_codex_home_requires_login(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(LLMError, match="codex login"):
+        CodexCliEngine(codex_bin="/bin/true")
+
+
 def test_codex_home_points_to_auth_dir_only(tmp_path: Path) -> None:
     codex = fake_codex(
         tmp_path,
