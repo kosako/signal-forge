@@ -62,6 +62,11 @@ class ObsidianConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    db_path: str | None = None  # 未設定なら ~/.local/share/intel/intel.db(設計 01 §1)
+
+
+@dataclass(frozen=True)
 class Config:
     config_dir: Path
     x: XConfig = field(default_factory=XConfig)
@@ -71,10 +76,13 @@ class Config:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
 
     @property
     def db_path(self) -> Path:
-        return self.config_dir / "intel.db"
+        if self.storage.db_path is not None:
+            return Path(self.storage.db_path).expanduser()
+        return Path.home() / ".local" / "share" / "intel" / "intel.db"
 
 
 _SECTIONS = {
@@ -85,6 +93,7 @@ _SECTIONS = {
     "budget": BudgetConfig,
     "telegram": TelegramConfig,
     "obsidian": ObsidianConfig,
+    "storage": StorageConfig,
 }
 
 
