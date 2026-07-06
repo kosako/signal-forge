@@ -114,9 +114,27 @@ def digest(
 
 
 @app.command()
-def deliver() -> None:
+def deliver(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
     """当日ダイジェストを Telegram に配信する。"""
-    _stub(16)
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.delivery import create_api, deliver_digest
+    from app.digest.builder import today_jst
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    row = conn.execute("SELECT id FROM digests WHERE digest_date = ?", (today_jst(),)).fetchone()
+    if row is None:
+        typer.echo("当日の digest が存在しない(先に intel digest を実行)", err=True)
+        raise typer.Exit(code=1)
+    sent = deliver_digest(conn, config, create_api(env), row["id"], logger)
+    typer.echo("配信済み(skip)" if sent == 0 else f"配信完了({sent}通)")
 
 
 @app.command()
@@ -134,7 +152,7 @@ def run(
     from ulid import ULID
 
     from app.analysis.llm import create_engine
-    from app.config import load_config
+    from app.config import load_config, load_env
     from app.connectors.rss import RssConnector
     from app.db import apply_migrations, connect
     from app.http import HttpClient
@@ -142,6 +160,7 @@ def run(
     from app.run import run_pipeline
 
     config = load_config(config_dir)
+    env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
@@ -150,6 +169,7 @@ def run(
     failures = run_pipeline(
         conn,
         config,
+        env,
         {"rss": RssConnector(http)},  # X コネクタは plan #15
         http,
         lambda: create_engine(config.llm.engine),
