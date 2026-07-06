@@ -21,6 +21,27 @@ def test_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert config.db_path == Path.home() / ".local" / "share" / "intel" / "intel.db"
 
 
+def test_analysis_section_lists_become_tuples(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        '[analysis]\nblock_domains = ["spam.example"]\nblock_keywords = ["宣伝"]\n'
+        "daily_llm_limit = 100\n",
+    )
+    config = load_config(tmp_path)
+    assert config.analysis.block_domains == ("spam.example",)
+    assert config.analysis.block_keywords == ("宣伝",)
+    assert config.analysis.daily_llm_limit == 100
+
+
+def test_analysis_rejects_nonpositive_and_bad_list(tmp_path: Path) -> None:
+    write_config(tmp_path, "[analysis]\ndaily_llm_limit = 0\n")
+    with pytest.raises(ConfigError, match="正の整数"):
+        load_config(tmp_path)
+    write_config(tmp_path, "[analysis]\nblock_domains = [1, 2]\n")
+    with pytest.raises(ConfigError, match="型が不正"):
+        load_config(tmp_path)
+
+
 def test_db_path_configurable(tmp_path: Path) -> None:
     write_config(tmp_path, f'[storage]\ndb_path = "{tmp_path}/custom.db"\n')
     assert load_config(tmp_path).db_path == tmp_path / "custom.db"

@@ -71,9 +71,24 @@ def extract(
 
 
 @app.command()
-def analyze() -> None:
+def analyze(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
     """事前選別+LLM 本分析で analyses を生成する。"""
-    _stub(10)
+    from app.analysis.profile import load_interest_profile
+    from app.analysis.stage1 import preselect
+    from app.config import load_config
+    from app.db import apply_migrations, connect
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
+    preselect(conn, config, logger)
+    typer.echo("Stage 2(LLM 本分析)は未実装: plan #11 で実装予定", err=True)
+    raise typer.Exit(code=1)
 
 
 @app.command()
