@@ -48,6 +48,8 @@ def test_poller_plist_contract() -> None:
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] == 30
     assert set(plist["EnvironmentVariables"]) == {"PATH", "HOME"}
+    # poller は常駐+内蔵タイマー。カレンダー起動を持たない(設計 05 §1.2)
+    assert "StartCalendarInterval" not in plist
 
 
 def test_no_secrets_in_plists() -> None:

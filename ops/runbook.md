@@ -10,21 +10,31 @@
 
 ## 1. plist の生成(プレースホルダ置換)
 
-`ops/launchd/*.plist` の `__PLACEHOLDER__` を実環境の値に置換して
-`~/Library/LaunchAgents/` へ**コピー**する(symlink は macOS が無視することがあるため不可)。
+`ops/launchd/*.plist` の `__PLACEHOLDER__` を実環境の値に置換し、一時ディレクトリで
+lint を通してから `~/Library/LaunchAgents/` へ**コピー**する(symlink は macOS が
+無視することがあるため不可。lint 前に設置すると壊れた plist が残るため tmp を経由)。
 
 リポジトリの root で:
 
 ```sh
 UV_BIN="$(command -v uv)"
+[ -n "$UV_BIN" ] || { echo "uv が見つからない(PATH を確認)"; exit 1; }
+# sed 置換のため、パスに sed / XML のメタ文字を含む環境は対象外(先に検知して止める)
+case "${UV_BIN}$(pwd)${HOME}" in
+  (*[\|\&\<\>]*) echo "パスに | & < > を含む環境は本手順のsed置換が壊れるため非対応"; exit 1;;
+esac
+mkdir -p "${HOME}/.local/state/intel/logs"   # launchd は exec 前に stdout/stderr を開く
+TMP_DIR="$(mktemp -d)"
 for name in com.intel.morning com.intel.poller; do
   sed -e "s|__UV_BIN__|${UV_BIN}|g" \
       -e "s|__UV_DIR__|$(dirname "${UV_BIN}")|g" \
       -e "s|__REPO_DIR__|$(pwd)|g" \
       -e "s|__HOME__|${HOME}|g" \
-      "ops/launchd/${name}.plist" > "${HOME}/Library/LaunchAgents/${name}.plist"
+      "ops/launchd/${name}.plist" > "${TMP_DIR}/${name}.plist"
+  plutil -lint "${TMP_DIR}/${name}.plist" || exit 1
+  cp "${TMP_DIR}/${name}.plist" "${HOME}/Library/LaunchAgents/${name}.plist"
 done
-plutil -lint "${HOME}/Library/LaunchAgents/com.intel."*.plist
+rm -rf "${TMP_DIR}"
 ```
 
 ## 2. bootstrap(ロード)
