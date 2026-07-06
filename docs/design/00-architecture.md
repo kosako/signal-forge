@@ -90,10 +90,10 @@ class LLMEngine(Protocol):
                             timeout_s: int = 120) -> BaseModel: ...
 ```
 
-- **MVP のスコープ**: LLMEngine Protocol +**第一候補エンジン1本**(Week 1 の安定性検証で codex-cli / claude-cli から選定)のみ実装する。複数エンジンの優先順リスト(`llm.engines`)・エンジンフォールバック・残り2実装(もう片方の CLI と `AnthropicApiEngine`)は**拡張点に降格**し、必要になった時点で追加する(理由: 1〜1.5週の工期に3実装+フォールバック網はテスト面と doctor 検査を3倍にする過剰装備。Protocol があるので後付けコストは低く、PROPOSAL の「API SDK へ1日で差し替え可能」要件は Protocol で満たす)。
+- **MVP のスコープ**: LLMEngine Protocol +**第一候補エンジン1本**のみ実装する。**第一候補は `codex-cli` に仮決定(2026-07-06、Issue #3)**: (1) 無人自動化ユースケースを公式ドキュメントが明記し規約リスク最小 (2) 開発作業(Claude Code)とクォータを食い合わない (3) `-o`(output-last-message)/`--output-schema` で構造化出力が素直(15件バッチ実測でフェンスなしクリーン JSON) (4) read-only sandbox+作業ディレクトリ隔離が動的検査で機能。Week 1 の安定性実測(#9/#14)で最終確定する。複数エンジンの優先順リスト(`llm.engines`)・エンジンフォールバック・残り2実装(もう片方の CLI と `AnthropicApiEngine`)は**拡張点に降格**し、必要になった時点で追加する(理由: 1〜1.5週の工期に3実装+フォールバック網はテスト面と doctor 検査を3倍にする過剰装備。Protocol があるので後付けコストは低く、PROPOSAL の「API SDK へ1日で差し替え可能」要件は Protocol で満たす)。
 - **切替**: config.toml の `llm.engine = "codex-cli"`(単一指定。値は `codex-cli` / `claude-cli` / `anthropic-api`。01 の analyses.engine enum と同一語彙)。コード変更なしで差し替え可能。推論専用モードを設定できないエンジンは起動時に doctor が fail させる(理由: 「LLM に書込・送信権限を与えない」を宣言でなく構成で担保)。
 - **呼び出しの隔離仕様(推論専用モードの実体)**。「ツール disallow」の宣言だけでは、ユーザーの設定・MCP 由来ツールが生き残りうるため、以下を構成で強制する:
-  1. `claude -p` は**専用の設定分離**で起動する: 専用 CONFIG DIR/HOME を指定し、ユーザーの `~/.claude/CLAUDE.md`・settings.json を読み込ませない。`--strict-mcp-config` で MCP を空指定し、許可ツールを空にする(設定側 allowlist や MCP サーバー由来ツールの残存を遮断)。
+  1. `claude -p` は**専用の設定分離**で起動する: `--setting-sources ""` で user/project/local 設定(CLAUDE.md・settings.json)を読み込ませず、`--disallowedTools "*"` + `--strict-mcp-config`(MCP 空指定)でツールを全遮断する。**専用 CONFIG DIR/HOME 分離は使わない**(実測 2026-07-06、Issue #3: CONFIG DIR を分けると認証も分離され Not logged in で不成立)。出力は ```json フェンス付きで返るため、スキーマ検証前にフェンス除去を行う。
   2. `codex exec` は**作業ディレクトリを空の専用ディレクトリに固定**し、ネットワーク遮断サンドボックスで起動する(read-only でもファイル読み取りは可能なため、`.env`・SSH 鍵等が summary 経由で出力に流出する経路を作業ディレクトリ隔離で塞ぐ)。
   3. doctor の推論専用モード検査は設定値の確認でなく**動的検査**とする: 実際にツール呼び出し・ファイル読み取りを試みるプロンプトを流し、拒否されることを確認する(設計 05 §2 #6)。
   4. プロンプトは **argv でなく stdin 渡し**(ps でのプロンプト露出防止と、シェル解釈の事故防止を兼ねる)。
