@@ -41,27 +41,27 @@ def seed(conn: sqlite3.Connection) -> None:
         )
     conn.execute(
         "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status) "
-        "VALUES (date('now'), '# md', ?, 4, 'sent')",
+        "VALUES (date('now','+9 hours'), '# md', ?, 4, 'sent')",
         (json.dumps(items),),
     )
     reactions = [("useful", items[0]), ("dig", items[1]), ("dig", items[2]), ("noise", items[3])]
     for value, item_id in reactions:
         conn.execute(
             "INSERT INTO signals (kind, item_id, value, signal_date) "
-            "VALUES ('reaction', ?, ?, date('now'))",
+            "VALUES ('reaction', ?, ?, date('now','+9 hours'))",
             (item_id, value),
         )
     conn.execute(
         "INSERT INTO signals (kind, value, signal_date) "
-        "VALUES ('survey_patrol', 'no', date('now'))"
+        "VALUES ('survey_patrol', 'no', date('now','+9 hours'))"
     )
     conn.execute(
         "INSERT INTO signals (kind, value, signal_date) "
-        "VALUES ('survey_read_min', '15', date('now'))"
+        "VALUES ('survey_read_min', '15', date('now','+9 hours'))"
     )
     conn.execute(
         "INSERT INTO signals (kind, item_id, value, signal_date) "
-        "VALUES ('followup_dig', ?, 'yes', date('now'))",
+        "VALUES ('followup_dig', ?, 'yes', date('now','+9 hours'))",
         (items[1],),
     )
 
@@ -231,9 +231,30 @@ def test_retap_uses_latest_reaction(conn) -> None:
     ).fetchone()["item_id"]
     conn.execute(
         "INSERT INTO signals (kind, item_id, value, signal_date) "
-        "VALUES ('reaction', ?, 'useful', date('now'))",
+        "VALUES ('reaction', ?, 'useful', date('now','+9 hours'))",
         (item,),
     )
     row = conn.execute((KPI_DIR / "01-daily-kpi.sql").read_text(encoding="utf-8")).fetchone()
     assert row["positive"] == 4
     assert row["reacted"] == 4  # 行は増えない(item×日の最新のみ)
+
+
+def test_weekly_window_boundary_is_jst(conn) -> None:
+    # 08 の直近7日窓は JST 暦日基準: ちょうど7日前は含み、8日前は含まない
+    inside = add_delivered_item(conn, "https://a/inside")
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status) "
+        "VALUES (date('now','+9 hours','-7 days'), '# md', ?, 1, 'sent')",
+        (json.dumps([inside]),),
+    )
+    outside = add_delivered_item(conn, "https://a/outside")
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status) "
+        "VALUES (date('now','+9 hours','-8 days'), '# md', ?, 1, 'sent')",
+        (json.dumps([outside]),),
+    )
+
+    row = conn.execute(
+        (KPI_DIR / "08-weekly-summary.sql").read_text(encoding="utf-8")
+    ).fetchone()
+    assert row["delivered_days"] == 2  # seed の当日分 + 7日前(8日前は窓外)

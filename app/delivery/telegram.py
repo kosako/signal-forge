@@ -33,6 +33,9 @@ BACKOFF_S = (1.0, 2.0, 4.0)
 LONG_POLL_S = 50  # getUpdates の long polling 秒(設計 05 §8)
 
 ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸収(設計 04 §2)
+# タイトルは RSS 由来で長さ未検証。異常に長い1件で Telegram の 4096 字上限を超えて
+# 配信全体が failed になるのを防ぐ(通常のタイトルはこの上限に届かない)
+TITLE_MAX_CHARS = 300
 
 _WEEKDAYS_JA = "月火水木金土日"
 
@@ -281,7 +284,7 @@ def _header_text(digest: sqlite3.Row) -> str:
 
 
 def _item_text(position: int, row: sqlite3.Row) -> str:
-    title = escape_text(row["title"] or "(タイトルなし)")
+    title = escape_and_truncate((row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS)
     source_line = (
         f'<a href="{escape_attr(row["canonical_url"])}">{escape_text(row["source_name"])}</a>'
     )
@@ -299,13 +302,13 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
     if trailer:
         budget -= len(trailer) + 1
     if summary and budget > 1:
-        fixed_lines.append(_escape_and_truncate(summary, budget))
+        fixed_lines.append(escape_and_truncate(summary, budget))
     if trailer:
         fixed_lines.append(trailer)
     return "\n".join(fixed_lines)
 
 
-def _escape_and_truncate(raw: str, budget: int) -> str:
+def escape_and_truncate(raw: str, budget: int) -> str:
     """raw をエスケープし、エスケープ後長が budget 内に収まるよう末尾を … で切る。
 
     エスケープ済み文字列の任意位置 slice は HTML entity(&amp; 等)を分断し、

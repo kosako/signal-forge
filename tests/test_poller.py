@@ -400,6 +400,46 @@ def test_update_failure_does_not_kill_batch(conn, tmp_path) -> None:
     ).fetchone()["value"] == "3"
 
 
+def test_insert_failure_answers_warning(conn, tmp_path) -> None:
+    # signals INSERT 自体の失敗(DB 故障相当)は「⚠️ 記録失敗、もう一度」で伝える
+    # (設計 04 §3 の「DB 書込失敗時のみ ⚠️」の実 INSERT 失敗経路)
+    a = add_item(conn, "https://a/1")
+    add_digest(conn, [a])
+    conn.execute("DROP TABLE signals")
+    api = FakeApi([[make_callback_update(a, "up")]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
+    assert api.edited == []  # 記帳できていないので ✓ も付けない
+    assert conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()["value"] == "2"  # offset は進む
+
+
+def test_survey_insert_failure_answers_warning(conn, tmp_path) -> None:
+    from datetime import datetime
+
+    from app.digest.builder import JST
+
+    conn.execute("DROP TABLE signals")
+    date_compact = datetime.now(JST).strftime("%Y%m%d")
+    api = FakeApi([[make_callback_update(0, data=f"q1:{date_compact}:y")]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert api.answered == [("cb1", "⚠️ 記録失敗、もう一度")]
+
+
+def test_corrupt_offset_resets_instead_of_crashing(conn, tmp_path) -> None:
+    conn.execute(
+        "INSERT INTO telegram_state (key, value) VALUES (?, 'garbage')", (OFFSET_KEY,)
+    )
+    api = FakeApi([[]])
+    poll_once(conn, make_config(tmp_path), api, logger)  # 落ちない
+    assert api.offsets == [None]  # offset なしで再開(at-least-once の安全側)
+
+
 def test_run_poller_requires_owner_user_id(conn, tmp_path) -> None:
     with pytest.raises(DeliveryError, match="owner_user_id"):
         run_poller(conn, make_config(tmp_path, owner_user_id=None), FakeApi(), logger)
@@ -456,3 +496,20 @@ def test_reaction_keyboard_selected_marks_only_one() -> None:
         "👍 価値あり", "🔖 深掘り ✓", "✅ 既知", "👎 不要"
     ]
     assert json.dumps(markup)  # シリアライズ可能
+
+
+def test_run_poller_backs_off_on_db_error_instead_of_crashing(conn, tmp_path) -> None:
+    # VACUUM/backup 競合等の sqlite3.OperationalError でプロセスを落とさず待って再開
+    conn.execute("DROP TABLE telegram_state")  # OperationalError を誘発
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    run_poller(
+        conn, make_config(tmp_path), FakeApi([[], []]), logger,
+        sleep=sleeps.append, should_stop=should_stop,
+    )
+    assert sleeps == [RECONNECT_BACKOFF_S, RECONNECT_BACKOFF_S]

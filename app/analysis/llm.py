@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -140,11 +141,16 @@ class CodexCliEngine:
             try:
                 _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
             except subprocess.TimeoutExpired as e:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                # timeout と kill の間に自然終了していたら ProcessLookupError(取り残しなし)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 process.wait()
                 raise LLMError(f"タイムアウト({timeout_s}s)") from e
             if process.returncode != 0:
-                raise LLMError(f"codex 非0終了({process.returncode}): {stderr_tail[-500:]}")
+                # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。
+                # 例外(=ログ)には制御文字を除去した末尾200字だけを載せる
+                tail = re.sub(r"[\x00-\x1f\x7f]", " ", stderr_tail)[-200:]
+                raise LLMError(f"codex 非0終了({process.returncode}): {tail}")
             if not out_file.exists():
                 raise LLMError("codex が最終応答ファイルを書かなかった")
             return parse_structured(out_file.read_text(encoding="utf-8"), schema)

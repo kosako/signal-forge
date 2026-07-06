@@ -270,5 +270,10 @@ def load_env(config_dir: Path) -> dict[str, str]:
         if "=" not in stripped:
             raise ConfigError(f"{path}:{lineno}: KEY=VALUE 形式でない行: {stripped[:20]}…")
         key, _, value = stripped.partition("=")
-        env[key.strip()] = value.strip().strip('"').strip("'")
+        value = value.strip()
+        # 囲みクォートは「対になっている場合のみ」1組だけ剥がす(str.strip だと
+        # 値の先頭・末尾に正当に含まれる引用符まで削れて token を破壊する)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        env[key.strip()] = value
     return env

@@ -249,7 +249,8 @@ def _recent_titles(conn: sqlite3.Connection) -> list[str]:
         """
         SELECT DISTINCT items.title FROM digests, json_each(digests.item_ids) AS je
         JOIN items ON items.id = je.value
-        WHERE digests.digest_date >= date('now', ?) AND items.title IS NOT NULL
+        WHERE digests.digest_date >= date('now', '+9 hours', ?)  -- digest_date は JST 暦日
+          AND items.title IS NOT NULL
         ORDER BY items.title
         """,
         (f"-{RECENT_DAYS} days",),
