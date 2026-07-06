@@ -42,7 +42,9 @@ def add_item(conn, *, source_id=2, url="https://example.com/1", raw_content=None
 def make_http(handler, calls=None):
     def counting_handler(request: httpx.Request) -> httpx.Response:
         if calls is not None:
-            calls.append(str(request.url))
+            # 接続は検証済み IP にピン留めされるため、記録は Host ヘッダ基準で行う
+            host = request.headers["host"]
+            calls.append(f"{request.url.scheme}://{host}{request.url.path}")
         return handler(request)
 
     return HttpClient(

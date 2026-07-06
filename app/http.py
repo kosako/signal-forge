@@ -5,7 +5,10 @@
 - リトライ: 2回・指数バックオフ(1s→4s)+ jitter。429 は Retry-After 尊重。
   恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)
 - SSRF ガード: DNS 解決後の接続先 IP が private / loopback / link-local 帯なら拒否。
-  リダイレクトは自動追跡せず各ホップで再検査する
+  リダイレクトは自動追跡せず各ホップで再検査する。
+  接続は**検証済み IP にピン留め**する(URL ホストを IP に書き換え、Host ヘッダ+SNI で
+  元ホスト名を維持)。検証と接続で DNS を別々に引くと、attacker 制御の DNS が
+  1回目 public・2回目 private を返す rebinding で検査を回避できるため
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -118,8 +121,8 @@ class HttpClient:
         current = url
         permanently_moved = False
         for _ in range(MAX_REDIRECTS + 1):
-            self._check_target(current)
-            response = self._client.get(current, headers=headers)
+            pinned_ip = self._check_target(current)
+            response = self._get_pinned(current, pinned_ip, headers)
             if response.status_code not in _REDIRECT_STATUSES:
                 return FetchedResponse(
                     response=response, final_url=current, permanently_moved=permanently_moved
@@ -133,7 +136,40 @@ class HttpClient:
             current = urljoin(current, location)
         raise FatalError(f"リダイレクトが {MAX_REDIRECTS} 回を超過(ループ疑い): {url}")
 
-    def _check_target(self, url: str) -> None:
+    def _get_pinned(
+        self, url: str, ip: str, headers: dict[str, str] | None
+    ) -> httpx.Response:
+        """URL ホストを検証済み IP に書き換えて GET する(DNS rebinding 対策)。
+
+        Host ヘッダと SNI(sni_hostname)に元ホスト名を残すため、サーバ側からは
+        通常のリクエストに見える。証明書検証も元ホスト名に対して行われる。
+        """
+        split = urlsplit(url)
+        host = split.hostname
+        if host is None:  # _check_target 通過済みだが契約として明示
+            raise FatalError(f"ホストのない URL: {url[:80]}")
+        ip_literal = f"[{ip}]" if ":" in ip else ip  # IPv6 はブラケット表記
+        userinfo = ""
+        if split.username is not None:
+            userinfo = split.username
+            if split.password is not None:
+                userinfo += f":{split.password}"
+            userinfo += "@"
+        try:
+            port = split.port
+        except ValueError as e:
+            raise FatalError(f"ポートが不正な URL: {url[:80]}") from e
+        port_suffix = f":{port}" if port is not None else ""
+        pinned_url = urlunsplit(
+            (split.scheme, f"{userinfo}{ip_literal}{port_suffix}", split.path, split.query, "")
+        )
+        host_header = f"{host}{port_suffix}"
+        request_headers = {**(headers or {}), "Host": host_header}
+        extensions = {"sni_hostname": host} if split.scheme.lower() == "https" else {}
+        return self._client.get(pinned_url, headers=request_headers, extensions=extensions)
+
+    def _check_target(self, url: str) -> str:
+        """接続先を検証し、接続に使う検証済み IP を返す。"""
         host = urlsplit(url).hostname
         if not host:
             raise FatalError(f"ホストのない URL: {url[:80]}")
@@ -151,3 +187,4 @@ class HttpClient:
                 raise SsrfBlockedError(
                     f"グローバルでないアドレスへの接続を拒否: {host} -> {address}"
                 )
+        return addresses[0]
