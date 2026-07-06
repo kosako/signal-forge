@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  受信デーモン(設計 05 §1.2)。__PLACEHOLDER__ は ops/runbook.md の手順で置換してから
+  ~/Library/LaunchAgents/ へ「コピー」して bootstrap する(symlink 不可)。
+  - KeepAlive: クラッシュしても callback の取りこぼしを最小化するため常時復帰
+  - 連続クラッシュは ThrottleInterval 30 で launchd が抑制(検知は doctor #8 / watchdog)
+  - 夜アンケート・watchdog はこのプロセスの内蔵タイマー(時刻は config.toml)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.intel.poller</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_BIN__</string>
+    <string>run</string>
+    <string>intel</string>
+    <string>poll</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:__UV_DIR__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/intel/logs/poller-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/intel/logs/poller-launchd.log</string>
+</dict>
+</plist>
