@@ -250,7 +250,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 - 削除ジョブは `intel run` の最終ステップ(単独実行は `intel doctor --purge` 相当のサブコマンドでも可):
   1. `DELETE FROM documents WHERE expires_at <= now`
   2. `raw_payload` の NULL 化は **documents から独立して**行う: `items.fetched_at + TTL <= now` の**全行**(documents の有無・status を問わない。duplicate・skipped・抽出未実行の行も対象)の `raw_payload` を NULL 化。TTL はソース別(X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days`)。理由: documents.expires_at 起点にすると documents 行を持たない items が purge から漏れる。特に X は full_text の無期限残存が本文非保持ポリシー違反になる(恒久保存は `analyses.summary` + メタ + URL のみ)。TTL 超過残存は doctor #11 が検査する(設計 05 §2)
-  3. 削除行が 1,000 行を超えた回は `VACUUM`。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
+  3. 削除行と `raw_payload` NULL 化行の合算が 1,000 行を超えた回は `VACUUM`(NULL 化も大きな空きを生むため合算で判定)。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
 
 ## 7. signals の表現(4ボタン+夜アンケート+追い掛け)
 

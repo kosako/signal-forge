@@ -148,7 +148,7 @@ def run(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
     force_digest: bool = typer.Option(False, "--force", help="当日 digest を置換再生成する"),
 ) -> None:
-    """朝バッチ: collect→extract→analyze→digest→export→deliver→purge を直列実行。"""
+    """朝バッチ: collect→extract→analyze→digest→export→deliver→purge→backup を直列実行。"""
     from ulid import ULID
 
     from app.analysis.llm import create_engine

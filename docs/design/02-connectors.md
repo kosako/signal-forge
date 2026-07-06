@@ -39,7 +39,7 @@ class Connector(Protocol):
   - `FatalError`(401/403・設定不備): リトライせずスキップ、doctor 警告対象。
   - いずれもソース単位で握りつぶし、**他ソースの collect は必ず継続**(縮退の基本形。X が死んでも RSS+手動URLでダイジェストは出る)。
 - **記録**: fetch 1回ごとに `collect_runs`(source_id, started_at, finished_at, status, items_fetched, api_reads, estimated_cost_usd, error)へ1行。テーブル定義の正本は 01(語彙も 01 に従う)。http_status・duration_ms はログ(JSON Lines)のみで DB には持たない(1人運用のデバッグはログで足りる)。`sources` には last_success_at / last_error_at / consecutive_failures を反映する(成功で 0 リセット・失敗で +1。01 §3)。
-- **SSRF ガード**: 短縮 URL 展開・本文抽出を含む外部 URL fetch の全経路は、設計 05 §8 の共通 HTTP クライアント規約(private/loopback/link-local 帯への接続拒否、リダイレクト各ホップで再検査)に従う。
+- **SSRF ガード**: 短縮 URL 展開・本文抽出を含む外部 URL fetch の全経路は、設計 05 §8 の共通 HTTP クライアント規約(global でないアドレスへの接続拒否 = is_global allowlist 方式、リダイレクト各ホップで再検査、検証済み IP へのピン留め)に従う。
 - 拡張点: 新ソースは Connector 実装+sources 1行の追加のみ。スケジューリング分岐(ソース別頻度)は現時点で作らない(朝バッチ1回で十分)。
 
 ## 2. X コネクタ(`connectors/x.py`)
