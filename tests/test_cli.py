@@ -15,7 +15,7 @@ def test_help_lists_all_subcommands() -> None:
 
 
 def test_stub_exits_nonzero() -> None:
-    result = runner.invoke(app, ["deliver"])
+    result = runner.invoke(app, ["poll"])
     assert result.exit_code == 1
     assert "未実装" in result.output
 

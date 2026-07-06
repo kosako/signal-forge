@@ -126,9 +126,41 @@ def poll() -> None:
 
 
 @app.command()
-def run() -> None:
+def run(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    force_digest: bool = typer.Option(False, "--force", help="当日 digest を置換再生成する"),
+) -> None:
     """朝バッチ: collect→extract→analyze→digest→export→deliver→purge を直列実行。"""
-    _stub(14)
+    from ulid import ULID
+
+    from app.analysis.llm import create_engine
+    from app.config import load_config
+    from app.connectors.rss import RssConnector
+    from app.db import apply_migrations, connect
+    from app.http import HttpClient
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import run_pipeline
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    http = HttpClient()
+    run_id = str(ULID())  # ログ・digests・analyses を貫通(設計 05 §3)
+    failures = run_pipeline(
+        conn,
+        config,
+        {"rss": RssConnector(http)},  # X コネクタは plan #15
+        http,
+        lambda: create_engine(config.llm.engine),
+        logger,
+        run_id,
+        force_digest=force_digest,
+    )
+    if failures:
+        typer.echo(f"失敗した段: {', '.join(failures)}(run_id={run_id})", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"run 完了(run_id={run_id})")
 
 
 @app.command()
