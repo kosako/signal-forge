@@ -19,6 +19,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 from app.config import Config
 from app.db import insert_item_with_dedup
@@ -252,8 +253,11 @@ def _handle_message(
     if inserted:
         note = f"(ほか{known}件は投入済み)" if known else ""
         reply(f"✅ {inserted}件受け付けました。明朝のダイジェストで分析します{note}")
-    else:
+    elif known:
         reply(f"投入済みです({known}件)")
+    else:
+        # 抽出はされたが全件が正規化 reject(userinfo・不正ポート・host なし等)
+        reply("有効な URL がありませんでした")
 
 
 def _ingest_manual_urls(
@@ -274,12 +278,17 @@ def _ingest_manual_urls(
     seen: set[str] = set()
     for url in urls:
         try:
-            # 短縮 URL 展開はしない(poller の外向き HTTP を Telegram API のみに保つ)
+            # 短縮 URL 展開はしない(poller の外向き HTTP を Telegram API のみに保つ。
+            # 設計 01 §4 の resolver 注入を manual では使わない例外 — 同 §4 に明記)
             canonical = normalize_url(url)
         except Exception as e:
             logger.warning(
                 f"URL 正規化失敗のため skip: {type(e).__name__}", extra={"stage": "poll"}
             )
+            continue
+        if not urlsplit(canonical).hostname:
+            # `https://?x=1` 等の host なし URL は normalize を素通りするため明示拒否
+            logger.warning("host のない URL のため skip", extra={"stage": "poll"})
             continue
         if canonical in seen:  # 同一メッセージ内の重複は1件として扱う
             continue

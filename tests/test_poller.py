@@ -331,6 +331,31 @@ def test_message_without_url_gets_guide(conn, tmp_path, no_url_text) -> None:
     assert api.sent == [(CHAT_ID, "URL を送ると翌朝のダイジェスト候補になります")]
 
 
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://alice:secret@example.com/a",  # userinfo(credential 漏えい防止で reject)
+        "https://example.com:99999/a",  # 不正ポート
+        "https://?x=1",  # host なし
+    ],
+)
+def test_invalid_urls_rejected_with_reply(conn, tmp_path, invalid_url) -> None:
+    api = FakeApi([[make_message_update(invalid_url)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == [(CHAT_ID, "有効な URL がありませんでした")]
+
+
+def test_channel_post_is_ignored(conn, tmp_path) -> None:
+    api = FakeApi([[{
+        "update_id": 1,
+        "channel_post": {"text": "https://example.com/a", "chat": {"id": CHAT_ID}},
+    }]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert manual_items(conn) == []
+    assert api.sent == []
+
+
 def test_non_owner_message_discarded_without_reply(conn, tmp_path) -> None:
     api = FakeApi([[make_message_update("https://example.com/a", from_id=999)]])
     poll_once(conn, make_config(tmp_path), api, logger)
