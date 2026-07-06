@@ -219,8 +219,8 @@ def _record_reaction(
     logger: logging.Logger,
 ) -> None:
     # 検証+INSERT を answer より先に行う(ローカル SQLite でミリ秒オーダー。10秒失効に
-    # 対して十分速く、「DB 書込失敗時のみ ⚠️ を返す」(設計 04 §3)は answer 1回の制約上
-    # 書込を先にしないと満たせない)
+    # 対して十分速く、「記帳できたら記録しました / 記帳できなければ警告」を answer 1回の
+    # 制約(設計 04 §3)で満たすには書込を先にする必要がある)
     digest_date = _digest_date_of_item(conn, item_id)
     if digest_date is None:
         # 古いメッセージ・偽造 data を KPI 分母に入れない(設計 04 §3)
