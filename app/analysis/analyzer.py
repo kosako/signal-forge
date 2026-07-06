@@ -117,12 +117,13 @@ def _analyze_chunk(
         for row in rows:
             if row["id"] in results:
                 continue
-            single = _reanalyze_single(
+            analysis, single_hash = _reanalyze_single(
                 config, engine, profile_body, recent_titles, row, logger, run_id
             )
-            if single is not None:
-                results[row["id"]] = single[0]
-                hashes[row["id"]] = single[1]
+            # degraded になっても「実際に渡した入力」= 単発プロンプトの hash を記録する
+            hashes[row["id"]] = single_hash
+            if analysis is not None:
+                results[row["id"]] = analysis
 
     # 分析結果の挿入と items の状態遷移を同一トランザクションで確定する
     # (別々だと途中クラッシュで status='new' のまま analyses だけ残り、再実行時に
@@ -138,7 +139,7 @@ def _analyze_chunk(
                 )
                 counts["analyzed"] += 1
             else:
-                _insert_degraded(conn, row, engine, chunk_hash, run_id)
+                _insert_degraded(conn, row, engine, hashes.get(row["id"], chunk_hash), run_id)
                 counts["degraded"] += 1
             conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (row["id"],))
         conn.execute("COMMIT")
@@ -160,8 +161,10 @@ def _reanalyze_single(
     row: sqlite3.Row,
     logger: logging.Logger,
     run_id: str | None,
-) -> tuple[ItemAnalysis, str] | None:
+) -> tuple[ItemAnalysis | None, str]:
+    """(分析結果 or None, 単発プロンプトの hash)。hash は失敗時も provenance 用に返す。"""
     prompt = build_prompt(config, profile_body, recent_titles, [row])
+    prompt_hash = _prompt_hash(prompt)
     try:
         batch = complete_with_retry(engine, prompt, AnalysisBatch)
     except LLMError as e:
@@ -169,11 +172,11 @@ def _reanalyze_single(
             f"単発再分析も失敗(degraded 記録): {e}",
             extra={"run_id": run_id, "stage": "analyze", "item_id": row["id"]},
         )
-        return None
+        return None, prompt_hash
     for result in batch.results:
         if result.item_id == row["id"]:
-            return result, _prompt_hash(prompt)
-    return None
+            return result, prompt_hash
+    return None, prompt_hash
 
 
 # --- プロンプト構築(設計 03 §3.1〜3.2) ---
