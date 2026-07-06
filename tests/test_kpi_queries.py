@@ -206,6 +206,24 @@ def test_phase2_not_ready_with_unanswered_digs(conn) -> None:
     assert row["phase2_ready"] == 1  # 9件中5件 yes(>=50%)
 
 
+def test_weekly_summary_empty_window_returns_zeroes(tmp_path) -> None:
+    # 直近7日に配信済み digest がなくても NULL でなく 0 を返す(fail-closed の判定を壊さない)
+    db_path = tmp_path / "empty.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    row = conn.execute(
+        (KPI_DIR / "08-weekly-summary.sql").read_text(encoding="utf-8")
+    ).fetchone()
+    conn.close()
+    assert (
+        row["delivered_days"],
+        row["reacted_days"],
+        row["kpi_met_days"],
+        row["invalid_days"],
+        row["week_fail_closed"],
+    ) == (0, 0, 0, 0, 0)
+
+
 def test_retap_uses_latest_reaction(conn) -> None:
     # items[3](noise)を useful に押し直すと positive が増える(最新採用の検証)
     item = conn.execute(

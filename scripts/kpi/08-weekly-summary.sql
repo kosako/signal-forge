@@ -23,9 +23,9 @@ daily AS (
     AND digests.digest_date >= date('now', '+9 hours', '-7 days')  -- JST 暦日
   GROUP BY digests.digest_date, digests.item_count
 )
-SELECT count(*)                       AS delivered_days,
-       sum(reacted > 0)               AS reacted_days,
-       sum(kpi_met)                   AS kpi_met_days,
-       sum(invalid_day)               AS invalid_days,
-       (sum(invalid_day) >= 3)        AS week_fail_closed
+SELECT count(*)                                 AS delivered_days,
+       coalesce(sum(reacted > 0), 0)            AS reacted_days,
+       coalesce(sum(kpi_met), 0)                AS kpi_met_days,
+       coalesce(sum(invalid_day), 0)            AS invalid_days,
+       (coalesce(sum(invalid_day), 0) >= 3)     AS week_fail_closed
 FROM daily;
