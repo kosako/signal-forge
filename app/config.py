@@ -58,7 +58,8 @@ class TelegramConfig:
 
 @dataclass(frozen=True)
 class ObsidianConfig:
-    vault_path: str | None = None  # 宿題 H4 確定までは未設定を許容(#13 が要求)
+    vault_path: str | None = None  # 宿題 H4 確定までは未設定を許容(export 実行時に要求)
+    folder: str = "SignalForge"  # Vault 内の出力フォルダ(設計 04 §7)
 
 
 @dataclass(frozen=True)
