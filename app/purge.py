@@ -5,7 +5,7 @@
    超過の全行(status・documents の有無を問わない)に適用する
    (documents 起点だと documents を持たない items が漏れ、特に X の full_text の
    無期限残存は本文非保持ポリシー違反になる)
-3. 削除行が 1,000 行を超えた回は VACUUM
+3. 削除行+NULL 化行の合計が 1,000 行を超えた回は VACUUM(空き回収の意図)
 """
 
 from __future__ import annotations
