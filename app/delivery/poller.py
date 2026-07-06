@@ -2,8 +2,11 @@
 
 - getUpdates long polling(50s)。offset は telegram_state に永続化し、再起動で
   取りこぼし・二重処理しない(at-least-once。signals は追記型なので重複は集計側で吸収)
-- callback 処理順: ①認可(from.id)→ ②即 answerCallbackQuery(10秒失効対策)→
-  ③検証(item 実在+digests 帰属)→ ④signals INSERT → ⑤editMessageReplyMarkup で ✓
+- callback 処理順: ①認可(from.id)→ ②検証(item 実在+digests 帰属)→
+  ③signals INSERT → ④結果に応じて answerCallbackQuery(成功=記録しました /
+  DB 失敗=⚠️ 記録失敗。answer は 1 callback 1回のため記帳を先に行う。
+  ローカル SQLite はミリ秒オーダーで10秒失効に間に合う)→
+  ⑤editMessageReplyMarkup で ✓
 - message 処理(URL 投入。設計 02 §4 / 04 §5): owner の平文メッセージから http/https
   URL を抽出し items(source=manual)へ投入して即 ACK。重複判定は canonical_url のみ
   (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)

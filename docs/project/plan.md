@@ -186,7 +186,7 @@
   - [ ] ヘッダ1通+アイテム最大 `digest.max_items` 通(既定10)(HTML・エスケープ規定・1通1000字切り詰め・4ボタン InlineKeyboard)
   - [ ] URL は items.canonical_url のみ使用(LLM 出力 URL 不使用)
   - [ ] digest_messages 台帳による未送信のみ再送、送信完了で delivery_status='sent'
-  - [ ] 送信リトライ(3回・429 は retry_after)。全滅時は `delivery_status='failed'` のまま終了(export は deliver の前段で完了済み。ステージ順序の正本は設計 00 §2: collect→extract→analyze→digest→export→deliver→purge)
+  - [ ] 送信リトライ(3回・429 は retry_after)。全滅時は `delivery_status='failed'` のまま終了(export は deliver の前段で完了済み。ステージ順序の正本は設計 00 §2: collect→extract→analyze→digest→export→deliver→purge→backup)
 - **依存**: #12
 - **参照**: 設計 04 §1〜2 / 設計 05 §8
 
@@ -194,7 +194,7 @@
 - **目的**: 4ボタン反応を KPI 測定可能にする常駐受信経路を作る。
 - **完了条件**:
   - [ ] getUpdates long polling(50s)+ offset の telegram_state 永続化+再起動で取りこぼしなし
-  - [ ] callback 処理: 即 answerCallbackQuery → item_id の実在+digests 帰属検証 → signals INSERT(追記型)→ editMessageReplyMarkup で ✓ 反映
+  - [ ] callback 処理: item_id の実在+digests 帰属検証 → signals INSERT(追記型)→ 結果に応じて answerCallbackQuery(成功/⚠️ 記録失敗)→ editMessageReplyMarkup で ✓ 反映
   - [ ] allowlist 認可(from.id 検証)。不一致は WARN 1行ログのみで無応答破棄
   - [ ] callback_data 形式(`s:{item_id}:{up|dig|knw|no}` ほか)が64バイト以内
 - **依存**: #16

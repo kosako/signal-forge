@@ -42,8 +42,8 @@
 
 ### 2プロセスの責務分離
 
-- **朝バッチ** `intel run`: **collect → extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload 削除)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
-- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 即 answerCallbackQuery 後に signals へ記録 (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
+- **朝バッチ** `intel run`: **collect → extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload 削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
+- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(answer は 1 callback に1回しか返せないため、「DB 書込失敗時のみ ⚠️」を満たすには記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
 
 ## 3. モジュール構成と依存方向
@@ -56,7 +56,8 @@ app/
   config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
   db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
   models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
-  connectors/     # x.py, rss.py, manual.py — items を produce(カーソル・冪等)
+  connectors/     # x.py(plan #15 予定), rss.py — items を produce(カーソル・冪等)
+                  #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
   analysis/       # llm.py(LLMEngine 抽象層)+ analyzer.py — analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
@@ -77,7 +78,7 @@ tests/
 
 ## 4. 設定・secrets 管理
 
-- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 日次取得上限、配信時刻・夜アンケート時刻、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
+- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 日次取得上限、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
 - **secrets**: `~/.config/intel/.env`(chmod 600)に X API キー・Telegram bot token。launchd の plist には secrets を書かない(plist は誰でも読めるため)。
 - **ANTHROPIC_API_KEY は launchd 実行環境に載せない**(理由: claude -p が API 課金へ無自覚フォールバックするのを設定で遮断)。API エンジンを明示使用する場合のみ .env に別名キーで持ち、AnthropicApiEngine 内でだけ環境へ渡す。
 - `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コスト見込みとクォータ消費率。
@@ -112,6 +113,7 @@ class LLMEngine(Protocol):
 | 本文抽出失敗 | extraction_status=failed のままタイトル+メタで degraded 分析に回す(黙って脱落させない) |
 | LLM 失敗 | §5 のリトライ→degraded ダイジェスト |
 | Telegram 送信失敗 | 指数バックオフで3回。export は deliver より前段(§2 の順序)なので Obsidian への蓄積は完了済み。全滅時は `delivery_status='failed'` のまま終了し、再走時に digest_messages 台帳で未送信のみ再送(SQLite が正本なので再送可能) |
+| Telegram 完全未設定 | deliver 段を skip(WARN ログ)。M2a 前の未セットアップ状態を段失敗にしない。欠落検知は doctor #4 の責務(設計 05 §2) |
 | 朝バッチ全体の異常終了 | watchdog(受信デーモン `intel poll` の内蔵タイマー。7:15 JST に digests の当日行を確認)が未生成を検知し Telegram に通知 |
 | 受信デーモン死亡 | launchd KeepAlive が再起動。getUpdates は offset カーソルで再開(取りこぼしなし) |
 

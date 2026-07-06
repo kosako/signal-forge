@@ -10,7 +10,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ### 1.1 朝バッチ `com.intel.morning`
 
-- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→extract→analyze→digest→export→deliver→purge** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。
+- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→extract→analyze→digest→export→deliver→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。
 - `StartCalendarInterval`: 06:30 JST(配信 7:00 の30分前。LLM バッチと X ページングの余裕をみる)。
 - **再起動方針: 自動再実行しない**。`intel run` は冪等(sources のカーソル管理+items の content_hash 重複排除)なので失敗時は手動 `intel run` で安全に再走できる。自動リトライを launchd に持たせない理由: 二重課金・二重配信の検知より、watchdog 通知→手動再走の方が単純で事故が少ない。
 - スリープ対策: `sudo pmset repeat wakeorpoweron MTWRFSU 06:25:00`。StartCalendarInterval はスリープ中スキップされるため wake を先に確保する。
@@ -20,7 +20,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 - `ProgramArguments`: `[uv, run, intel, poll]`(Telegram long polling 常駐。ボタン反応・手動 URL・夜アンケートを受信し signals / items に記録)。
 - **再起動方針: `KeepAlive: true` + `ThrottleInterval: 30`**。クラッシュしても callback query の取りこぼしを最小化するため常時復帰。連続クラッシュ(30秒間に再起動が繰り返される状態)は launchd が抑制し、doctor と watchdog で検知する。
-- 夜アンケート送信(**21:30 JST 仮**、config で変更可。設計 04 §4 と同一方式・同一時刻)と watchdog(7:15 JST に digests の当日行を確認、無ければ失敗通知)はポーラー内のタイマーで実行する。理由: plist を2枚に抑え、Telegram 送信経路を1プロセスに集約するため(別 launchd ジョブによる `--survey` 起動は採らない)。送信ロジック自体は `delivery/telegram.py` の関数(実装の置き場は 04 が正本)。
+- 夜アンケート送信(**21:30 JST 仮**、config で変更可。設計 04 §4 と同一方式・同一時刻)と watchdog(7:15 JST に digests の当日行を確認、無ければ失敗通知)はポーラー内のタイマーで実行する。`telegram.watchdog_time` は**配信時刻+15分程度に設定する前提**(それ以前だと朝バッチ未完の時点で確認が走り誤通知になる)。理由: plist を2枚に抑え、Telegram 送信経路を1プロセスに集約するため(別 launchd ジョブによる `--survey` 起動は採らない)。送信ロジック自体は `delivery/telegram.py` の関数(実装の置き場は 04 が正本)。
 
 ### 1.3 事前セットアップ(doctor で検査)
 
@@ -42,7 +42,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 8 | launchd 2ジョブのロード状態(`launchctl print`) | WARN |
 | 9 | 当月コスト見込み(analyses.estimated_cost 合算+X 読取件数×単価)と $30 比 | 超過ペースで WARN |
 | 10 | バックアップ最新世代の日付(48h 超で WARN)+アーカイブのパーミッション(600 以外は WARN) | WARN |
-| 11 | documents の TTL 超過残存件数+X 由来 `items.raw_payload` の TTL 超過残存件数(削除経路の故障検知。01 §6) | WARN |
+| 11 | documents の TTL 超過残存件数+**全ソース**の `items.raw_payload` の TTL 超過残存件数(ソース別 TTL — X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days` — で判定。削除経路の故障検知。01 §6) | WARN |
 | 12 | 環境に `ANTHROPIC_API_KEY` が存在したら WARN(無自覚 API 課金防止) | WARN |
 
 ## 3. ログ設計
@@ -89,10 +89,10 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 |---|---|---|---|
 | HTTP 取得(RSS・本文・X) | connect 10s / read 30s | 2回、指数バックオフ(1s→4s)+ jitter | 429 は Retry-After 尊重。恒久 4xx はリトライしない |
 | LLM `complete_structured` | 120s/呼 | 同一エンジン1回(失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。なお失敗は degraded 直行(エンジンフォールバックは拡張点。設計 00 §5) |
-| Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ |
+| Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |
 
-- **SSRF ガード(外部 URL を fetch する全経路の共通 HTTP クライアント規約)**: 本文抽出・短縮 URL 展開・RSS 取得を含むすべての外向き HTTP は、**DNS 解決後の接続先 IP が private / loopback / link-local 帯なら接続を拒否**し、**リダイレクト追跡の各ホップで再検査**する(悪意ある RSS entry・短縮 URL のリダイレクト先から、常時稼働機の LAN 内・localhost へのプローブを遮断)。
+- **SSRF ガード(外部 URL を fetch する全経路の共通 HTTP クライアント規約)**: 本文抽出・短縮 URL 展開・RSS 取得を含むすべての外向き HTTP は、**DNS 解決後の接続先 IP が global でなければ接続を拒否する(`is_global` を基本にした allowlist 方式。private / loopback / link-local に加え shared address space 100.64.0.0/10 等のブラックリスト漏れも遮断)**。**リダイレクト追跡の各ホップで再検査**し(悪意ある RSS entry・短縮 URL のリダイレクト先から、常時稼働機の LAN 内・localhost へのプローブを遮断)、接続は**検証済み IP にピン留め**する(URL ホストを IP に書き換え、Host ヘッダ+SNI で元ホスト名を維持。検証と接続で DNS を別々に引くと、1回目 public・2回目 private を返す DNS rebinding で検査を回避できるため)。
 - 原則: **リトライはステージ内で完結**させ、ステージをまたぐ再実行は冪等な `intel run` 全体の手動再走に一本化する(部分再開の状態管理を持たない)。
 - 個別ソースの失敗はそのソースをスキップして続行し、sources の成否時刻・consecutive_failures に記録(1本の死んだ RSS で朝が全滅しないため)。
 

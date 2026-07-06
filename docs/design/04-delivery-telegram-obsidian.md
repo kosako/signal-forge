@@ -40,7 +40,7 @@
 - **callback_data 形式**(64バイト制限内・ASCII のみ):
   - 反応ボタン: `s:{item_id}:{up|dig|knw|no}`(👍🔖✅👎に対応)
   - 夜アンケート: `q1:{YYYYMMDD}:{y|n}` / `q2:{YYYYMMDD}:{分}` / 深掘り追い掛け: `f:{item_id}:{y|n}`
-- 処理順は **①即 answerCallbackQuery(10秒失効対策)→ ② signals に INSERT → ③ editMessageReplyMarkup で選択状態を反映**(選ばれたボタンに `✓` を付けた盤面に差し替え)。
+- 処理順は **①検証+signals に INSERT → ②結果に応じて answerCallbackQuery(成功 = `記録しました` / DB 書込失敗 = `⚠️ 記録失敗`)→ ③ editMessageReplyMarkup で選択状態を反映**(選ばれたボタンに `✓` を付けた盤面に差し替え)。answerCallbackQuery は 1 callback につき 1 回しか返せないため、「DB 書込失敗時のみ ⚠️ を返す」は記帳を answer より先に行わないと満たせない(ローカル SQLite はミリ秒オーダーで、10秒失効に十分間に合う)。
 - **INSERT 前の検証**: パースした item_id が items に実在し、かつ**いずれかの `digests.item_ids` に含まれる**ことを確認してから signals に書く(signal_date の帰属=その digest_date もこの照合で同時に解決)。不一致・不正形式の callback_data は記帳せずログのみ(古いメッセージや偽造データで KPI 分母外に記帳されるのを防ぐ)。
 - **押し直し許容**: signals は追記型(append-only)で記録し、KPI 集計時は item ごとの最新レコードを採用 — 誤タップを訂正可能にしつつ履歴を失わない。
 - answerCallbackQuery の text は短く(例: `👍 記録しました`)。DB 書込失敗時のみ `⚠️ 記録失敗、もう一度` を返す。
@@ -80,9 +80,9 @@ title: "…"
 url: https://…          # DB の正規 URL のみ
 source: TechCrunch
 source_type: rss        # x / rss / manual
-published: 2026-07-04
+published: 2026-07-04T09:30:00Z   # items.published_at(ISO タイムスタンプ)をそのまま
 digest_date: 2026-07-05
-score: 0.82
+score: 82.0             # analyses.total_score(0〜100)をそのまま
 reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予約フィールド
 ---
 <!-- GENERATED:BEGIN -->
@@ -92,6 +92,8 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 …(RSS/manual のみ。X 由来は保持ポリシー上ここを出力しない)
 ## 推薦理由
 …
+## 示唆
+…(自分への示唆 1文)
 <!-- GENERATED:END -->
 
 (この下は手書きメモ領域。再生成でも保持される)
