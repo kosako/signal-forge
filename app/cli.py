@@ -19,7 +19,7 @@ def collect(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """全ソース(X・RSS)から items を取り込む。"""
-    # import は実行時(スタブ含む他コマンドの --help を httpx 等に依存させない)
+    # import は実行時(他コマンドの --help を httpx 等の重い依存に触れさせない)
     from app.collect import collect_all
     from app.config import load_config
     from app.connectors.rss import RssConnector
