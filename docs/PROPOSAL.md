@@ -186,7 +186,7 @@ X 前提が崩れたらここで企画を止める。**実測項目と合否基�
 - **接続方式: long polling 固定**(受信ポートを開けない。webhook は外部公開が必要なため不採用)。
 - **受信デーモンは朝バッチと別の常駐プロセス**(launchd KeepAlive で監視)。callback query は約10秒で失効するため、周期バッチでは構造的に応答できない。
 - 配信は **1アイテム=1メッセージ+ボタン**(ヘッダ+最大10通。1メッセージ4096字制限対応)。
-- callback_data は **64バイト以内**(item ID のみ格納)。callback 受信時は**即 answerCallbackQuery してから DB 書き込み**。
+- callback_data は **64バイト以内**(item ID のみ格納)。callback 受信時は**検証+DB 記帳を先に行い、結果に応じて answerCallbackQuery**(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告)。answer は 1 callback に1回しか返せないため記帳を先にする(ローカル SQLite はミリ秒オーダーで10秒失効に間に合う。実装詳細は設計 04 §3)。
 - **認可**: 所有者の Telegram user_id / chat_id の **allowlist** を持ち、それ以外からの message・callback_query は記録のみして破棄する(callback は from.id で検証)。第三者による URL 投入(悪意コンテンツのパイプライン注入)と KPI 汚染を遮断。
 - bot token 漏洩時: BotFather で revoke → 再発行(運用手順として明記)。
 
