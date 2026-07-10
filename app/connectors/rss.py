@@ -47,7 +47,11 @@ class RssConnector:
 
         if response.status_code == 304:
             stats = FetchStats(
-                items_fetched=0, api_reads=0, http_status=304, duration_ms=duration_ms
+                items_fetched=0,
+                api_reads=0,
+                estimated_cost_usd=0.0,
+                http_status=304,
+                duration_ms=duration_ms,
             )
             return FetchResult(items=[], next_cursor=cursor, stats=stats)
         if response.status_code == 410:
@@ -80,6 +84,7 @@ class RssConnector:
             stats=FetchStats(
                 items_fetched=len(items),
                 api_reads=0,
+                estimated_cost_usd=0.0,
                 http_status=response.status_code,
                 duration_ms=duration_ms,
             ),

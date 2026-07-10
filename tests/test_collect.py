@@ -42,7 +42,11 @@ class FakeConnector:
             items=self.items,
             next_cursor=self.next_cursor,
             stats=FetchStats(
-                items_fetched=len(self.items), api_reads=0, http_status=200, duration_ms=5
+                items_fetched=len(self.items),
+                api_reads=0,
+                estimated_cost_usd=0.0,
+                http_status=200,
+                duration_ms=5,
             ),
         )
 

@@ -92,7 +92,12 @@ def _collect_source(
             estimated_cost_usd = ?
         WHERE id = ?
         """,
-        (result.stats.items_fetched, result.stats.api_reads, 0.0, run_row_id),
+        (
+            result.stats.items_fetched,
+            result.stats.api_reads,
+            result.stats.estimated_cost_usd,  # X は api_reads×単価、RSS は 0.0(設計 02 §2)
+            run_row_id,
+        ),
     )
     logger.info(
         "collect 完了",
