@@ -1,8 +1,11 @@
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 
+from app.cli import _build_connectors
+from app.config import Config, XConfig
 from app.connectors.base import FatalError, RetryableError
 from app.connectors.x import (
     XConnector,
@@ -10,7 +13,11 @@ from app.connectors.x import (
     build_x_connector,
     has_x_credentials,
 )
+from app.http import HttpClient
 from app.models import Source
+
+FULL_ENV = {k: "v" for k in
+            ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
 
 CREDS = XCredentials(
     api_key="ck", api_secret="cs", access_token="at", access_token_secret="ats"
@@ -56,24 +63,35 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
 
 def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
                    unit_price=0.004, seen=None) -> XConnector:
-    """pages: 各 timeline リクエストが返す (status, body_dict, headers) のリスト。"""
-    calls = {"timeline": 0}
+    """pages[i] = (status, body_dict, headers)。timeline リクエストは pagination_token で
+    index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。200 応答は
+    max_results で data を切り詰めて実 API の挙動を模す。"""
+    token_index = {
+        body.get("meta", {}).get("next_token"): i + 1
+        for i, (_s, body, _h) in enumerate(pages)
+        if body.get("meta", {}).get("next_token")
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        path = urlsplit(str(request.url)).path
+        split = urlsplit(str(request.url))
         if seen is not None:
             seen.append(request)
-        if path.endswith("/users/me"):
+        if split.path.endswith("/users/me"):
             return httpx.Response(200, json={"data": {"id": me_id}})
-        idx = calls["timeline"]
-        calls["timeline"] += 1
-        status, body, headers = pages[idx]
+        query = parse_qs(split.query)
+        token = query.get("pagination_token", [None])[0]
+        status, body, headers = pages[0 if token is None else token_index[token]]
+        if status == 200:
+            limit = int(query.get("max_results", ["100"])[0])
+            body = {**body, "data": body.get("data", [])[:limit]}
         return httpx.Response(status, json=body, headers=headers)
 
-    client = httpx.Client(transport=httpx.MockTransport(handler))
     return XConnector(
-        client=client, credentials=CREDS,
-        daily_read_cap=daily_read_cap, unit_price_usd=unit_price,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=CREDS,
+        daily_read_cap=daily_read_cap,
+        unit_price_usd=unit_price,
+        sleep=lambda _s: None,
     )
 
 
@@ -82,8 +100,7 @@ def test_basic_fetch_parses_and_costs() -> None:
         [tweet("300", "こんにちは"), tweet("299", "ふたつめ", author="a2")],
         users={"a1": "alice", "a2": "bob"},
     )
-    conn = connector_from([(200, body, {})])
-    result = conn.fetch(make_source(), {})
+    result = connector_from([(200, body, {})]).fetch(make_source(), {})
 
     assert result.stats.items_fetched == 2
     assert result.stats.api_reads == 2
@@ -99,37 +116,42 @@ def test_basic_fetch_parses_and_costs() -> None:
     assert result.next_cursor == {"since_id": "300"}  # 最大 tweet id
 
 
-def test_pagination_stops_at_daily_read_cap() -> None:
-    p1 = page([tweet(str(400 - i), "t") for i in range(100)], next_token="tok1")
-    p2 = page([tweet(str(300 - i), "t") for i in range(100)], next_token="tok2")
-    # cap=150 なら 2ページ(200件)取得後に cap 到達で3ページ目は取りに行かない
-    conn = connector_from([(200, p1, {}), (200, p2, {})], daily_read_cap=150)
-    result = conn.fetch(make_source(), {})
-    assert result.stats.api_reads == 200
-    assert result.next_cursor == {"since_id": "400"}
+def test_pagination_hard_caps_at_daily_read_cap() -> None:
+    seen: list[httpx.Request] = []
+    p1 = page([tweet(str(500 - i), "t") for i in range(100)], next_token="tok1")
+    p2 = page([tweet(str(400 - i), "t") for i in range(100)], next_token="tok2")
+    result = connector_from(
+        [(200, p1, {}), (200, p2, {})], daily_read_cap=130, seen=seen
+    ).fetch(make_source(), {})
+    assert result.stats.api_reads == 130  # ちょうど cap。超過しない
+    timeline = [r for r in seen if "timelines" in str(r.url)]
+    assert parse_qs(urlsplit(str(timeline[-1].url)).query)["max_results"] == ["30"]  # 残枠
 
 
 def test_rate_limit_remaining_zero_stops() -> None:
     p1 = page([tweet("500", "t")], next_token="tok1")
-    conn = connector_from([(200, p1, {"x-rate-limit-remaining": "0"})])
-    result = conn.fetch(make_source(), {})
-    # 残0で打ち切り。next_token があっても2ページ目は取らない
-    assert result.stats.api_reads == 1
+    result = connector_from([(200, p1, {"x-rate-limit-remaining": "0"})]).fetch(make_source(), {})
+    assert result.stats.api_reads == 1  # 残0で打ち切り。next_token があっても2ページ目は取らない
 
 
 def test_no_next_token_stops() -> None:
     p1 = page([tweet("500", "t")])  # next_token なし = TL 末尾 / since_id 到達
-    conn = connector_from([(200, p1, {})])
-    result = conn.fetch(make_source(), {})
+    result = connector_from([(200, p1, {})]).fetch(make_source(), {})
     assert result.stats.api_reads == 1
     assert result.next_cursor == {"since_id": "500"}
 
 
+def test_empty_page_stops_even_with_next_token() -> None:
+    p1 = page([], next_token="tok1")  # 空ページに next_token → ループさせない
+    result = connector_from([(200, p1, {})]).fetch(make_source(), {"since_id": "900"})
+    assert result.items == []
+    assert result.stats.api_reads == 0
+    assert result.next_cursor == {"since_id": "900"}  # 取得ゼロなら据え置き
+
+
 def test_retweet_normalizes_to_original() -> None:
     body = page([tweet("600", "RT @x: ...", retweeted="42")], users={"a1": "alice"})
-    conn = connector_from([(200, body, {})])
-    result = conn.fetch(make_source(), {})
-    (rt,) = result.items
+    (rt,) = connector_from([(200, body, {})]).fetch(make_source(), {}).items
     assert rt.external_id == "42"  # 元ツイに寄せて dedup
     assert rt.url == "https://x.com/i/web/status/42"
     assert rt.meta == {"retweet": True, "reply": False}
@@ -141,68 +163,92 @@ def test_reply_to_other_excluded_but_self_reply_kept() -> None:
         tweet("701", "自分宛リプライ", in_reply_to="me"),
         tweet("702", "通常ポスト"),
     ])
-    conn = connector_from([(200, body, {})], me_id="me")
-    result = conn.fetch(make_source(), {})
-    kept = {i.external_id for i in result.items}
-    assert kept == {"701", "702"}  # 他人宛リプライ(700)は除外
+    result = connector_from([(200, body, {})], me_id="me").fetch(make_source(), {})
+    assert {i.external_id for i in result.items} == {"701", "702"}  # 他人宛(700)は除外
     assert result.stats.api_reads == 3  # 除外しても読取件数(課金)は3
 
 
 def test_since_id_passed_as_param() -> None:
     seen: list[httpx.Request] = []
-    body = page([tweet("800", "t")])
-    conn = connector_from([(200, body, {})], seen=seen)
-    conn.fetch(make_source(), {"since_id": "790"})
-    timeline_req = next(r for r in seen if "timelines" in str(r.url))
-    assert parse_qs(urlsplit(str(timeline_req.url)).query)["since_id"] == ["790"]
+    connector_from([(200, page([tweet("800", "t")]), {})], seen=seen).fetch(
+        make_source(), {"since_id": "790"}
+    )
+    timeline = next(r for r in seen if "timelines" in str(r.url))
+    assert parse_qs(urlsplit(str(timeline.url)).query)["since_id"] == ["790"]
 
 
-def test_empty_timeline_keeps_cursor() -> None:
-    conn = connector_from([(200, page([]), {})])
-    result = conn.fetch(make_source(), {"since_id": "900"})
-    assert result.items == []
-    assert result.stats.api_reads == 0
-    assert result.next_cursor == {"since_id": "900"}  # 取得ゼロなら据え置き
+def test_first_page_429_is_retryable_not_silent_success() -> None:
+    # page1 の 429 を「0件成功」で返すと consecutive_failures がリセットされ障害を隠す
+    conn = connector_from([(429, {}, {})], daily_read_cap=130)
+    with pytest.raises(RetryableError, match="429"):
+        conn.fetch(make_source(), {})
+
+
+def test_429_after_first_page_returns_partial() -> None:
+    p1 = page([tweet("500", "t")], next_token="tok1")
+    result = connector_from([(200, p1, {}), (429, {}, {})], daily_read_cap=500).fetch(
+        make_source(), {}
+    )
+    assert result.stats.api_reads == 1  # 1ページ取得後の 429 → 既取得分を返す
+    assert result.next_cursor == {"since_id": "500"}
 
 
 def test_auth_error_is_fatal() -> None:
-    conn = connector_from([(200, page([]), {})], me_id="me")
-
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={})
 
-    conn._client = httpx.Client(transport=httpx.MockTransport(handler))
+    conn = XConnector(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=CREDS, daily_read_cap=130, unit_price_usd=0.004, sleep=lambda _s: None,
+    )
     with pytest.raises(FatalError, match="認証失敗"):
         conn.fetch(make_source(), {})
 
 
-def test_429_returns_partial() -> None:
-    p1 = page([tweet("500", "t")], next_token="tok1")
-    conn = connector_from([(200, p1, {}), (429, {}, {})], daily_read_cap=500)
-    result = conn.fetch(make_source(), {})
-    assert result.stats.api_reads == 1  # 1ページ取得後に 429 → 既取得分を返す
-    assert result.next_cursor == {"since_id": "500"}
-
-
 def test_5xx_on_first_page_is_retryable() -> None:
-    conn = connector_from([(503, {}, {})])
     with pytest.raises(RetryableError, match="503"):
-        conn.fetch(make_source(), {})
+        connector_from([(503, {}, {})]).fetch(make_source(), {})
 
 
 def test_5xx_after_first_page_returns_partial() -> None:
     p1 = page([tweet("500", "t")], next_token="tok1")
-    conn = connector_from([(200, p1, {}), (503, {}, {})], daily_read_cap=500)
-    result = conn.fetch(make_source(), {})
-    assert result.stats.api_reads == 1  # 途中の 5xx は既取得分で打ち切り
+    result = connector_from([(200, p1, {}), (503, {}, {})], daily_read_cap=500).fetch(
+        make_source(), {}
+    )
+    assert result.stats.api_reads == 1  # 途中の 5xx はリトライ尽き後に既取得分で打ち切り
+
+
+def test_transport_error_is_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/users/me"):
+            return httpx.Response(200, json={"data": {"id": "me"}})
+        raise httpx.ConnectError("boom")
+
+    conn = XConnector(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=CREDS, daily_read_cap=130, unit_price_usd=0.004, sleep=lambda _s: None,
+    )
+    with pytest.raises(RetryableError, match="接続失敗"):
+        conn.fetch(make_source(), {})
 
 
 def test_has_x_credentials() -> None:
-    full = {k: "v" for k in
-            ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
+    full = dict(FULL_ENV)
     assert has_x_credentials(full) is True
     del full["X_ACCESS_TOKEN"]
     assert has_x_credentials(full) is False
+
+
+def _config(x_enabled: bool) -> Config:
+    return Config(config_dir=Path("/tmp/x-test"), x=XConfig(enabled=x_enabled))
+
+
+def test_build_connectors_wires_x_only_when_enabled_and_keyed() -> None:
+    http = HttpClient()
+    assert set(_build_connectors(_config(False), FULL_ENV, http)) == {"rss"}  # X 無効
+    assert set(_build_connectors(_config(True), FULL_ENV, http)) == {"rss", "x"}  # 有効+キー
+    # 有効だがキー欠落 → X は載せず RSS は残る(縮退。欠落は doctor #5)
+    assert set(_build_connectors(_config(True), {}, http)) == {"rss"}
 
 
 def test_build_x_connector_signs_requests() -> None:

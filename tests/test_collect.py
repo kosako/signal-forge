@@ -67,6 +67,32 @@ def item(url: str, *, external_id=None, title=None, body=None) -> RawItem:
     )
 
 
+class CostFakeConnector:
+    """X 相当: api_reads と estimated_cost_usd(api_reads×単価)を返す。"""
+
+    def fetch(self, source_row, cursor):
+        return FetchResult(
+            items=[],
+            next_cursor={"since_id": "1"},
+            stats=FetchStats(
+                items_fetched=0, api_reads=50, estimated_cost_usd=0.2,
+                http_status=200, duration_ms=1,
+            ),
+        )
+
+
+def test_estimated_cost_persisted_to_collect_runs(conn: sqlite3.Connection) -> None:
+    # 監査の 0.0 ハードコード修正: コネクタの estimated_cost_usd が collect_runs に保存される
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')")
+    collect_all(conn, {"rss": FakeConnector([]), "x": CostFakeConnector()}, logger)
+    row = conn.execute(
+        "SELECT api_reads, estimated_cost_usd FROM collect_runs "
+        "WHERE source_id = (SELECT id FROM sources WHERE type='x')"
+    ).fetchone()
+    assert row["api_reads"] == 50
+    assert row["estimated_cost_usd"] == pytest.approx(0.2)
+
+
 def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:
     connector = FakeConnector([item("https://example.com/1"), item("https://example.com/2/")])
     collect_all(conn, {"rss": connector}, logger)

@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlencode
@@ -23,6 +25,7 @@ import httpx
 from oauthlib.oauth1 import Client as OAuth1Client
 
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
+from app.http import BACKOFF_S, MAX_RETRIES  # 共通リトライ規約(設計 05 §8)
 from app.models import Source
 
 API_BASE = "https://api.twitter.com/2"
@@ -51,6 +54,7 @@ class XConnector:
         credentials: XCredentials,
         daily_read_cap: int,
         unit_price_usd: float,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._client = client
         self._oauth = OAuth1Client(
@@ -61,6 +65,7 @@ class XConnector:
         )
         self._daily_read_cap = daily_read_cap
         self._unit_price = unit_price_usd
+        self._sleep = sleep
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
@@ -108,7 +113,8 @@ class XConnector:
         http_status: int | None = None
         while reads < self._daily_read_cap:
             params: dict[str, str | int] = {
-                "max_results": MAX_RESULTS,
+                # cap を1件も超えないよう残枠を上限に(設計 02 §2 / ADR 0001 予算配分)
+                "max_results": min(MAX_RESULTS, self._daily_read_cap - reads),
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
             }
@@ -119,32 +125,53 @@ class XConnector:
             response = self._request(url, params)
             http_status = response.status_code
             self._raise_for_auth(response, "timeline")
-            if response.status_code == 429:
-                break  # rate limit 到達 → 打ち切り(既取得分は返す。設計 02 §2)
             if response.status_code != 200:
-                if not tweets:  # 1ページ目から失敗なら丸ごとスキップ扱い
+                # 1ページ目から失敗(429/5xx/4xx)は「取得0件の成功」で隠さず失敗として返す
+                # (consecutive_failures を上げ doctor #5 / watchdog に拾わせる)。
+                # 既取得分があれば部分取得で打ち切り(古い側の欠落は許容。設計 02 §2)
+                if not tweets:
                     raise self._status_error(response, url)
-                break  # 途中失敗は既取得分で打ち切り(古い側の欠落は許容)
+                break
             body = response.json()
             page = body.get("data", [])
             for user in body.get("includes", {}).get("users", []):
                 users[user["id"]] = user.get("username")
             tweets.extend(page)
             reads += len(page)
+            if not page:
+                break  # 空ページ = 新規なし。next_token 循環によるループも塞ぐ
             if _rate_limit_exhausted(response):
-                break  # 残 0 → 打ち切り(15分待ちはしない)
+                break  # 残 0 → 打ち切り(15分待ちはしない。設計 02 §2)
             token = body.get("meta", {}).get("next_token")
             if not token:
                 break  # since_id 到達 / TL 末尾
         return tweets, users, reads, http_status
 
     def _request(self, url: str, params: dict[str, str | int]) -> httpx.Response:
+        """署名して GET。transport error と 5xx は共通規約でリトライ(設計 05 §8)。
+
+        429 はリトライせず即返す(rate limit は待たず打ち切る = 設計 02 §2)。
+        署名は試行ごとに引き直す(OAuth nonce/timestamp を新規にして replay 拒否を避ける)。
+        """
         full_url = f"{url}?{urlencode(params)}" if params else url
-        signed_url, headers, _ = self._oauth.sign(full_url, http_method="GET")
-        try:
-            return self._client.get(signed_url, headers=headers)
-        except httpx.HTTPError as e:
-            raise RetryableError(f"X 接続失敗: {type(e).__name__}") from e
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            signed_url, headers, _ = self._oauth.sign(full_url, http_method="GET")
+            try:
+                response = self._client.get(signed_url, headers=headers)
+            except httpx.HTTPError as e:
+                last_error = RetryableError(f"X 接続失敗: {type(e).__name__}")
+                self._backoff(attempt)
+                continue
+            if response.status_code >= 500 and attempt < MAX_RETRIES:
+                self._backoff(attempt)
+                continue
+            return response
+        raise last_error  # transport error のリトライ尽き(直前 continue で必ず設定済み)
+
+    def _backoff(self, attempt: int) -> None:
+        if attempt < MAX_RETRIES:
+            self._sleep(BACKOFF_S[attempt] + random.random())
 
     @staticmethod
     def _raise_for_auth(response: httpx.Response, where: str) -> None:
@@ -153,7 +180,8 @@ class XConnector:
 
     @staticmethod
     def _status_error(response: httpx.Response, url: str) -> Exception:
-        if response.status_code >= 500:
+        # 429(rate limit)・5xx は一時的 → リトライ対象。他の 4xx は恒久
+        if response.status_code == 429 or response.status_code >= 500:
             return RetryableError(f"X が HTTP {response.status_code}: {url}")
         return FatalError(f"X が HTTP {response.status_code}: {url}")
 
