@@ -44,9 +44,11 @@ class Connector(Protocol):
 
 ## 2. X コネクタ(`connectors/x.py`)
 
-- **エンドポイント**: `GET /2/timelines/reverse_chronological`(逆時系列ホームTL)のみ。パラメータ: `max_results=100`, `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。単価は Day 0 実測(Posts Read $0.005/件の可能性が高い。PROPOSAL §Day 0 ゲート)。
-- **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。$0.005 想定なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
-- **rate limit**: 期待値 5 req/15min。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。
+> **ADR 0001(2026-07-10)で拡張・訂正**: Day 0 実測(実効単価 ≈ $0.004/件・rate limit home 180/15min)を受け、X ソースは「ホームTLのみ」から **ホームTL + AI 検索(`/2/tweets/search/recent`・3スロット固定)** に拡張(検索の詳細は ADR 0001 / Issue #57)。旧記載の rate limit「5 req/15min」「単価 $0.005 想定」は下記のとおり実測値に更新。読取コストは**ホームTL + 検索の合算日次上限**で月 $20 以内に管理する(3スロット固定はクエリ本数の上限でありコスト上限ではない。ADR 0001「予算配分」)。
+
+- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results=100`, `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは Issue #57 で追加。
+- **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。実測 $0.004 なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
+- **rate limit**: **実測 home 180/15min**(Day 0。旧記載 5/15min は誤り)。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。実測上は cap 130 が rate limit の制約を受けない。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
 - **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外(meta に記録)。理由: ノイズ率対策の最安の一手。
 - **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。**確定済み(2026-07-06、Issue #2)**: `x_cache_ttl_days=7`、X 由来の抜粋は Obsidian に置かない(詳細は 01 §6 / 04 §7)。
@@ -59,7 +61,7 @@ class Connector(Protocol):
 | 測定 | 方法 | 合格基準 |
 |---|---|---|
 | 取得範囲・時系列性 | max_results=100 × 最大5ページ取得し、created_at の範囲と単調性を表示。author 別件数と全件 CSV を出力し、直近24hのTLと目視突合 | 直近24hのフォロー投稿が時系列で取れ、体感欠落1割未満 |
-| 実効単価 | 実行前後の課金メーター/クレジット残を手動記録(スクリプトは総読取件数を表示) | 実効単価 × daily_read_cap × 30日 ≦ $20 |
+| 実効単価 | 実行前後の課金メーター/クレジット残を手動記録(スクリプトは総読取件数を表示) | 実効単価 × daily_read_cap × 30日 ≦ $20(この `daily_read_cap` はホームTL単独の Day 0 測定基準。運用の予算はホームTL + 検索の**合算日次上限 ≦ 165件/日**で管理する。ADR 0001「予算配分」) |
 | rate limit | 各レスポンスの x-rate-limit-remaining / reset を表示 | 1回のバッチで daily_read_cap 分を取得完了できる |
 | ノイズ率 | author 別集計 CSV を目視で娯楽/追跡に分類 | 娯楽混入が過半なら追跡専用アカウント新設に切替 |
 | リスト方式の再検討材料 | 厳選リスト(既存 or 仮作成)で `GET /2/lists/{id}/tweets` を1ページ取得し、取得可否と課金カウント(実効単価)を小確認 | ホームTLと単価が同等なら「リストは5倍高い」前提は消滅。ホームTL継続 / 厳選リスト / 追跡専用アカウントのいずれかを決定して記録(plan #1 の完了条件) |
