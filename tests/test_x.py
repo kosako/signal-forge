@@ -179,9 +179,36 @@ def test_since_id_passed_as_param() -> None:
 
 def test_first_page_429_is_retryable_not_silent_success() -> None:
     # page1 の 429 を「0件成功」で返すと consecutive_failures がリセットされ障害を隠す
-    conn = connector_from([(429, {}, {})], daily_read_cap=130)
+    seen: list[httpx.Request] = []
+    conn = connector_from([(429, {}, {})], daily_read_cap=130, seen=seen)
     with pytest.raises(RetryableError, match="429"):
         conn.fetch(make_source(), {})
+    # 429 は待たず即打ち切り(リトライしない。設計 02 §2)
+    assert sum("timelines" in str(r.url) for r in seen) == 1
+
+
+def test_5xx_retries_then_recovers_and_resigns() -> None:
+    # 5xx を初回+2回まではリトライし、途中で成功したら復帰する。署名は試行ごとに引き直す
+    calls = {"n": 0}
+    auths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/users/me"):
+            return httpx.Response(200, json={"data": {"id": "me"}})
+        calls["n"] += 1
+        auths.append(request.headers.get("authorization", ""))
+        if calls["n"] < 3:
+            return httpx.Response(503, json={})
+        return httpx.Response(200, json=page([tweet("1", "t")]))
+
+    conn = XConnector(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=CREDS, daily_read_cap=130, unit_price_usd=0.004, sleep=lambda _s: None,
+    )
+    result = conn.fetch(make_source(), {})
+    assert calls["n"] == 3  # 初回 + 2 リトライで成功
+    assert result.stats.api_reads == 1
+    assert len(set(auths)) == 3  # 試行ごとに再署名(nonce/timestamp が変わる)
 
 
 def test_429_after_first_page_returns_partial() -> None:
