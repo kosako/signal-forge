@@ -48,7 +48,13 @@ class StaticConnector:
         return FetchResult(
             items=[item],
             next_cursor={"etag": None, "last_modified": None},
-            stats=FetchStats(items_fetched=1, api_reads=0, http_status=200, duration_ms=1),
+            stats=FetchStats(
+                items_fetched=1,
+                api_reads=0,
+                estimated_cost_usd=0.0,
+                http_status=200,
+                duration_ms=1,
+            ),
         )
 
 

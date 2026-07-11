@@ -14,27 +14,46 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+
+def _build_connectors(config, env: dict[str, str], http) -> dict:
+    """有効なソース種別のコネクタを組み立てる(合成点)。X は config で有効なときだけ配線。
+
+    import は実行時(他コマンドの --help を httpx 等の重い依存に触れさせない)。
+    """
+    from app.connectors.rss import RssConnector
+
+    connectors = {"rss": RssConnector(http)}
+    if config.x.enabled:
+        from app.connectors.x import build_x_connector, has_x_credentials
+
+        # キー欠落は doctor #5 が WARN。ここでは X を載せず RSS の collect を止めない
+        if has_x_credentials(env):
+            connectors["x"] = build_x_connector(
+                config.x.daily_read_cap, config.x.unit_price_usd, env
+            )
+    return connectors
+
+
 @app.command()
 def collect(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """全ソース(X・RSS)から items を取り込む。"""
-    # import は実行時(他コマンドの --help を httpx 等の重い依存に触れさせない)
     from app.collect import collect_all
-    from app.config import load_config
-    from app.connectors.rss import RssConnector
+    from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.http import HttpClient
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
+    env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)  # CLI 起動時に自動適用(設計 01 §10)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
     http = HttpClient()
     collect_all(
         conn,
-        {"rss": RssConnector(http)},  # X コネクタは plan #15(Day 0 ゲート通過後)
+        _build_connectors(config, env, http),
         logger,
         resolve_short=http.resolve_short_url,
     )
@@ -153,7 +172,6 @@ def run(
 
     from app.analysis.llm import create_engine
     from app.config import load_config, load_env
-    from app.connectors.rss import RssConnector
     from app.db import apply_migrations, connect
     from app.http import HttpClient
     from app.logs import DEFAULT_LOG_DIR, setup_logging
@@ -170,7 +188,7 @@ def run(
         conn,
         config,
         env,
-        {"rss": RssConnector(http)},  # X コネクタは plan #15
+        _build_connectors(config, env, http),
         http,
         lambda: create_engine(config.llm.engine),
         logger,

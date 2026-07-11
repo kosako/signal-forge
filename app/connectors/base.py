@@ -36,6 +36,7 @@ class RawItem:
 class FetchStats:
     items_fetched: int
     api_reads: int  # X の課金対象読み取り件数(collect_runs へ記録)
+    estimated_cost_usd: float  # api_reads × 単価。課金のないソース(RSS)は 0.0
     http_status: int | None  # ログのみ(DB には持たない。設計 02 §1)
     duration_ms: int
 

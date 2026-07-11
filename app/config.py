@@ -24,9 +24,9 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class XConfig:
-    enabled: bool = False  # Day 0 ゲート(#1)通過までは無効が既定
-    daily_read_cap: int = 130
-    unit_price_usd: float = 0.005  # Day 0 実測値で上書きする
+    enabled: bool = False  # Day 0 ゲート(#1)通過後、config で明示 on にする
+    daily_read_cap: int = 130  # ホームTL の日次読取上限(ADR 0001 予算配分。検索は #57)
+    unit_price_usd: float = 0.004  # Day 0 実測(2026-07-10)。config で上書き可
 
 
 @dataclass(frozen=True)

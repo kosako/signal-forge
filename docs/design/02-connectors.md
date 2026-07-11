@@ -46,7 +46,7 @@ class Connector(Protocol):
 
 > **ADR 0001(2026-07-10)で拡張・訂正**: Day 0 実測(実効単価 ≈ $0.004/件・rate limit home 180/15min)を受け、X ソースは「ホームTLのみ」から **ホームTL + AI 検索(`/2/tweets/search/recent`・3スロット固定)** に拡張(検索の詳細は ADR 0001 / Issue #57)。旧記載の rate limit「5 req/15min」「単価 $0.005 想定」は下記のとおり実測値に更新。読取コストは**ホームTL + 検索の合算日次上限**で月 $20 以内に管理する(3スロット固定はクエリ本数の上限でありコスト上限ではない。ADR 0001「予算配分」)。
 
-- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results=100`, `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは Issue #57 で追加。
+- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results`(上限100。残枠が100未満なら `daily_read_cap - reads` = cap を1件も超えないため), `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは Issue #57 で追加。
 - **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。実測 $0.004 なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
 - **rate limit**: **実測 home 180/15min**(Day 0。旧記載 5/15min は誤り)。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。実測上は cap 130 が rate limit の制約を受けない。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
