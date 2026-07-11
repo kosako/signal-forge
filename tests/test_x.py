@@ -5,14 +5,16 @@ import httpx
 import pytest
 
 from app.cli import _build_connectors
-from app.config import Config, XConfig
-from app.connectors.base import FatalError, RetryableError
+from app.config import Config, XConfig, XSearchConfig
+from app.connectors.base import FatalError, FetchResult, FetchStats, RetryableError
 from app.connectors.x import (
     XConnector,
     XCredentials,
+    XRouter,
     build_x_connector,
     has_x_credentials,
 )
+from app.connectors.x_search import XSearchConnector
 from app.http import HttpClient
 from app.models import Source
 
@@ -266,8 +268,50 @@ def test_has_x_credentials() -> None:
     assert has_x_credentials(full) is False
 
 
-def _config(x_enabled: bool) -> Config:
-    return Config(config_dir=Path("/tmp/x-test"), x=XConfig(enabled=x_enabled))
+class _StubConnector:
+    source_type = "x"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
+        self.calls.append((source_row.name, cursor))
+        return FetchResult(items=[], next_cursor={}, stats=FetchStats(0, 0, 0.0, None, 0))
+
+
+def test_router_routes_by_source_config_mode() -> None:
+    home, search = _StubConnector(), _StubConnector()
+    router = XRouter(home=home, search=search)
+    router.fetch(make_source(), {})  # config NULL = home(既存行の互換)
+    router.fetch(make_source(id=2, name="x:home", config='{"mode": "home"}'), {})
+    router.fetch(make_source(id=3, name="x:search", config='{"mode": "search"}'), {"since_id": "9"})
+    assert [c[0] for c in home.calls] == ["home", "x:home"]
+    assert search.calls == [("x:search", {"since_id": "9"})]
+
+
+def test_router_rejects_bad_config_fail_fast() -> None:
+    # タイポで home に化けてホームTL を二重取得(二重課金)する事故を防ぐ
+    router = XRouter(home=_StubConnector(), search=_StubConnector())
+    with pytest.raises(FatalError, match="mode が不正"):
+        router.fetch(make_source(config='{"mode": "serach"}'), {})
+    with pytest.raises(FatalError, match="mode が不正"):
+        router.fetch(make_source(config="{}"), {})  # config を書くなら mode 必須
+    with pytest.raises(FatalError, match="不明なキー"):
+        router.fetch(make_source(config='{"mdoe": "search"}'), {})
+
+
+def test_router_without_search_wiring_fails_fast() -> None:
+    router = XRouter(home=_StubConnector(), search=None)
+    with pytest.raises(FatalError, match="slots が未設定"):
+        router.fetch(make_source(config='{"mode": "search"}'), {})
+
+
+def _config(x_enabled: bool, slots: tuple[str, ...] = ()) -> Config:
+    return Config(
+        config_dir=Path("/tmp/x-test"),
+        x=XConfig(enabled=x_enabled),
+        x_search=XSearchConfig(slots=slots),
+    )
 
 
 def test_build_connectors_wires_x_only_when_enabled_and_keyed() -> None:
@@ -276,6 +320,16 @@ def test_build_connectors_wires_x_only_when_enabled_and_keyed() -> None:
     assert set(_build_connectors(_config(True), FULL_ENV, http)) == {"rss", "x"}  # 有効+キー
     # 有効だがキー欠落 → X は載せず RSS は残る(縮退。欠落は doctor #5)
     assert set(_build_connectors(_config(True), {}, http)) == {"rss"}
+
+
+def test_build_connectors_wires_search_only_with_slots() -> None:
+    http = HttpClient()
+    router = _build_connectors(_config(True), FULL_ENV, http)["x"]
+    assert isinstance(router, XRouter)
+    assert router._search is None  # slots 空 = 検索無効
+    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, http)["x"]
+    assert isinstance(router._home, XConnector)
+    assert isinstance(router._search, XSearchConnector)
 
 
 def test_build_x_connector_signs_requests() -> None:
@@ -290,6 +344,6 @@ def test_build_x_connector_signs_requests() -> None:
             return httpx.Response(200, json={"data": {"id": "me"}})
         return httpx.Response(200, json=page([tweet("1", "t")]))
 
-    conn._client = httpx.Client(transport=httpx.MockTransport(handler))
+    conn._session._client = httpx.Client(transport=httpx.MockTransport(handler))
     conn.fetch(make_source(), {})
     assert all(r.headers.get("authorization", "").startswith("OAuth ") for r in seen)

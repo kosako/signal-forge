@@ -42,6 +42,53 @@ def test_analysis_rejects_nonpositive_and_bad_list(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+def test_x_search_parse_and_defaults(tmp_path: Path) -> None:
+    write_config(tmp_path, '[x_search]\nslots = ["ai agents", "llm"]\n')
+    config = load_config(tmp_path)
+    assert config.x_search.slots == ("ai agents", "llm")
+    assert config.x_search.daily_read_cap == 35
+    assert config.x.combined_daily_read_cap == 165
+    assert load_config(tmp_path.joinpath("nx")).x_search.slots == ()  # 既定 = 検索無効
+
+
+def test_x_search_slots_validation(tmp_path: Path) -> None:
+    write_config(tmp_path, '[x_search]\nslots = ["a", "b", "c", "d"]\n')
+    with pytest.raises(ConfigError, match="最大 3 本"):  # 増やさない設計の担保(ADR 0001)
+        load_config(tmp_path)
+    write_config(tmp_path, '[x_search]\nslots = ["a", "a"]\n')
+    with pytest.raises(ConfigError, match="重複"):
+        load_config(tmp_path)
+    write_config(tmp_path, '[x_search]\nslots = ["a", " "]\n')
+    with pytest.raises(ConfigError, match="空のクエリ"):
+        load_config(tmp_path)
+    write_config(tmp_path, f'[x_search]\nslots = ["{"x" * 500}"]\n')
+    with pytest.raises(ConfigError, match="長すぎる"):  # 自動付加分込みで 512 超
+        load_config(tmp_path)
+
+
+def test_x_search_cap_requires_min_page_per_slot(tmp_path: Path) -> None:
+    # 20 // 3 = 6 < 10(search/recent の max_results 下限)→ 黙って 0 件にせず起動時に止める
+    write_config(tmp_path, '[x_search]\nslots = ["a", "b", "c"]\ndaily_read_cap = 20\n')
+    with pytest.raises(ConfigError, match="少なすぎる"):
+        load_config(tmp_path)
+
+
+def test_x_combined_cap_cross_validation(tmp_path: Path) -> None:
+    # slots ありで内訳合計(130 + 40)が合算 cap 165 を超える → エラー(ADR 0001 予算配分)
+    write_config(tmp_path, '[x_search]\nslots = ["a"]\ndaily_read_cap = 40\n')
+    with pytest.raises(ConfigError, match="combined_daily_read_cap"):
+        load_config(tmp_path)
+    # slots が空なら検索 cap は合算に数えない(130 ≤ 165 で通る)
+    write_config(tmp_path, "[x_search]\ndaily_read_cap = 40\n")
+    assert load_config(tmp_path).x_search.daily_read_cap == 40
+    # 合算 cap 自体を上げれば通る(単一ノブ)
+    write_config(
+        tmp_path,
+        '[x]\ncombined_daily_read_cap = 170\n[x_search]\nslots = ["a"]\ndaily_read_cap = 40\n',
+    )
+    assert load_config(tmp_path).x.combined_daily_read_cap == 170
+
+
 def test_db_path_configurable(tmp_path: Path) -> None:
     write_config(tmp_path, f'[storage]\ndb_path = "{tmp_path}/custom.db"\n')
     assert load_config(tmp_path).db_path == tmp_path / "custom.db"

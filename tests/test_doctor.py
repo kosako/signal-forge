@@ -260,7 +260,75 @@ def test_x_enabled_requires_keys(config_dir, tmp_path) -> None:
     )
     env_path.chmod(0o600)
     result = by_number(doctor(config_dir, tmp_path), 5)
-    assert result.status == "WARN"  # 疎通は plan #15
+    assert result.status == "WARN"  # 疎通は未実装(Issue #63)
+
+
+def _write_x_env(config_dir: Path) -> None:
+    env_path = config_dir / ".env"
+    env_path.write_text(
+        "TELEGRAM_BOT_TOKEN=tok\nX_API_KEY=a\nX_API_SECRET=b\n"
+        "X_ACCESS_TOKEN=c\nX_ACCESS_TOKEN_SECRET=d\n",
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+
+
+def test_x_search_slots_without_search_row_warns(config_dir, tmp_path) -> None:
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\n[x]\nenabled = true\n[x_search]\nslots = ["ai"]\n',
+        encoding="utf-8",
+    )
+    _write_x_env(config_dir)
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-tl', 1)")
+    conn.commit()
+
+    # slots 設定済みだが mode=search 行が無い → 検索が黙って収集されないことを可視化
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert result.status == "WARN"
+    assert "mode=search のソース行が無い" in result.detail
+
+    # search 行を登録すると整合し、残る WARN は疎通未実装のみ
+    conn.execute(
+        "INSERT INTO sources (type, name, config, enabled) "
+        """VALUES ('x', 'x:search', '{"mode": "search"}', 1)"""
+    )
+    conn.commit()
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert result.status == "WARN"
+    assert "疎通検査は未実装" in result.detail
+
+    # 同一 mode の複数行は二重取得(二重課金)として WARN
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-2', 1)")
+    conn.commit()
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert "二重取得" in result.detail
+    conn.close()
+
+
+def test_x_search_row_without_slots_warns(config_dir, tmp_path) -> None:
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
+    )
+    _write_x_env(config_dir)
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO sources (type, name, config, enabled) "
+        """VALUES ('x', 'x:search', '{"mode": "search"}', 1)"""
+    )
+    conn.execute(
+        "INSERT INTO sources (type, name, config, enabled) "
+        """VALUES ('x', 'x:bad', '{"mode": "serach"}', 1)"""
+    )
+    conn.commit()
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 5)
+    assert result.status == "WARN"
+    assert "[x_search].slots 未設定" in result.detail  # collect で失敗し続ける構成
+    assert "config(mode)が不正" in result.detail  # タイポ行も名指しで可視化
 
 
 def test_llm_canary_leak_fails_and_cleans_up(config_dir, tmp_path) -> None:

@@ -211,8 +211,44 @@ def _check_x(
     missing = [key for key in X_ENV_KEYS if key not in env]
     if missing:
         return CheckResult(5, "X API", "FAIL", f".env に X キーがない: {', '.join(missing)}")
-    # 疎通(無料エンドポイント)は X コネクタ実装(plan #15)後に追加する
-    return CheckResult(5, "X API", "WARN", "キーは存在。疎通検査は plan #15 で実装")
+    warns = _x_mode_consistency_warns(conn, config)
+    if warns:
+        return CheckResult(5, "X API", "WARN", " / ".join(warns))
+    return CheckResult(5, "X API", "WARN", "キーは存在。疎通検査は未実装(Issue #63)")
+
+
+def _x_mode_consistency_warns(conn: sqlite3.Connection, config: Config) -> list[str]:
+    """config の [x_search].slots と sources の mode(home/search)行の整合(設計 02 §2)。
+
+    片方だけ設定すると「検索が黙って収集されない」「collect で失敗し続ける」になるため
+    WARN で可視化する。同一 mode の複数行は二重取得(二重課金)事故なので WARN。
+    呼び出し前提: sources テーブルが存在し、enabled な type='x' 行がある。
+    """
+    from app.connectors.base import FatalError  # 遅延 import(cli の流儀に合わせる)
+    from app.connectors.x import x_source_mode
+    from app.models import Source
+
+    counts = {"home": 0, "search": 0}
+    invalid: list[str] = []
+    for row in conn.execute("SELECT * FROM sources WHERE type = 'x' AND enabled = 1"):
+        source = Source.from_row(row)
+        try:
+            counts[x_source_mode(source)] += 1
+        except FatalError:
+            invalid.append(source.name)
+    warns = []
+    if invalid:
+        warns.append(f"config(mode)が不正な X ソース行: {', '.join(invalid)}")
+    if config.x_search.slots and counts["search"] == 0:
+        warns.append(
+            "[x_search].slots 設定済みだが mode=search のソース行が無い(検索は収集されない)"
+        )
+    if counts["search"] > 0 and not config.x_search.slots:
+        warns.append("mode=search のソース行があるが [x_search].slots 未設定(collect で失敗する)")
+    for mode, count in counts.items():
+        if count > 1:
+            warns.append(f"mode={mode} のソース行が {count} 行 enabled(二重取得・二重課金)")
+    return warns
 
 
 def _check_anthropic_key(environ: dict[str, str]) -> CheckResult:
