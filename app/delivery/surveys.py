@@ -105,10 +105,14 @@ def send_evening_survey(
     chat_id = _require_chat_id(config)
     date_compact = now.strftime("%Y%m%d")
     api.send_message(
-        chat_id, "📝 今日、情報収集目的の巡回をした?", reply_markup=q1_keyboard(date_compact)
+        chat_id,
+        "📝 今日、自分から情報を探しに巡回した?\n(ダイジェストを読むのは含めない)",
+        reply_markup=q1_keyboard(date_compact),
     )
     api.send_message(
-        chat_id, "📝 今日の読了時間は?", reply_markup=q2_keyboard(date_compact)
+        chat_id,
+        "📝 今朝のダイジェストを読むのにかかった時間は?\n(ざっくりでOK)",
+        reply_markup=q2_keyboard(date_compact),
     )
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
