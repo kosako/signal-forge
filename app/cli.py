@@ -24,13 +24,24 @@ def _build_connectors(config, env: dict[str, str], http) -> dict:
 
     connectors = {"rss": RssConnector(http)}
     if config.x.enabled:
-        from app.connectors.x import build_x_connector, has_x_credentials
+        from app.connectors.x import XRouter, build_x_connector, has_x_credentials
 
         # キー欠落は doctor #5 が WARN。ここでは X を載せず RSS の collect を止めない
         if has_x_credentials(env):
-            connectors["x"] = build_x_connector(
-                config.x.daily_read_cap, config.x.unit_price_usd, env
-            )
+            search = None
+            if config.x_search.slots:  # slots 空 = 検索無効(設計 02 §2)
+                from app.connectors.x_search import build_x_search_connector
+
+                search = build_x_search_connector(
+                    config.x_search.slots,
+                    config.x_search.daily_read_cap,
+                    config.x.unit_price_usd,
+                    env,
+                )
+            home = build_x_connector(config.x.daily_read_cap, config.x.unit_price_usd, env)
+            # type='x' の sources 行は home / search の2種(config.mode で識別)。
+            # collect の「type → Connector 1:1」契約は XRouter が保つ
+            connectors["x"] = XRouter(home=home, search=search)
     return connectors
 
 

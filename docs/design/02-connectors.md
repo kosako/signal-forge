@@ -46,13 +46,27 @@ class Connector(Protocol):
 
 > **ADR 0001(2026-07-10)で拡張・訂正**: Day 0 実測(実効単価 ≈ $0.004/件・rate limit home 180/15min)を受け、X ソースは「ホームTLのみ」から **ホームTL + AI 検索(`/2/tweets/search/recent`・3スロット固定)** に拡張(検索の詳細は ADR 0001 / Issue #57)。旧記載の rate limit「5 req/15min」「単価 $0.005 想定」は下記のとおり実測値に更新。読取コストは**ホームTL + 検索の合算日次上限**で月 $20 以内に管理する(3スロット固定はクエリ本数の上限でありコスト上限ではない。ADR 0001「予算配分」)。
 
-- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results`(上限100。残枠が100未満なら `daily_read_cap - reads` = cap を1件も超えないため), `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは Issue #57 で追加。
+- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results`(上限100。残枠が100未満なら `daily_read_cap - reads` = cap を1件も超えないため), `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは下記「AI 検索」(Issue #57 で追加)。
 - **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。実測 $0.004 なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
 - **rate limit**: **実測 home 180/15min**(Day 0。旧記載 5/15min は誤り)。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。実測上は cap 130 が rate limit の制約を受けない。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
 - **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外(meta に記録)。理由: ノイズ率対策の最安の一手。
 - **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。**確定済み(2026-07-06、Issue #2)**: `x_cache_ttl_days=7`、X 由来の抜粋は Obsidian に置かない(詳細は 01 §6 / 04 §7)。
 - **縮退**: consecutive_failures ≥ 3 で doctor・watchdog 通知(自動 disable はしない。理由: 勝手に情報源が消えるより通知して人が `sources.enabled=0` を切る方が安全)。X 停止中もパイプラインはソース非依存で RSS+手動URLで継続。
+
+### AI 検索(`connectors/x_search.py`・Issue #57)
+
+- **エンドポイント**: `GET /2/tweets/search/recent`。パラメータ: `query`(スロット + 自動付加演算子), `max_results`(10〜100。**下限 10 は API 仕様**), `since_id`, `next_token`(検索は `pagination_token` でなく `next_token`), `tweet.fields=created_at,author_id`, `expansions=author_id`(RT/リプライはクエリ演算子で除外済みのため referenced_tweets は要らない)。認証はホームTL と同じ OAuth 1.0a(既存4キー。Bearer は使わず認証経路を1本に保つ)。署名・リトライは共有トランスポート(`XApiSession`)。
+- **スロット**: config `[x_search].slots`(**最大3・入れ替え式**。ADR 0001)。4本以上・重複・空文字・自動付加分込み512字超(Basic tier のクエリ長上限)は ConfigError で fail fast。**slots 空 = 検索無効**(コネクタを配線しない)。スロット自動更新は作らない(更新提案は S2 = #59 の人間承認ゲート)。
+- **クエリの自動付加**: 各スロットに `-is:retweet -is:reply` を付加し、RT・リプライを**課金前にサーバ側で除外**する。ホームTL の「RT は元ツイへ正規化・他人宛リプライ除外」と方針整合で、取ってから捨てると読取課金が無駄になるため。`lang:` 等の演算子はスロット側に書いてよい。スレッド(著者の自己リプライ)も落ちるが MVP はノイズ削減を優先(RawItem.meta に `{"query": スロット}` を記録し、週次の再配分材料にする)。
+- **予算**: `[x_search].daily_read_cap`(既定35)をスロット数で均等割(端数は先頭から。35 → 12/12/11)。スロット間の再配分はしない(多産クエリが他スロットを飢えさせない)。残枠が 10(max_results 下限)を切ったらそのスロットは打ち切り(**cap はハード上限**。超過方向に丸めない)。**ホームTL との合算は `[x].combined_daily_read_cap`(既定165)が単一ノブ**で、内訳合計が超えると起動時 ConfigError(ADR 0001 予算配分)。
+- **カーソル**: `cursor = {"since_id": 全スロット横断の最大 tweet id}`。tweet id(snowflake)は時刻単調なので単一 watermark で足り、スロット入れ替え後もそのまま有効(新スロットは前回実行以降ぶんから取れる)。**watermark は全スロット完走時のみ進める**: 途中打ち切り(失敗・rate limit 残0)で進めると未実行スロットのその日ぶんが watermark の背後に隠れて恒久欠落するため、打ち切り時は据え置く(翌日、旧 watermark から再取得して UNIQUE で吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。スロット内の予算打ち切りで捨てる古い側はホームTL 同様に追わない。失敗の扱いもホームTL と同方針: 累計0件での失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗・rate limit 残0は打ち切り返却(残りスロットも当日分は諦める)。
+- **sources 行と識別**: **type='x' のまま2行運用**(purge の `x_cache_ttl_days`・Obsidian 抜粋なし・KPI 集計が無変更で検索アイテムにも効く)。識別は sources.config の JSON `{"mode": "search"}`。**config NULL = home**(既存ホームTL 行の互換)。mode 不正・不明キーは FatalError(タイポで home に化けてホームTL を二重取得・二重課金する事故を防ぐ)。collect の「type → Connector 1:1」契約(§1)は `XRouter`(connectors/x.py)が吸収する。検索ソースの登録 SQL:
+  ```sql
+  INSERT INTO sources (type, name, config) VALUES ('x', 'x:search', '{"mode": "search"}');
+  ```
+- **doctor #5 の整合検査**: `[x_search].slots` ⟷ mode=search 行の相互欠落(検索が黙って収集されない / collect で失敗し続ける)、同一 mode の複数 enabled 行(二重取得・二重課金)、mode 不正行を WARN で可視化。
+- **月次上限**: 課金は credits 従量(Day 0 実測)のため検索専用の別枠上限は持たず、合算日次 cap × 30(165 × 30 × $0.004 ≈ $19.8/月)と doctor #9 の当月集計(collect_runs の estimated_cost_usd 合算。検索も自動で載る)で管理する。
 
 ### Day 0 テストスクリプト仕様(`scripts/day0_x_probe.py`)
 

@@ -17,6 +17,13 @@ DEFAULT_CONFIG_DIR = Path.home() / ".config" / "intel"
 
 _LLM_ENGINES = ("codex-cli", "claude-cli", "anthropic-api")
 
+# X 検索(search/recent)の契約値。コネクタ(connectors/x_search.py)と検証の両方が参照する
+# (コネクタ側に置くと config が httpx 依存を吸ってしまうため、軽い側=ここに置く)
+X_SEARCH_MAX_SLOTS = 3  # 3スロット固定・入れ替え式(ADR 0001。増やさない設計の担保)
+X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
+X_SEARCH_QUERY_MAX = 512  # クエリ長上限(Basic tier)
+X_SEARCH_QUERY_SUFFIX = "-is:retweet -is:reply"  # 各スロットに自動付加(設計 02 §2)
+
 
 class ConfigError(Exception):
     """設定の欠落・型不一致・値域外。呼び出し側は捕捉せず終了させる。"""
@@ -25,8 +32,20 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class XConfig:
     enabled: bool = False  # Day 0 ゲート(#1)通過後、config で明示 on にする
-    daily_read_cap: int = 130  # ホームTL の日次読取上限(ADR 0001 予算配分。検索は #57)
+    daily_read_cap: int = 130  # ホームTL の日次読取上限(ADR 0001 予算配分)
     unit_price_usd: float = 0.004  # Day 0 実測(2026-07-10)。config で上書き可
+    # ホームTL + 検索(+S1 の取込)の合算日次読取上限(単一ノブ。ADR 0001 予算配分)。
+    # 内訳(daily_read_cap / [x_search].daily_read_cap)の合計がこれを超えると起動時エラー
+    combined_daily_read_cap: int = 165
+
+
+@dataclass(frozen=True)
+class XSearchConfig:
+    # 検索クエリのスロット(最大 X_SEARCH_MAX_SLOTS 本・入れ替え式。ADR 0001)。
+    # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
+    # `-is:retweet -is:reply` はコネクタが自動付加する(設計 02 §2)
+    slots: tuple[str, ...] = ()
+    daily_read_cap: int = 35  # 検索の日次読取上限(全スロットで均等割。ADR 0001 予算配分)
 
 
 @dataclass(frozen=True)
@@ -102,6 +121,7 @@ class AnalysisConfig:
 class Config:
     config_dir: Path
     x: XConfig = field(default_factory=XConfig)
+    x_search: XSearchConfig = field(default_factory=XSearchConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
@@ -133,6 +153,7 @@ class Config:
 
 _SECTIONS = {
     "x": XConfig,
+    "x_search": XSearchConfig,
     "digest": DigestConfig,
     "llm": LLMConfig,
     "retention": RetentionConfig,
@@ -211,8 +232,11 @@ def _validate(path: Path, config: Config) -> None:
         raise ConfigError(
             f"{path}: [llm].engine は {'/'.join(_LLM_ENGINES)} のいずれか: {config.llm.engine!r}"
         )
+    _validate_x_search(path, config)
     positives = [
         ("x", "daily_read_cap", config.x.daily_read_cap),
+        ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),
+        ("x_search", "daily_read_cap", config.x_search.daily_read_cap),
         ("digest", "max_items", config.digest.max_items),
         ("retention", "cache_ttl_days", config.retention.cache_ttl_days),
         ("retention", "x_cache_ttl_days", config.retention.x_cache_ttl_days),
@@ -246,6 +270,42 @@ def _validate(path: Path, config: Config) -> None:
     ):
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
             raise ConfigError(f"{path}: [telegram].{key} は HH:MM 形式であること: {value!r}")
+
+
+def _validate_x_search(path: Path, config: Config) -> None:
+    """[x_search] と合算予算の検証(ADR 0001 予算配分 / 設計 02 §2)。
+
+    slots が空 = 検索無効(検証はスロット非依存の合算 cap のみ)。
+    """
+    slots = config.x_search.slots
+    if len(slots) > X_SEARCH_MAX_SLOTS:
+        raise ConfigError(
+            f"{path}: [x_search].slots は最大 {X_SEARCH_MAX_SLOTS} 本"
+            f"(増やさない設計。ADR 0001): {len(slots)} 本ある"
+        )
+    if len(set(slots)) != len(slots):
+        raise ConfigError(f"{path}: [x_search].slots に重複クエリがある")
+    for slot in slots:
+        if not slot.strip():
+            raise ConfigError(f"{path}: [x_search].slots に空のクエリがある")
+        effective = f"{slot} {X_SEARCH_QUERY_SUFFIX}"
+        if len(effective) > X_SEARCH_QUERY_MAX:
+            raise ConfigError(
+                f"{path}: [x_search].slots のクエリが長すぎる(自動付加分込みで"
+                f" {len(effective)} > {X_SEARCH_QUERY_MAX}): {slot[:40]}…"
+            )
+    if slots and config.x_search.daily_read_cap // len(slots) < X_SEARCH_MIN_PAGE:
+        raise ConfigError(
+            f"{path}: [x_search].daily_read_cap({config.x_search.daily_read_cap})が"
+            f"少なすぎる(スロットあたり {X_SEARCH_MIN_PAGE} 件以上必要。"
+            f"search/recent の max_results 下限)"
+        )
+    cap_sum = config.x.daily_read_cap + (config.x_search.daily_read_cap if slots else 0)
+    if cap_sum > config.x.combined_daily_read_cap:
+        raise ConfigError(
+            f"{path}: X 読取の内訳合計({cap_sum})が [x].combined_daily_read_cap"
+            f"({config.x.combined_daily_read_cap})を超えている(ADR 0001 予算配分)"
+        )
 
 
 def load_env(config_dir: Path) -> dict[str, str]:
