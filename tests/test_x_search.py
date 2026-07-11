@@ -155,16 +155,19 @@ def test_pagination_second_page_uses_next_token_and_remainder() -> None:
     assert q2["next_token"] == ["tok1"]  # search/recent は pagination_token でなく next_token
 
 
-def test_rate_limit_zero_stops_remaining_slots() -> None:
+def test_rate_limit_zero_stops_remaining_slots_and_keeps_cursor() -> None:
     seen: list[httpx.Request] = []
     pages = {
         "a": [(200, page([tweet("500")], next_token="tok1"), {"x-rate-limit-remaining": "0"})],
         "b": [(200, page([tweet("600")]), {})],
     }
-    result = connector_from(pages, slots=("a", "b"), seen=seen).fetch(make_source(), {})
+    result = connector_from(pages, slots=("a", "b"), seen=seen).fetch(
+        make_source(), {"since_id": "100"}
+    )
     assert result.stats.api_reads == 1  # 残 0 → スロット b は当日分を諦める
     assert len(seen) == 1
-    assert result.next_cursor == {"since_id": "500"}
+    # 未実行スロット(b)の当日ぶんを watermark の背後に隠さない → カーソル据え置き
+    assert result.next_cursor == {"since_id": "100"}
 
 
 def test_first_page_429_with_zero_total_raises() -> None:
@@ -174,7 +177,7 @@ def test_first_page_429_with_zero_total_raises() -> None:
         connector_from(pages, slots=("a", "b")).fetch(make_source(), {})
 
 
-def test_failure_after_prior_slot_returns_partial() -> None:
+def test_failure_after_prior_slot_returns_partial_without_advancing_cursor() -> None:
     seen: list[httpx.Request] = []
     pages = {
         "a": [(200, page([tweet("500")]), {})],
@@ -183,7 +186,8 @@ def test_failure_after_prior_slot_returns_partial() -> None:
     }
     result = connector_from(pages, slots=("a", "b", "c"), seen=seen).fetch(make_source(), {})
     assert [i.external_id for i in result.items] == ["500"]  # 部分取得。c は取らない
-    assert result.next_cursor == {"since_id": "500"}
+    # カーソルを 500 に進めると b/c の当日ぶんが恒久欠落する → 据え置き(翌日再取得)
+    assert result.next_cursor == {}
     assert sum("query=b" in str(r.url) for r in seen) == 3  # 5xx は初回+2回リトライ
 
 

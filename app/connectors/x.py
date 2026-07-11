@@ -284,6 +284,10 @@ def x_source_mode(source: Source) -> str:
     if source.config is None:
         return "home"
     parsed = json.loads(source.config)  # DDL の json_valid CHECK 済み(設計 01 §3)
+    if not isinstance(parsed, dict):
+        # json_valid は null / 数値 / 配列も通す。分類可能な FatalError に揃える
+        # (doctor #5 の「mode 不正行を WARN」の契約を TypeError で破らない)
+        raise FatalError(f"X ソース '{source.name}' の config が JSON オブジェクトでない")
     unknown = sorted(set(parsed) - {"mode"})
     if unknown:
         raise FatalError(f"X ソース '{source.name}' の config に不明なキー: {', '.join(unknown)}")

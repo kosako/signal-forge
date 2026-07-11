@@ -298,6 +298,11 @@ def test_router_rejects_bad_config_fail_fast() -> None:
         router.fetch(make_source(config="{}"), {})  # config を書くなら mode 必須
     with pytest.raises(FatalError, match="不明なキー"):
         router.fetch(make_source(config='{"mdoe": "search"}'), {})
+    # json_valid は null / 配列も通す → object でなければ FatalError(TypeError にしない)
+    with pytest.raises(FatalError, match="JSON オブジェクトでない"):
+        router.fetch(make_source(config="null"), {})
+    with pytest.raises(FatalError, match="JSON オブジェクトでない"):
+        router.fetch(make_source(config='["search"]'), {})
 
 
 def test_router_without_search_wiring_fails_fast() -> None:

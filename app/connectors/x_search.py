@@ -7,7 +7,10 @@
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
   そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。
 - カーソルは全スロット横断の最大 tweet id を `{"since_id": ...}` に(snowflake id は時刻単調
-  のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。
+  のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。**全スロットが完走した
+  ときだけ進める**: 途中打ち切りで進めると未実行スロットのその日ぶんが watermark の背後に
+  隠れて恒久欠落するため、打ち切り時は据え置き(翌日、旧 watermark から再取得して UNIQUE で
+  吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。
 - 打ち切り・失敗はホームTL と同じ方針: rate limit 残 0 で全体打ち切り / 累計 0 件での
   HTTP 失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
@@ -69,22 +72,26 @@ class XSearchConnector:
         reads = 0
         http_status: int | None = None
         budgets = _split_budget(self._daily_read_cap, len(self._slots))
+        stopped = False
         for query, budget in zip(self._slots, budgets, strict=True):
-            tweets, status, stop_all = self._fetch_slot(
+            tweets, status, stopped = self._fetch_slot(
                 query, budget, since_id, users, have_prior=any(t for _q, t in fetched)
             )
             fetched.append((query, tweets))
             reads += len(tweets)
             if status is not None:
                 http_status = status
-            if stop_all:
+            if stopped:
                 break  # rate limit 残 0 / 部分取得後の失敗 → 残りスロットも当日分は諦める
         items = [
             _to_raw_item(tweet, users, query) for query, tweets in fetched for tweet in tweets
         ]
         all_ids = [int(t["id"]) for _q, tweets in fetched for t in tweets]
-        # 次回 since_id は今回の最大 tweet id(打ち切っても古い側の穴は追わない。設計 02 §2)
-        next_since = str(max(all_ids)) if all_ids else since_id
+        # 次回 since_id は「全スロット完走」時のみ今回の最大 tweet id に進める。
+        # 途中打ち切りで進めると未実行スロットのその日ぶんが恒久欠落する(据え置きなら
+        # 翌日再取得され UNIQUE で吸収)。スロット内の予算打ち切りで捨てる古い側は
+        # ホームTL と同じく追わない(設計 02 §2)
+        next_since = str(max(all_ids)) if all_ids and not stopped else since_id
         return FetchResult(
             items=items,
             next_cursor={"since_id": next_since} if next_since else {},
