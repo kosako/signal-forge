@@ -74,8 +74,8 @@ def test_survey_sent_once_at_time(conn, tmp_path) -> None:
 
     texts = [t for _, t in api.sent]
     assert len(texts) == 2  # 質問1 + 質問2(追い掛け対象なし)
-    assert "巡回をした?" in texts[0]
-    assert "読了時間" in texts[1]
+    assert "巡回した?" in texts[0]
+    assert "ダイジェストを読むのにかかった時間" in texts[1]
     assert get_state(conn, STATE_SURVEY_SENT) == now.strftime("%Y-%m-%d")
 
 
@@ -398,5 +398,5 @@ def test_run_poller_fires_timers_each_cycle(conn, tmp_path) -> None:
         conn, make_config(tmp_path), api, logger,
         should_stop=should_stop, now_fn=lambda: jst_now("21:30"),
     )
-    assert [t for _, t in api.sent if "巡回をした?" in t]  # タイマー経由で送信された
+    assert [t for _, t in api.sent if "巡回した?" in t]  # タイマー経由で送信された
     assert api.sent[0][0] == CHAT_ID
