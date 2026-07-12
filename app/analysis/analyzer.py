@@ -1,6 +1,6 @@
 """分析 Stage 2: LLM 本分析(設計 03 §3)。
 
-- プロンプトは prompts/analyze-v001.md(全文は設計 03 §3.1 の正本)。
+- プロンプトは prompts/analyze-v002.md(全文は設計 03 §3.1 の正本)。
   プレースホルダ: interest_profile / recent_titles / items / schema / nonce
 - 外部由来フィールドは全て(メタデータ含む)サニタイズしてから注入し、body と
   recent_titles は実行ごとの乱数 nonce でフェンスする
@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.config import Config
 
-PROMPT_VERSION = "analyze-v001"
+PROMPT_VERSION = "analyze-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 RECENT_DAYS = 14
@@ -39,6 +39,7 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 class ItemAnalysis(BaseModel):
     item_id: int  # 入力バッチの id 集合に含まれること(allowlist は写像側で検証)
+    title_ja: str = Field(max_length=300)  # 日本語見出し(v002。タイトル無しアイテムは本文から生成)
     summary: str = Field(max_length=300)
     relevance: int = Field(ge=0, le=100)
     category: Literal["課題直結", "ゲームチェンジャー", "組織AI活用", "その他"]
@@ -290,14 +291,15 @@ def _insert_analysis(
     conn.execute(
         """
         INSERT OR IGNORE INTO analyses
-          (item_id, run_id, summary, category, topic, relevance_score, novelty,
+          (item_id, run_id, title_ja, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
            prompt_version, input_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
             run_id,
+            analysis.title_ja,
             analysis.summary,
             analysis.category,
             analysis.topic,

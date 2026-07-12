@@ -47,6 +47,7 @@ def add_item(conn, url, *, title="記事タイトル", body="本文テキスト"
 def analysis_for(item_id: int, **overrides) -> ItemAnalysis:
     values = dict(
         item_id=item_id,
+        title_ja="日本語見出し",
         summary="要約",
         relevance=80,
         category="課題直結",
@@ -96,7 +97,8 @@ def test_batch_analyzed_and_mapped(conn, tmp_path) -> None:
 
     rows = conn.execute("SELECT * FROM analyses ORDER BY item_id").fetchall()
     assert rows[0]["relevance_score"] == 80
-    assert rows[0]["prompt_version"] == "analyze-v001"
+    assert rows[0]["title_ja"] == "日本語見出し"  # v002 で追加(表示側が優先使用)
+    assert rows[0]["prompt_version"] == "analyze-v002"
     assert rows[0]["engine"] == "codex-cli"
     assert rows[0]["total_score"] is None  # ranking が書く(analyze では書かない)
     assert json.loads(rows[1]["negative_labels"]) == ["hype"]

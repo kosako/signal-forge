@@ -70,8 +70,9 @@ class ScriptedEngine:
         return AnalysisBatch(
             results=[
                 ItemAnalysis(
-                    item_id=i, summary="要約", relevance=90, category="課題直結",
-                    negative=[], novelty="new", topic=f"t{i}", reason="理由", implication="示唆",
+                    item_id=i, title_ja="日本語見出し", summary="要約", relevance=90,
+                    category="課題直結", negative=[], novelty="new", topic=f"t{i}",
+                    reason="理由", implication="示唆",
                 )
                 for i in ids
             ]

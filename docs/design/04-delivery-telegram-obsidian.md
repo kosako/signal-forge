@@ -24,6 +24,7 @@
 💡 {自分への示唆 1文}
 ```
 
+- **見出しの言語**: `{タイトル}` は **analyses.title_ja(日本語見出し。analyze-v002)優先・NULL(v001 世代 / degraded)は items.title に fallback**。追い掛け(🔖 深掘りした?)の引用タイトルも同じ規則(設計 01 §3 / 03 §3.3)。
 - **長さ制限**: Telegram は1通4096字だが、安全側で **1通1000字(概算)を上限**にし、超過分は要約末尾を `…` で切り詰める(タイトル・URL・示唆は削らない)— 制限は要約で吸収するのが読みやすさを壊さない。
 - 各アイテムに InlineKeyboard 1行4ボタン: `👍 価値あり / 🔖 深掘り / ✅ 既知 / 👎 不要`。
 - 文体例(1件分、日本語ダイジェストのトーンの正):
@@ -69,7 +70,7 @@
 - **ディレクトリ**: `{vault}/{folder}/Daily/` と `{vault}/{folder}/Items/`。
 - **ファイル名規則**:
   - Daily: `YYYY-MM-DD.md`(digest 生成日)
-  - Items: `YYYYMMDD-{item_id}-{slug}.md`。slug はタイトルから Obsidian 禁止文字(`/\:*?"<>|#^[]`)を除去し40字で切る。item_id を含めるので slug 衝突は無害(一意性は id が担保)。
+  - Items: `YYYYMMDD-{item_id}-{slug}.md`。slug は**原文タイトル(items.title)**から Obsidian 禁止文字(`/\:*?"<>|#^[]`)を除去し40字で切る(title_ja 導入後もファイル名規則は不変。frontmatter の `title` のみ title_ja 優先)。item_id を含めるので slug 衝突は無害(一意性は id が担保)。
 - **Daily ノート**: frontmatter(`date`, `item_count`, `degraded`)+ digest Markdown 全文。各アイテムから `[[YYYYMMDD-{id}-{slug}]]` で Items へ wikilink。
 - **Items ノート**の構造:
 

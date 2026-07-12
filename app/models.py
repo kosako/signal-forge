@@ -88,6 +88,7 @@ class Analysis(_Row):
     output_tokens: int | None
     estimated_cost_usd: float
     analyzed_at: str
+    title_ja: str | None  # 002 で追加(ALTER のため実テーブルでは末尾列)
 
 
 @dataclass(frozen=True)

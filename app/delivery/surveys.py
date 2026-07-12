@@ -117,7 +117,7 @@ def send_evening_survey(
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
         title = escape_and_truncate(
-            (row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS
+            (row["title_ja"] or row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS
         )
         api.send_message(
             chat_id,
@@ -159,7 +159,9 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
     """dig_date の最新 reaction が 🔖 で、followup_dig 未記録のアイテム(設計 04 §4)。"""
     return conn.execute(
         """
-        SELECT items.id AS item_id, items.title
+        SELECT items.id AS item_id, items.title,
+               (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
+                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
         FROM signals AS s
         JOIN items ON items.id = s.item_id
         WHERE s.kind = 'reaction' AND s.signal_date = ? AND s.value = 'dig'

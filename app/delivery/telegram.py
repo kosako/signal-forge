@@ -284,7 +284,9 @@ def _header_text(digest: sqlite3.Row) -> str:
 
 
 def _item_text(position: int, row: sqlite3.Row) -> str:
-    title = escape_and_truncate((row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS)
+    # 見出しは日本語タイトル優先(analyze-v002)。NULL / 空は原文に fallback
+    raw_title = row["title_ja"] or row["title"] or "(タイトルなし)"
+    title = escape_and_truncate(raw_title.strip(), TITLE_MAX_CHARS)
     source_line = (
         f'<a href="{escape_attr(row["canonical_url"])}">{escape_text(row["source_name"])}</a>'
     )
@@ -364,7 +366,7 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
         f"""
         SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
                sources.name AS source_name,
-               analyses.summary, analyses.implication
+               analyses.title_ja, analyses.summary, analyses.implication
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (

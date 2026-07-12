@@ -38,6 +38,7 @@ def add_analyzed(
     topic=None,
     published_hours_ago=1.0,
     degraded=0,
+    title_ja=None,
 ):
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, published_at, content_hash, "
@@ -45,12 +46,12 @@ def add_analyzed(
         (source_id, url, url, f"title {url}", iso_hours_ago(published_hours_ago)),
     ).lastrowid
     conn.execute(
-        "INSERT INTO analyses (item_id, summary, category, topic, relevance_score, novelty, "
-        "negative_labels, recommendation_reason, implication, degraded, engine, model, "
+        "INSERT INTO analyses (item_id, title_ja, summary, category, topic, relevance_score, "
+        "novelty, negative_labels, recommendation_reason, implication, degraded, engine, model, "
         "prompt_version, input_hash) "
-        "VALUES (?, '要約', '課題直結', ?, ?, ?, ?, '理由', '示唆', ?, 'codex-cli', 'm', "
+        "VALUES (?, ?, '要約', '課題直結', ?, ?, ?, ?, '理由', '示唆', ?, 'codex-cli', 'm', "
         "'analyze-v001', ?)",
-        (item_id, topic, relevance, novelty, negative, degraded, f"sha256:{url}"),
+        (item_id, title_ja, topic, relevance, novelty, negative, degraded, f"sha256:{url}"),
     )
     return item_id
 

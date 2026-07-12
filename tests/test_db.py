@@ -25,7 +25,10 @@ def test_connect_sets_pragmas(tmp_path: Path) -> None:
 
 def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connection) -> None:
     ledger = conn.execute("SELECT version, filename FROM schema_migrations").fetchall()
-    assert [(row["version"], row["filename"]) for row in ledger] == [(1, "001_init.sql")]
+    assert [(row["version"], row["filename"]) for row in ledger] == [
+        (1, "001_init.sql"),
+        (2, "002_analyses_title_ja.sql"),
+    ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
 
@@ -52,8 +55,10 @@ def test_backup_is_consistent_snapshot_of_pre_apply_state(tmp_path: Path) -> Non
     )
     other = tmp_path / "migrations"
     other.mkdir()
-    (other / "001_init.sql").write_text((MIGRATIONS_DIR / "001_init.sql").read_text())
-    (other / "002_extra.sql").write_text("CREATE TABLE extra (id INTEGER PRIMARY KEY) STRICT;")
+    applied = _copy_real_migrations(other)
+    (other / f"{applied + 1:03d}_extra.sql").write_text(
+        "CREATE TABLE extra (id INTEGER PRIMARY KEY) STRICT;"
+    )
     apply_migrations(conn, db_path, other)
 
     bak = sqlite3.connect(tmp_path / "intel.db.bak")
@@ -146,12 +151,21 @@ def test_failed_migration_rolls_back(tmp_path: Path) -> None:
     apply_migrations(conn, db_path)
     other = tmp_path / "migrations"
     other.mkdir()
-    (other / "001_init.sql").write_text((MIGRATIONS_DIR / "001_init.sql").read_text())
-    (other / "002_bad.sql").write_text(
+    applied = _copy_real_migrations(other)
+    bad_name = f"{applied + 1:03d}_bad.sql"
+    (other / bad_name).write_text(
         "CREATE TABLE will_rollback (id INTEGER PRIMARY KEY) STRICT;\nINVALID SQL;"
     )
-    with pytest.raises(MigrationError, match="002_bad.sql"):
+    with pytest.raises(MigrationError, match=bad_name):
         apply_migrations(conn, db_path, other)
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "will_rollback" not in tables
-    assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == applied
+
+
+def _copy_real_migrations(other: Path) -> int:
+    """実マイグレーション一式を複製し、適用済み件数(= 既存の最大版番号)を返す。"""
+    files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    for f in files:
+        (other / f.name).write_text(f.read_text())
+    return len(files)
