@@ -19,8 +19,13 @@ lint を通してから `~/Library/LaunchAgents/` へ**コピー**する(symlink
 ```sh
 UV_BIN="$(command -v uv)"
 [ -n "$UV_BIN" ] || { echo "uv が見つからない(PATH を確認)"; exit 1; }
+# 朝バッチの analyze は codex を subprocess 起動する。launchd の PATH に codex(と node)の
+# dir が無いと全チャンク「codex not found」で degraded になる(#72)。setup 時に解決して plist の
+# PATH に焼き込む。__CODEX_DIR__ は morning.plist のみで使う(poller は codex を使わない)。
+CODEX_BIN="$(command -v codex)"
+[ -n "$CODEX_BIN" ] || { echo "codex が見つからない(PATH を確認 / codex login 済みか)"; exit 1; }
 # sed 置換のため、パスに sed / XML のメタ文字を含む環境は対象外(先に検知して止める)
-case "${UV_BIN}$(pwd)${HOME}" in
+case "${UV_BIN}${CODEX_BIN}$(pwd)${HOME}" in
   (*[\|\&\<\>]*) echo "パスに | & < > を含む環境は本手順のsed置換が壊れるため非対応"; exit 1;;
 esac
 mkdir -p "${HOME}/.local/state/intel/logs"   # launchd は exec 前に stdout/stderr を開く
@@ -28,6 +33,7 @@ TMP_DIR="$(mktemp -d)"
 for name in com.intel.morning com.intel.poller; do
   sed -e "s|__UV_BIN__|${UV_BIN}|g" \
       -e "s|__UV_DIR__|$(dirname "${UV_BIN}")|g" \
+      -e "s|__CODEX_DIR__|$(dirname "${CODEX_BIN}")|g" \
       -e "s|__REPO_DIR__|$(pwd)|g" \
       -e "s|__HOME__|${HOME}|g" \
       "ops/launchd/${name}.plist" > "${TMP_DIR}/${name}.plist"
