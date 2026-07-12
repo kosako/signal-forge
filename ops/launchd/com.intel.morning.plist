@@ -5,6 +5,8 @@
   ~/Library/LaunchAgents/ へ「コピー」して bootstrap する(symlink 不可)。
   - 自動再実行しない(KeepAlive なし): 失敗時は watchdog 通知 → 手動 `intel run` 再走
   - EnvironmentVariables は PATH/HOME のみ。ANTHROPIC_API_KEY を絶対に入れない
+  - PATH には uv(起動)に加え codex(analyze で subprocess 起動)の dir(__CODEX_DIR__)を
+    必ず含める。抜けると analyze が全チャンク「codex not found」で degraded になる(#72)
   - 時刻はシステムのローカルタイムゾーン(JST 前提)。配信時刻(宿題 H5)確定時は
     Hour/Minute と pmset wake を合わせて更新する
 -->
@@ -31,7 +33,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/bin:/bin:/usr/sbin:/sbin:__UV_DIR__</string>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:__UV_DIR__:__CODEX_DIR__</string>
     <key>HOME</key>
     <string>__HOME__</string>
   </dict>
