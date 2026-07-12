@@ -85,6 +85,30 @@ def test_engine_passes_prompt_via_stdin_not_argv(tmp_path: Path) -> None:
     assert secret_prompt not in argv_file.read_text()  # argv に露出しない(ps 対策)
 
 
+def test_engine_uses_deny_read_profile_not_read_only_sandbox(tmp_path: Path) -> None:
+    # Issue #54: read-only sandbox は読取を許すため、CODEX_HOME(auth 同居)の deny-read を
+    # permission profile で課す。`-s read-only` は profile を無効化するので付けない。
+    argv_file = tmp_path / "argv.txt"
+    codex = fake_codex(
+        tmp_path,
+        f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        + OUT_FILE_SNIPPET
+        + f"echo '{VALID}' > \"$out\"\n",
+    )
+    CodexCliEngine(codex_bin=codex, codex_home="/fake/codex-auth").complete_structured(
+        "p", Verdict
+    )
+    argv = argv_file.read_text()
+    assert "default_permissions=intel_isolated" in argv
+    # deny 対象に この呼び出しの CODEX_HOME と実 ~/.codex の双方が入る(防御多層)
+    assert "/fake/codex-auth" in argv
+    assert f'{Path.home() / ".codex"}' in argv
+    assert 'permissions.intel_isolated.filesystem=' in argv
+    assert '"none"' in argv  # deny-read(none アクセス)
+    assert "permissions.intel_isolated.network={}" in argv  # network 遮断
+    assert "read-only" not in argv  # -s read-only は付けない(profile が無効化されるため)
+
+
 def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "sleep 5\n")
     with pytest.raises(LLMError, match="タイムアウト"):
