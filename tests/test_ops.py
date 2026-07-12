@@ -9,6 +9,7 @@ OPS_DIR = Path(__file__).resolve().parent.parent / "ops" / "launchd"
 PLACEHOLDERS = {
     "__UV_BIN__": "/opt/homebrew/bin/uv",
     "__UV_DIR__": "/opt/homebrew/bin",
+    "__CODEX_DIR__": "/opt/homebrew/codex-bin",  # morning のみ(analyze が codex を起動)
     "__REPO_DIR__": "/tmp/repo",
     "__HOME__": "/tmp/home",
 }
@@ -23,7 +24,7 @@ def load_plist(name: str) -> dict:
     text = plist_text_without_comments(name)
     for placeholder, value in PLACEHOLDERS.items():
         text = text.replace(placeholder, value)
-    # runbook の sed が置換する 4 種以外のプレースホルダが紛れていない(置換漏れ検知)
+    # runbook の sed が置換する種類以外のプレースホルダが紛れていない(置換漏れ検知)
     assert not re.search(r"__[A-Z_]+__", text)
     return plistlib.loads(text.encode("utf-8"))
 
@@ -40,6 +41,8 @@ def test_morning_plist_contract() -> None:
     assert "KeepAlive" not in plist  # 自動再実行しない(手動再走に一本化)
     # EnvironmentVariables は PATH/HOME のみ。ANTHROPIC_API_KEY を構成で遮断(設計 05 §1.1)
     assert set(plist["EnvironmentVariables"]) == {"PATH", "HOME"}
+    # PATH に codex(node)の dir を含む。無いと analyze が「codex not found」で全 degraded(#72)
+    assert "/opt/homebrew/codex-bin" in plist["EnvironmentVariables"]["PATH"]
 
 
 def test_poller_plist_contract() -> None:
@@ -48,6 +51,8 @@ def test_poller_plist_contract() -> None:
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] == 30
     assert set(plist["EnvironmentVariables"]) == {"PATH", "HOME"}
+    # poller は codex を使わないため codex dir は PATH に入れない(morning のみ・#72)
+    assert "/opt/homebrew/codex-bin" not in plist["EnvironmentVariables"]["PATH"]
     # poller は常駐+内蔵タイマー。カレンダー起動を持たない(設計 05 §1.2)
     assert "StartCalendarInterval" not in plist
 
