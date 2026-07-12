@@ -85,6 +85,78 @@ def test_engine_passes_prompt_via_stdin_not_argv(tmp_path: Path) -> None:
     assert secret_prompt not in argv_file.read_text()  # argv に露出しない(ps 対策)
 
 
+def test_isolation_profile_args_exact(tmp_path: Path) -> None:
+    # Issue #54 / Codex review: 引数を単位で完全一致検証する(部分文字列でなく)。
+    from app.analysis.llm import _isolation_profile_args
+
+    home_codex = str(Path.home() / ".codex")
+    args = _isolation_profile_args("/fake/codex-auth")
+    assert args == [
+        "-c",
+        "default_permissions=intel_isolated",
+        "-c",
+        f'permissions.intel_isolated.filesystem={{"/fake/codex-auth"="none",'
+        f'"{home_codex}"="none"}}',
+        "-c",
+        "permissions.intel_isolated.network={}",
+    ]
+
+
+def test_isolation_profile_args_escapes_toml_injection() -> None:
+    # Codex review must: パスに " を含めても文字列を閉じて追加キーを注入できない。
+    # 構築した TOML を実際にパースし、悪意あるパスが「単一キー」のまま(=構造注入なし)
+    # であることを検証する。
+    import tomllib
+
+    from app.analysis.llm import _isolation_profile_args
+
+    evil = '/x"="write"} injected = {"/etc'  # 文字列を閉じてキー注入を狙うパス
+    args = _isolation_profile_args(evil)
+    fs = next(a for a in args if a.startswith("permissions.intel_isolated.filesystem="))
+    inline = fs.split("=", 1)[1]  # {"..."="none",...}
+    parsed = tomllib.loads(f"t = {inline}")["t"]
+    home_codex = str(Path.home() / ".codex")
+    # キーは deny 対象 2 つだけ(injected 等の追加キーが生えていない)。悪意パスは原文のまま
+    assert set(parsed) == {evil, home_codex}
+    assert parsed[evil] == "none"
+    assert "injected" not in parsed
+
+
+def test_toml_basic_string_escapes_specials() -> None:
+    from app.analysis.llm import _toml_basic_string
+
+    assert _toml_basic_string("/plain/path") == '"/plain/path"'
+    assert _toml_basic_string('a"b') == '"a\\"b"'
+    assert _toml_basic_string("a\\b") == '"a\\\\b"'
+    assert _toml_basic_string("a\x01b") == '"a\\u0001b"'
+    assert _toml_basic_string("a\nb") == '"a\\nb"'
+
+
+def test_engine_command_isolation_flags(tmp_path: Path) -> None:
+    # Issue #54: engine が実際に組み立てる argv を検証する。
+    argv_file = tmp_path / "argv.txt"
+    codex = fake_codex(
+        tmp_path,
+        f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        + OUT_FILE_SNIPPET
+        + f"echo '{VALID}' > \"$out\"\n",
+    )
+    CodexCliEngine(codex_bin=codex, codex_home="/fake/codex-auth").complete_structured(
+        "p", Verdict
+    )
+    argv = argv_file.read_text().splitlines()
+    # 未対応 codex で profile を黙って無視させない fail-closed ガード
+    assert "--strict-config" in argv
+    assert "default_permissions=intel_isolated" in argv
+    assert "permissions.intel_isolated.network={}" in argv
+    # deny 対象に この呼び出しの CODEX_HOME と実 ~/.codex の双方が入る(防御多層)
+    fs = next(a for a in argv if a.startswith("permissions.intel_isolated.filesystem="))
+    assert '"/fake/codex-auth"="none"' in fs
+    assert f'"{Path.home() / ".codex"}"="none"' in fs
+    # -s read-only は付けない(profile が無効化されるため)
+    assert "read-only" not in argv
+
+
 def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "sleep 5\n")
     with pytest.raises(LLMError, match="タイムアウト"):
