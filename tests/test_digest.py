@@ -44,6 +44,18 @@ def test_digest_generated_with_items_in_score_order(conn, tmp_path) -> None:
     assert statuses == {"digested"}
 
 
+def test_headline_prefers_title_ja_with_fallback(conn, tmp_path) -> None:
+    # analyze-v002 の日本語見出しを優先。NULL(v001 世代)は原文に fallback
+    add_analyzed(conn, "https://a/en", relevance=90, title_ja="日本語の見出し")
+    add_analyzed(conn, "https://a/legacy", relevance=80)  # title_ja NULL
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    md = conn.execute("SELECT markdown FROM digests WHERE id = ?", (digest_id,)).fetchone()[0]
+    assert "## 1. 日本語の見出し" in md
+    assert "title https://a/en" not in md  # 原文タイトルは表示しない
+    assert "## 2. title https://a/legacy" in md  # fallback
+
+
 def test_second_run_skips_force_replaces(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1", relevance=90)
     config = make_config(tmp_path)

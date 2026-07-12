@@ -13,7 +13,7 @@ from app.analysis.analyzer import (
     sanitize,
     sanitize_body,
 )
-from app.analysis.llm import LLMError
+from app.analysis.llm import LLMError, parse_structured
 from app.config import AnalysisConfig, Config
 from app.db import apply_migrations, connect
 
@@ -47,6 +47,7 @@ def add_item(conn, url, *, title="記事タイトル", body="本文テキスト"
 def analysis_for(item_id: int, **overrides) -> ItemAnalysis:
     values = dict(
         item_id=item_id,
+        title_ja="日本語見出し",
         summary="要約",
         relevance=80,
         category="課題直結",
@@ -96,7 +97,8 @@ def test_batch_analyzed_and_mapped(conn, tmp_path) -> None:
 
     rows = conn.execute("SELECT * FROM analyses ORDER BY item_id").fetchall()
     assert rows[0]["relevance_score"] == 80
-    assert rows[0]["prompt_version"] == "analyze-v001"
+    assert rows[0]["title_ja"] == "日本語見出し"  # v002 で追加(表示側が優先使用)
+    assert rows[0]["prompt_version"] == "analyze-v002"
     assert rows[0]["engine"] == "codex-cli"
     assert rows[0]["total_score"] is None  # ranking が書く(analyze では書かない)
     assert json.loads(rows[1]["negative_labels"]) == ["hype"]
@@ -137,6 +139,38 @@ def test_still_missing_after_retry_becomes_degraded(conn, tmp_path) -> None:
     assert row["degraded"] == 1
     assert row["summary"] == "タイトルX"
     assert row["relevance_score"] == 0
+
+
+def test_missing_title_ja_fails_validation_and_degrades(conn, tmp_path) -> None:
+    """v002 の必須フィールド欠落は実経路(parse_structured の Pydantic 検証 →
+    LLMError 正規化 → リトライ → チャンク degraded)で吸収され、黙って止まらない。"""
+    a = add_item(conn, "https://a/1")
+    v001_shape = json.dumps(
+        {
+            "results": [
+                {
+                    "item_id": a, "summary": "要約", "relevance": 80,
+                    "category": "課題直結", "negative": [], "novelty": "new",
+                    "topic": "t", "reason": "理由", "implication": "示唆",
+                }  # title_ja 欠落(v001 形の出力)
+            ]
+        }
+    )
+
+    class V001ShapedEngine:
+        name = "codex-cli"
+        model = "fake-model"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            return parse_structured(v001_shape, schema)
+
+    counts = analyze_selected(
+        conn, make_config(tmp_path), V001ShapedEngine(), "プロファイル", [a], logger
+    )
+    assert counts == {"analyzed": 0, "degraded": 1}
+    row = conn.execute("SELECT degraded, title_ja FROM analyses WHERE item_id=?", (a,)).fetchone()
+    assert row["degraded"] == 1
+    assert row["title_ja"] is None  # degraded 記録は title_ja を持たない(表示は原文 fallback)
 
 
 def test_chunk_llm_failure_goes_degraded_without_singles(conn, tmp_path) -> None:

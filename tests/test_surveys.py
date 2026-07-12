@@ -136,6 +136,21 @@ def test_followup_sent_for_yesterdays_dig(conn, tmp_path) -> None:
     assert "深掘り対象 &lt;X&gt;" in followup_texts[0]  # HTML エスケープ済み
 
 
+def test_followup_prefers_title_ja(conn, tmp_path) -> None:
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    dug = add_item(conn, "https://a/en", title="English Title", title_ja="日本語の見出し")
+    add_dig_reaction(conn, dug, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    followup = next(t for _, t in api.sent if "深掘りした?" in t)
+    assert "日本語の見出し" in followup
+    assert "English Title" not in followup
+
+
 # --- 内蔵タイマー: watchdog ---
 
 

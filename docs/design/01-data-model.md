@@ -106,7 +106,10 @@ CREATE TABLE analyses (
   input_tokens          INTEGER,
   output_tokens         INTEGER,
   estimated_cost_usd    REAL    NOT NULL DEFAULT 0,  -- サブスク枠実行時は 0(クォータは doctor で別掲)
-  analyzed_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  analyzed_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  title_ja              TEXT                          -- 日本語見出し(002 で追加のため末尾列。
+                                                      -- NULL = v001 世代 / degraded。表示側は
+                                                      -- title_ja 優先・無ければ items.title)
 ) STRICT;
 CREATE UNIQUE INDEX ux_analyses_idem ON analyses(item_id, prompt_version, input_hash);
 CREATE INDEX ix_analyses_item ON analyses(item_id, analyzed_at);

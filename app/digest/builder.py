@@ -149,7 +149,8 @@ def _render_markdown(digest_date: str, items: list[RankedItem], *, degraded: boo
         return "\n".join(lines)
 
     for position, item in enumerate(items, start=1):
-        title = item.title or "(タイトルなし)"
+        # 見出しは日本語タイトル優先(analyze-v002)。degraded / v001 世代は原文に fallback
+        title = item.title_ja or item.title or "(タイトルなし)"
         lines.append(f"## {position}. {title}")
         lines.append(f"- ソース: {item.source_label} / スコア: {item.score:.0f}")
         lines.append(f"- URL: {item.canonical_url}")  # DB 正規 URL のみ(LLM 出力 URL 不使用)

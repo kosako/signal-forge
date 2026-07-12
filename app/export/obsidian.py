@@ -106,7 +106,9 @@ def _item_note_name(digest_date: str, item_id: int, title: str | None) -> str:
 def _item_frontmatter(row: sqlite3.Row, digest_date: str) -> dict:
     return {
         "id": row["item_id"],
-        "title": row["title"] or "",
+        # 表示タイトルは日本語優先(analyze-v002)。ノートのファイル名は原文 title 由来のまま
+        # (規則不変。設計 04 §7)
+        "title": row["title_ja"] or row["title"] or "",
         "url": row["canonical_url"],  # DB の正規 URL のみ
         "source": row["source_name"],
         "source_type": row["source_type"],
@@ -133,7 +135,8 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
         f"""
         SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
                sources.name AS source_name, sources.type AS source_type,
-               analyses.summary, analyses.recommendation_reason, analyses.implication,
+               analyses.title_ja, analyses.summary, analyses.recommendation_reason,
+               analyses.implication,
                analyses.total_score,
                documents.extracted_text
         FROM items

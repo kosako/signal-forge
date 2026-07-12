@@ -31,7 +31,8 @@ def make_config(tmp_path: Path) -> Config:
 
 
 def add_digested(
-    conn, url, *, source_id=2, title="記事タイトル", body="抽出済み本文。" * 100, score=80.0
+    conn, url, *, source_id=2, title="記事タイトル", title_ja=None,
+    body="抽出済み本文。" * 100, score=80.0
 ):
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, content_hash, status) "
@@ -44,12 +45,12 @@ def add_digested(
         (item_id, body),
     )
     conn.execute(
-        "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
+        "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
         "negative_labels, recommendation_reason, implication, total_score, engine, model, "
         "prompt_version, input_hash) "
-        "VALUES (?, '要約文', 'カテゴリ', 80, 'new', '[]', '理由', '示唆', ?, 'codex-cli', 'm', "
-        "'analyze-v001', ?)",
-        (item_id, score, f"sha256:{url}"),
+        "VALUES (?, ?, '要約文', 'カテゴリ', 80, 'new', '[]', '理由', '示唆', ?, 'codex-cli', "
+        "'m', 'analyze-v001', ?)",
+        (item_id, title_ja, score, f"sha256:{url}"),
     )
     return item_id
 
@@ -106,6 +107,17 @@ def test_frontmatter_resists_injection_via_title(conn, tmp_path) -> None:
     assert front["title"] == evil_title  # YAML として安全にエンコードされ round-trip する
     assert "evil" not in front  # キー偽造されない
     assert front["reaction"] is None
+
+
+def test_title_ja_in_frontmatter_but_filename_from_original(conn, tmp_path) -> None:
+    # 表示タイトルは日本語優先。ファイル名規則(原文 title 由来 slug)は不変(設計 04 §7)
+    item = add_digested(conn, "https://a/1", title="English Title", title_ja="日本語の見出し")
+    digest_id = add_digest(conn, [item])
+    export_digest(conn, make_config(tmp_path), digest_id, logger)
+
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    assert "English-Title" in note.name  # slug は原文由来のまま
+    assert read_front(note)["title"] == "日本語の見出し"
 
 
 def test_x_items_have_no_excerpt_rss_do(conn, tmp_path) -> None:

@@ -31,6 +31,8 @@ class RankedItem:
     recommendation_reason: str
     implication: str
     degraded: bool
+    # 日本語見出し(analyze-v002)。None = v001 世代 / degraded(表示は原文 title に fallback)
+    title_ja: str | None = None
 
 
 def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem]:
@@ -44,8 +46,9 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
                items.published_at,
                sources.type AS source_type, sources.type || ':' || sources.name AS source_label,
                analyses.id AS analysis_id, analyses.relevance_score, analyses.novelty,
-               analyses.negative_labels, analyses.topic, analyses.summary, analyses.category,
-               analyses.recommendation_reason, analyses.implication, analyses.degraded
+               analyses.negative_labels, analyses.topic, analyses.title_ja, analyses.summary,
+               analyses.category, analyses.recommendation_reason, analyses.implication,
+               analyses.degraded
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (
@@ -154,6 +157,7 @@ def _select(scored: list[tuple[sqlite3.Row, float]], config: Config) -> list[Ran
                 recommendation_reason=row["recommendation_reason"],
                 implication=row["implication"],
                 degraded=bool(row["degraded"]),
+                title_ja=row["title_ja"],
             )
         )
     return selected

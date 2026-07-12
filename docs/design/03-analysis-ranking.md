@@ -32,7 +32,7 @@ extraction_status=failed の items は除外**しない**(タイトル+メタで
 
 ## 3. 分析プロンプト設計
 
-### 3.1 テンプレート構造(prompts/analyze-v001.md)
+### 3.1 テンプレート構造(prompts/analyze-v002.md。旧版は履歴として凍結・編集禁止)
 
 プレースホルダは `{{interest_profile}}` `{{recent_titles}}` `{{items}}` `{{schema}}` `{{nonce}}`(実行ごとの乱数。§3.2)の 5 つ。全文(実装はこのまま使う):
 
@@ -66,6 +66,9 @@ DATA-{{nonce}}>>>
 - novelty: 配信済みタイトル・✅実例と同一トピックなら known、
   既知トピックの実質的な続報・進展なら update、それ以外は new。
 - topic: 重複判定用の正規化トピックラベル(名詞句、15字以内)。
+- title_ja: 日本語の見出し(60字目安)。原文タイトルが日本語ならそのまま、
+  他言語なら内容に忠実に日本語化。タイトルの無いアイテム(X ポスト等)は
+  本文から見出しを作る。誇張しない。
 - summary: 200字以内の日本語要約(英語ソースも日本語で)。
 - reason: なぜ私に価値があるか 1 文。implication: 「自分への示唆」を 1 文。
 ```
@@ -97,6 +100,7 @@ DATA-a1b2c3d4>>>
 ```python
 class ItemAnalysis(BaseModel):
     item_id: int                       # 入力バッチの id 集合に含まれること(allowlist)
+    title_ja: str = Field(max_length=300)  # 日本語見出し(v002 で追加)
     summary: str = Field(max_length=300)
     relevance: int = Field(ge=0, le=100)
     category: Literal["課題直結", "ゲームチェンジャー", "組織AI活用", "その他"]
@@ -112,7 +116,7 @@ class AnalysisBatch(BaseModel):
 
 検証追加規則: item_id が入力集合外 → その要素を破棄。入力集合に結果が無い item → 該当 item のみ単発再分析(1 回)、なお欠落なら relevance=0・summary=タイトルで degraded 記録。URL はスキーマに**持たせない**(配信・ノートは DB 正規 URL のみ使用)。
 
-analyses への写像(01 §3 の列に対応): `relevance` → relevance_score / `novelty` → novelty(enum のまま)/ `negative` → negative_labels(JSON 配列のまま保存。ペナルティ計算は ranking/)/ `topic` → topic / `summary`・`category`・`reason`・`implication` → 同名系列。`total_score` は analyze 段では書かず、ranking/ が §6 の式で算出して書き戻す。
+analyses への写像(01 §3 の列に対応): `relevance` → relevance_score / `novelty` → novelty(enum のまま)/ `negative` → negative_labels(JSON 配列のまま保存。ペナルティ計算は ranking/)/ `topic` → topic / `title_ja` → title_ja(表示は title_ja 優先・無ければ items.title)/ `summary`・`category`・`reason`・`implication` → 同名系列。`total_score` は analyze 段では書かず、ranking/ が §6 の式で算出して書き戻す。
 
 ### 3.4 signals 実例の few-shot 還流
 

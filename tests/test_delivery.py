@@ -36,6 +36,7 @@ def add_item(
     url,
     *,
     title="記事タイトル",
+    title_ja=None,
     published_at="2026-07-04T10:00:00Z",
     summary="要約テキスト。",
     implication="示唆テキスト。",
@@ -46,10 +47,10 @@ def add_item(
         (url, url, title, published_at),
     ).lastrowid
     conn.execute(
-        "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
+        "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
         "recommendation_reason, implication, engine, model, prompt_version, input_hash) "
-        "VALUES (?, ?, '課題直結', 80, 'new', '理由', ?, 'codex-cli', 'm', 'analyze-v001', ?)",
-        (item_id, summary, implication, f"sha256:{url}"),
+        "VALUES (?, ?, ?, '課題直結', 80, 'new', '理由', ?, 'codex-cli', 'm', 'analyze-v001', ?)",
+        (item_id, title_ja, summary, implication, f"sha256:{url}"),
     )
     return item_id
 
@@ -158,6 +159,17 @@ def test_html_escaping_of_title_and_url(conn, tmp_path) -> None:
     assert 'href="https://a/1?q=&quot;x&quot;&amp;y=&lt;z&gt;"' in text
     assert "要約 &lt;s&gt;" in text
     assert "💡 示唆 &amp; 例" in text
+
+
+def test_title_ja_preferred_in_item_text(conn, tmp_path) -> None:
+    a = add_item(conn, "https://a/en", title="English Title", title_ja="日本語の見出し")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert "<b>日本語の見出し</b>" in text
+    assert "English Title" not in text
 
 
 def test_long_summary_truncated_but_title_url_implication_kept(conn, tmp_path) -> None:
