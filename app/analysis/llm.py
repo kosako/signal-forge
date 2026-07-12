@@ -117,6 +117,12 @@ class CodexCliEngine:
                 # profile を使う。profile なら read-only 相当(書込・network 遮断)を保ったまま
                 # CODEX_HOME/実 ~/.codex の読取を deny できる(Issue #54)。`-s` を明示すると
                 # profile の filesystem deny が無視されるため -s は付けない(実測)
+                #
+                # --strict-config: profile キー(default_permissions/permissions.*)を
+                # 認識しない codex では未知 -c キーとしてエラー終了させる(fail-closed)。
+                # これが無いと未対応版で -c が黙って無視され、隔離が exec 既定(read-only)に
+                # 退化して deny-read だけ失われる(= #54 に静かに逆戻り)経路を塞ぐ(実測)
+                "--strict-config",
                 *_isolation_profile_args(codex_home),
                 # -a/--ask-for-approval はトップレベル専用で exec では使えない(実測)。
                 # exec では config override で承認を止める
@@ -179,6 +185,34 @@ class CodexCliEngine:
 _ISOLATION_PROFILE = "intel_isolated"
 
 
+def _toml_basic_string(s: str) -> str:
+    """任意の文字列を TOML basic string リテラル(前後の二重引用符込み)に変換する。
+
+    パスをそのまま `"..."` に埋めると、`"` を含むパスで文字列を閉じて追加のキーを注入でき、
+    隔離ポリシー自体への config injection が成立する(Codex レビュー must)。`\\`・`"`・
+    制御文字を TOML 仕様どおりエスケープして、値が常に単一の well-formed な文字列になるよう
+    構造的に保証する(注入を排除)。
+    """
+    out = ['"']
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch < "\x20" or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
 def _isolation_profile_args(codex_home: str) -> list[str]:
     """read-only 相当 + CODEX_HOME/実 ~/.codex の deny-read を課す profile の -c 群(Issue #54)。
 
@@ -190,11 +224,12 @@ def _isolation_profile_args(codex_home: str) -> list[str]:
       - ~/.codex: symlink の実体側。symlink 経由の読取・絶対パス直読みの双方を塞ぐ(防御多層)
     codex 自身の auth 読取は sandbox 外で行われるため deny の影響を受けず、認証は維持される。
 
-    パスは TOML basic string(二重引用符)で埋める。CODEX_HOME は tempfile 由来、~/.codex は
-    ユーザーホーム配下で、いずれも `"`/`\\` を含まない(含めば TOML パースが fail-close する)。
+    パスは _toml_basic_string でエスケープしてから埋める(注入を構造的に排除)。
     """
     real_codex_home = str(Path.home() / ".codex")
-    deny_fs = f'{{"{codex_home}"="none","{real_codex_home}"="none"}}'
+    ch = _toml_basic_string(codex_home)
+    rh = _toml_basic_string(real_codex_home)
+    deny_fs = f"{{{ch}=\"none\",{rh}=\"none\"}}"
     prof = _ISOLATION_PROFILE
     return [
         "-c",
