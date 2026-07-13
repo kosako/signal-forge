@@ -7,13 +7,14 @@ import pytest
 
 from app.analysis.analyzer import (
     AnalysisBatch,
+    FullDegradationError,
     ItemAnalysis,
     analyze_selected,
     build_prompt,
     sanitize,
     sanitize_body,
 )
-from app.analysis.llm import LLMError, parse_structured
+from app.analysis.llm import LLMError, LLMUnavailableError, parse_structured
 from app.config import AnalysisConfig, Config
 from app.db import apply_migrations, connect
 
@@ -133,8 +134,9 @@ def test_still_missing_after_retry_becomes_degraded(conn, tmp_path) -> None:
     engine = FakeEngine(
         [AnalysisBatch(results=[]), AnalysisBatch(results=[])]  # バッチも単発も空
     )
-    counts = analyze_selected(conn, make_config(tmp_path), engine, "p", [a], logger)
-    assert counts == {"analyzed": 0, "degraded": 1}
+    # 1件のみの run では欠落 = 全滅なので loud(GH#74)。degraded 記録自体は維持
+    with pytest.raises(FullDegradationError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a], logger)
     row = conn.execute("SELECT * FROM analyses WHERE item_id=?", (a,)).fetchone()
     assert row["degraded"] == 1
     assert row["summary"] == "タイトルX"
@@ -164,10 +166,11 @@ def test_missing_title_ja_fails_validation_and_degrades(conn, tmp_path) -> None:
         def complete_structured(self, prompt, schema, timeout_s=120):
             return parse_structured(v001_shape, schema)
 
-    counts = analyze_selected(
-        conn, make_config(tmp_path), V001ShapedEngine(), "プロファイル", [a], logger
-    )
-    assert counts == {"analyzed": 0, "degraded": 1}
+    # 1件のみの run では検証失敗 = 全滅なので loud(GH#74)。degraded 記録自体は維持
+    with pytest.raises(FullDegradationError):
+        analyze_selected(
+            conn, make_config(tmp_path), V001ShapedEngine(), "プロファイル", [a], logger
+        )
     row = conn.execute("SELECT degraded, title_ja FROM analyses WHERE item_id=?", (a,)).fetchone()
     assert row["degraded"] == 1
     assert row["title_ja"] is None  # degraded 記録は title_ja を持たない(表示は原文 fallback)
@@ -178,15 +181,43 @@ def test_chunk_llm_failure_goes_degraded_without_singles(conn, tmp_path) -> None
     b = add_item(conn, "https://a.example/2")
     # チャンク失敗(retry 込み2回)後は単発再分析に流れない(設計 03 §2)
     engine = FakeEngine([LLMError("落ちた")] * 2)
-    counts = analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
-    assert counts == {"analyzed": 0, "degraded": 2}
+    # 全滅(analyzed=0)は degraded 記録後に loud に落ちる(GH#74)
+    with pytest.raises(FullDegradationError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
     assert len(engine.prompts) == 2  # バッチの2試行のみ
     rows = conn.execute("SELECT degraded, topic FROM analyses").fetchall()
+    assert len(rows) == 2  # degraded 行は書き込み済み(劣化配信は成立する)
     assert all(r["degraded"] == 1 for r in rows)
     assert all(r["topic"] is None for r in rows)  # 空文字でなく NULL(ranking の重複判定対策)
     # degraded でも items は analyzed に遷移(止まらない)
     statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
     assert statuses == {"analyzed"}
+
+
+def test_partial_chunk_failure_degrades_and_continues(conn, tmp_path) -> None:
+    # transient なチャンク失敗は degraded 継続(GH#74 で loud になるのは環境障害と全滅のみ)
+    a = add_item(conn, "https://a.example/1")
+    b = add_item(conn, "https://a.example/2")
+    engine = FakeEngine(
+        [LLMError("落ちた"), LLMError("落ちた"), AnalysisBatch(results=[analysis_for(b)])]
+    )
+    counts = analyze_selected(
+        conn, make_config(tmp_path, batch_size=1), engine, "p", [a, b], logger
+    )
+    assert counts == {"analyzed": 1, "degraded": 1}
+
+
+def test_engine_unavailable_propagates_without_degraded(conn, tmp_path) -> None:
+    # 環境障害(codex 不在 = #72)は degraded で握らず伝播し、items も遷移させない
+    # (修復後の再実行がそのまま再分析になる。GH#74)
+    a = add_item(conn, "https://a.example/1")
+    engine = FakeEngine([LLMUnavailableError("codex 起動失敗")])
+    with pytest.raises(LLMUnavailableError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a], logger)
+    assert len(engine.prompts) == 1  # リトライもしない
+    assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+    statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
+    assert statuses == {"new"}
 
 
 def test_batching_respects_batch_size(conn, tmp_path) -> None:

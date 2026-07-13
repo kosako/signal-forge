@@ -39,6 +39,15 @@ class LLMError(Exception):
     """呼び出し失敗(timeout・非0終了・JSON/スキーマ検証失敗)の正規化。"""
 
 
+class LLMUnavailableError(LLMError):
+    """エンジン実行不能(バイナリ不在・認証不在などの環境障害。GH#74)。
+
+    transient な呼び出し失敗(LLMError)と違い、リトライしても・チャンクを進めても
+    回復しない。per-chunk degraded で握ると全件が黙って劣化する(#72 の実障害)ため、
+    呼び出し側は degraded にせず analyze 段の失敗として伝播させる。
+    """
+
+
 class LLMEngine(Protocol):
     name: str
 
@@ -53,6 +62,8 @@ def complete_with_retry[M: BaseModel](
     """同一エンジンで1リトライ(設計 00 §5 の呼び出し規約)。なお失敗は呼び出し側で degraded へ。"""
     try:
         return engine.complete_structured(prompt, schema, timeout_s)
+    except LLMUnavailableError:
+        raise  # 環境障害はリトライで回復しない(GH#74)
     except LLMError:
         return engine.complete_structured(prompt, schema, timeout_s)
 
@@ -149,7 +160,8 @@ class CodexCliEngine:
                     start_new_session=True,  # timeout 時に孫プロセスごと落とすための別セッション
                 )
             except OSError as e:
-                raise LLMError(f"codex 起動失敗: {e}") from e
+                # バイナリ不在(FileNotFoundError = #72)・権限等の環境障害
+                raise LLMUnavailableError(f"codex 起動失敗: {e}") from e
             try:
                 _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
             except subprocess.TimeoutExpired as e:
@@ -250,7 +262,7 @@ def _ephemeral_codex_home(base: Path) -> str:
     """
     real_auth = Path.home() / ".codex" / "auth.json"
     if not real_auth.exists():
-        raise LLMError("~/.codex/auth.json がない(先に codex login が必要)")
+        raise LLMUnavailableError("~/.codex/auth.json がない(先に codex login が必要)")
     home = base / "codex-home"
     home.mkdir()
     (home / "auth.json").symlink_to(real_auth)

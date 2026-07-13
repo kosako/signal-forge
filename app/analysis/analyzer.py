@@ -6,6 +6,8 @@
   recent_titles は実行ごとの乱数 nonce でフェンスする
 - バッチ(既定15件)→ AnalysisBatch 検証 → allowlist 外破棄 → 欠落は単発再分析1回 →
   なお欠落・チャンク失敗は degraded 記録(黙って止まらない。設計 00 §6)
+- 例外(GH#74): 環境障害(LLMUnavailableError)と全滅(analyzed=0)は degraded で
+  握らず段の失敗として raise する(silent full-degradation 防止。失敗通知 = 設計 05 §4)
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
+from app.analysis.llm import LLMEngine, LLMError, LLMUnavailableError, complete_with_retry
 from app.config import Config
 
 PROMPT_VERSION = "analyze-v002"
@@ -54,6 +56,14 @@ class AnalysisBatch(BaseModel):
     results: list[ItemAnalysis]
 
 
+class FullDegradationError(RuntimeError):
+    """1 run の分析が全滅(analyzed=0・degraded>0)。systemic 障害の兆候(GH#74)。
+
+    degraded 行は書き込み済みのため劣化配信は成立するが、「まともに分析できていない朝」を
+    黙って正常系に見せないよう、run は失敗として失敗通知(設計 05 §4)に載せる。
+    """
+
+
 def analyze_selected(
     conn: sqlite3.Connection,
     config: Config,
@@ -77,6 +87,11 @@ def analyze_selected(
         )
         counts["analyzed"] += chunk_counts["analyzed"]
         counts["degraded"] += chunk_counts["degraded"]
+    if counts["analyzed"] == 0 and counts["degraded"] > 0:
+        # 原因を問わない全滅検知(種別分岐をすり抜ける systemic 障害の安全網。GH#74)
+        raise FullDegradationError(
+            f"分析が全滅({counts['degraded']} 件すべて degraded)。環境障害を疑うこと"
+        )
     logger.info("本分析 完了", extra={"run_id": run_id, "stage": "analyze", "extra": counts})
     return counts
 
@@ -104,6 +119,10 @@ def _analyze_chunk(
             if result.item_id in chunk_ids:  # allowlist 外の item_id は破棄
                 results[result.item_id] = result
                 hashes[result.item_id] = chunk_hash
+    except LLMUnavailableError:
+        # 環境障害(codex 不在・認証不在)は degraded で握ると全件が黙って劣化する
+        # (#72)。段の失敗として伝播させ失敗通知に載せる(GH#74)
+        raise
     except LLMError as e:
         # チャンク失敗(リトライ済み)はチャンクごと degraded 直行(設計 03 §2。
         # 単発再分析へ流すと呼び出しが 2+2N に増える)
@@ -168,6 +187,8 @@ def _reanalyze_single(
     prompt_hash = _prompt_hash(prompt)
     try:
         batch = complete_with_retry(engine, prompt, AnalysisBatch)
+    except LLMUnavailableError:
+        raise  # 環境障害は degraded にしない(_analyze_chunk と同方針。GH#74)
     except LLMError as e:
         logger.warning(
             f"単発再分析も失敗(degraded 記録): {e}",

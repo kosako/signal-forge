@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.analysis.llm import (
     CodexCliEngine,
     LLMError,
+    LLMUnavailableError,
     complete_with_retry,
     create_engine,
     parse_structured,
@@ -157,6 +158,21 @@ def test_engine_command_isolation_flags(tmp_path: Path) -> None:
     assert "read-only" not in argv
 
 
+def test_engine_launch_failure_raises_unavailable(tmp_path: Path) -> None:
+    # バイナリ不在(#72 の実障害)は transient と区別して環境障害に分類する(GH#74)
+    with pytest.raises(LLMUnavailableError, match="起動失敗"):
+        CodexCliEngine(codex_bin=str(tmp_path / "no-such-codex")).complete_structured(
+            "p", Verdict
+        )
+
+
+def test_missing_auth_raises_unavailable(tmp_path: Path, fake_user_home: Path) -> None:
+    (fake_user_home / ".codex" / "auth.json").unlink()
+    codex = fake_codex(tmp_path, OUT_FILE_SNIPPET + f"echo '{VALID}' > \"$out\"\n")
+    with pytest.raises(LLMUnavailableError, match="auth.json"):
+        CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+
+
 def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "sleep 5\n")
     with pytest.raises(LLMError, match="タイムアウト"):
@@ -264,6 +280,20 @@ def test_complete_with_retry_gives_up_after_two(tmp_path: Path) -> None:
     with pytest.raises(LLMError):
         complete_with_retry(Broken(), "p", Verdict)
     assert Broken.calls == 2
+
+
+def test_complete_with_retry_no_retry_on_unavailable() -> None:
+    class Unavailable:
+        name = "unavailable"
+        calls = 0
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            Unavailable.calls += 1
+            raise LLMUnavailableError("codex 起動失敗")
+
+    with pytest.raises(LLMUnavailableError):
+        complete_with_retry(Unavailable(), "p", Verdict)
+    assert Unavailable.calls == 1  # 環境障害はリトライで回復しない(GH#74)
 
 
 def test_create_engine_only_codex_cli() -> None:
