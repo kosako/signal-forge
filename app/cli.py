@@ -216,7 +216,13 @@ def x_auth(
 def x_signals(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
     backfill: bool = typer.Option(
-        False, "--backfill", help="初回全件取込(cold start。cap を無視して全ページ辿る)"
+        False, "--backfill", help="cold start: kind ごと直近 --limit 件を種に取り込む"
+    ),
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        min=5,
+        help="--backfill 時の kind ごと読取上限(最悪コスト = 3 × limit × 単価。GH#84)",
     ),
 ) -> None:
     """X 興味シグナル(🔖ブックマーク・❤️いいね・🔁自RT)を取り込む(S1b = GH#58)。"""
@@ -236,7 +242,7 @@ def x_signals(
     if config.x_signals.daily_read_cap == 0 and not backfill:
         typer.echo(
             "[x_signals].daily_read_cap が 0(取込無効)。有効化は合算予算の再配分"
-            "(ADR 0001)、初回全件は --backfill",
+            "(ADR 0001)、cold start は --backfill(kind ごと直近 --limit 件)",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -250,7 +256,9 @@ def x_signals(
             client_id=config.x_oauth2.client_id,
             client_secret=env.get(ENV_CLIENT_SECRET),
         )
-        totals = collect_x_signals(conn, config, session, logger, backfill=backfill)
+        totals = collect_x_signals(
+            conn, config, session, logger, backfill_limit=limit if backfill else None
+        )
     typer.echo(f"reads={totals['api_reads']} new_signals={totals['new_signals']}")
 
 
