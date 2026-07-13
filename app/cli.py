@@ -212,6 +212,66 @@ def x_auth(
     typer.echo(f"認可完了: @{username} / token を保存した({token_path(config_dir)})")
 
 
+@app.command(name="x-signals")
+def x_signals(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    backfill: bool = typer.Option(
+        False, "--backfill", help="初回全件取込(cold start。cap を無視して全ページ辿る)"
+    ),
+) -> None:
+    """X 興味シグナル(🔖ブックマーク・❤️いいね・🔁自RT)を取り込む(S1b = GH#58)。"""
+    import httpx
+
+    from app.config import load_config, load_env
+    from app.connectors.x import (
+        XApiSession,
+        build_x_client,
+        credentials_from_env,
+        has_x_credentials,
+    )
+    from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session
+    from app.connectors.x_signals import collect_x_signals
+    from app.db import apply_migrations, connect
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    if config.x_oauth2.client_id is None:
+        typer.echo("[x_oauth2].client_id が未設定(runbook §9 → intel x-auth)", err=True)
+        raise typer.Exit(code=1)
+    if config.x_signals.daily_read_cap == 0 and not backfill:
+        typer.echo(
+            "[x_signals].daily_read_cap が 0(取込無効)。有効化は合算予算の再配分"
+            "(ADR 0001)、初回全件は --backfill",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    with httpx.Client() as client:
+        oauth2 = XOAuth2Session.load(
+            client=client,
+            config_dir=config_dir,
+            client_id=config.x_oauth2.client_id,
+            client_secret=env.get(ENV_CLIENT_SECRET),
+        )
+        oauth1_client = build_x_client() if has_x_credentials(env) else None
+        try:
+            oauth1 = (
+                XApiSession(client=oauth1_client, credentials=credentials_from_env(env))
+                if oauth1_client is not None
+                else None
+            )
+            totals = collect_x_signals(
+                conn, config, oauth2, oauth1, logger, backfill=backfill
+            )
+        finally:
+            if oauth1_client is not None:
+                oauth1_client.close()
+    typer.echo(f"reads={totals['api_reads']} new_signals={totals['new_signals']}")
+
+
 @app.command()
 def poll(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),

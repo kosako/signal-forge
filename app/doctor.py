@@ -572,6 +572,12 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
         "WHERE started_at LIKE ? || '%'",
         (month_prefix,),
     ).fetchone()[0]
+    if _table_exists(conn, "x_signal_runs"):  # migration 004 未適用の DB を落とさない
+        x_cost += conn.execute(
+            "SELECT coalesce(sum(estimated_cost_usd), 0) FROM x_signal_runs "
+            "WHERE started_at LIKE ? || '%'",
+            (month_prefix,),
+        ).fetchone()[0]
     now = datetime.now(UTC)
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     spent = llm_cost + x_cost

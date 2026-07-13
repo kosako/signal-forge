@@ -42,7 +42,7 @@
 
 ### 2プロセスの責務分離
 
-- **朝バッチ** `intel run`: **collect → extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload 削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
+- **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
 - **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
 
@@ -56,7 +56,7 @@ app/
   config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
   db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
   models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
-  connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), x_oauth2.py(OAuth2 PKCE・S1), rss.py
+  connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), x_oauth2.py(OAuth2 PKCE・S1), x_signals.py(興味シグナル取込・S1b), rss.py
                   #   — items を produce(カーソル・冪等)
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)

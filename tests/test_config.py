@@ -249,3 +249,12 @@ def test_x_oauth2_validation(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[x_oauth2]\ncallback_port = 0\n"))
     with pytest.raises(ConfigError, match="client_id"):
         load_config(write_config(tmp_path, '[x_oauth2]\nclient_id = " "\n'))
+
+
+def test_x_signals_cap_counts_toward_combined_budget(tmp_path: Path) -> None:
+    # S1b 取込も合算予算の単一ノブの内側(ADR 0001)。既定 0 は挙動不変
+    assert load_config(tmp_path / "nowhere").x_signals.daily_read_cap == 0
+    config = load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 35\n"))
+    assert config.x_signals.daily_read_cap == 35  # 130 + 35 = 165 ちょうどは OK
+    with pytest.raises(ConfigError, match="combined_daily_read_cap"):
+        load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 36\n"))

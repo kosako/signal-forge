@@ -79,6 +79,18 @@ class Connector(Protocol):
 - **セッション(`XOAuth2Session`)**: Bearer つき GET。共通リトライ規約(設計 05 §8)は `XApiSession` と同形(429 は待たず即返す)。失効 5 分前の先回り refresh + 401 時の1回 refresh。**新 token は使用前に永続化**(保存失敗時に旧 token で続行しない)。refresh 失敗は再認可(`intel x-auth`)の案内つきエラー。
 - **検証**: `/2/users/me`(読取課金なし)。x-auth の完了確認と doctor #13 が使う。
 
+### 興味シグナル取込(`connectors/x_signals.py`・S1b = GH#58)
+
+自分の X 行動(🔖ブックマーク・❤️いいね・🔁自RT)を**探索シグナル**として `x_signals` に記録する(ADR 0001 の興味フィードバックループ入力)。**digest には流さない**(items に書かない = §1 の collect 契約から独立。朝バッチの専用段 `x_signals` として実行)。
+
+- **エンドポイントと認証**: `/2/users/:id/bookmarks`・`/2/users/:id/liked_tweets`(OAuth 2.0 = `XOAuth2Session`)/ 自RT は `/2/users/:id/tweets`(OAuth 1.0a・既存キー。`exclude=replies` + referenced_tweets の `type='retweeted'` で判定)。me_id は OAuth2 の users/me(読取課金なし)で 1 回だけ取得し全 kind で共用。OAuth1 キー未設定時は self_rt のみ skip(WARN)
+- **差分検出**: bookmarks / liked_tweets は since_id 非対応のため、新→旧に読み**既知 tweet_id 到達で打ち切り**(`UNIQUE (kind, tweet_id)` + INSERT OR IGNORE の rowcount で判定)。解除→再登録で古い側に隠れた新規は追わない(見逃し防止は非目標。ホームTL と同方針)。ページ単位で commit(途中失敗でも取得済みぶんを失わない)
+- **自RT の正規化**: 記録する id・著者・本文・時刻は **RT 元ツイートのもの**(興味の対象は元ツイ。ホームTL の RT 正規化と同方針)。通常ポスト・引用はシグナル対象外
+- **予算**: `[x_signals].daily_read_cap`(**既定 0 = 取込無効**)。読取 = 取得ツイート数(collect と同じ意味論)。合算 `[x.combined_daily_read_cap]` の検証に含まれ、有効化は内訳の再配分 = 人間の config 変更(ADR 0001。例: home 115 / search 35 / signals 15)。予算は bookmark → like → self_rt の順(強シグナル優先)に消費し、残 < 5(liked_tweets の max_results 下限)で打ち切り。429 は待たず打ち切り
+- **cold start**: 初回全件は日次 run でなく **`intel x-signals --backfill` の手動実行**(cap 無視で全ページ。課金操作は人間ゲート = ADR 0001 の原則)。backfill 分の observed_at は一括時刻になるため直近性の代理としては使えない(制約として許容)
+- **障害隔離**: kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。**全 kind 失敗かつ取得 0 は段の失敗として loud に落とす**(GH#74 と同方針)。cap > 0 なのに未認可・client_id 欠落も段の失敗(黙って skip しない)
+- **記録**: 取込 1 回ごとに `x_signal_runs` へ 1 行(api_reads・estimated_cost_usd・new_signals。設計 01 §9)。doctor #9 の当月コストに合算
+
 ### Day 0 テストスクリプト仕様(`scripts/day0_x_probe.py`)
 
 本体外の使い捨てスクリプト(vibe 品質でよい)。X コネクタと同じ認証・エンドポイントを使い、以下を実測して合否を出す。

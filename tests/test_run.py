@@ -273,3 +273,28 @@ def test_run_id_in_json_log_lines(conn, tmp_path) -> None:
     stages = {line["stage"] for line in lines if line["run_id"] == "01RUNID"}
     # 主要ステージのログに run_id が貫通している
     assert {"collect", "extract", "analyze", "digest", "export", "purge", "run"} <= stages
+
+
+def test_x_signals_stage_absent_when_cap_zero(conn, tmp_path) -> None:
+    # 既定(cap 0 = 無効)では x_signals 段を配線しない(挙動不変)
+    failures = run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert failures == []
+    assert conn.execute("SELECT count(*) FROM x_signal_runs").fetchone()[0] == 0
+
+
+def test_x_signals_stage_fails_loud_when_enabled_but_unconfigured(conn, tmp_path) -> None:
+    # cap > 0(取込を意図)なのに client_id / token 未設定は段の失敗(黙って skip しない)
+    from dataclasses import replace
+
+    from app.config import XSignalsConfig
+
+    config = replace(make_config(tmp_path), x_signals=XSignalsConfig(daily_read_cap=15))
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert "x_signals" in failures
+    assert "digest" not in failures  # 後続の段は継続

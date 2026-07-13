@@ -54,6 +54,17 @@ class XOAuth2Config:
 
 
 @dataclass(frozen=True)
+class XSignalsConfig:
+    """X 興味シグナル取込(S1b = GH#58 / ADR 0001)。
+
+    0 = 取込無効(既定)。有効化は合算予算(combined_daily_read_cap)の内側での
+    再配分 = 人間の config 変更(例: home 115 / search 35 / signals 15)。
+    """
+
+    daily_read_cap: int = 0
+
+
+@dataclass(frozen=True)
 class XSearchConfig:
     # 検索クエリのスロット(最大 X_SEARCH_MAX_SLOTS 本・入れ替え式。ADR 0001)。
     # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
@@ -137,6 +148,7 @@ class Config:
     x: XConfig = field(default_factory=XConfig)
     x_oauth2: XOAuth2Config = field(default_factory=XOAuth2Config)
     x_search: XSearchConfig = field(default_factory=XSearchConfig)
+    x_signals: XSignalsConfig = field(default_factory=XSignalsConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
@@ -170,6 +182,7 @@ _SECTIONS = {
     "x": XConfig,
     "x_oauth2": XOAuth2Config,
     "x_search": XSearchConfig,
+    "x_signals": XSignalsConfig,
     "digest": DigestConfig,
     "llm": LLMConfig,
     "retention": RetentionConfig,
@@ -270,6 +283,7 @@ def _validate(path: Path, config: Config) -> None:
         ("ranking", "max_per_source", config.ranking.max_per_source),
     ]
     nonnegatives = [
+        ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),
         ("ranking", "min_score", config.ranking.min_score),
         ("ranking", "negative_penalty", config.ranking.negative_penalty),
         ("ranking", "freshness_penalty_24_48", config.ranking.freshness_penalty_24_48),
@@ -323,7 +337,11 @@ def _validate_x_search(path: Path, config: Config) -> None:
             f"少なすぎる(スロットあたり {X_SEARCH_MIN_PAGE} 件以上必要。"
             f"search/recent の max_results 下限)"
         )
-    cap_sum = config.x.daily_read_cap + (config.x_search.daily_read_cap if slots else 0)
+    cap_sum = (
+        config.x.daily_read_cap
+        + (config.x_search.daily_read_cap if slots else 0)
+        + config.x_signals.daily_read_cap  # S1b 取込も同じ予算の内側(ADR 0001)
+    )
     if cap_sum > config.x.combined_daily_read_cap:
         raise ConfigError(
             f"{path}: X 読取の内訳合計({cap_sum})が [x].combined_daily_read_cap"
