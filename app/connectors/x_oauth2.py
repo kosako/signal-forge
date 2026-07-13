@@ -109,13 +109,17 @@ def load_token(config_dir: Path) -> XOAuth2Token | None:
             expires_at=data["expires_at"],
             scope=data["scope"],
         )
-        # 意味的破損(null・空文字・parse 不能な期限)も load 境界で fail fast する
+        # 意味的破損(null・空文字・parse 不能/naive な期限・scope 欠け)も load 境界で
+        # fail fast する(naive 日時は失効判定の aware 比較で TypeError になる)
         if not all(
             isinstance(v, str) and v
             for v in (token.access_token, token.refresh_token, token.expires_at, token.scope)
         ):
             raise ValueError("空または非文字列のフィールド")
-        _from_iso(token.expires_at)
+        if _from_iso(token.expires_at).tzinfo is None:
+            raise ValueError("expires_at に timezone がない")
+        if set(OAUTH2_SCOPES) - set(token.scope.split()):
+            raise ValueError("必要な scope が欠けている")
         return token
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
         # 黙って再認可に倒さない(半端な上書き・手編集ミスの検出を優先)
@@ -272,18 +276,37 @@ def _post_token(
     )
 
 
+# RFC 6749 §5.2 + X が返す既知の error code。これ以外の値は表示しない
+_KNOWN_OAUTH_ERRORS = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "unsupported_response_type",
+        "invalid_scope",
+        "access_denied",
+        "server_error",
+        "temporarily_unavailable",
+    }
+)
+
+
 def _safe_error_detail(response: httpx.Response) -> str:
-    """エラー本文から短い error code だけを出す(本文は gateway/API が要求内容を反射
-    しうる untrusted データ。token・code が例外経由で CLI/doctor に漏れる経路を塞ぐ)。"""
+    """既知の OAuth error code に一致したときだけ表示する(allowlist)。
+
+    エラー本文は gateway/API が要求内容(token・code)を任意フィールドに反射しうる
+    untrusted データ。値の切り詰めでは不十分で、一致以外は固定文言に落とす。
+    """
     try:
         body = response.json()
     except ValueError:
         return "(本文非表示)"
-    if not isinstance(body, dict):
-        return "(本文非表示)"
-    code = body.get("error") or body.get("title")
-    if isinstance(code, str) and code:
-        return code[:50]
+    if isinstance(body, dict):
+        code = body.get("error")
+        if isinstance(code, str) and code in _KNOWN_OAUTH_ERRORS:
+            return code
     return "(本文非表示)"
 
 
@@ -489,15 +512,13 @@ class XOAuth2Session:
     def _refresh(self) -> None:
         with _token_lock(self._config_dir):
             # 他プロセス(朝バッチ ⟷ doctor)が先に refresh していたらその token を採用
-            # (使用済み refresh token を再送して invalid_grant にしない)
+            # (旧 refresh token は使用済み。再送すると invalid_grant で認可を失う)。
+            # 採用した token も失効間近なら、新しい refresh token で refresh を続行する
             on_disk = load_token(self._config_dir)
-            if (
-                on_disk is not None
-                and on_disk.refresh_token != self._token.refresh_token
-                and not self._is_expiring(on_disk)
-            ):
+            if on_disk is not None and on_disk.refresh_token != self._token.refresh_token:
                 self._token = on_disk
-                return
+                if not self._is_expiring(on_disk):
+                    return
             try:
                 new_token = refresh_token_grant(
                     self._client,

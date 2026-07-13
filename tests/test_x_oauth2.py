@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 import stat
 import threading
 from datetime import UTC, datetime
@@ -124,6 +125,23 @@ def test_load_token_rejects_symlink(tmp_path: Path) -> None:
         load_token(tmp_path)
 
 
+def test_load_token_rejects_naive_expires_at_and_missing_scope(tmp_path: Path) -> None:
+    # naive 日時は失効判定の aware 比較で TypeError になる前に load で拒否する
+    save_token(tmp_path, make_token(expires_at="2026-07-13T14:00:00"))
+    with pytest.raises(XOAuth2Error, match="壊れている"):
+        load_token(tmp_path)
+    # 必要 scope を欠く保存済み token も再認可へ誘導(S1b の取込だけが失敗する事故防止)
+    save_token(
+        tmp_path,
+        XOAuth2Token(
+            access_token="at", refresh_token="rt",
+            expires_at="2026-07-13T14:00:00Z", scope="users.read offline.access",
+        ),
+    )
+    with pytest.raises(XOAuth2Error, match="壊れている"):
+        load_token(tmp_path)
+
+
 # --- token エンドポイント ---
 
 
@@ -207,17 +225,30 @@ def test_refresh_response_without_scope_keeps_stored_scope() -> None:
 
 
 def test_error_body_not_reflected_in_exception() -> None:
-    # エラー本文は untrusted(gateway が要求内容を反射しうる)。error code 以外を出さない
+    # エラー本文は untrusted(gateway が要求内容を任意フィールドに反射しうる)。
+    # 既知の OAuth error code の allowlist 一致以外は固定文言(error 欄自体の反射も遮断)
     sentinel = "SECRET-REFRESH-TOKEN-VALUE"
-    body = {"error": "invalid_grant", "error_description": f"bad token {sentinel}"}
-    client = httpx.Client(transport=capture_transport([], body, status=400))
-    with pytest.raises(XOAuth2Error) as exc_info:
+    for body in (
+        {"error": "invalid_grant", "error_description": f"bad token {sentinel}"},
+        {"error": sentinel},  # error 欄そのものに反射されるケース
+        {"title": sentinel},
+    ):
+        client = httpx.Client(transport=capture_transport([], body, status=400))
+        with pytest.raises(XOAuth2Error) as exc_info:
+            exchange_code(
+                client, client_id="cid", client_secret=None,
+                code="c", redirect_uri="r", code_verifier="v",
+            )
+        assert sentinel not in str(exc_info.value)
+    # allowlist 一致は code を表示する(診断可能性は保つ)
+    client = httpx.Client(
+        transport=capture_transport([], {"error": "invalid_grant"}, status=400)
+    )
+    with pytest.raises(XOAuth2Error, match="invalid_grant"):
         exchange_code(
             client, client_id="cid", client_secret=None,
             code="c", redirect_uri="r", code_verifier="v",
         )
-    assert sentinel not in str(exc_info.value)
-    assert "invalid_grant" in str(exc_info.value)
 
 
 def test_token_endpoint_error_surfaces_status() -> None:
@@ -374,6 +405,63 @@ def test_refresh_adopts_token_rotated_by_other_process(tmp_path: Path) -> None:
     session = make_session(tmp_path, httpx.MockTransport(handler), stale)
     assert fetch_me(session) == "kosako"
     assert calls == ["Bearer at-2"]  # ネットワーク refresh なしで新 token を採用
+
+
+def test_refresh_adopts_rotated_expiring_token_and_refreshes_with_it(tmp_path: Path) -> None:
+    # 他プロセスの新 token 自体も失効間近なら、旧(使用済み)でなく新 refresh token で
+    # refresh を続行する(旧を再送すると invalid_grant で認可を失う)
+    rotated_expiring = XOAuth2Token(
+        access_token="at-2", refresh_token="rt-2",
+        expires_at="2026-07-13T12:01:00Z", scope=" ".join(OAUTH2_SCOPES),  # margin 内
+    )
+    save_token(tmp_path, rotated_expiring)
+    sent_refresh_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            form = dict(parse_qsl(request.content.decode()))
+            sent_refresh_tokens.append(form["refresh_token"])
+            return httpx.Response(200, json=token_response(3))
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    stale = make_token(expires_at="2026-07-13T11:00:00Z")  # 失効済みの旧 token(rt-1)
+    session = make_session(tmp_path, httpx.MockTransport(handler), stale)
+    assert fetch_me(session) == "kosako"
+    assert sent_refresh_tokens == ["rt-2"]  # 使用済みの rt-1 を再送しない
+    assert load_token(tmp_path).refresh_token == "rt-3"
+
+
+def test_token_lock_is_exclusive_and_released(tmp_path: Path) -> None:
+    import fcntl
+
+    from app.connectors.x_oauth2 import LOCK_FILENAME, _token_lock
+
+    lock_file = tmp_path / LOCK_FILENAME
+    with _token_lock(tmp_path):
+        fd = os.open(lock_file, os.O_WRONLY)
+        with pytest.raises(BlockingIOError):  # 保持中は他者が取れない(排他)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(fd)
+    fd = os.open(lock_file, os.O_WRONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 解放後は取れる
+    os.close(fd)
+
+
+def test_refresh_failure_releases_lock_for_next_attempt(tmp_path: Path) -> None:
+    statuses = [400]  # 初回 refresh は失敗、次回は成功
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            if statuses:
+                return httpx.Response(statuses.pop(0), json={"error": "server_error"})
+            return httpx.Response(200, json=token_response(2))
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    expired = make_token(expires_at="2026-07-13T11:00:00Z")
+    session = make_session(tmp_path, httpx.MockTransport(handler), expired)
+    with pytest.raises(XOAuth2Error, match="再認可"):
+        session.get(USERS_ME_URL)
+    assert fetch_me(session) == "kosako"  # 失敗後もロックが解放されており続行できる
 
 
 def test_session_load_without_token_guides_auth(tmp_path: Path) -> None:
