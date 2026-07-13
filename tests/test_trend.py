@@ -91,6 +91,19 @@ def test_summary_truncated_to_bound(conn) -> None:
     assert len(md) < 300  # ヘッダ 1 通が肥大しない
 
 
+def test_prompt_compliant_summary_not_truncated(conn) -> None:
+    # prompt(v002)の指示上限 160 字を守った要約は文中で切らない(GH#78)。
+    # MAX_SUMMARY はあくまで指示無視時の安全網
+    ids = seed_six(conn)
+    compliant_summary = "い" * 159 + "。"
+    result = TrendSummary(
+        themes=[TrendTheme(label="遵守", summary=compliant_summary, item_ids=[ids[0]])]
+    )
+    md = synthesize_trend(conn, FakeEngine(result), logger)
+    assert compliant_summary in md  # 全文がそのまま載る
+    assert "…" not in md
+
+
 def test_too_few_items_returns_none(conn) -> None:
     add_analyzed(conn, "only", topic="t", title_ja="1件だけ")
     result = TrendSummary(themes=[TrendTheme(label="x", summary="y", item_ids=[1])])
