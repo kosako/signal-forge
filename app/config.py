@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -274,15 +275,20 @@ def _validate(path: Path, config: Config) -> None:
             f"{path}: [llm].engine は {'/'.join(_LLM_ENGINES)} のいずれか: {config.llm.engine!r}"
         )
     _validate_x_search(path, config)
-    if config.x_signals.half_life_days <= 0:
-        raise ConfigError(f"{path}: [x_signals].half_life_days は正の値(減衰の半減期)")
+    # nan/inf は TOML として合法だがスコア計算・順位を壊すため有限値のみ受ける
+    if not (
+        math.isfinite(config.x_signals.half_life_days) and config.x_signals.half_life_days > 0
+    ):
+        raise ConfigError(f"{path}: [x_signals].half_life_days は正の有限値(減衰の半減期)")
     for key, value in (
         ("weight_bookmark", config.x_signals.weight_bookmark),
         ("weight_like", config.x_signals.weight_like),
         ("weight_self_rt", config.x_signals.weight_self_rt),
     ):
-        if value < 0:
-            raise ConfigError(f"{path}: [x_signals].{key} は 0 以上(負のシグナルは無い)")
+        if not (math.isfinite(value) and value >= 0):
+            raise ConfigError(
+                f"{path}: [x_signals].{key} は 0 以上の有限値(負のシグナルは無い)"
+            )
     signals_cap = config.x_signals.daily_read_cap
     if 0 < signals_cap < X_SIGNALS_MIN_PAGE:
         raise ConfigError(

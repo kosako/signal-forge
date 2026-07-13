@@ -276,3 +276,11 @@ def test_x_signals_weights_validation(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[x_signals]\nhalf_life_days = 0\n"))
     with pytest.raises(ConfigError, match="weight_bookmark"):
         load_config(write_config(tmp_path, "[x_signals]\nweight_bookmark = -1.0\n"))
+
+
+def test_x_signals_weights_reject_non_finite(tmp_path: Path) -> None:
+    # nan/inf は TOML として合法だがスコア・順位を壊す
+    with pytest.raises(ConfigError, match="half_life_days"):
+        load_config(write_config(tmp_path, "[x_signals]\nhalf_life_days = nan\n"))
+    with pytest.raises(ConfigError, match="weight_like"):
+        load_config(write_config(tmp_path, "[x_signals]\nweight_like = inf\n"))

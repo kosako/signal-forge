@@ -259,14 +259,30 @@ def x_insights(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """X 興味シグナルの週次インサイト(常連著者・頻出テーマ。読取専用 = GH#58 S1c)。"""
+    import sqlite3
+
     from app.config import load_config
-    from app.db import apply_migrations, connect
     from app.insights import render_insights
 
     config = load_config(config_dir)
-    conn = connect(config.db_path)
-    apply_migrations(conn, config.db_path)
-    typer.echo(render_insights(conn, config))
+    # 読取専用契約: connect()/apply_migrations は DB 作成・WAL 化・migration 適用の
+    # 書込を行うため使わない。未初期化・未 migration は変更せず fail fast する
+    try:
+        conn = sqlite3.connect(f"file:{config.db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        typer.echo(
+            f"DB がまだ無い({config.db_path})。先に intel run / collect で初期化する",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    conn.row_factory = sqlite3.Row
+    try:
+        typer.echo(render_insights(conn, config))
+    except sqlite3.OperationalError as e:
+        typer.echo(f"DB が読めない({e})。migration 未適用なら intel run で適用", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        conn.close()
 
 
 @app.command()

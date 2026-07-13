@@ -82,6 +82,49 @@ def test_topic_insights_join_analyzed_items_only(conn, tmp_path) -> None:
     assert topics[0].score == pytest.approx(3.0)
 
 
+def test_topic_signal_counted_once_even_with_duplicate_items(conn, tmp_path) -> None:
+    # external_id の一意性は (source_id, external_id) 単位。同一 tweet の item が
+    # 複数 X ソース下にあっても 1 シグナル = 高々 1 item(重複加算しない)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'x:home')")  # id=2
+    conn.execute(
+        "INSERT INTO sources (type, name, config) "
+        "VALUES ('x', 'x:search', '{\"mode\": \"search\"}')"
+    )  # id=3
+    for source_id, url in ((2, "https://x.com/a/status/t1"), (3, "https://x.com/b/status/t1")):
+        item_id = conn.execute(
+            "INSERT INTO items (source_id, url, canonical_url, external_id, content_hash) "
+            "VALUES (?, ?, ?, 't1', 'sha256:' || ?)",
+            (source_id, url, url, url),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO analyses (item_id, summary, category, topic, relevance_score, "
+            "novelty, negative_labels, recommendation_reason, implication, degraded, "
+            "engine, model, prompt_version, input_hash) "
+            "VALUES (?, 's', 'その他', 'MCP', 50, 'new', '[]', 'r', 'i', 0, "
+            "'codex-cli', 'm', 'v', 'h')",
+            (item_id,),
+        )
+    add_signal(conn, "bookmark", "t1", author_id="u1")
+    topics = topic_insights(conn, make_config(tmp_path), now=NOW)
+    assert [(t.topic, t.signals) for t in topics] == [("MCP", 1)]
+    assert topics[0].score == pytest.approx(3.0)  # 6.0(二重加算)にならない
+
+
+def test_author_username_last_write_wins_deterministically(conn, tmp_path) -> None:
+    add_signal(conn, "like", "l1", author_id="u1", username="old-name", days_ago=10)
+    add_signal(conn, "like", "l2", author_id="u1", username="new-name", days_ago=1)
+    insights = author_insights(conn, make_config(tmp_path), now=NOW)
+    assert insights[0].author == "@new-name"  # 新しい観測の username を採用
+
+
+def test_render_normalizes_multiline_excerpt(conn, tmp_path) -> None:
+    add_signal(
+        conn, "bookmark", "b1", author_id="u1", username="a", excerpt="1行目\n2行目\n3行目"
+    )
+    text = render_insights(conn, make_config(tmp_path), now=NOW)
+    assert "1行目 2行目 3行目" in text  # 1 シグナル = 1 行(一覧を崩さない)
+
+
 def test_render_empty_and_smoke(conn, tmp_path) -> None:
     config = make_config(tmp_path)
     assert "シグナルなし" in render_insights(conn, config, now=NOW)
@@ -95,3 +138,41 @@ def test_render_empty_and_smoke(conn, tmp_path) -> None:
     assert "TTL 切れ" in text  # excerpt NULL は明示
     assert "常連著者" in text and "頻出テーマ" in text
     assert "提案" not in text  # 読取専用(提案は S2 の領分)
+
+
+def test_x_insights_cli_is_read_only(tmp_path) -> None:
+    # 読取専用契約: DB のバイト列を一切変更しない(connect()/apply_migrations を使わない)
+    from typer.testing import CliRunner
+
+    from app.cli import app
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    db_path = tmp_path / "intel.db"
+    seed = connect(db_path)
+    apply_migrations(seed, db_path)
+    seed.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', 'b1')")
+    seed.close()
+    (conf / "config.toml").write_text(
+        f'[storage]\ndb_path = "{db_path}"\n', encoding="utf-8"
+    )
+    before = db_path.read_bytes()
+    result = CliRunner().invoke(app, ["x-insights", "--config-dir", str(conf)])
+    assert result.exit_code == 0
+    assert "インサイト" in result.output
+    assert db_path.read_bytes() == before  # 書込ゼロ
+
+
+def test_x_insights_cli_fails_fast_without_db(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from app.cli import app
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    (conf / "config.toml").write_text(
+        f'[storage]\ndb_path = "{tmp_path}/nonexistent.db"\n', encoding="utf-8"
+    )
+    result = CliRunner().invoke(app, ["x-insights", "--config-dir", str(conf)])
+    assert result.exit_code == 1  # DB を作らず fail fast
+    assert not (tmp_path / "nonexistent.db").exists()

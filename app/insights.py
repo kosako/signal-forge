@@ -67,9 +67,10 @@ def author_insights(
 ) -> list[AuthorInsight]:
     """常連著者(重み付きスコア降順)。著者不明のシグナルは集計から除く。"""
     now = now or datetime.now(UTC)
+    # 順序を明示(username の「後勝ち」を取得順の偶然に依存させない)
     rows = conn.execute(
         "SELECT kind, author_id, author_username, observed_at FROM x_signals "
-        "WHERE author_id IS NOT NULL"
+        "WHERE author_id IS NOT NULL ORDER BY observed_at, id"
     ).fetchall()
     by_author: dict[str, dict] = {}
     for row in rows:
@@ -105,12 +106,18 @@ def topic_insights(
 ) -> list[TopicInsight]:
     """頻出テーマ: 分析済みツイート(items を external_id で突合)の topic 集計。"""
     now = now or datetime.now(UTC)
+    # 1 シグナル : 高々 1 item に固定(external_id の一意性は (source_id, external_id)
+    # 単位のため、素朴な JOIN は同一 tweet の item が複数あると重複加算する)
     rows = conn.execute(
         """
         SELECT s.kind, s.observed_at, a.topic
         FROM x_signals s
-        JOIN sources src ON src.type = 'x'
-        JOIN items i ON i.source_id = src.id AND i.external_id = s.tweet_id
+        JOIN items i ON i.id = (
+            SELECT i2.id FROM items i2
+            JOIN sources s2 ON s2.id = i2.source_id AND s2.type = 'x'
+            WHERE i2.external_id = s.tweet_id
+            ORDER BY i2.id LIMIT 1
+        )
         JOIN analyses a ON a.id = (
             SELECT id FROM analyses WHERE item_id = i.id
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
@@ -175,7 +182,10 @@ def render_insights(
     lines.append("■ 直近シグナル(テーマ判断の材料。本文は TTL 内のみ)")
     for row in recent_signals(conn):
         author = f"@{row['author_username']}" if row["author_username"] else "(不明)"
-        excerpt = (row["text_excerpt"] or "(本文 TTL 切れ)")[:EXCERPT_DISPLAY]
+        # 本文の改行・連続空白を潰す(1 シグナル = 1 行の一覧を崩さない)
+        excerpt = " ".join((row["text_excerpt"] or "(本文 TTL 切れ)").split())[
+            :EXCERPT_DISPLAY
+        ]
         lines.append(
             f"  {row['observed_at'][:10]} {KIND_LABELS[row['kind']]} {author}: {excerpt}"
         )
