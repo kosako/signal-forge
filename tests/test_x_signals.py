@@ -210,6 +210,16 @@ def test_page_rolls_back_atomically_on_midpage_failure(conn, tmp_path) -> None:
     assert "bookmark" in run["error"]
 
 
+def test_self_rt_malformed_tweet_is_isolated_to_kind(conn, tmp_path) -> None:
+    # id 無しツイートが KeyError で kind 隔離を抜けない(SF82-09 の self_rt 経路)
+    session = session_with([page(tw("b1"))], [], [page({"text": "id なし"})])
+    totals = collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert totals["new_signals"] == 1  # bookmark は成功
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "ok"
+    assert "self_rt" in run["error"]
+
+
 def test_non_rt_posts_are_not_signals(conn, tmp_path) -> None:
     session = session_with([], [], [page({"id": "1", "text": "自分の通常ポスト"})])
     collect_x_signals(conn, make_config(tmp_path), session, logger)

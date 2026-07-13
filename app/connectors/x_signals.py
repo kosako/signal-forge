@@ -181,6 +181,9 @@ def _collect_kind(
             break
         stats["api_reads"] += len(tweets)
         if kind == "self_rt":
+            if any("id" not in t for t in tweets):
+                # _to_signal_row と同じ扱い(KeyError で kind 隔離を抜けさせない)
+                raise XSignalsError("応答に id の無いツイートが含まれる")
             max_wrapper_id = max(max_wrapper_id, *(int(t["id"]) for t in tweets))
         users, ref_tweets = _index_includes(body)
         hit_known = False
