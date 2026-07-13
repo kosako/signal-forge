@@ -89,15 +89,26 @@ def _digest(
     from app.analysis.trend import synthesize_trend
 
     trend = None
-    try:
-        trend = synthesize_trend(conn, config, engine_factory(), logger, run_id=run_id)
-    except Exception as e:  # トレンドは付加機能。失敗しても digest 本体を止めない
-        logger.warning(
-            f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
-            extra={"run_id": run_id, "stage": "digest"},
-        )
+    # digest が skip される場合(当日生成済み & not force)は synthesis しない(無駄な LLM 呼び)
+    if force_digest or not _digest_exists_today(conn):
+        try:
+            trend = synthesize_trend(conn, engine_factory(), logger, run_id=run_id)
+        except Exception as e:  # トレンドは付加機能。失敗しても digest 本体を止めない
+            logger.warning(
+                f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "digest"},
+            )
     return generate_digest(
         conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend
+    )
+
+
+def _digest_exists_today(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM digests WHERE digest_date = ?", (today_jst(),)
+        ).fetchone()
+        is not None
     )
 
 

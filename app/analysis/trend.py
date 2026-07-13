@@ -23,7 +23,6 @@ from pydantic import BaseModel, Field
 
 from app.analysis.analyzer import sanitize
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
-from app.config import Config
 
 JST = timezone(timedelta(hours=9))
 
@@ -34,6 +33,7 @@ MIN_ITEMS = 5  # これ未満は全体トレンドとして意味が出ないの
 MAX_INPUT_ITEMS = 120  # LLM 入力の上限(コスト・文脈保護。relevance 上位を優先)
 MAX_THEMES = 5
 MAX_LABEL = 40
+MAX_SUMMARY = 120  # テーマ要約の切り詰め上限(ヘッダ 1 通の Telegram 上限超過を防ぐ)
 
 
 class TrendTheme(BaseModel):
@@ -48,13 +48,16 @@ class TrendSummary(BaseModel):
 
 def synthesize_trend(
     conn: sqlite3.Connection,
-    config: Config,
     engine: LLMEngine,
     logger: logging.Logger,
     *,
     run_id: str | None = None,
 ) -> str | None:
-    """当日の分析を俯瞰したトレンド markdown を返す。対象少数・失敗時は None。"""
+    """当日の分析を俯瞰したトレンドのプレーンテキストを返す。対象少数・失敗時は None。
+
+    戻り値は markup を含まないプレーンテキスト(consumer 側で escape/整形する)。
+    Telegram(parse_mode=HTML)は _header_text で escape_text してから載せる。
+    """
     rows = _fetch_today_items(conn)
     if len(rows) < MIN_ITEMS:
         logger.info(
@@ -78,14 +81,23 @@ def synthesize_trend(
     return _render(result, valid_ids) or None
 
 
-def _today_jst_start_utc() -> str:
-    """本日(JST 暦日)0:00 を UTC の ISO 文字列で返す(analyzed_at の下限)。"""
+def _today_jst_bounds_utc() -> tuple[str, str]:
+    """本日(JST 暦日)の [0:00, 翌 0:00) を UTC の ISO 文字列で返す(analyzed_at の範囲)。"""
     start = datetime.now(UTC).astimezone(JST).replace(hour=0, minute=0, second=0, microsecond=0)
-    return start.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return (
+        start.astimezone(UTC).strftime(fmt),
+        (start + timedelta(days=1)).astimezone(UTC).strftime(fmt),
+    )
 
 
 def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """本日 JST に分析された非 degraded アイテム(最新分析)。relevance 上位から。"""
+    """本日 JST に分析された非 degraded アイテム(最新分析)。relevance 上位から。
+
+    上限も持つ(未来時刻・時計ずれの分析を翌日ぶんとして拾わない)。'digested' 済みの
+    item も含む(--force 再生成時に当日分を落とさない。status で絞らず analyzed_at で絞る)。
+    """
+    start, end = _today_jst_bounds_utc()
     return conn.execute(
         """
         SELECT items.id AS item_id,
@@ -97,10 +109,10 @@ def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             SELECT id FROM analyses WHERE item_id = items.id
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
-        WHERE a.degraded = 0 AND a.analyzed_at >= ?
+        WHERE a.degraded = 0 AND a.analyzed_at >= ? AND a.analyzed_at < ?
         ORDER BY a.relevance_score DESC, items.id
         """,
-        (_today_jst_start_utc(),),
+        (start, end),
     ).fetchall()
 
 
@@ -128,20 +140,23 @@ def _build_prompt(rows: list[sqlite3.Row], nonce: str) -> str:
 
 
 def _render(result: TrendSummary, valid_ids: set[int]) -> str:
-    """接地のあるテーマ(実在 id を1つ以上含む)だけを markdown 節にする。"""
-    lines = ["## 今日のトレンド", ""]
-    rendered = 0
+    """接地のあるテーマ(実在 id を1つ以上含む)だけをプレーンテキスト節にする。
+
+    markup は入れない(consumer 側で escape/整形)。要約は MAX_SUMMARY で切り詰めて
+    ヘッダ 1 通が Telegram 上限を超えないようにする。
+    """
+    themes: list[str] = []
     for theme in result.themes:
         label = theme.label.strip()
         summary = theme.summary.strip()
         grounded = any(i in valid_ids for i in theme.item_ids)  # 幻テーマを排除
         if not label or not summary or not grounded:
             continue
-        lines.append(f"- **{label}** — {summary}")
-        rendered += 1
-        if rendered >= MAX_THEMES:
+        if len(summary) > MAX_SUMMARY:
+            summary = summary[: MAX_SUMMARY - 1].rstrip() + "…"
+        themes.append(f"・{label} — {summary}")
+        if len(themes) >= MAX_THEMES:
             break
-    if rendered == 0:
+    if not themes:
         return ""
-    lines.append("")
-    return "\n".join(lines)
+    return "\n".join(["今日のトレンド", *themes])

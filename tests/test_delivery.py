@@ -232,10 +232,11 @@ def test_degraded_digest_header_has_warning(conn, tmp_path) -> None:
     assert "💡" not in recorder.texts()[1]
 
 
-def test_header_includes_trend_summary(conn, tmp_path) -> None:
-    # 「今日のトレンド」節はヘッダ(冒頭)メッセージに同梱される(GH#75)
+def test_header_includes_trend_summary_html_escaped(conn, tmp_path) -> None:
+    # 「今日のトレンド」節はヘッダ(冒頭)メッセージに同梱され、parse_mode=HTML 用に
+    # escape される(LLM 生成の <>& で配信全体が 400 で落ちないこと。GH#75)
     a = add_item(conn, "https://a/1")
-    trend = "## 今日のトレンド\n\n- **AI セキュリティ** — 権限と秘匿が話題。"
+    trend = "今日のトレンド\n・A<B>&C — 権限と秘匿が話題。"
     digest_id = add_digest(conn, [a], trend_markdown=trend)
     recorder = ApiRecorder()
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
@@ -243,7 +244,8 @@ def test_header_includes_trend_summary(conn, tmp_path) -> None:
     header = recorder.texts()[0]
     assert "のダイジェスト" in header  # 通常のヘッダ行
     assert "今日のトレンド" in header  # トレンド節が冒頭メッセージに載る
-    assert "AI セキュリティ" in header
+    assert "A&lt;B&gt;&amp;C" in header  # <>& が escape されている
+    assert "A<B>&C" not in header  # 生の HTML 特殊文字は残さない
 
 
 def test_empty_digest_sends_header_only(conn, tmp_path) -> None:
