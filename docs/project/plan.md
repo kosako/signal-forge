@@ -230,10 +230,10 @@
 - **依存**: #17
 - **参照**: 設計 04 §4 / 設計 05 §1.2, §4 / 設計 01 §7
 
-#### #21 intel doctor(12項目)
+#### #21 intel doctor(12項目 → 13項目に拡張: #13 X OAuth2 token は GH#58 S1a で追加)
 - **目的**: 構成不備・故障・コスト超過を1コマンドで検査可能にする。
 - **完了条件**:
-  - [ ] 設計 05 §2 の12項目(config/.env 600/migrations/Telegram getMe/X 疎通/LLM 動的検査/Vault 書込/launchd/コスト/バックアップ/TTL 残存/ANTHROPIC_API_KEY)を実装
+  - [ ] 設計 05 §2 の13項目(config/.env 600/migrations/Telegram getMe/X 疎通/LLM 動的検査/Vault 書込/launchd/コスト/バックアップ/TTL 残存/ANTHROPIC_API_KEY/X OAuth2 token = GH#58 S1a 追加)を実装
   - [ ] **X 無効時(`x.enabled=false` / sources の type='x' 全行 enabled=0)は X 疎通を SKIP/WARN 表示**とし、「RSS+手動URLのみ」縮退運用で恒久 FAIL にならない(設計 05 §2 #5)
   - [ ] LLM 推論専用モードは動的検査(ツール呼び出し・ファイル読取を試み拒否を確認)
   - [ ] `--purge` / `--cost` サブオプションが動く

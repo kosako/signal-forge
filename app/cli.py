@@ -166,6 +166,52 @@ def deliver(
     typer.echo("配信済み(skip)" if sent == 0 else f"配信完了({sent}通)")
 
 
+@app.command(name="x-auth")
+def x_auth(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """X OAuth 2.0(PKCE)の認可フローを実行し token を保存する(S1 = GH#58)。"""
+    import httpx
+
+    from app.config import load_config, load_env
+    from app.connectors.x_oauth2 import (
+        ENV_CLIENT_SECRET,
+        XOAuth2Session,
+        fetch_me,
+        run_authorization_flow,
+        token_path,
+    )
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    if config.x_oauth2.client_id is None:
+        typer.echo(
+            "config.toml の [x_oauth2].client_id が未設定"
+            "(X developer portal の OAuth 2.0 Client ID。runbook §9)",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    with httpx.Client() as client:
+        token = run_authorization_flow(
+            client,
+            config_dir=config_dir,
+            client_id=config.x_oauth2.client_id,
+            client_secret=env.get(ENV_CLIENT_SECRET),
+            callback_port=config.x_oauth2.callback_port,
+            echo=typer.echo,
+        )
+        # 保存した token で実際に認証できることまで確認して終わる(users/me は読取課金なし)
+        session = XOAuth2Session(
+            client=client,
+            config_dir=config_dir,
+            client_id=config.x_oauth2.client_id,
+            client_secret=env.get(ENV_CLIENT_SECRET),
+            token=token,
+        )
+        username = fetch_me(session)
+    typer.echo(f"認可完了: @{username} / token を保存した({token_path(config_dir)})")
+
+
 @app.command()
 def poll(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
@@ -237,7 +283,7 @@ def doctor(
     purge: bool = typer.Option(False, "--purge", help="期限切れ削除の単独実行"),
     cost: bool = typer.Option(False, "--cost", help="コスト集計の単発表示"),
 ) -> None:
-    """構成不備・故障・コスト超過の検査(12項目)。終了コード: FAIL あり=1。"""
+    """構成不備・故障・コスト超過の検査(13項目)。終了コード: FAIL あり=1。"""
     from app.config import load_config
     from app.doctor import has_failure, month_cost_summary, run_doctor
     from app.logs import DEFAULT_LOG_DIR, setup_logging

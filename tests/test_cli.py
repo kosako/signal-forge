@@ -4,7 +4,9 @@ from app.cli import app
 
 runner = CliRunner()
 
-ALL_COMMANDS = ("collect", "extract", "analyze", "digest", "deliver", "poll", "run", "doctor")
+ALL_COMMANDS = (
+    "collect", "extract", "analyze", "digest", "deliver", "poll", "run", "doctor", "x-auth",
+)
 
 
 def test_help_lists_all_subcommands() -> None:

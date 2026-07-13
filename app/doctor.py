@@ -1,4 +1,4 @@
-"""intel doctor — 構成不備・故障・コスト超過の検査(設計 05 §2 の12項目)。
+"""intel doctor — 構成不備・故障・コスト超過の検査(設計 05 §2 の13項目)。
 
 - 終了コード: 全 OK=0 / WARN のみ=0 / FAIL あり=1
 - 各検査は独立に実行し、1つの失敗で残りを止めない(検査自体の例外はその項目の FAIL)
@@ -57,8 +57,9 @@ def run_doctor(
     launchctl: Callable[[str], bool] | None = None,
     environ: dict[str, str] | None = None,
     home: Path | None = None,
+    x_oauth2_probe: Callable[[Config, dict[str, str], Path], str] | None = None,
 ) -> list[CheckResult]:
-    """12項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
+    """13項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
     environ = dict(os.environ) if environ is None else environ
     home = Path.home() if home is None else home
 
@@ -119,6 +120,11 @@ def run_doctor(
             (10, "バックアップ", lambda: _check_backup(config)),
             (11, "TTL 残存", lambda: _check_ttl_leftovers(conn, config)),
             (12, "ANTHROPIC_API_KEY", lambda: _check_anthropic_key(environ)),
+            (
+                13,
+                "X OAuth2 token",
+                lambda: _check_x_oauth2(config, env, config_dir, x_oauth2_probe),
+            ),
         ]
         done = {r.number for r in results}
         for number, name, check in checks:
@@ -257,6 +263,59 @@ def _check_anthropic_key(environ: dict[str, str]) -> CheckResult:
             12, "ANTHROPIC_API_KEY", "WARN", "環境に存在(無自覚 API 課金の恐れ)"
         )
     return CheckResult(12, "ANTHROPIC_API_KEY", "PASS", "環境に存在しない")
+
+
+def _check_x_oauth2(
+    config: Config | None,
+    env: dict[str, str],
+    config_dir: Path,
+    probe: Callable[[Config, dict[str, str], Path], str] | None,
+) -> CheckResult:
+    """#13 X OAuth2 token(S1 = GH#58)。token 有効性を users/me(読取課金なし)で確認。
+
+    token 未取得は SKIP(S1 取込を使うまで認可は不要。恒久 FAIL にしない)。
+    refresh はローテーションを伴うため、この検査は users/me 呼び出しに留める
+    (失効時のみセッションが refresh する。無用な token 消費をしない)。
+    """
+    from app.connectors.x_oauth2 import XOAuth2Error, load_token, token_path
+
+    if config is None:
+        return CheckResult(13, "X OAuth2 token", "FAIL", _CONFIG_UNAVAILABLE)
+    try:
+        token = load_token(config_dir)
+    except XOAuth2Error as e:
+        return CheckResult(13, "X OAuth2 token", "FAIL", str(e))
+    if token is None:
+        return CheckResult(
+            13, "X OAuth2 token", "SKIP", "未認可(S1 取込を使うときに intel x-auth)"
+        )
+    if config.x_oauth2.client_id is None:
+        return CheckResult(
+            13,
+            "X OAuth2 token",
+            "FAIL",
+            f"{token_path(config_dir).name} はあるが [x_oauth2].client_id 未設定(refresh 不能)",
+        )
+    try:
+        username = (probe or _probe_x_oauth2)(config, env, config_dir)
+        return CheckResult(13, "X OAuth2 token", "PASS", f"users/me OK(@{username})")
+    except XOAuth2Error as e:
+        return CheckResult(13, "X OAuth2 token", "FAIL", str(e))
+
+
+def _probe_x_oauth2(config: Config, env: dict[str, str], config_dir: Path) -> str:
+    import httpx
+
+    from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session, fetch_me
+
+    with httpx.Client() as client:
+        session = XOAuth2Session.load(
+            client=client,
+            config_dir=config_dir,
+            client_id=config.x_oauth2.client_id,
+            client_secret=env.get(ENV_CLIENT_SECRET),
+        )
+        return fetch_me(session)
 
 
 def _check_llm(

@@ -44,6 +44,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 10 | バックアップ最新世代の日付(48h 超で WARN)+アーカイブのパーミッション(600 以外は WARN) | WARN |
 | 11 | documents の TTL 超過残存件数+**全ソース**の `items.raw_payload` の TTL 超過残存件数(ソース別 TTL — X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days` — で判定。削除経路の故障検知。01 §6) | WARN |
 | 12 | 環境に `ANTHROPIC_API_KEY` が存在したら WARN(無自覚 API 課金防止) | WARN |
+| 13 | X OAuth2 token(S1 = GH#58): token 有効性を `/2/users/me`(読取課金なし)で確認。**token 未取得は SKIP**(S1 取込を使うまで認可不要。恒久 FAIL にしない)。token ファイル破損・client_id 未設定(refresh 不能)・users/me 失敗は FAIL。refresh はローテーションを伴うため検査では強制しない(失効時のみセッションが refresh) | FAIL(未認可時は SKIP) |
 
 ## 3. ログ設計
 
@@ -72,7 +73,8 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ## 6. secrets 保管
 
-- 置き場: `~/.config/intel/.env`(chmod 600、リポジトリ外)。キー: X API・Telegram bot token・(fallback 用)Anthropic API キー。Keychain 対応は拡張点(security CLI 呼び出しの抽象は config.py に閉じる)。
+- 置き場: `~/.config/intel/.env`(chmod 600、リポジトリ外)。キー: X API・Telegram bot token・(fallback 用)Anthropic API キー・(confidential client のみ・任意)`X_OAUTH2_CLIENT_SECRET`。Keychain 対応は拡張点(security CLI 呼び出しの抽象は config.py に閉じる)。
+- X OAuth2 token(S1): `~/.config/intel/x-oauth2-token.json`(chmod 600)。`intel x-auth` が生成し、refresh のローテーションで自動更新される(手編集しない)。無効化は X 側のアプリ連携解除 + ファイル削除。
 - **Anthropic キーは .env にのみ置き、シェル環境・launchd 環境に export しない**。AnthropicApiEngine だけが .env から直接読む。
 - ローテーション手順(runbook): X = ポータルで再発行→.env 差し替え→doctor。Telegram = BotFather revoke→再発行→.env 差し替え→doctor(allowlist は chat_id 不変なので変更不要)。
 
