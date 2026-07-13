@@ -40,6 +40,20 @@ class XConfig:
 
 
 @dataclass(frozen=True)
+class XOAuth2Config:
+    """X OAuth 2.0(PKCE)クライアント設定(S1 = GH#58 / ADR 0001)。
+
+    client_id は secret ではない(認可はブラウザ+PKCE で完結)。confidential client
+    (portal で Web App 型)の client secret のみ .env(X_OAUTH2_CLIENT_SECRET)。
+    """
+
+    client_id: str | None = None  # 未設定 = S1 未セットアップ(intel x-auth が fail fast)
+    # loopback redirect のポート。portal 登録の redirect URI
+    # (http://127.0.0.1:<port>/callback)と完全一致していること
+    callback_port: int = 8791
+
+
+@dataclass(frozen=True)
 class XSearchConfig:
     # 検索クエリのスロット(最大 X_SEARCH_MAX_SLOTS 本・入れ替え式。ADR 0001)。
     # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
@@ -121,6 +135,7 @@ class AnalysisConfig:
 class Config:
     config_dir: Path
     x: XConfig = field(default_factory=XConfig)
+    x_oauth2: XOAuth2Config = field(default_factory=XOAuth2Config)
     x_search: XSearchConfig = field(default_factory=XSearchConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -153,6 +168,7 @@ class Config:
 
 _SECTIONS = {
     "x": XConfig,
+    "x_oauth2": XOAuth2Config,
     "x_search": XSearchConfig,
     "digest": DigestConfig,
     "llm": LLMConfig,
@@ -233,6 +249,13 @@ def _validate(path: Path, config: Config) -> None:
             f"{path}: [llm].engine は {'/'.join(_LLM_ENGINES)} のいずれか: {config.llm.engine!r}"
         )
     _validate_x_search(path, config)
+    if not (1 <= config.x_oauth2.callback_port <= 65535):
+        raise ConfigError(
+            f"{path}: [x_oauth2].callback_port はポート番号(1〜65535): "
+            f"{config.x_oauth2.callback_port}"
+        )
+    if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
+        raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
     positives = [
         ("x", "daily_read_cap", config.x.daily_read_cap),
         ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),

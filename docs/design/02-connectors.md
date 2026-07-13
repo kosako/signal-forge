@@ -68,6 +68,17 @@ class Connector(Protocol):
 - **doctor #5 の整合検査**: `[x_search].slots` ⟷ mode=search 行の相互欠落(検索が黙って収集されない / collect で失敗し続ける)、同一 mode の複数 enabled 行(二重取得・二重課金)、mode 不正行を WARN で可視化。
 - **月次上限**: 課金は credits 従量(Day 0 実測)のため検索専用の別枠上限は持たず、合算日次 cap × 30(165 × 30 × $0.004 ≈ $19.8/月)と doctor #9 の当月集計(collect_runs の estimated_cost_usd 合算。検索も自動で載る)で管理する。
 
+### OAuth 2.0(PKCE)認証基盤(`connectors/x_oauth2.py`・S1 = GH#58)
+
+ブックマーク取得(`/2/users/:id/bookmarks`)は OAuth 2.0 user context が API 上の必須のため、S1 の取込(ブックマーク・いいね)は **OAuth2 に統一**する(ADR 0001「X ソースと認証」。認証経路を1本に保つ実装選択)。ホームTL・検索の OAuth 1.0a(`XApiSession`)とは独立の並走。
+
+- **前提事実(API 実確認 2026-07-13)**: access token は **offline.access を付けても 2h で失効**する。無人朝バッチには refresh token(**offline.access scope 必須** — Issue #58 記載の 4 scope に追加)が要る。refresh token は**ローテーションされる**(使用のたびに新 refresh token が発行される)前提で設計する。
+- **scope**: `tweet.read users.read bookmark.read like.read offline.access`(S1b の取込に必要な最小集合)。
+- **認可フロー(`intel x-auth`)**: PKCE(S256)+ loopback redirect(`http://127.0.0.1:<port>/callback`。port は config `[x_oauth2].callback_port`、既定 8791。**portal 登録の redirect URI と完全一致必須**)。state 照合(不一致は中断)。public client(Native App 型)は body の client_id、confidential client(Web App 型)は .env `X_OAUTH2_CLIENT_SECRET` の Basic 認証。
+- **token 保存**: `~/.config/intel/x-oauth2-token.json`(chmod 600・.env と同じ扱い = 設計 05 §6)。**0600 一時ファイル → rename の原子的更新**(ローテーションされた refresh token の取りこぼし = 認可チェーン切断を防ぐ)。壊れたファイルは fail fast(黙って再認可に倒さない)。
+- **セッション(`XOAuth2Session`)**: Bearer つき GET。共通リトライ規約(設計 05 §8)は `XApiSession` と同形(429 は待たず即返す)。失効 5 分前の先回り refresh + 401 時の1回 refresh。**新 token は使用前に永続化**(保存失敗時に旧 token で続行しない)。refresh 失敗は再認可(`intel x-auth`)の案内つきエラー。
+- **検証**: `/2/users/me`(読取課金なし)。x-auth の完了確認と doctor #13 が使う。
+
 ### Day 0 テストスクリプト仕様(`scripts/day0_x_probe.py`)
 
 本体外の使い捨てスクリプト(vibe 品質でよい)。X コネクタと同じ認証・エンドポイントを使い、以下を実測して合否を出す。

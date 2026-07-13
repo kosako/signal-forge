@@ -142,3 +142,29 @@ Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の
 - X: Developer Portal で再発行 → `.env` 差し替え → `intel doctor`
 - Telegram: BotFather で revoke → 再発行 → `.env` 差し替え → `intel doctor`
   (allowlist は chat_id 不変なので変更不要)
+
+## 9. X OAuth 2.0 セットアップ(S1 = GH#58・設計 02 §2)
+
+ブックマーク/いいね取込(S1)に必要。ホームTL・検索(OAuth 1.0a の4キー)とは別の認証。
+
+1. **X Developer Portal**: 対象アプリの User authentication settings で OAuth 2.0 を有効化
+   - Type of App: **Native App(public client)を推奨**(client secret 不要)。
+     Web App(confidential)にした場合のみ client secret を `.env` の
+     `X_OAUTH2_CLIENT_SECRET` に置く(chmod 600)
+   - App permissions: Read
+   - Callback URI: `http://127.0.0.1:8791/callback`
+     (config `[x_oauth2].callback_port` を変えた場合は合わせる。**完全一致必須**)
+2. **config.toml** に Client ID を記入:
+   ```toml
+   [x_oauth2]
+   client_id = "<OAuth 2.0 Client ID>"
+   ```
+3. **認可フローを実行**(ブラウザが開く → X で承認):
+   ```sh
+   uv run intel x-auth
+   ```
+   完了すると `~/.config/intel/x-oauth2-token.json`(chmod 600)が生成され、
+   `@ユーザー名` が表示される。token は refresh で自動更新される(手編集しない)
+4. **確認**: `uv run intel doctor` の #13(X OAuth2 token)が PASS
+5. **無効化 / 再認可**: X の設定 → アプリ連携から revoke + token ファイル削除。
+   再認可は `intel x-auth` を再実行(refresh 失敗時も同様)

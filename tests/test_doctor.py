@@ -129,7 +129,7 @@ def make_fresh_backup(tmp_path: Path) -> Path:
 def test_baseline_has_no_failure(config_dir, tmp_path) -> None:
     make_fresh_backup(tmp_path)
     results = doctor(config_dir, tmp_path)
-    assert len(results) == 12
+    assert len(results) == 13
     assert not has_failure(results)
     statuses = {r.number: r.status for r in results}
     assert statuses[1] == "PASS"
@@ -137,6 +137,7 @@ def test_baseline_has_no_failure(config_dir, tmp_path) -> None:
     assert statuses[5] == "SKIP"  # X 無効(縮退運用が恒久 FAIL にならない)
     assert statuses[6] == "PASS"
     assert statuses[12] == "PASS"
+    assert statuses[13] == "SKIP"  # OAuth2 未認可(S1 前は恒久 FAIL にしない)
 
 
 def test_missing_config_is_fail_but_all_checks_run(tmp_path) -> None:
@@ -144,7 +145,7 @@ def test_missing_config_is_fail_but_all_checks_run(tmp_path) -> None:
     empty.mkdir()
     results = doctor(empty, tmp_path)
     assert by_number(results, 1).status == "FAIL"
-    assert len(results) == 12  # 1つの失敗で残りを止めない
+    assert len(results) == 13  # 1つの失敗で残りを止めない
     assert has_failure(results)
     # config 依存項目は既定 Config で別 DB を診断せず「検査不可」に倒す
     assert "検査不可" in by_number(results, 3).detail
@@ -172,7 +173,7 @@ def test_check_exception_is_isolated_to_its_item(config_dir, tmp_path) -> None:
     result = by_number(results, 8)
     assert result.status == "FAIL"
     assert "例外" in result.detail
-    assert len(results) == 12  # 他の検査は巻き添えにならない
+    assert len(results) == 13  # 他の検査は巻き添えにならない
     assert by_number(results, 4).status == "PASS"
 
 
@@ -572,3 +573,64 @@ def test_month_cost_summary_breakdown(config_dir, tmp_path) -> None:
     assert summary["spent_usd"] == 1.5
     assert summary["projected_usd"] >= 1.5
     assert summary["cap_usd"] == 30.0
+
+
+# --- #13 X OAuth2 token(S1 = GH#58) ---
+
+
+def write_oauth2_token(config_dir: Path) -> None:
+    from app.connectors.x_oauth2 import XOAuth2Token, save_token
+
+    save_token(
+        config_dir,
+        XOAuth2Token(
+            access_token="at",
+            refresh_token="rt",
+            expires_at="2026-12-31T00:00:00Z",
+            scope="tweet.read users.read bookmark.read like.read offline.access",
+        ),
+    )
+
+
+def append_client_id(config_dir: Path) -> None:
+    with open(config_dir / "config.toml", "a", encoding="utf-8") as f:
+        f.write('\n[x_oauth2]\nclient_id = "cid"\n')
+
+
+def test_x_oauth2_token_present_and_valid_passes(config_dir, tmp_path) -> None:
+    append_client_id(config_dir)
+    write_oauth2_token(config_dir)
+    results = doctor(
+        config_dir, tmp_path, x_oauth2_probe=lambda config, env, config_dir: "kosako"
+    )
+    result = by_number(results, 13)
+    assert result.status == "PASS"
+    assert "@kosako" in result.detail
+
+
+def test_x_oauth2_token_without_client_id_fails(config_dir, tmp_path) -> None:
+    write_oauth2_token(config_dir)  # token はあるが [x_oauth2] 未設定 = refresh 不能
+    result = by_number(doctor(config_dir, tmp_path), 13)
+    assert result.status == "FAIL"
+    assert "client_id" in result.detail
+
+
+def test_x_oauth2_probe_failure_fails(config_dir, tmp_path) -> None:
+    from app.connectors.x_oauth2 import XOAuth2Error
+
+    append_client_id(config_dir)
+    write_oauth2_token(config_dir)
+
+    def probe(config, env, config_dir):
+        raise XOAuth2Error("refresh 失敗(intel x-auth で再認可が必要)")
+
+    result = by_number(doctor(config_dir, tmp_path, x_oauth2_probe=probe), 13)
+    assert result.status == "FAIL"
+    assert "再認可" in result.detail
+
+
+def test_x_oauth2_corrupted_token_file_fails(config_dir, tmp_path) -> None:
+    (config_dir / "x-oauth2-token.json").write_text("not json", encoding="utf-8")
+    result = by_number(doctor(config_dir, tmp_path), 13)
+    assert result.status == "FAIL"
+    assert "壊れている" in result.detail

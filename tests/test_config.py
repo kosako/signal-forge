@@ -231,3 +231,21 @@ def test_load_env_preserves_inner_and_unpaired_quotes(tmp_path: Path) -> None:
     assert env["TRAILING"] == "abc'"
     assert env["INNER"] == "a'b\"c"
     assert env["NESTED"] == '"abc"'  # 外側の1組だけ剥がす
+
+
+def test_x_oauth2_parse_and_defaults(tmp_path: Path) -> None:
+    config = load_config(
+        write_config(tmp_path, '[x_oauth2]\nclient_id = "cid"\ncallback_port = 9000\n')
+    )
+    assert config.x_oauth2.client_id == "cid"
+    assert config.x_oauth2.callback_port == 9000
+    # 既定: 未設定 = S1 未セットアップ(x-auth 側で fail fast)
+    assert load_config(tmp_path / "nowhere").x_oauth2.client_id is None
+    assert load_config(tmp_path / "nowhere").x_oauth2.callback_port == 8791
+
+
+def test_x_oauth2_validation(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="callback_port"):
+        load_config(write_config(tmp_path, "[x_oauth2]\ncallback_port = 0\n"))
+    with pytest.raises(ConfigError, match="client_id"):
+        load_config(write_config(tmp_path, '[x_oauth2]\nclient_id = " "\n'))
