@@ -1,7 +1,7 @@
 """intel run — 朝バッチの直列実行(設計 00 §2・§6)。
 
-順序: collect → extract → analyze → digest → export → deliver → purge → backup
-(backup は設計 05 §5 の「朝バッチ末尾」)。
+順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ extract → analyze →
+digest → export → deliver → purge → backup(backup は設計 05 §5 の「朝バッチ末尾」)。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
 段の失敗はその段で捕捉して記録し、後続の段は実行する。失敗が1つでもあれば
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
@@ -55,6 +55,8 @@ def run_pipeline(
     stage("collect", lambda: collect_all(
         conn, connectors, logger, run_id=run_id, resolve_short=http.resolve_short_url
     ))
+    if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
+        stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
     stage("analyze", lambda: _analyze(conn, config, engine_factory, logger, run_id))
     stage("digest", lambda: _digest(conn, config, engine_factory, logger, run_id, force_digest))
@@ -110,6 +112,32 @@ def _digest_exists_today(conn: sqlite3.Connection) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _collect_x_signals(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    logger: logging.Logger,
+    run_id: str,
+) -> None:
+    """x_signals 段(S1b = GH#58)。cap > 0(取込を意図)なのに未認可・client_id 欠落は
+    設定不備として段の失敗に倒す(黙って skip しない)。"""
+    import httpx
+
+    from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session
+    from app.connectors.x_signals import collect_x_signals
+
+    if config.x_oauth2.client_id is None:
+        raise RuntimeError("[x_signals].daily_read_cap > 0 だが [x_oauth2].client_id 未設定")
+    with httpx.Client() as client:
+        session = XOAuth2Session.load(
+            client=client,
+            config_dir=config.config_dir,
+            client_id=config.x_oauth2.client_id,
+            client_secret=env.get(ENV_CLIENT_SECRET),
+        )
+        collect_x_signals(conn, config, session, logger, run_id=run_id)
 
 
 def _analyze(

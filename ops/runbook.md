@@ -168,3 +168,23 @@ Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の
 4. **確認**: `uv run intel doctor` の #13(X OAuth2 token)が PASS
 5. **無効化 / 再認可**: X の設定 → アプリ連携から revoke + token ファイル削除。
    再認可は `intel x-auth` を再実行(refresh 失敗時も同様)
+
+## 10. X 興味シグナル取込の有効化(S1b = GH#58・設計 02 §2)
+
+前提: §9(OAuth 2.0 セットアップ)が完了していること(`intel doctor` #13 = PASS)。
+
+1. **予算の再配分**: 合算上限(165/日)の内側で取込枠を作る。例:
+   ```toml
+   [x]
+   daily_read_cap = 115   # 130 から 15 を取込へ再配分
+   [x_signals]
+   daily_read_cap = 15
+   ```
+   (内訳合計 > combined_daily_read_cap は起動時 ConfigError)
+2. **cold start(任意・初回のみ)**: 過去のブックマーク全件を種にする:
+   ```sh
+   uv run intel x-signals --backfill
+   ```
+   cap を無視して全ページ辿る(数百件なら $1〜2 程度。reads×$0.004)
+3. 以降は**朝バッチが毎日差分を自動取込**(x_signals 段)。確認は
+   `sqlite3 ~/.local/share/intel/intel.db "SELECT kind, count(*) FROM x_signals GROUP BY kind"`

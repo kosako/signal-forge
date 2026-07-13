@@ -102,4 +102,26 @@ def test_purge_is_idempotent(conn, tmp_path) -> None:
     add_document(conn, item, expires_days=-1)
     purge_expired(conn, Config(config_dir=tmp_path), logger)
     counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
-    assert counts == {"documents_deleted": 0, "raw_payload_nullified": 0}
+    assert counts == {
+        "documents_deleted": 0,
+        "raw_payload_nullified": 0,
+        "x_signal_excerpts_nullified": 0,
+    }
+
+
+def test_x_signal_excerpts_nullified_by_ttl(conn, tmp_path) -> None:
+    # x_signals の本文抜粋は TTL キャッシュのみ(Issue #2 / GH#58 S1b)。行自体は残す
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt, observed_at) "
+        "VALUES ('bookmark', 'old', '古い本文', strftime('%Y-%m-%dT%H:%M:%SZ','now','-8 days'))"
+    )
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt) VALUES ('like', 'new', '新しい本文')"
+    )
+    counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
+    assert counts["x_signal_excerpts_nullified"] == 1
+    rows = {
+        r["tweet_id"]: r["text_excerpt"]
+        for r in conn.execute("SELECT tweet_id, text_excerpt FROM x_signals")
+    }
+    assert rows == {"old": None, "new": "新しい本文"}  # シグナル行は消えない

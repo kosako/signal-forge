@@ -44,11 +44,26 @@ def purge_expired(
         (config.retention.x_cache_ttl_days, config.retention.cache_ttl_days),
     ).rowcount
 
+    # x_signals の本文抜粋も X 由来の TTL キャッシュ(Issue #2 / GH#58 S1b)。
+    # シグナル行(id・著者・時刻)は残し、本文だけ落とす
+    excerpts_nullified = conn.execute(
+        """
+        UPDATE x_signals SET text_excerpt = NULL
+        WHERE text_excerpt IS NOT NULL
+          AND observed_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' days')
+        """,
+        (config.retention.x_cache_ttl_days,),
+    ).rowcount
+
     # 設計 01 §6 の文言は「削除行 >1,000」だが、raw_payload の NULL 化も大きな空き
     # ページを生む(X full_text 等)ため、空き回収の意図に沿って合算で判定する
-    if deleted + nullified > VACUUM_THRESHOLD_ROWS:
+    if deleted + nullified + excerpts_nullified > VACUUM_THRESHOLD_ROWS:
         conn.execute("VACUUM")
 
-    counts = {"documents_deleted": deleted, "raw_payload_nullified": nullified}
+    counts = {
+        "documents_deleted": deleted,
+        "raw_payload_nullified": nullified,
+        "x_signal_excerpts_nullified": excerpts_nullified,
+    }
     logger.info("purge 完了", extra={"run_id": run_id, "stage": "purge", "extra": counts})
     return counts

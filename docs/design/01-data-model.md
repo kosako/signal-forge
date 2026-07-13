@@ -268,6 +268,16 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 
 - 同一アイテムへの再タップは行を追加し、**集計は created_at 最新の行を採用**。理由: 上書きせず履歴を残すと、👍校正(遅延スポットチェック)の乖離分析材料になる。
 - 受信デーモンは callback の `from.id` を allowlist 照合してから書き込む(認可は設計 04 Telegram の責務。本テーブルは認可済みデータのみ格納)。
+### X 興味シグナル(x_signals・migration 004。GH#58 S1b / ADR 0001)
+
+Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探索**シグナル(X 上の自分の行動)を別テーブルで持つ(ADR 0001「探索と活用を区別」)。tweet_id ベースで items を参照しない(ブックマーク等は collect 経路に乗っていない tweet が普通)。
+
+- `kind`: `bookmark`(🔖・強)/ `like`(❤️・弱)/ `self_rt`(🔁・強。RT 元ツイートの id・著者を記録)
+- `UNIQUE (kind, tweet_id)` + INSERT OR IGNORE で再観測を吸収(差分検出は「新→旧に読み既知 id 到達で打ち切り」。bookmarks / liked_tweets は since_id 非対応のため)
+- `observed_at` = 初回観測時刻。`bookmarked_at` 等を API が提供しないため、**直近性の代理**とする(cold start の --backfill 一括取込分は「直近」として扱えない制約を含む)
+- `text_excerpt`(≤280字)は **TTL キャッシュのみ**(purge が `x_cache_ttl_days` で NULL 化。§6 の X 本文非保持ポリシー準拠)。恒久保存は id・著者・時刻
+- 取込コストは `x_signal_runs`(collect_runs は sources 行が前提のため独立の台帳)に記録し、doctor #9 が合算する(§9)
+
 - 日次 KPI(👍∨🔖 ≥3)の集計クエリ例(手動):
 
 ```sql
@@ -293,8 +303,8 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 ## 9. コスト記録
 
 - LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率は doctor が別途表示)。
-- X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。
-- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(collect_runs.estimated_cost_usd)` の日割り外挿。
+- X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。
+- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿。
 
 ## 10. マイグレーション運用
 

@@ -62,7 +62,7 @@ Day 0 実測(実効単価 ≈ $0.004/件)を前提に、**X の読取は「ホ�
 | AI 検索 | `/2/tweets/search/recent` | OAuth 1.0a / Bearer | S0(新コネクタ) |
 | ブックマーク | `/2/users/:id/bookmarks` | **OAuth 2.0(PKCE, `bookmark.read`)必須** | S1 |
 | 自分のいいね | `/2/users/:id/liked_tweets` | OAuth 1.0a も可(実装では OAuth2 に寄せる) | S1 |
-| 自分の RT | `/2/users/:id/tweets` | OAuth 1.0a(既存) | S1 |
+| 自分の RT | `/2/users/:id/tweets` | OAuth 1.0a も可(**S1b 実装は OAuth2 に統一** = 下記の実装選択。2026-07-14 追記) | S1 |
 
 - **ブックマークだけが OAuth 2.0 必須**(API 上の制約)。いいね・自RT は OAuth 1.0a User Context でも取れるが、**S1 では OAuth 2.0 に統一する(実装選択)** — ブックマーク用に組む OAuth2 に相乗りさせ、認証経路を1本に保つため(API 上の必須条件ではない)。
 - 検索・ホームTL・自RT は OAuth 1.0a / Bearer で足りる(OAuth 2.0 不要)。tier の月次上限は S0 実装時に要確認。

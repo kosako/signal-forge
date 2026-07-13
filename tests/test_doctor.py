@@ -644,3 +644,16 @@ def test_x_oauth2_loose_permission_token_fails(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 13)
     assert result.status == "FAIL"
     assert "パーミッション" in result.detail
+
+
+def test_month_cost_summary_includes_x_signal_runs(config_dir, tmp_path) -> None:
+    conn = connect(tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO x_signal_runs (status, api_reads, estimated_cost_usd) "
+        "VALUES ('ok', 15, 0.06)"
+    )
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["x_usd"] == pytest.approx(0.06)  # S1b 取込コストも月次見込みに載る
