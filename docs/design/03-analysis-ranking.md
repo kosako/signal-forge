@@ -156,6 +156,15 @@ updated: 2026-07-05
 
 `intel doctor` は「存在・front matter・updated が 14 日超で警告」のみ検査する。
 
+### 興味シグナルの重みとインサイト(S1c = GH#58 / ADR 0001)
+
+静的な関心プロファイルを補う行動シグナル(x_signals)の可視化。**S1 は収集・可視化まで**で、ランキング・検索スロットへの自動反映はしない(S2 = #59 の「提案 → 人が承認」ゲート)。
+
+- スコア = **種類の重み × 直近の重み**(ADR 0001)。config `[x_signals]` の `weight_bookmark`(既定 3.0)/ `weight_like`(1.0)/ `weight_self_rt`(3.0)× 半減期 `half_life_days`(既定 14 日)の**指数減衰**(「移動平均」の実装。固定プロファイルでなく直近を重く見る)
+- **常連著者**: x_signals の author 別の重み付きスコア(フォロー推薦 = S2 の入力候補)
+- **頻出テーマ**: digest 経由で分析済みのツイート(items を external_id で突合)の `analyses.topic` 集計。テーマは LLM 分析を経たものにしか無いため、未分析分は「直近シグナル」の本文抜粋(TTL 内)を人間の判断材料として並べる(追加の LLM 呼び出しはしない)
+- 表示は `intel x-insights`(読取専用)。週次レビュー(plan §6-8)で見る
+
 ## 5. プロンプトのバージョン管理
 
 - `prompts/analyze-vNNN.md`。**既存版は編集禁止・変更は新番号で追加**。理由: analyses.prompt_version と KPI の対応を後から比較可能に保つ。

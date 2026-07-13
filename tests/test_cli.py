@@ -6,7 +6,7 @@ runner = CliRunner()
 
 ALL_COMMANDS = (
     "collect", "extract", "analyze", "digest", "deliver", "poll", "run", "doctor",
-    "x-auth", "x-signals",
+    "x-auth", "x-signals", "x-insights",
 )
 
 

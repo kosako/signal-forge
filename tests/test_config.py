@@ -264,3 +264,15 @@ def test_x_signals_cap_below_page_min_rejected(tmp_path: Path) -> None:
     # 1〜4 は全 kind が黙って skip になる設定なので fail fast(0 = 無効は OK)
     with pytest.raises(ConfigError, match="daily_read_cap"):
         load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 4\n"))
+
+
+def test_x_signals_weights_validation(tmp_path: Path) -> None:
+    config = load_config(
+        write_config(tmp_path, "[x_signals]\nweight_like = 2.0\nhalf_life_days = 7\n")
+    )
+    assert config.x_signals.weight_like == 2.0
+    assert config.x_signals.half_life_days == 7
+    with pytest.raises(ConfigError, match="half_life_days"):
+        load_config(write_config(tmp_path, "[x_signals]\nhalf_life_days = 0\n"))
+    with pytest.raises(ConfigError, match="weight_bookmark"):
+        load_config(write_config(tmp_path, "[x_signals]\nweight_bookmark = -1.0\n"))

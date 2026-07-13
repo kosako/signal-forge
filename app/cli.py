@@ -254,6 +254,21 @@ def x_signals(
     typer.echo(f"reads={totals['api_reads']} new_signals={totals['new_signals']}")
 
 
+@app.command(name="x-insights")
+def x_insights(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """X 興味シグナルの週次インサイト(常連著者・頻出テーマ。読取専用 = GH#58 S1c)。"""
+    from app.config import load_config
+    from app.db import apply_migrations, connect
+    from app.insights import render_insights
+
+    config = load_config(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    typer.echo(render_insights(conn, config))
+
+
 @app.command()
 def poll(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
