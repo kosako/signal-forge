@@ -242,7 +242,7 @@ def x_signals(
     if config.x_signals.daily_read_cap == 0 and not backfill:
         typer.echo(
             "[x_signals].daily_read_cap が 0(取込無効)。有効化は合算予算の再配分"
-            "(ADR 0001)、初回全件は --backfill",
+            "(ADR 0001)、cold start は --backfill(kind ごと直近 --limit 件)",
             err=True,
         )
         raise typer.Exit(code=1)

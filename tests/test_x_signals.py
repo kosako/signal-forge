@@ -180,6 +180,39 @@ def test_backfill_limit_bounds_each_kind_independently(conn, tmp_path) -> None:
     assert calls_to(session, "/liked_tweets")[0]["max_results"] == 5
 
 
+def test_backfill_limit_stops_at_page_min_boundary_across_pages(conn, tmp_path) -> None:
+    # limit=104: 1ページ目 100 件(max_results=100)→ 残 4 < 5 で2ページ目に行かない
+    session = session_with(
+        [page(*[tw(f"b{i}") for i in range(100)], next_token="p2"), page(tw("b_x"))], []
+    )
+    totals = collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=104
+    )
+    assert totals["api_reads"] == 100
+    bookmark_calls = calls_to(session, "/bookmarks")
+    assert len(bookmark_calls) == 1
+    assert bookmark_calls[0]["max_results"] == 100  # min(PAGE_MAX, remaining)
+
+
+def test_cli_limit_validation_and_independence(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from app.cli import app
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    (conf / "config.toml").write_text("", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["x-signals", "--config-dir", str(conf), "--backfill", "--limit", "4"]
+    )
+    assert result.exit_code == 2  # 下限 5 未満は typer が拒否
+    # --backfill なしの --limit は通常経路に影響しない(client_id 未設定の fail fast が先)
+    result = runner.invoke(app, ["x-signals", "--config-dir", str(conf), "--limit", "50"])
+    assert result.exit_code == 1
+    assert "client_id" in result.output
+
+
 def test_self_rt_cursor_persisted_and_used_as_since_id(conn, tmp_path) -> None:
     # 通常投稿は保存されず既知到達が効かない → since_id カーソルで差分化(SF82-05)。
     # 打ち切り時も最大 id へ進める(ホームTL と同じ規約)
