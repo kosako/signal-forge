@@ -223,12 +223,6 @@ def x_signals(
     import httpx
 
     from app.config import load_config, load_env
-    from app.connectors.x import (
-        XApiSession,
-        build_x_client,
-        credentials_from_env,
-        has_x_credentials,
-    )
     from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session
     from app.connectors.x_signals import collect_x_signals
     from app.db import apply_migrations, connect
@@ -250,25 +244,13 @@ def x_signals(
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
     with httpx.Client() as client:
-        oauth2 = XOAuth2Session.load(
+        session = XOAuth2Session.load(
             client=client,
             config_dir=config_dir,
             client_id=config.x_oauth2.client_id,
             client_secret=env.get(ENV_CLIENT_SECRET),
         )
-        oauth1_client = build_x_client() if has_x_credentials(env) else None
-        try:
-            oauth1 = (
-                XApiSession(client=oauth1_client, credentials=credentials_from_env(env))
-                if oauth1_client is not None
-                else None
-            )
-            totals = collect_x_signals(
-                conn, config, oauth2, oauth1, logger, backfill=backfill
-            )
-        finally:
-            if oauth1_client is not None:
-                oauth1_client.close()
+        totals = collect_x_signals(conn, config, session, logger, backfill=backfill)
     typer.echo(f"reads={totals['api_reads']} new_signals={totals['new_signals']}")
 
 

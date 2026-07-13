@@ -19,6 +19,14 @@ CREATE TABLE x_signals (
 ) STRICT;
 CREATE INDEX ix_x_signals_kind_observed ON x_signals(kind, observed_at);
 
+-- 差分カーソル(self_rt のみ。/users/:id/tweets は since_id 対応で、通常投稿は
+-- x_signals に保存されず「既知到達」方式が効かないため。bookmarks/liked_tweets は
+-- since_id 非対応 = 既知到達方式で差分化しカーソル不要)
+CREATE TABLE x_signal_cursors (
+  kind     TEXT PRIMARY KEY CHECK (kind IN ('bookmark','like','self_rt')),
+  since_id TEXT NOT NULL
+) STRICT;
+
 -- 取込 run のコスト台帳(collect_runs は sources 行が前提のため独立させる。
 -- doctor #9 の当月コスト集計が合算する)
 CREATE TABLE x_signal_runs (

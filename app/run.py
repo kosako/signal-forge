@@ -125,35 +125,19 @@ def _collect_x_signals(
     設定不備として段の失敗に倒す(黙って skip しない)。"""
     import httpx
 
-    from app.connectors.x import (
-        XApiSession,
-        build_x_client,
-        credentials_from_env,
-        has_x_credentials,
-    )
     from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session
     from app.connectors.x_signals import collect_x_signals
 
     if config.x_oauth2.client_id is None:
         raise RuntimeError("[x_signals].daily_read_cap > 0 だが [x_oauth2].client_id 未設定")
     with httpx.Client() as client:
-        oauth2 = XOAuth2Session.load(
+        session = XOAuth2Session.load(
             client=client,
             config_dir=config.config_dir,
             client_id=config.x_oauth2.client_id,
             client_secret=env.get(ENV_CLIENT_SECRET),
         )
-        oauth1_client = build_x_client() if has_x_credentials(env) else None
-        try:
-            oauth1 = (
-                XApiSession(client=oauth1_client, credentials=credentials_from_env(env))
-                if oauth1_client is not None
-                else None  # OAuth1 キー無しは self_rt のみ skip(コネクタ側で WARN)
-            )
-            collect_x_signals(conn, config, oauth2, oauth1, logger, run_id=run_id)
-        finally:
-            if oauth1_client is not None:
-                oauth1_client.close()
+        collect_x_signals(conn, config, session, logger, run_id=run_id)
 
 
 def _analyze(

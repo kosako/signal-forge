@@ -258,3 +258,9 @@ def test_x_signals_cap_counts_toward_combined_budget(tmp_path: Path) -> None:
     assert config.x_signals.daily_read_cap == 35  # 130 + 35 = 165 ちょうどは OK
     with pytest.raises(ConfigError, match="combined_daily_read_cap"):
         load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 36\n"))
+
+
+def test_x_signals_cap_below_page_min_rejected(tmp_path: Path) -> None:
+    # 1〜4 は全 kind が黙って skip になる設定なので fail fast(0 = 無効は OK)
+    with pytest.raises(ConfigError, match="daily_read_cap"):
+        load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 4\n"))

@@ -24,6 +24,10 @@ X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
 X_SEARCH_QUERY_MAX = 512  # クエリ長上限(Basic tier)
 X_SEARCH_QUERY_SUFFIX = "-is:retweet -is:reply"  # 各スロットに自動付加(設計 02 §2)
 
+# S1b 取込の 1 ページ下限(liked_tweets / user tweets の max_results 下限 = 5 に統一。
+# 設計 02 §2)。コネクタ側に置くと config が httpx 依存を吸うため、軽い側 = ここに置く
+X_SIGNALS_MIN_PAGE = 5
+
 
 class ConfigError(Exception):
     """設定の欠落・型不一致・値域外。呼び出し側は捕捉せず終了させる。"""
@@ -262,6 +266,12 @@ def _validate(path: Path, config: Config) -> None:
             f"{path}: [llm].engine は {'/'.join(_LLM_ENGINES)} のいずれか: {config.llm.engine!r}"
         )
     _validate_x_search(path, config)
+    signals_cap = config.x_signals.daily_read_cap
+    if 0 < signals_cap < X_SIGNALS_MIN_PAGE:
+        raise ConfigError(
+            f"{path}: [x_signals].daily_read_cap は 0(無効)か {X_SIGNALS_MIN_PAGE} 以上"
+            f"(1 ページ下限。全 kind が黙って skip になる): {signals_cap}"
+        )
     if not (1 <= config.x_oauth2.callback_port <= 65535):
         raise ConfigError(
             f"{path}: [x_oauth2].callback_port はポート番号(1〜65535): "
