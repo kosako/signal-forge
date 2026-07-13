@@ -56,7 +56,7 @@ app/
   config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
   db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
   models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
-  connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), rss.py
+  connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), x_oauth2.py(OAuth2 PKCE・S1), rss.py
                   #   — items を produce(カーソル・冪等)
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)

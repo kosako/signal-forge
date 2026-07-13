@@ -98,7 +98,29 @@ def test_load_token_absent_returns_none(tmp_path: Path) -> None:
 
 def test_load_token_corrupted_fails_fast(tmp_path: Path) -> None:
     token_path(tmp_path).write_text('{"access_token": "at"}', encoding="utf-8")  # キー欠落
+    token_path(tmp_path).chmod(0o600)
     with pytest.raises(XOAuth2Error, match="壊れている"):
+        load_token(tmp_path)
+
+
+def test_load_token_semantic_corruption_fails_fast(tmp_path: Path) -> None:
+    save_token(tmp_path, make_token(expires_at="not-a-date"))
+    with pytest.raises(XOAuth2Error, match="壊れている"):
+        load_token(tmp_path)
+
+
+def test_load_token_rejects_loose_permissions(tmp_path: Path) -> None:
+    save_token(tmp_path, make_token())
+    token_path(tmp_path).chmod(0o644)
+    with pytest.raises(XOAuth2Error, match="パーミッション"):
+        load_token(tmp_path)
+
+
+def test_load_token_rejects_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "elsewhere.json"
+    real.write_text("{}", encoding="utf-8")
+    token_path(tmp_path).symlink_to(real)
+    with pytest.raises(XOAuth2Error, match="symlink"):
         load_token(tmp_path)
 
 
@@ -157,7 +179,45 @@ def test_missing_refresh_token_in_response_rejected() -> None:
     body = {"access_token": "at", "expires_in": 7200}  # offline.access 欠落の応答
     client = httpx.Client(transport=capture_transport([], body))
     with pytest.raises(XOAuth2Error, match="offline.access"):
-        refresh_token_grant(client, client_id="cid", client_secret=None, refresh_token="rt")
+        refresh_token_grant(
+            client, client_id="cid", client_secret=None,
+            refresh_token="rt", fallback_scope=" ".join(OAUTH2_SCOPES),
+        )
+
+
+def test_scope_shrink_rejected_without_leaking(tmp_path: Path) -> None:
+    # scope 縮小を「認可完了」で保存しない(S1b の取込だけが後で失敗する事故防止)
+    body = {**token_response(1), "scope": "users.read offline.access"}
+    client = httpx.Client(transport=capture_transport([], body))
+    with pytest.raises(XOAuth2Error, match="bookmark.read"):
+        exchange_code(
+            client, client_id="cid", client_secret=None,
+            code="c", redirect_uri="r", code_verifier="v",
+        )
+
+
+def test_refresh_response_without_scope_keeps_stored_scope() -> None:
+    body = {k: v for k, v in token_response(2).items() if k != "scope"}
+    client = httpx.Client(transport=capture_transport([], body))
+    token = refresh_token_grant(
+        client, client_id="cid", client_secret=None,
+        refresh_token="rt", fallback_scope=" ".join(OAUTH2_SCOPES),
+    )
+    assert token.scope == " ".join(OAUTH2_SCOPES)  # 省略時は検証済みの値を維持
+
+
+def test_error_body_not_reflected_in_exception() -> None:
+    # エラー本文は untrusted(gateway が要求内容を反射しうる)。error code 以外を出さない
+    sentinel = "SECRET-REFRESH-TOKEN-VALUE"
+    body = {"error": "invalid_grant", "error_description": f"bad token {sentinel}"}
+    client = httpx.Client(transport=capture_transport([], body, status=400))
+    with pytest.raises(XOAuth2Error) as exc_info:
+        exchange_code(
+            client, client_id="cid", client_secret=None,
+            code="c", redirect_uri="r", code_verifier="v",
+        )
+    assert sentinel not in str(exc_info.value)
+    assert "invalid_grant" in str(exc_info.value)
 
 
 def test_token_endpoint_error_surfaces_status() -> None:
@@ -257,6 +317,65 @@ def test_session_retries_5xx_then_returns(tmp_path: Path) -> None:
     assert len(attempts) == 2
 
 
+def test_session_401_on_last_retry_attempt_still_refreshes_and_resends(tmp_path: Path) -> None:
+    # 500→500→401(リトライ予算の最終試行で 401)でも refresh + 再送が走る(SF81-003)
+    save_token(tmp_path, make_token())
+    statuses = [500, 500, 401]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            calls.append("refresh")
+            return httpx.Response(200, json=token_response(2))
+        calls.append("get")
+        if statuses:
+            return httpx.Response(statuses.pop(0))
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    session = make_session(tmp_path, httpx.MockTransport(handler), make_token())
+    assert fetch_me(session) == "kosako"
+    assert calls == ["get", "get", "get", "refresh", "get"]
+
+
+def test_session_401_after_refresh_returns_401_without_loop(tmp_path: Path) -> None:
+    save_token(tmp_path, make_token())
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            calls.append("refresh")
+            return httpx.Response(200, json=token_response(2))
+        calls.append("get")
+        return httpx.Response(401)
+
+    session = make_session(tmp_path, httpx.MockTransport(handler), make_token())
+    assert session.get(USERS_ME_URL).status_code == 401  # 恒久 401 はそのまま返す
+    assert calls == ["get", "refresh", "get"]  # refresh は1回だけ(ループしない)
+
+
+def test_refresh_adopts_token_rotated_by_other_process(tmp_path: Path) -> None:
+    # 他プロセス(朝バッチ ⟷ doctor)が先に refresh 済みなら、使用済み refresh token を
+    # 再送して invalid_grant にせず、ディスクの新 token を採用する(SF81-002)
+    rotated = XOAuth2Token(
+        access_token="at-2", refresh_token="rt-2",
+        expires_at="2026-07-13T14:00:00Z", scope=" ".join(OAUTH2_SCOPES),
+    )
+    save_token(tmp_path, rotated)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            calls.append("refresh")  # 呼ばれてはいけない
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        calls.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    stale = make_token(expires_at="2026-07-13T11:00:00Z")  # 失効済みの旧 token(rt-1)
+    session = make_session(tmp_path, httpx.MockTransport(handler), stale)
+    assert fetch_me(session) == "kosako"
+    assert calls == ["Bearer at-2"]  # ネットワーク refresh なしで新 token を採用
+
+
 def test_session_load_without_token_guides_auth(tmp_path: Path) -> None:
     with pytest.raises(XOAuth2Error, match="x-auth"):
         XOAuth2Session.load(
@@ -275,10 +394,10 @@ def hit(url: str) -> httpx.Response:
         return client.get(url, timeout=5)
 
 
-def run_callback(server: CallbackServer, state: str, results: dict) -> threading.Thread:
+def run_callback(server: CallbackServer, results: dict) -> threading.Thread:
     def target() -> None:
         try:
-            results["code"] = server.wait_for_code(state, timeout_s=10)
+            results["code"] = server.wait_for_code(timeout_s=10)
         except XOAuth2Error as e:
             results["error"] = str(e)
 
@@ -288,9 +407,9 @@ def run_callback(server: CallbackServer, state: str, results: dict) -> threading
 
 
 def test_callback_server_returns_code_and_ignores_other_paths() -> None:
-    server = CallbackServer(0)  # テストは空きポート(実フローは config の固定ポート)
+    server = CallbackServer(0, "st")  # テストは空きポート(実フローは config の固定ポート)
     results: dict = {}
-    thread = run_callback(server, "st", results)
+    thread = run_callback(server, results)
     hit(f"http://127.0.0.1:{server.port}/favicon.ico")  # ブラウザのノイズは無視
     response = hit(f"http://127.0.0.1:{server.port}/callback?code=abc&state=st")
     thread.join(timeout=10)
@@ -298,19 +417,24 @@ def test_callback_server_returns_code_and_ignores_other_paths() -> None:
     assert response.status_code == 200
 
 
-def test_callback_server_rejects_state_mismatch() -> None:
-    server = CallbackServer(0)
+def test_callback_server_ignores_forged_state_and_accepts_valid_one() -> None:
+    # 偽 callback(state 不一致)は 400 で無視し、フローを中断・確定させない(SF81-007)
+    server = CallbackServer(0, "expected")
     results: dict = {}
-    thread = run_callback(server, "expected", results)
-    hit(f"http://127.0.0.1:{server.port}/callback?code=abc&state=forged")
+    thread = run_callback(server, results)
+    forged = hit(f"http://127.0.0.1:{server.port}/callback?code=evil&state=forged")
+    denial = hit(f"http://127.0.0.1:{server.port}/callback?error=denied&state=forged")
+    response = hit(f"http://127.0.0.1:{server.port}/callback?code=abc&state=expected")
     thread.join(timeout=10)
-    assert "state 不一致" in results["error"]
+    assert forged.status_code == 400 and denial.status_code == 400
+    assert response.status_code == 200
+    assert results["code"] == "abc"  # 偽 code は採用されない
 
 
-def test_callback_server_surfaces_denial() -> None:
-    server = CallbackServer(0)
+def test_callback_server_surfaces_denial_with_valid_state() -> None:
+    server = CallbackServer(0, "st")
     results: dict = {}
-    thread = run_callback(server, "st", results)
+    thread = run_callback(server, results)
     hit(f"http://127.0.0.1:{server.port}/callback?error=access_denied&state=st")
     thread.join(timeout=10)
     assert "拒否" in results["error"]

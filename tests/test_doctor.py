@@ -630,7 +630,17 @@ def test_x_oauth2_probe_failure_fails(config_dir, tmp_path) -> None:
 
 
 def test_x_oauth2_corrupted_token_file_fails(config_dir, tmp_path) -> None:
-    (config_dir / "x-oauth2-token.json").write_text("not json", encoding="utf-8")
+    token_file = config_dir / "x-oauth2-token.json"
+    token_file.write_text("not json", encoding="utf-8")
+    token_file.chmod(0o600)  # 権限は正しく中身だけ壊れているケース
     result = by_number(doctor(config_dir, tmp_path), 13)
     assert result.status == "FAIL"
     assert "壊れている" in result.detail
+
+
+def test_x_oauth2_loose_permission_token_fails(config_dir, tmp_path) -> None:
+    write_oauth2_token(config_dir)
+    (config_dir / "x-oauth2-token.json").chmod(0o644)
+    result = by_number(doctor(config_dir, tmp_path), 13)
+    assert result.status == "FAIL"
+    assert "パーミッション" in result.detail

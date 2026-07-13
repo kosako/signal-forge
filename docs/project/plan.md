@@ -230,7 +230,7 @@
 - **依存**: #17
 - **参照**: 設計 04 §4 / 設計 05 §1.2, §4 / 設計 01 §7
 
-#### #21 intel doctor(12項目)
+#### #21 intel doctor(12項目 → 13項目に拡張: #13 X OAuth2 token は GH#58 S1a で追加)
 - **目的**: 構成不備・故障・コスト超過を1コマンドで検査可能にする。
 - **完了条件**:
   - [ ] 設計 05 §2 の12項目(config/.env 600/migrations/Telegram getMe/X 疎通/LLM 動的検査/Vault 書込/launchd/コスト/バックアップ/TTL 残存/ANTHROPIC_API_KEY)を実装

@@ -283,7 +283,7 @@ def doctor(
     purge: bool = typer.Option(False, "--purge", help="期限切れ削除の単独実行"),
     cost: bool = typer.Option(False, "--cost", help="コスト集計の単発表示"),
 ) -> None:
-    """構成不備・故障・コスト超過の検査(12項目)。終了コード: FAIL あり=1。"""
+    """構成不備・故障・コスト超過の検査(13項目)。終了コード: FAIL あり=1。"""
     from app.config import load_config
     from app.doctor import has_failure, month_cost_summary, run_doctor
     from app.logs import DEFAULT_LOG_DIR, setup_logging
