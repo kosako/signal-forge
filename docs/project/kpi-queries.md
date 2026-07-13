@@ -23,6 +23,7 @@ sqlite3 -header -column ~/.local/share/intel/intel.db < scripts/kpi/01-daily-kpi
 | 06 | `06-phase2-boundary.sql` | 🔖累計・深掘り実施率・フェーズ2境界判定 | 最終判定 |
 | 07 | `07-invalid-streak.sql` | 無効日3日連続の検知 | R1 発動判定 |
 | 08 | `08-weekly-summary.sql` | 直近7日の配信日数・KPI 達成日数・無効日数・fail-closed 週判定 | §6-1〜2 |
+| 09 | (SQL でなく)`uv run intel x-insights` | X 興味シグナルのインサイト(常連著者・頻出テーマ・直近シグナル)。重み係数は config `[x_signals]`(GH#58 S1c) | §6-8 |
 
 ## fail-closed の突合(SQL に出ない分の手作業)
 

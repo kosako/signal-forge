@@ -57,6 +57,7 @@ app/
   db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
   models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
   connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), x_oauth2.py(OAuth2 PKCE・S1), x_signals.py(興味シグナル取込・S1b), rss.py
+  insights.py     # X 興味シグナルの週次インサイト(読取専用・S1c)
                   #   — items を produce(カーソル・冪等)
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)

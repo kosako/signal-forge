@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -59,13 +60,21 @@ class XOAuth2Config:
 
 @dataclass(frozen=True)
 class XSignalsConfig:
-    """X 興味シグナル取込(S1b = GH#58 / ADR 0001)。
+    """X 興味シグナル取込(S1b)+ インサイト重み(S1c)(GH#58 / ADR 0001)。
 
-    0 = 取込無効(既定)。有効化は合算予算(combined_daily_read_cap)の内側での
-    再配分 = 人間の config 変更(例: home 115 / search 35 / signals 15)。
+    daily_read_cap 0 = 取込無効(既定)。有効化は合算予算(combined_daily_read_cap)の
+    内側での再配分 = 人間の config 変更(例: home 115 / search 35 / signals 15)。
+
+    重みは「種類の重み × 直近の重み」(ADR 0001)。直近の重みは半減期
+    half_life_days の指数減衰(移動平均の実装)。intel x-insights の表示にのみ
+    使い、ランキング・検索スロットへの自動反映はしない(S2 の人間ゲート)。
     """
 
     daily_read_cap: int = 0
+    weight_bookmark: float = 3.0  # 強・正(意図的に「後で」保存)
+    weight_like: float = 1.0  # 弱・正(儀礼的も混じる)
+    weight_self_rt: float = 3.0  # 強・正(是認・拡散)
+    half_life_days: float = 14.0
 
 
 @dataclass(frozen=True)
@@ -266,6 +275,20 @@ def _validate(path: Path, config: Config) -> None:
             f"{path}: [llm].engine は {'/'.join(_LLM_ENGINES)} のいずれか: {config.llm.engine!r}"
         )
     _validate_x_search(path, config)
+    # nan/inf は TOML として合法だがスコア計算・順位を壊すため有限値のみ受ける
+    if not (
+        math.isfinite(config.x_signals.half_life_days) and config.x_signals.half_life_days > 0
+    ):
+        raise ConfigError(f"{path}: [x_signals].half_life_days は正の有限値(減衰の半減期)")
+    for key, value in (
+        ("weight_bookmark", config.x_signals.weight_bookmark),
+        ("weight_like", config.x_signals.weight_like),
+        ("weight_self_rt", config.x_signals.weight_self_rt),
+    ):
+        if not (math.isfinite(value) and value >= 0):
+            raise ConfigError(
+                f"{path}: [x_signals].{key} は 0 以上の有限値(負のシグナルは無い)"
+            )
     signals_cap = config.x_signals.daily_read_cap
     if 0 < signals_cap < X_SIGNALS_MIN_PAGE:
         raise ConfigError(
