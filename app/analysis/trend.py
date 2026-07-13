@@ -26,14 +26,16 @@ from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 
 JST = timezone(timedelta(hours=9))
 
-PROMPT_VERSION = "trend-v001"
+PROMPT_VERSION = "trend-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 MIN_ITEMS = 5  # これ未満は全体トレンドとして意味が出ないので節を省く
 MAX_INPUT_ITEMS = 120  # LLM 入力の上限(コスト・文脈保護。relevance 上位を優先)
 MAX_THEMES = 5
 MAX_LABEL = 40
-MAX_SUMMARY = 120  # テーマ要約の切り詰め上限(ヘッダ 1 通の Telegram 上限超過を防ぐ)
+# テーマ要約の切り詰め上限。prompt(v002)が 160 字以内を指示するため、遵守時は発動しない
+# 安全網(指示を無視した超過だけ切る)。5 テーマ満載でもヘッダ 1 通は Telegram 4096 字に収まる
+MAX_SUMMARY = 200
 
 
 class TrendTheme(BaseModel):
