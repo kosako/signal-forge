@@ -184,6 +184,7 @@ def _collect_kind(
             max_wrapper_id = max(max_wrapper_id, *(int(t["id"]) for t in tweets))
         users, ref_tweets = _index_includes(body)
         hit_known = False
+        page_new = 0  # new_signals は COMMIT 成功後に計上(rollback 分を数えない)
         # 接続は autocommit のため、ページ単位の原子性は明示トランザクションで作る
         # (半端なページが残ると、次回の既知到達打ち切りが未保存の残りを飛ばす)
         conn.execute("BEGIN IMMEDIATE")
@@ -199,13 +200,18 @@ def _collect_kind(
                     (kind, *row, run_id),
                 ).rowcount
                 if inserted:
-                    stats["new_signals"] += 1
-                elif not backfill:
-                    hit_known = True  # 既知に到達 = これより古い側は取込済み
+                    page_new += 1
+                elif not backfill and kind != "self_rt":
+                    # 既知に到達 = これより古い側は取込済み。self_rt には適用しない:
+                    # tweet_id は RT 元 id のため、解除→再RT が「既知」に化けて
+                    # ページングを止め、未取得の古い RT を恒久欠落させる(境界は
+                    # since_id カーソルのみ。SF82-08)
+                    hit_known = True
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
             raise
+        stats["new_signals"] += page_new
         if hit_known and not backfill:
             break
         next_token = body.get("meta", {}).get("next_token")
@@ -246,6 +252,9 @@ def _to_signal_row(
     元ツイ。ホームTL の「RT は元ツイに正規化」と同方針)。RT 元が includes に無い
     場合は id のみ記録する(シグナルとしては成立する)。
     """
+    if "id" not in tweet:
+        # 想定外の応答形は黙って握らず kind の失敗に(ページはロールバックされる)
+        raise XSignalsError("応答に id の無いツイートが含まれる")
     if kind != "self_rt":
         author_id = tweet.get("author_id")
         return (

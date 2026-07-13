@@ -88,7 +88,7 @@ class Connector(Protocol):
 - **自RT の正規化**: 記録する id・著者・本文・時刻は **RT 元ツイートのもの**(興味の対象は元ツイ。ホームTL の RT 正規化と同方針)。通常ポスト・引用はシグナル対象外
 - **予算**: `[x_signals].daily_read_cap`(**既定 0 = 取込無効**。1〜4 は全 kind が黙って skip になるため ConfigError)。読取 = 取得ツイート数(collect と同じ意味論)。合算 `[x.combined_daily_read_cap]` の検証に含まれ、有効化は内訳の再配分 = 人間の config 変更(ADR 0001。例: home 115 / search 35 / signals 15)。予算は bookmark → like → self_rt の順(強シグナル優先)に消費し、残 < 5(liked_tweets / user tweets の max_results 下限)で打ち切り。**途中ページ失敗でも取得済みぶんは必ず予算・台帳に計上**(過少計上で後続 kind に予算が再配分され cap を実質超過しない)。429 は待たず打ち切り(取得 0 のままの 429 はその kind の失敗として記録)
 - **cold start**: 初回全件は日次 run でなく **`intel x-signals --backfill` の手動実行**(cap 無視で全ページ。課金操作は人間ゲート = ADR 0001 の原則)。backfill 分の observed_at は一括時刻になるため直近性の代理としては使えない(制約として許容)
-- **障害隔離**: kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。**全 kind 失敗かつ取得 0 は段の失敗として loud に落とす**(GH#74 と同方針)。cap > 0 なのに未認可・client_id 欠落も段の失敗(黙って skip しない)
+- **障害隔離**: kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。kind ごとの成否を判定し(0 件は正常な成功・**取得 0 のままの rate limit は失敗**)、**試行した全 kind が失敗したときは段の失敗として loud に落とす**(GH#74 と同方針)。cap > 0 なのに未認可・client_id 欠落も段の失敗(黙って skip しない)
 - **記録**: 取込 1 回ごとに `x_signal_runs` へ 1 行(api_reads・estimated_cost_usd・new_signals。設計 01 §9)。doctor #9 の当月コストに合算
 
 ### Day 0 テストスクリプト仕様(`scripts/day0_x_probe.py`)

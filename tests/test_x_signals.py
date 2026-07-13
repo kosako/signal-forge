@@ -181,6 +181,35 @@ def test_self_rt_cursor_persisted_and_used_as_since_id(conn, tmp_path) -> None:
     ).fetchone()["since_id"] == "1100"
 
 
+def test_self_rt_known_source_does_not_stop_paging(conn, tmp_path) -> None:
+    # 解除→再RT(wrapper は新しいが RT 元は既知)でページングを止めない(SF82-08)。
+    # self_rt の差分境界は since_id のみ
+    conn.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('self_rt', '900')")
+    conn.execute("INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', '100')")
+    session = session_with(
+        [], [], [page(rt("300", "900"), next_token="p2"), page(rt("200", "901"))]
+    )
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert len(calls_to(session, "42/tweets")) == 2  # 既知 RT 元でも次ページへ進む
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["900", "901"]
+    cursor = conn.execute(
+        "SELECT since_id FROM x_signal_cursors WHERE kind='self_rt'"
+    ).fetchone()
+    assert cursor["since_id"] == "300"
+
+
+def test_page_rolls_back_atomically_on_midpage_failure(conn, tmp_path) -> None:
+    # ページ途中の失敗はページ全体を rollback(半端ページが残ると次回の既知到達
+    # 判定が未保存の残りを飛ばす。SF82-09)。想定外の応答形は kind の失敗に隔離
+    session = session_with([page(tw("b1"), {"text": "id なし"})], [page(tw("l1"))])
+    totals = collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert rows(conn, "bookmark") == []  # 先行の b1 も残らない(原子性)
+    assert totals["new_signals"] == 1  # like は継続
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "ok"
+    assert "bookmark" in run["error"]
+
+
 def test_non_rt_posts_are_not_signals(conn, tmp_path) -> None:
     session = session_with([], [], [page({"id": "1", "text": "自分の通常ポスト"})])
     collect_x_signals(conn, make_config(tmp_path), session, logger)
