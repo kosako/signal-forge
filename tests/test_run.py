@@ -146,6 +146,53 @@ def test_stage_failure_is_isolated_and_reported(conn, tmp_path) -> None:
     assert digest["item_count"] == 0  # 分析なしでも digest 段は空で完走
 
 
+def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path) -> None:
+    # 環境障害(codex 不在 = #72)は silent full-degradation でなく analyze 段の失敗になる
+    # (failures 非空は CLI の非0終了・失敗通知の入口 = app/run.py docstring。GH#74)。
+    # 後続の段は継続する
+    from app.analysis.llm import LLMUnavailableError
+
+    class UnavailableEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 起動失敗: [Errno 2] No such file or directory")
+
+    failures = run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: UnavailableEngine(), logger, "01RUNID",
+    )
+    assert "analyze" in failures
+    assert "purge" not in failures and "backup" not in failures  # 後続の段は継続
+    # degraded を1件も書かない(修復後の再実行がそのまま再分析になる)
+    assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+    # digest 段は空で完走(トレンドは付加機能として節省略・本体は止めない)
+    assert conn.execute("SELECT item_count FROM digests").fetchone()["item_count"] == 0
+
+
+def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(conn, tmp_path) -> None:
+    # transient 由来の全滅(FullDegradationError)も analyze 段の失敗になるが、
+    # degraded 行は書き込み済みで digest は劣化配信のまま完走する(GH#74 案2の二重ガード)
+    from app.analysis.llm import LLMError
+
+    class AlwaysFailEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMError("常に失敗")
+
+    failures = run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: AlwaysFailEngine(), logger, "01RUNID",
+    )
+    assert "analyze" in failures
+    assert conn.execute("SELECT count(*) FROM analyses WHERE degraded=1").fetchone()[0] == 1
+    digest = conn.execute("SELECT item_count, status FROM digests").fetchone()
+    assert digest["status"] == "degraded" and digest["item_count"] == 1  # 劣化配信は維持
+
+
 def test_export_failure_reported_but_purge_runs(conn, tmp_path) -> None:
     profile = tmp_path / "interest-profile.md"
     profile.write_text("---\nupdated: 2026-07-06\n---\n# 関心\n")
