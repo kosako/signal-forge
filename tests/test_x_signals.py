@@ -155,15 +155,29 @@ def test_partial_page_failure_still_counts_reads_and_cost(conn, tmp_path) -> Non
     assert "bookmark" in run["error"]
 
 
-def test_backfill_follows_all_pages_ignoring_known_and_cap(conn, tmp_path) -> None:
+def test_backfill_pages_past_known_within_limit(conn, tmp_path) -> None:
     conn.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', 'b1')")
     session = session_with([page(tw("b1"), tw("b2"), next_token="p2"), page(tw("b3"))], [])
     totals = collect_x_signals(
-        conn, make_config(tmp_path, cap=0), session, logger, backfill=True
+        conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=100
     )
     assert totals["new_signals"] == 2  # b2, b3(b1 は既知でも打ち切らず先へ)
     assert [r["tweet_id"] for r in rows(conn, "bookmark")] == ["b1", "b2", "b3"]
-    assert calls_to(session, "/bookmarks")[0]["max_results"] == 100  # cap 無視(全件)
+    assert calls_to(session, "/bookmarks")[0]["max_results"] == 100  # 日次 cap でなく limit
+
+
+def test_backfill_limit_bounds_each_kind_independently(conn, tmp_path) -> None:
+    # 全ページ辿りのコスト事故防止(GH#84): limit は kind ごとの読取上限
+    session = session_with(
+        [page(*[tw(f"b{i}") for i in range(5)], next_token="more")],
+        [page(*[tw(f"l{i}") for i in range(5)], next_token="more")],
+    )
+    totals = collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=5
+    )
+    assert totals["api_reads"] == 10  # bookmark 5 + like 5(kind ごと独立の上限)
+    assert len(calls_to(session, "/bookmarks")) == 1  # limit 到達で次ページに行かない
+    assert calls_to(session, "/liked_tweets")[0]["max_results"] == 5
 
 
 def test_self_rt_cursor_persisted_and_used_as_since_id(conn, tmp_path) -> None:

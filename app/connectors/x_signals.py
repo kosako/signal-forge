@@ -14,8 +14,9 @@
   「打ち切り時も今回の最大 id へ進める」(古い側は追わない)
 - 予算: [x_signals].daily_read_cap(既定 0 = 無効)。読取 = 取得ツイート数で
   collect と同じ意味論。途中失敗でも取得済みページぶんは必ず予算・台帳に計上する。
-  cold start(初回全件)は日次 run でなく intel x-signals --backfill の手動実行
-  (課金操作は人間ゲート。ADR 0001)
+  cold start は日次 run でなく intel x-signals --backfill の手動実行(課金操作は
+  人間ゲート。ADR 0001)。backfill は「kind ごと直近 N 件を種に」の上限つき
+  (全ページ辿りは過去のいいねが多いとコスト事故になる。GH#84)
 - text_excerpt は TTL キャッシュのみ(purge が retention.x_cache_ttl_days で
   NULL 化。Issue #2 の確定ポリシー)
 - 失敗は kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。
@@ -57,17 +58,24 @@ def collect_x_signals(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
-    backfill: bool = False,
+    backfill_limit: int | None = None,
 ) -> dict[str, int]:
-    """3 種のシグナルを cap 内で取込み、x_signal_runs に 1 行記録して集計を返す。"""
+    """3 種のシグナルを cap 内で取込み、x_signal_runs に 1 行記録して集計を返す。
+
+    backfill_limit を渡すと cold start モード: 既知到達で打ち切らず、日次 cap の
+    代わりに **kind ごと**の読取上限として適用する(最悪コスト = 3 × limit × 単価)。
+    """
+    backfill = backfill_limit is not None
     me_id = _get_me_id(session)
-    budget = None if backfill else config.x_signals.daily_read_cap
     totals = {"api_reads": 0, "new_signals": 0}
     outcomes: dict[str, str] = {}  # 試行した kind → 'ok' | 'failed'(skip は含めない)
     errors: list[str] = []
     for kind in KIND_ENDPOINTS:
-        remaining = None if budget is None else budget - totals["api_reads"]
-        if remaining is not None and remaining < X_SIGNALS_MIN_PAGE:
+        if backfill:
+            remaining = backfill_limit  # kind ごとに独立の上限(日次 cap と共有しない)
+        else:
+            remaining = config.x_signals.daily_read_cap - totals["api_reads"]
+        if remaining < X_SIGNALS_MIN_PAGE:
             logger.info(
                 f"{kind} を skip(予算残 {remaining} < {X_SIGNALS_MIN_PAGE})",
                 extra={"run_id": run_id, "stage": "x_signals"},
@@ -138,7 +146,7 @@ def _collect_kind(
     session: XOAuth2Session,
     kind: str,
     me_id: str,
-    budget: int | None,
+    budget: int,
     run_id: str | None,
     stats: dict[str, int],
     backfill: bool,
@@ -154,11 +162,11 @@ def _collect_kind(
     max_wrapper_id = 0  # self_rt のカーソル素材(自分のタイムライン上の最大 tweet id)
     next_token: str | None = None
     while True:
-        remaining = None if budget is None else budget - stats["api_reads"]
-        if remaining is not None and remaining < X_SIGNALS_MIN_PAGE:
+        remaining = budget - stats["api_reads"]
+        if remaining < X_SIGNALS_MIN_PAGE:
             break
         params: dict[str, str | int] = {
-            "max_results": PAGE_MAX if remaining is None else min(PAGE_MAX, remaining),
+            "max_results": min(PAGE_MAX, remaining),
             "tweet.fields": TWEET_FIELDS,
             "expansions": EXPANSIONS,
         }

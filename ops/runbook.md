@@ -181,10 +181,10 @@ Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の
    daily_read_cap = 15
    ```
    (内訳合計 > combined_daily_read_cap は起動時 ConfigError)
-2. **cold start(任意・初回のみ)**: 過去のブックマーク全件を種にする:
+2. **cold start(任意・初回のみ)**: kind ごと直近 N 件(既定 100)を種にする:
    ```sh
-   uv run intel x-signals --backfill
+   uv run intel x-signals --backfill --limit 100
    ```
-   cap を無視して全ページ辿る(数百件なら $1〜2 程度。reads×$0.004)
+   最悪コスト = 3 kind × N × $0.004(既定 100 なら ≤ $1.2。GH#84)
 3. 以降は**朝バッチが毎日差分を自動取込**(x_signals 段)。確認は
    `sqlite3 ~/.local/share/intel/intel.db "SELECT kind, count(*) FROM x_signals GROUP BY kind"`
