@@ -30,8 +30,12 @@ def generate_digest(
     *,
     run_id: str | None = None,
     force: bool = False,
+    trend_markdown: str | None = None,
 ) -> int | None:
-    """当日ダイジェストを生成し digests.id を返す(skip 時は None)。"""
+    """当日ダイジェストを生成し digests.id を返す(skip 時は None)。
+
+    trend_markdown: 「今日のトレンド」節(GH#75)。付加機能なので None 可(節を省く)。
+    """
     digest_date = today_jst()
     existing = conn.execute(
         "SELECT id, item_ids FROM digests WHERE digest_date = ?", (digest_date,)
@@ -67,12 +71,15 @@ def generate_digest(
         if not degraded_digest:
             ranked = rank_for_digest(conn, config)
 
-        markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest)
+        # トレンド節は degraded 配信では付けない(分析が無いため意味を成さない)
+        trend = None if degraded_digest else trend_markdown
+        markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest, trend=trend)
         item_ids = [item.item_id for item in ranked]
         digest_id = conn.execute(
             """
-            INSERT INTO digests (digest_date, run_id, status, markdown, item_ids, item_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO digests
+                (digest_date, run_id, status, markdown, item_ids, item_count, trend_markdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 digest_date,
@@ -81,6 +88,7 @@ def generate_digest(
                 markdown,
                 json.dumps(item_ids),
                 len(item_ids),
+                trend,
             ),
         ).lastrowid
         for item_id in item_ids:
@@ -139,10 +147,15 @@ def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[R
     ]
 
 
-def _render_markdown(digest_date: str, items: list[RankedItem], *, degraded: bool) -> str:
+def _render_markdown(
+    digest_date: str, items: list[RankedItem], *, degraded: bool, trend: str | None = None
+) -> str:
     lines = [f"# 朝のダイジェスト {digest_date}", ""]
     if degraded:
         lines.append("> ⚠️ LLM 分析が失敗したため、タイトルのみの degraded 配信です。")
+        lines.append("")
+    if trend:  # 「今日のトレンド」節を全体感として冒頭に(GH#75)
+        lines.append(trend)
         lines.append("")
     if not items:
         lines.append("本日は基準(min_score)を満たすアイテムがありませんでした。")

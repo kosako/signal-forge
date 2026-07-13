@@ -57,9 +57,7 @@ def run_pipeline(
     ))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
     stage("analyze", lambda: _analyze(conn, config, engine_factory, logger, run_id))
-    stage("digest", lambda: generate_digest(
-        conn, config, logger, run_id=run_id, force=force_digest
-    ))
+    stage("digest", lambda: _digest(conn, config, engine_factory, logger, run_id, force_digest))
     stage("export", lambda: _export_today(conn, config, logger, run_id))
     if is_telegram_configured(config, env):
         stage("deliver", lambda: _deliver_today(conn, config, env, logger, run_id))
@@ -77,6 +75,41 @@ def run_pipeline(
         extra={"run_id": run_id, "stage": "run", "extra": {"failures": failures}},
     )
     return failures
+
+
+def _digest(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[], LLMEngine],
+    logger: logging.Logger,
+    run_id: str,
+    force_digest: bool,
+) -> int | None:
+    """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。"""
+    from app.analysis.trend import synthesize_trend
+
+    trend = None
+    # digest が skip される場合(当日生成済み & not force)は synthesis しない(無駄な LLM 呼び)
+    if force_digest or not _digest_exists_today(conn):
+        try:
+            trend = synthesize_trend(conn, engine_factory(), logger, run_id=run_id)
+        except Exception as e:  # トレンドは付加機能。失敗しても digest 本体を止めない
+            logger.warning(
+                f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "digest"},
+            )
+    return generate_digest(
+        conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend
+    )
+
+
+def _digest_exists_today(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM digests WHERE digest_date = ?", (today_jst(),)
+        ).fetchone()
+        is not None
+    )
 
 
 def _analyze(

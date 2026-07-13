@@ -118,16 +118,27 @@ def digest(
     force: bool = typer.Option(False, "--force", help="生成済みでも当日分を置換する"),
 ) -> None:
     """ランキングして日本語ダイジェスト(digests)を生成する。"""
+    from app.analysis.llm import create_engine
+    from app.analysis.trend import synthesize_trend
     from app.config import load_config
     from app.db import apply_migrations, connect
     from app.digest import generate_digest
+    from app.digest.builder import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
-    digest_id = generate_digest(conn, config, logger, force=force)
+    trend = None
+    exists = conn.execute("SELECT 1 FROM digests WHERE digest_date = ?", (today_jst(),)).fetchone()
+    # 生成済み & not force なら generate_digest は skip する。無駄な synthesis を避ける
+    if force or exists is None:
+        try:  # トレンドは付加機能。失敗しても digest 本体を止めない
+            trend = synthesize_trend(conn, create_engine(config.llm.engine), logger)
+        except Exception as e:
+            logger.warning(f"トレンド synthesis が例外(節を省略): {type(e).__name__}")
+    digest_id = generate_digest(conn, config, logger, force=force, trend_markdown=trend)
     typer.echo("skip(生成済み)" if digest_id is None else f"digest id={digest_id}")
 
 

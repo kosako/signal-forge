@@ -280,6 +280,10 @@ def _header_text(digest: sqlite3.Row) -> str:
     )
     if digest["status"] == "degraded":
         header += "\n⚠️ 本文抽出失敗/分析縮退あり"
+    if digest["trend_markdown"]:  # 「今日のトレンド」節を冒頭メッセージに同梱(GH#75)
+        # trend はプレーンテキスト。HTML(parse_mode=HTML)へ載せる前に必ず escape する
+        # (LLM 生成の <>& で配信全体が 400 で落ちるのを防ぐ)
+        header += "\n\n" + escape_text(digest["trend_markdown"])
     return header
 
 
