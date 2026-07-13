@@ -205,6 +205,10 @@ def test_partial_chunk_failure_degrades_and_continues(conn, tmp_path) -> None:
         conn, make_config(tmp_path, batch_size=1), engine, "p", [a, b], logger
     )
     assert counts == {"analyzed": 1, "degraded": 1}
+    rows = {r["item_id"]: r for r in conn.execute("SELECT item_id, degraded FROM analyses")}
+    assert rows[a]["degraded"] == 1 and rows[b]["degraded"] == 0  # 永続化も両系そのまま
+    statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
+    assert statuses == {"analyzed"}
 
 
 def test_engine_unavailable_propagates_without_degraded(conn, tmp_path) -> None:
