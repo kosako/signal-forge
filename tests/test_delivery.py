@@ -55,11 +55,11 @@ def add_item(
     return item_id
 
 
-def add_digest(conn, item_ids, *, status="ok") -> int:
+def add_digest(conn, item_ids, *, status="ok", trend_markdown=None) -> int:
     return conn.execute(
-        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status) "
-        "VALUES (?, '# md', ?, ?, ?)",
-        (today_jst(), json.dumps(item_ids), len(item_ids), status),
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status, "
+        "trend_markdown) VALUES (?, '# md', ?, ?, ?, ?)",
+        (today_jst(), json.dumps(item_ids), len(item_ids), status, trend_markdown),
     ).lastrowid
 
 
@@ -230,6 +230,20 @@ def test_degraded_digest_header_has_warning(conn, tmp_path) -> None:
     # summary/implication 空でもタイトル+ソース行のメッセージは成立する
     assert "1. <b>" in recorder.texts()[1]
     assert "💡" not in recorder.texts()[1]
+
+
+def test_header_includes_trend_summary(conn, tmp_path) -> None:
+    # 「今日のトレンド」節はヘッダ(冒頭)メッセージに同梱される(GH#75)
+    a = add_item(conn, "https://a/1")
+    trend = "## 今日のトレンド\n\n- **AI セキュリティ** — 権限と秘匿が話題。"
+    digest_id = add_digest(conn, [a], trend_markdown=trend)
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert "のダイジェスト" in header  # 通常のヘッダ行
+    assert "今日のトレンド" in header  # トレンド節が冒頭メッセージに載る
+    assert "AI セキュリティ" in header
 
 
 def test_empty_digest_sends_header_only(conn, tmp_path) -> None:
