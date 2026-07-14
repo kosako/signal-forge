@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.connectors.base import FatalError, RetryableError
 from app.db import apply_migrations, connect
 from app.doctor import CanaryProbe, CheckResult, has_failure, month_cost_summary, run_doctor
 
@@ -106,6 +107,7 @@ def doctor(config_dir: Path, tmp_path: Path, **overrides) -> list[CheckResult]:
         "launchctl": lambda job: True,
         "environ": {},
         "home": tmp_path / "home",
+        "x_oauth1_probe": lambda env: "intel_probe",  # 実 users/me を呼ばない(GH#63)
     }
     (tmp_path / "home").mkdir(exist_ok=True)
     kwargs.update(overrides)
@@ -261,7 +263,8 @@ def test_x_enabled_requires_keys(config_dir, tmp_path) -> None:
     )
     env_path.chmod(0o600)
     result = by_number(doctor(config_dir, tmp_path), 5)
-    assert result.status == "WARN"  # 疎通は未実装(Issue #63)
+    assert result.status == "PASS"
+    assert "@intel_probe" in result.detail
 
 
 def _write_x_env(config_dir: Path) -> None:
@@ -272,6 +275,73 @@ def _write_x_env(config_dir: Path) -> None:
         encoding="utf-8",
     )
     env_path.chmod(0o600)
+
+
+def _enable_x(config_dir: Path, tmp_path: Path) -> None:
+    """[x] enabled + キー + enabled なホームTL 行(疎通検査まで到達する構成)。"""
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
+    )
+    _write_x_env(config_dir)
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-tl', 1)")
+    conn.commit()
+    conn.close()
+
+
+def test_x_probe_auth_failure_is_fail(config_dir, tmp_path) -> None:
+    # 設計 05 §2 #5 / GH#63: 401/403(FatalError)はキー・権限の恒久異常 → FAIL
+    _enable_x(config_dir, tmp_path)
+
+    def probe(env):
+        assert env["X_API_KEY"] == "a"  # .env のキーが probe に渡ること
+        raise FatalError("X 認証失敗(users/me): HTTP 401(キー・権限を確認)")
+
+    result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=probe), 5)
+    assert result.status == "FAIL"
+    assert "認証失敗" in result.detail
+
+
+def test_x_probe_transient_error_is_warn(config_dir, tmp_path) -> None:
+    # GH#63: 429・5xx・transport(RetryableError)は一時異常 → WARN(恒久 FAIL にしない)
+    _enable_x(config_dir, tmp_path)
+
+    def probe(env):
+        raise RetryableError("users/me が HTTP 429")
+
+    result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=probe), 5)
+    assert result.status == "WARN"
+    assert "一時エラー" in result.detail
+
+
+def test_x_probe_success_is_pass(config_dir, tmp_path) -> None:
+    _enable_x(config_dir, tmp_path)
+    result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=lambda env: "aki"), 5)
+    assert result.status == "PASS"
+    assert "users/me OK(@aki)" in result.detail
+
+
+def test_x_probe_not_called_when_keys_missing_or_disabled(config_dir, tmp_path) -> None:
+    def exploding(env):
+        raise AssertionError("キー欠落・X 無効時は users/me を呼ばない")
+
+    # X 無効(既定 config)→ SKIP で probe 不発
+    result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=exploding), 5)
+    assert result.status == "SKIP"
+
+    # X 有効だがキー欠落 → FAIL(キー名)で probe 不発
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
+    )
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-tl', 1)")
+    conn.commit()
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=exploding), 5)
+    assert result.status == "FAIL"
+    assert "X_API_KEY" in result.detail
 
 
 def test_x_search_slots_without_search_row_warns(config_dir, tmp_path) -> None:
@@ -291,15 +361,15 @@ def test_x_search_slots_without_search_row_warns(config_dir, tmp_path) -> None:
     assert result.status == "WARN"
     assert "mode=search のソース行が無い" in result.detail
 
-    # search 行を登録すると整合し、残る WARN は疎通未実装のみ
+    # search 行を登録すると整合し、疎通 OK なら PASS
     conn.execute(
         "INSERT INTO sources (type, name, config, enabled) "
         """VALUES ('x', 'x:search', '{"mode": "search"}', 1)"""
     )
     conn.commit()
     result = by_number(doctor(config_dir, tmp_path), 5)
-    assert result.status == "WARN"
-    assert "疎通検査は未実装" in result.detail
+    assert result.status == "PASS"
+    assert "users/me OK" in result.detail
 
     # 同一 mode の複数行は二重取得(二重課金)として WARN
     conn.execute("INSERT INTO sources (type, name, enabled) VALUES ('x', 'home-2', 1)")
