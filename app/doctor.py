@@ -2,7 +2,7 @@
 
 - 終了コード: 全 OK=0 / WARN のみ=0 / FAIL あり=1
 - 各検査は独立に実行し、1つの失敗で残りを止めない(検査自体の例外はその項目の FAIL)
-- 外部 I/O(Telegram・LLM・launchctl)は factory/runner を注入可能にしてテストする
+- 外部 I/O(Telegram・X・LLM・launchctl)は factory/runner を注入可能にしてテストする
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ def run_doctor(
     launchctl: Callable[[str], bool] | None = None,
     environ: dict[str, str] | None = None,
     home: Path | None = None,
+    x_oauth1_probe: Callable[[dict[str, str]], str] | None = None,
     x_oauth2_probe: Callable[[Config, dict[str, str], Path], str] | None = None,
 ) -> list[CheckResult]:
     """13項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
@@ -102,7 +103,7 @@ def run_doctor(
         checks: list[tuple[int, str, Callable[[], CheckResult]]] = [
             (3, "SQLite/migrations", lambda: _check_migrations(conn)),
             (4, "Telegram", lambda: _check_telegram(config, env, api_factory)),
-            (5, "X API", lambda: _check_x(config, env, conn)),
+            (5, "X API", lambda: _check_x(config, env, conn, x_oauth1_probe)),
             (
                 6,
                 "LLM",
@@ -184,7 +185,10 @@ def _check_telegram(
 
 
 def _check_x(
-    config: Config | None, env: dict[str, str], conn: sqlite3.Connection | None
+    config: Config | None,
+    env: dict[str, str],
+    conn: sqlite3.Connection | None,
+    probe: Callable[[dict[str, str]], str] | None,
 ) -> CheckResult:
     if config is None:
         return CheckResult(5, "X API", "FAIL", _CONFIG_UNAVAILABLE)
@@ -220,7 +224,49 @@ def _check_x(
     warns = _x_mode_consistency_warns(conn, config)
     if warns:
         return CheckResult(5, "X API", "WARN", " / ".join(warns))
-    return CheckResult(5, "X API", "WARN", "キーは存在。疎通検査は未実装(Issue #63)")
+    # users/me(読取課金なし)で OAuth 1.0a キーの実疎通を確認(GH#63)。
+    # 恒久異常(401/403 = キー・権限、他 4xx・応答欠損 = 想定外)= FatalError → FAIL /
+    # 一時異常(429・5xx・transport)= RetryableError → WARN(恒久 FAIL にしない)
+    from app.connectors.base import FatalError, RetryableError
+
+    try:
+        username = (probe or _probe_x_users_me)(env)
+    except FatalError as e:
+        return CheckResult(5, "X API", "FAIL", str(e))
+    except RetryableError as e:
+        return CheckResult(5, "X API", "WARN", f"一時エラー(再実行で解消しうる): {e}")
+    return CheckResult(5, "X API", "PASS", f"users/me OK(@{username})")
+
+
+def _probe_x_users_me(env: dict[str, str]) -> str:
+    """users/me(読取課金なし)で OAuth 1.0a キーの疎通を確認し username を返す。"""
+    from app.connectors.x import XApiSession, build_x_client, credentials_from_env
+
+    with build_x_client() as client:
+        return _users_me_username(
+            XApiSession(client=client, credentials=credentials_from_env(env))
+        )
+
+
+def _users_me_username(session: object) -> str:
+    """疎通結果の判定写像(GH#63 / 設計 05 §2 #5)。
+
+    401/403(raise_for_auth)= キー・権限の恒久異常 → FatalError。他の非 200 は
+    status_error に従う(429・5xx = RetryableError / 他 4xx = FatalError。HTTP 400 等の
+    恒久異常を WARN に埋めない)。username 欠損も想定外応答として FatalError。
+    コネクタの _get_me_id(非 200 = 全て Retryable)とは写像が異なるため共通化しない。
+    """
+    from app.connectors.base import FatalError
+    from app.connectors.x import API_BASE, raise_for_auth, status_error
+
+    response = session.get(f"{API_BASE}/users/me", {})  # type: ignore[attr-defined]
+    raise_for_auth(response, "users/me")
+    if response.status_code != 200:
+        raise status_error(response, "users/me")
+    username = (response.json().get("data") or {}).get("username")
+    if not username:
+        raise FatalError("users/me の応答に username がない(想定外の応答)")
+    return username
 
 
 def _x_mode_consistency_warns(conn: sqlite3.Connection, config: Config) -> list[str]:
