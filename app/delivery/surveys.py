@@ -16,7 +16,12 @@ from datetime import datetime, time, timedelta
 
 from app.config import Config
 from app.delivery.state import get_state, set_state
-from app.delivery.telegram import TITLE_MAX_CHARS, TelegramApi, escape_and_truncate
+from app.delivery.telegram import (
+    TITLE_MAX_CHARS,
+    TelegramApi,
+    escape_and_truncate,
+    escape_attr,
+)
 from app.digest.builder import JST, today_jst
 
 STATE_SURVEY_SENT = "survey_sent_date"
@@ -24,6 +29,10 @@ STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
 STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
 
 READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
+
+# 未消化 🔖 一覧(GH#88)。可視テキストを 4096 字制限に収める(URL は href 側で不算入)
+DIG_BACKLOG_MAX_ITEMS = 15
+DIG_BACKLOG_TITLE_MAX_CHARS = 80
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -114,20 +123,43 @@ def send_evening_survey(
         "📝 今朝のダイジェストを読むのにかかった時間は?\n(ざっくりでOK)",
         reply_markup=q2_keyboard(date_compact),
     )
+    backlog = _pending_dig_items(conn)
+    if backlog:  # 0件の日は送らない(GH#88)
+        api.send_message(chat_id, _dig_backlog_text(backlog))
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
-        title = escape_and_truncate(
-            (row["title_ja"] or row["title"] or "(タイトルなし)").strip(), TITLE_MAX_CHARS
-        )
         api.send_message(
             chat_id,
-            f"🔖 深掘りした?\n{title}",
+            f"🔖 深掘りした?\n{_linked_title(row, TITLE_MAX_CHARS)}",
             reply_markup=followup_keyboard(row["item_id"]),
         )
     logger.info(
         "夜アンケート送信",
-        extra={"stage": "poll", "extra": {"followups": len(followups)}},
+        extra={
+            "stage": "poll",
+            "extra": {"followups": len(followups), "dig_backlog": len(backlog)},
+        },
     )
+
+
+def _linked_title(row: sqlite3.Row, budget: int) -> str:
+    """タイトルを深掘り動線(canonical_url へのリンク)にする(GH#88)。"""
+    title = escape_and_truncate(
+        (row["title_ja"] or row["title"] or "(タイトルなし)").strip(), budget
+    )
+    return f'<a href="{escape_attr(row["canonical_url"])}">{title}</a>'
+
+
+def _dig_backlog_text(rows: list[sqlite3.Row]) -> str:
+    """未消化 🔖 一覧(1通)。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。"""
+    lines = [f"🔖 未消化の深掘り候補({len(rows)}件)"]
+    lines += [
+        f"{position}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
+        for position, row in enumerate(rows[:DIG_BACKLOG_MAX_ITEMS], start=1)
+    ]
+    if len(rows) > DIG_BACKLOG_MAX_ITEMS:
+        lines.append(f"(他 {len(rows) - DIG_BACKLOG_MAX_ITEMS} 件)")
+    return "\n".join(lines)
 
 
 def notify_run_failure(
@@ -159,7 +191,7 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
     """dig_date の最新 reaction が 🔖 で、followup_dig 未記録のアイテム(設計 04 §4)。"""
     return conn.execute(
         """
-        SELECT items.id AS item_id, items.title,
+        SELECT items.id AS item_id, items.title, items.canonical_url,
                (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
                 ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
         FROM signals AS s
@@ -178,6 +210,33 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
         ORDER BY items.id
         """,
         (dig_date,),
+    ).fetchall()
+
+
+def _pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """未消化 🔖 の累計: 最新 reaction が 🔖 のままで、深掘り実施(followup_dig=yes)が
+    記録されていないアイテム(GH#88)。「いいえ」回答済みは残す(まだ深掘っていない)。
+    新しい 🔖 が上(直近の関心を先頭に)。"""
+    return conn.execute(
+        """
+        SELECT items.id AS item_id, items.title, items.canonical_url,
+               (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
+                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
+        FROM signals AS s
+        JOIN items ON items.id = s.item_id
+        WHERE s.kind = 'reaction' AND s.value = 'dig'
+          AND s.id = (
+            SELECT id FROM signals AS s2
+            WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
+            ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM signals AS f
+            WHERE f.kind = 'followup_dig' AND f.item_id = s.item_id
+              AND f.value = 'yes'
+          )
+        ORDER BY s.created_at DESC, s.id DESC
+        """
     ).fetchall()
 
 
