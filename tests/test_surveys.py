@@ -151,6 +151,103 @@ def test_followup_prefers_title_ja(conn, tmp_path) -> None:
     assert "English Title" not in followup
 
 
+def test_followup_links_to_canonical_url(conn, tmp_path) -> None:
+    # GH#88: その場から対象を読みに行ける(タイトルが canonical_url へのリンク)
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    dug = add_item(conn, "https://a/dug?x=1&y=2", title="対象記事")
+    add_dig_reaction(conn, dug, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    followup = next(t for _, t in api.sent if "深掘りした?" in t)
+    assert '<a href="https://a/dug?x=1&amp;y=2">対象記事</a>' in followup  # 属性エスケープ済み
+
+
+def test_dig_backlog_list_sent_before_followups(conn, tmp_path) -> None:
+    # GH#88: 未消化 🔖 の累計一覧を追い掛けの前に1通。「いいえ」回答済みは残し、
+    # 「はい」(深掘り済み)と reaction 訂正済みは載せない。新しい 🔖 が上
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    older = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+
+    not_dug_yet = add_item(conn, "https://a/not-dug", title="いいえ回答済み")
+    add_dig_reaction(conn, not_dug_yet, older)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'no', ?)",
+        (not_dug_yet, older),
+    )
+    done = add_item(conn, "https://a/done", title="深掘り済み")  # yes → 一覧に載せない
+    add_dig_reaction(conn, done, older)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', ?)",
+        (done, older),
+    )
+    corrected = add_item(conn, "https://a/corrected", title="訂正済み")  # 最新が noise
+    add_dig_reaction(conn, corrected, older)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'noise', ?)",
+        (corrected, older),
+    )
+    fresh = add_item(conn, "https://a/fresh", title="昨日の🔖")
+    add_dig_reaction(conn, fresh, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    texts = [t for _, t in api.sent]
+    backlog = next(t for t in texts if "未消化の深掘り候補" in t)
+    assert "(2件)" in backlog
+    assert backlog.index("昨日の🔖") < backlog.index("いいえ回答済み")  # 新しい 🔖 が上
+    assert "深掘り済み" not in backlog
+    assert "訂正済み" not in backlog
+    followup_index = next(i for i, t in enumerate(texts) if "深掘りした?" in t)
+    assert texts.index(backlog) < followup_index  # 一覧は追い掛けより前
+
+
+def test_dig_backlog_not_sent_when_empty(conn, tmp_path) -> None:
+    # GH#88: 0件の日は一覧を送らない(followup_dig=yes 済みのみ → 未消化ゼロ)
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    done = add_item(conn, "https://a/done")
+    add_dig_reaction(conn, done, yesterday)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', ?)",
+        (done, yesterday),
+    )
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    assert not any("未消化の深掘り候補" in t for _, t in api.sent)
+
+
+def test_dig_backlog_caps_at_max_items(conn, tmp_path) -> None:
+    # GH#88: 上限 15 件 + 「他 N 件」。可視テキストを 4096 字制限内に保つ
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    for i in range(17):
+        item = add_item(conn, f"https://a/many-{i}", title=f"記事{i}")
+        add_dig_reaction(conn, item, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    assert "(17件)" in backlog
+    assert backlog.count("<a href=") == 15
+    assert "(他 2 件)" in backlog
+
+
 # --- 内蔵タイマー: watchdog ---
 
 
