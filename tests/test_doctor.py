@@ -3,11 +3,20 @@ import sqlite3
 import tarfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.connectors.base import FatalError, RetryableError
+from app.connectors.x import XApiSession, XCredentials
 from app.db import apply_migrations, connect
-from app.doctor import CanaryProbe, CheckResult, has_failure, month_cost_summary, run_doctor
+from app.doctor import (
+    CanaryProbe,
+    CheckResult,
+    _users_me_username,
+    has_failure,
+    month_cost_summary,
+    run_doctor,
+)
 
 
 @pytest.fixture
@@ -320,6 +329,41 @@ def test_x_probe_success_is_pass(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path, x_oauth1_probe=lambda env: "aki"), 5)
     assert result.status == "PASS"
     assert "users/me OK(@aki)" in result.detail
+
+
+def _probe_session(status: int, body: dict) -> XApiSession:
+    """既定 probe の判定写像(_users_me_username)を実 HTTP なしで検証するセッション。"""
+    return XApiSession(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body))
+        ),
+        credentials=XCredentials(
+            api_key="k", api_secret="s", access_token="t", access_token_secret="ts"
+        ),
+        sleep=lambda _s: None,
+    )
+
+
+def test_users_me_mapping_success_and_auth_failure() -> None:
+    username = _users_me_username(_probe_session(200, {"data": {"id": "1", "username": "aki"}}))
+    assert username == "aki"
+    with pytest.raises(FatalError, match="認証失敗"):
+        _users_me_username(_probe_session(401, {}))
+
+
+def test_users_me_mapping_permanent_anomaly_is_fatal_not_warn() -> None:
+    # Codex must(PR #86): HTTP 400 等の恒久異常・username 欠損を WARN に埋めない
+    with pytest.raises(FatalError, match="400"):
+        _users_me_username(_probe_session(400, {}))
+    with pytest.raises(FatalError, match="username がない"):
+        _users_me_username(_probe_session(200, {"data": {"id": "1"}}))
+
+
+def test_users_me_mapping_transient_is_retryable() -> None:
+    with pytest.raises(RetryableError, match="429"):
+        _users_me_username(_probe_session(429, {}))
+    with pytest.raises(RetryableError, match="503"):
+        _users_me_username(_probe_session(503, {}))
 
 
 def test_x_probe_not_called_when_keys_missing_or_disabled(config_dir, tmp_path) -> None:

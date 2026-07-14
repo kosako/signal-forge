@@ -225,8 +225,8 @@ def _check_x(
     if warns:
         return CheckResult(5, "X API", "WARN", " / ".join(warns))
     # users/me(読取課金なし)で OAuth 1.0a キーの実疎通を確認(GH#63)。
-    # 401/403(FatalError)= キー・権限の恒久異常 → FAIL / 429・5xx・transport
-    # (RetryableError)= 一時異常 → WARN(恒久 FAIL にしない)
+    # 恒久異常(401/403 = キー・権限、他 4xx・応答欠損 = 想定外)= FatalError → FAIL /
+    # 一時異常(429・5xx・transport)= RetryableError → WARN(恒久 FAIL にしない)
     from app.connectors.base import FatalError, RetryableError
 
     try:
@@ -240,11 +240,33 @@ def _check_x(
 
 def _probe_x_users_me(env: dict[str, str]) -> str:
     """users/me(読取課金なし)で OAuth 1.0a キーの疎通を確認し username を返す。"""
-    from app.connectors.x import XApiSession, build_x_client, credentials_from_env, fetch_me
+    from app.connectors.x import XApiSession, build_x_client, credentials_from_env
 
     with build_x_client() as client:
-        session = XApiSession(client=client, credentials=credentials_from_env(env))
-        return fetch_me(session).get("username", "?")
+        return _users_me_username(
+            XApiSession(client=client, credentials=credentials_from_env(env))
+        )
+
+
+def _users_me_username(session: object) -> str:
+    """疎通結果の判定写像(GH#63 / 設計 05 §2 #5)。
+
+    401/403(raise_for_auth)= キー・権限の恒久異常 → FatalError。他の非 200 は
+    status_error に従う(429・5xx = RetryableError / 他 4xx = FatalError。HTTP 400 等の
+    恒久異常を WARN に埋めない)。username 欠損も想定外応答として FatalError。
+    コネクタの _get_me_id(非 200 = 全て Retryable)とは写像が異なるため共通化しない。
+    """
+    from app.connectors.base import FatalError
+    from app.connectors.x import API_BASE, raise_for_auth, status_error
+
+    response = session.get(f"{API_BASE}/users/me", {})  # type: ignore[attr-defined]
+    raise_for_auth(response, "users/me")
+    if response.status_code != 200:
+        raise status_error(response, "users/me")
+    username = (response.json().get("data") or {}).get("username")
+    if not username:
+        raise FatalError("users/me の応答に username がない(想定外の応答)")
+    return username
 
 
 def _x_mode_consistency_warns(conn: sqlite3.Connection, config: Config) -> list[str]:

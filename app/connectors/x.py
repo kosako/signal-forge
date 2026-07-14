@@ -143,7 +143,14 @@ class XConnector:
 
     def _get_me_id(self) -> str:
         """逆時系列ホームTL のパスに要る認証ユーザー id(Posts Read には数えない)。"""
-        return fetch_me(self._session)["id"]
+        response = self._session.get(f"{API_BASE}/users/me", {})
+        raise_for_auth(response, "users/me")
+        if response.status_code != 200:
+            raise RetryableError(f"users/me が HTTP {response.status_code}")
+        data = response.json().get("data")
+        if not data or "id" not in data:
+            raise RetryableError("users/me の応答に id がない")
+        return data["id"]
 
     def _fetch_timeline(
         self, me_id: str, since_id: str | None
@@ -201,22 +208,6 @@ def status_error(response: httpx.Response, url: str) -> Exception:
     if response.status_code == 429 or response.status_code >= 500:
         return RetryableError(f"X が HTTP {response.status_code}: {url}")
     return FatalError(f"X が HTTP {response.status_code}: {url}")
-
-
-def fetch_me(session: XApiSession) -> dict:
-    """GET /2/users/me(Posts Read には数えない)。認証ユーザーの data を返す。
-
-    401/403 は FatalError(raise_for_auth)、他の非 200・欠損応答は RetryableError。
-    ホームTL(_get_me_id)と doctor #5 の疎通検査(GH#63)が共用する。
-    """
-    response = session.get(f"{API_BASE}/users/me", {})
-    raise_for_auth(response, "users/me")
-    if response.status_code != 200:
-        raise RetryableError(f"users/me が HTTP {response.status_code}")
-    data = response.json().get("data")
-    if not data or "id" not in data:
-        raise RetryableError("users/me の応答に id がない")
-    return data
 
 
 def has_x_credentials(env: dict[str, str]) -> bool:

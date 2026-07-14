@@ -8,12 +8,10 @@ from app.cli import _build_connectors
 from app.config import Config, XConfig, XSearchConfig
 from app.connectors.base import FatalError, FetchResult, FetchStats, RetryableError
 from app.connectors.x import (
-    XApiSession,
     XConnector,
     XCredentials,
     XRouter,
     build_x_connector,
-    fetch_me,
     has_x_credentials,
 )
 from app.connectors.x_search import XSearchConnector
@@ -239,31 +237,6 @@ def test_auth_error_is_fatal() -> None:
 def test_5xx_on_first_page_is_retryable() -> None:
     with pytest.raises(RetryableError, match="503"):
         connector_from([(503, {}, {})]).fetch(make_source(), {})
-
-
-def _me_session(handler) -> XApiSession:
-    return XApiSession(
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=CREDS,
-        sleep=lambda _s: None,
-    )
-
-
-def test_fetch_me_returns_data() -> None:
-    # doctor #5(GH#63)とホームTL が共用する users/me。username まで取れること
-    session = _me_session(
-        lambda request: httpx.Response(200, json={"data": {"id": "1", "username": "aki"}})
-    )
-    assert fetch_me(session) == {"id": "1", "username": "aki"}
-
-
-def test_fetch_me_maps_statuses_to_errors() -> None:
-    with pytest.raises(FatalError, match="認証失敗"):
-        fetch_me(_me_session(lambda request: httpx.Response(403, json={})))
-    with pytest.raises(RetryableError, match="429"):
-        fetch_me(_me_session(lambda request: httpx.Response(429, json={})))
-    with pytest.raises(RetryableError, match="id がない"):
-        fetch_me(_me_session(lambda request: httpx.Response(200, json={"data": {}})))
 
 
 def test_5xx_after_first_page_returns_partial() -> None:
