@@ -616,8 +616,13 @@ def test_reply_in_other_chat_not_matched_to_dm_ledger(conn, tmp_path) -> None:
     add_delivered_item(conn, "https://a/article", message_id=500)
     update = make_reply_update("グループでの感想", 500)
     update["message"]["chat"] = {"id": CHAT_ID + 1}  # owner DM 以外の chat
-    api = FakeApi([[update]])
+    with_url = make_reply_update("グループから https://example.com/g", 500, update_id=2)
+    with_url["message"]["chat"] = {"id": CHAT_ID + 1}
+    api = FakeApi([[update, with_url]])
     poll_once(conn, make_config(tmp_path), api, logger)
 
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
-    assert api.sent == [(CHAT_ID + 1, NO_URL_GUIDE)]
+    assert api.sent[0] == (CHAT_ID + 1, NO_URL_GUIDE)
+    # 従来の URL 投入フローへ正しくフォールスルーする(感想扱いで握られない)
+    assert len(manual_items(conn)) == 1
+    assert api.sent[1] == (CHAT_ID + 1, "✅ 1件受け付けました。明朝のダイジェストで分析します")

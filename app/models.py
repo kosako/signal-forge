@@ -1,7 +1,7 @@
 """テーブル行の型(設計 01 §3 の列と 1:1)。
 
 共通語彙6テーブル(sources/items/documents/analyses/signals/digests)+
-運用系3テーブル(collect_runs/telegram_state/digest_messages)。
+運用系4テーブル(collect_runs/telegram_state/digest_messages/item_notes)。
 `from_row` が薄いリポジトリ層の共通入口(SELECT 結果 → 型付きオブジェクト)。
 列挙値の正本は DDL の CHECK 制約(ここに enum を二重定義しない)。
 """
@@ -142,3 +142,12 @@ class DigestMessage(_Row):
     item_id: int | None
     message_id: int
     sent_at: str
+
+
+@dataclass(frozen=True)
+class ItemNote(_Row):
+    id: int
+    item_id: int
+    note: str
+    created_at: str
+    exported_at: str | None

@@ -316,7 +316,7 @@ def test_export_pending_notes_vault_unset_raises(conn, tmp_path) -> None:
         export_pending_notes(conn, Config(config_dir=tmp_path), logger)
 
 
-def test_export_pending_notes_conflict_keeps_pending(conn, tmp_path) -> None:
+def test_export_pending_notes_conflict_keeps_pending(conn, tmp_path, caplog) -> None:
     # conflict 退避 = 正本ノート未更新なので exported_at を立てない(Codex must)。
     # マーカー修復後の翌 run で自動再投影される
     item = add_digested(conn, "https://a/1")
@@ -332,7 +332,11 @@ def test_export_pending_notes_conflict_keeps_pending(conn, tmp_path) -> None:
     )
     add_note(conn, item, "後で深掘りする")
 
-    export_pending_notes(conn, config, logger)
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="test-obsidian"):
+        export_pending_notes(conn, config, logger)
+    assert "1 件を .conflict.md に退避" in caplog.text  # conflicts カウントと WARN が残る
     pending = conn.execute(
         "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
     ).fetchone()[0]
