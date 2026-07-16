@@ -588,10 +588,36 @@ def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> Non
 
 
 def test_reply_with_malformed_reply_to_is_url_flow(conn, tmp_path) -> None:
-    # 外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)
+    # 外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
+    # 台帳側に一致しうる行(500・1)を用意し、型不正が「たまたま不一致」でなく
+    # 型検査で弾かれていることを確認する
     add_delivered_item(conn, "https://a/article", message_id=500)
-    api = FakeApi([[make_reply_update("感想テキスト", "500")]])  # message_id が文字列
+    second = add_item(conn, "https://a/second")
+    conn.execute(  # 同一 digest に2本目の記事メッセージ(message_id=1)を台帳登録
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) "
+        "SELECT digest_id, ?, 1 FROM digest_messages LIMIT 1",
+        (second,),
+    )
+    conn.commit()
+    api = FakeApi([[
+        make_reply_update("感想テキスト", "500", update_id=1),  # 文字列(SQLite 型親和で一致しうる)
+        # bool は int の派生型で ID 1 に一致しうる(Codex should)。素通りさせない
+        make_reply_update("感想テキスト", True, update_id=2),
+    ]])
     poll_once(conn, make_config(tmp_path), api, logger)
 
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
-    assert api.sent == [(CHAT_ID, NO_URL_GUIDE)]
+    assert api.sent == [(CHAT_ID, NO_URL_GUIDE), (CHAT_ID, NO_URL_GUIDE)]
+
+
+def test_reply_in_other_chat_not_matched_to_dm_ledger(conn, tmp_path) -> None:
+    # message_id は chat 単位(Codex must): owner が別チャットで同じ message_id に
+    # 返信しても、owner DM の台帳と突合してはならない(誤記帳防止)→ 従来 URL フロー
+    add_delivered_item(conn, "https://a/article", message_id=500)
+    update = make_reply_update("グループでの感想", 500)
+    update["message"]["chat"] = {"id": CHAT_ID + 1}  # owner DM 以外の chat
+    api = FakeApi([[update]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert api.sent == [(CHAT_ID + 1, NO_URL_GUIDE)]

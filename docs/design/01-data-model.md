@@ -19,6 +19,7 @@ sources 1 ──< collect_runs                     (コスト・実行ログ)
 sources 1 ──< items ──1 documents              (本文キャッシュ、TTL付き)
                 │ ├──< analyses                (LLM分析。再分析で複数行)
                 │ ├──< signals                 (kind='reaction'/'followup_dig' は item_id 必須)
+                │ ├──< item_notes              (感想 = Telegram リプライ。恒久保存。GH#92)
                 │ └── dup_of_item_id ──> items (自己参照: 24h dedup の親)
 signals(kind='survey_*') … item_id NULL(日単位の回答)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
@@ -200,7 +201,7 @@ CREATE INDEX ix_item_notes_pending ON item_notes(item_id) WHERE exported_at IS N
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)の3つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(感想 = Telegram リプライの正本。GH#92 / migration 005)の4つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 

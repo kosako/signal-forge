@@ -425,8 +425,14 @@ def _handle_message(
     text = message.get("text")
     # digest の記事メッセージへのリプライ = 感想キャプチャ(GH#92)。感想の正本は
     # item_notes(Obsidian へは朝バッチ export が投影)。この経路では URL 取込をしない
-    # (感想内の URL は感想の一部)。記事以外へのリプライ・非リプライは従来の URL 投入へ
-    if isinstance(text, str) and text.strip():
+    # (感想内の URL は感想の一部)。記事以外へのリプライ・非リプライは従来の URL 投入へ。
+    # message_id は chat 単位のため owner DM(配信先 chat)からのリプライに限定する
+    # (別チャットの同一 message_id との衝突 = 誤記帳を防ぐ。Codex must)
+    if (
+        isinstance(text, str)
+        and text.strip()
+        and chat_id == config.telegram.owner_chat_id
+    ):
         note_item_id = _replied_item_id(conn, message.get("reply_to_message"))
         if note_item_id is not None:
             conn.execute(
@@ -523,7 +529,7 @@ def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
     if not isinstance(replied, dict):
         return None
     message_id = replied.get("message_id")
-    if not isinstance(message_id, int):
+    if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
         return None
     row = conn.execute(
         "SELECT item_id FROM digest_messages WHERE message_id = ? AND item_id IS NOT NULL",

@@ -314,3 +314,29 @@ def test_export_pending_notes_projects_and_preserves_handwriting(conn, tmp_path)
 def test_export_pending_notes_vault_unset_raises(conn, tmp_path) -> None:
     with pytest.raises(ExportError, match="vault_path"):
         export_pending_notes(conn, Config(config_dir=tmp_path), logger)
+
+
+def test_export_pending_notes_conflict_keeps_pending(conn, tmp_path) -> None:
+    # conflict 退避 = 正本ノート未更新なので exported_at を立てない(Codex must)。
+    # マーカー修復後の翌 run で自動再投影される
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("20260706-*.md"))
+    note.write_text(note.read_text().replace("<!-- GENERATED:END -->", ""))  # マーカー破壊
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (digest_id, item),
+    )
+    add_note(conn, item, "後で深掘りする")
+
+    export_pending_notes(conn, config, logger)
+    pending = conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    assert pending == 1  # 未反映のまま(翌 run で再試行)
+    conflict = note.with_suffix(".conflict.md")
+    assert conflict.exists()
+    assert "後で深掘りする" in conflict.read_text()  # 感想自体は退避側に保全

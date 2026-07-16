@@ -143,8 +143,11 @@ def export_pending_notes(
             _item_frontmatter(row, entry["digest_date"]),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
         ):
+            # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
+            # (立てると DB とノートが恒久不一致になる。Codex must)
             conflicts += 1
-        # 書込済みぶんだけ反映済みに(export 中に届いた新規感想は翌 run が拾う)
+            continue
+        # 書込成功ぶんだけ反映済みに(export 中に届いた新規感想は翌 run が拾う)
         conn.execute(
             "UPDATE item_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             "WHERE item_id = ? AND exported_at IS NULL AND id <= ?",
