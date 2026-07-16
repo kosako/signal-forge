@@ -8,7 +8,7 @@ import yaml
 
 from app.config import Config, ObsidianConfig
 from app.db import apply_migrations, connect
-from app.export import ExportError, export_digest
+from app.export import ExportError, export_digest, export_pending_notes
 
 logger = logging.getLogger("test-obsidian")
 
@@ -258,3 +258,59 @@ def test_no_tmp_files_left(conn, tmp_path) -> None:
     export_digest(conn, make_config(tmp_path), digest_id, logger)
     leftovers = list((tmp_path / "vault").rglob("*.tmp"))
     assert leftovers == []
+
+
+# --- 感想の投影(Telegram リプライ → item ノート。GH#92)---
+
+
+def add_note(conn, item_id, note, *, created_at="2026-07-16T13:00:00Z") -> int:
+    return conn.execute(
+        "INSERT INTO item_notes (item_id, note, created_at) VALUES (?, ?, ?)",
+        (item_id, note, created_at),
+    ).lastrowid
+
+
+def test_item_note_renders_kanso_section_inside_generated(conn, tmp_path) -> None:
+    item = add_digested(conn, "https://a/1")
+    add_note(conn, item, "これ試したい", created_at="2026-07-16T20:00:00Z")  # JST 07-17
+    digest_id = add_digest(conn, [item])
+    export_digest(conn, make_config(tmp_path), digest_id, logger)
+
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    text = note.read_text()
+    assert "## 感想(2026-07-17)" in text  # 表示日付は JST
+    assert "これ試したい" in text
+    # DB の純関数として GENERATED 領域内に投影される(手書き領域ではない)
+    assert text.index("## 感想") < text.index("<!-- GENERATED:END -->")
+
+
+def test_export_pending_notes_projects_and_preserves_handwriting(conn, tmp_path) -> None:
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)  # 感想なしで初回 export 済み
+
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("20260706-*.md"))
+    note.write_text(note.read_text() + "\n手書きのメモ\n")  # 手書き領域に追記
+    conn.execute(  # 感想はリプライ経由 = 配信済みが前提(台帳あり)
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (digest_id, item),
+    )
+    add_note(conn, item, "後で深掘りする")
+
+    export_pending_notes(conn, config, logger)
+    text = note.read_text()
+    assert "後で深掘りする" in text
+    assert "手書きのメモ" in text  # 手書き領域は保全
+    pending = conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    assert pending == 0  # 反映済みマーク
+
+    export_pending_notes(conn, config, logger)  # 冪等: 2回目は対象なし・変更なし
+    assert note.read_text() == text
+
+
+def test_export_pending_notes_vault_unset_raises(conn, tmp_path) -> None:
+    with pytest.raises(ExportError, match="vault_path"):
+        export_pending_notes(conn, Config(config_dir=tmp_path), logger)

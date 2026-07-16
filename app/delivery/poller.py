@@ -423,6 +423,24 @@ def _handle_message(
             logger.warning("chat の形が不正なため返信を skip", extra={"stage": "poll"})
 
     text = message.get("text")
+    # digest の記事メッセージへのリプライ = 感想キャプチャ(GH#92)。感想の正本は
+    # item_notes(Obsidian へは朝バッチ export が投影)。この経路では URL 取込をしない
+    # (感想内の URL は感想の一部)。記事以外へのリプライ・非リプライは従来の URL 投入へ
+    if isinstance(text, str) and text.strip():
+        note_item_id = _replied_item_id(conn, message.get("reply_to_message"))
+        if note_item_id is not None:
+            conn.execute(
+                "INSERT INTO item_notes (item_id, note) VALUES (?, ?)",
+                (note_item_id, text.strip()),
+            )
+            conn.commit()
+            logger.info(
+                "感想を記録",
+                extra={"stage": "poll", "item_id": note_item_id},
+            )
+            reply("📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+            return
+
     urls = _URL_RE.findall(text) if isinstance(text, str) else []
     if not urls:
         reply(NO_URL_GUIDE)
@@ -493,6 +511,25 @@ def _ingest_manual_urls(
         else:
             known += 1
     return inserted, known
+
+
+def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
+    """リプライ先が digest の記事メッセージなら item_id を返す(GH#92)。
+
+    外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
+    digest_messages は owner chat にしか送っていないため message_id 単独で一意に引ける。
+    ヘッダ(item_id IS NULL)・台帳に無いメッセージ(追い掛け・アンケート等)は対象外。
+    """
+    if not isinstance(replied, dict):
+        return None
+    message_id = replied.get("message_id")
+    if not isinstance(message_id, int):
+        return None
+    row = conn.execute(
+        "SELECT item_id FROM digest_messages WHERE message_id = ? AND item_id IS NOT NULL",
+        (message_id,),
+    ).fetchone()
+    return row["item_id"] if row else None
 
 
 def _digest_date_of_item(conn: sqlite3.Connection, item_id: int) -> str | None:

@@ -181,6 +181,21 @@ CREATE UNIQUE INDEX ux_digest_messages_item   ON digest_messages(digest_id, item
 CREATE UNIQUE INDEX ux_digest_messages_header ON digest_messages(digest_id)
   WHERE item_id IS NULL;
 
+-- 感想(Telegram 配信の記事メッセージへのリプライ。GH#92 / migration 005)。
+-- 「その場で書いた自分の take」= 知見の種(ADR 0003)。自分の文章のため Issue #2
+-- (X 本文の TTL 制約)の対象外で恒久保存する。正本は本テーブル、Obsidian の item ノート
+-- (GENERATED 領域「## 感想」節)は DB の純関数として投影。KPI には接続しない
+-- (reaction を自動記帳しない = 測定定義の汚染防止)。
+CREATE TABLE item_notes (
+  id          INTEGER PRIMARY KEY,
+  item_id     INTEGER NOT NULL REFERENCES items(id),
+  note        TEXT    NOT NULL,
+  created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  exported_at TEXT                          -- Obsidian へ反映済みか(NULL = 未反映)
+) STRICT;
+CREATE INDEX ix_item_notes_item ON item_notes(item_id);
+CREATE INDEX ix_item_notes_pending ON item_notes(item_id) WHERE exported_at IS NULL;
+
 -- manual ソースは1行固定(手動URL投入の親)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```

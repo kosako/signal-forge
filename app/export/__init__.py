@@ -1,3 +1,3 @@
-from app.export.obsidian import ExportError, export_digest
+from app.export.obsidian import ExportError, export_digest, export_pending_notes
 
-__all__ = ["ExportError", "export_digest"]
+__all__ = ["ExportError", "export_digest", "export_pending_notes"]
