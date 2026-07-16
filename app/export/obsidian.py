@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -68,7 +69,7 @@ def export_digest(
         if not _write_note(
             items_dir / f"{note_name}.md",
             _item_frontmatter(row, digest["digest_date"]),
-            _item_generated_body(row),
+            _item_generated_body(row, _load_notes(conn, row["item_id"])),
         ):
             conflicts += 1
 
@@ -91,6 +92,76 @@ def export_digest(
     logger.info(
         "export 完了",
         extra={"run_id": run_id, "stage": "export", "extra": {"items": len(rows)}},
+    )
+
+
+def export_pending_notes(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+) -> None:
+    """未反映の感想(item_notes.exported_at IS NULL)を該当 item ノートへ投影する(GH#92)。
+
+    感想は配信済みメッセージへのリプライでしか生まれないため、ノート名の digest_date は
+    digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
+    その item は配信済み)。再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
+    """
+    if config.obsidian.vault_path is None:
+        raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
+    pending = conn.execute(
+        """
+        SELECT item_notes.item_id,
+               MIN(digests.digest_date) AS digest_date,
+               MAX(item_notes.id) AS max_note_id
+        FROM item_notes
+        JOIN digest_messages ON digest_messages.item_id = item_notes.item_id
+        JOIN digests ON digests.id = digest_messages.digest_id
+        WHERE item_notes.exported_at IS NULL
+        GROUP BY item_notes.item_id
+        """
+    ).fetchall()
+    if not pending:
+        return
+    items_dir = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder / "Items"
+    items_dir.mkdir(parents=True, exist_ok=True)
+    conflicts = 0
+    for entry in pending:
+        rows = _load_items(conn, [entry["item_id"]])
+        if not rows:
+            # 分析行が無い item は投影できない(通常経路では起きない)。翌 run で再試行
+            logger.warning(
+                "感想の投影先 item が解決できない",
+                extra={"run_id": run_id, "stage": "export", "item_id": entry["item_id"]},
+            )
+            continue
+        row = rows[0]
+        note_name = _item_note_name(entry["digest_date"], row["item_id"], row["title"])
+        if not _write_note(
+            items_dir / f"{note_name}.md",
+            _item_frontmatter(row, entry["digest_date"]),
+            _item_generated_body(row, _load_notes(conn, row["item_id"])),
+        ):
+            # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
+            # (立てると DB とノートが恒久不一致になる。Codex must)
+            conflicts += 1
+            continue
+        # 書込成功ぶんだけ反映済みに(export 中に届いた新規感想は翌 run が拾う)
+        conn.execute(
+            "UPDATE item_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE item_id = ? AND exported_at IS NULL AND id <= ?",
+            (entry["item_id"], entry["max_note_id"]),
+        )
+        conn.commit()
+    if conflicts:
+        logger.warning(
+            f"GENERATED マーカー欠損のため {conflicts} 件を .conflict.md に退避",
+            extra={"run_id": run_id, "stage": "export"},
+        )
+    logger.info(
+        "感想の投影完了",
+        extra={"run_id": run_id, "stage": "export", "extra": {"items": len(pending)}},
     )
 
 
@@ -119,14 +190,31 @@ def _item_frontmatter(row: sqlite3.Row, digest_date: str) -> dict:
     }
 
 
-def _item_generated_body(row: sqlite3.Row) -> str:
+def _item_generated_body(row: sqlite3.Row, notes: list[sqlite3.Row]) -> str:
     lines = ["## 要約", row["summary"] or "(なし)"]
     # X 由来は本文・抜粋を恒久保存層に置かない(Issue #2 確定)
     if row["source_type"] in ("rss", "manual") and row["extracted_text"]:
         lines += ["", "## 抜粋", row["extracted_text"][:EXCERPT_MAX_CHARS]]
     lines += ["", "## 推薦理由", row["recommendation_reason"] or "(なし)"]
     lines += ["", "## 示唆", row["implication"] or "(なし)"]
+    # 感想(Telegram リプライ。GH#92)。正本は item_notes で、ここは DB の純関数として
+    # 全感想を投影する(再生成・再 export で消えない)。自分の文章のため Issue #2 対象外
+    for note in notes:
+        lines += ["", f"## 感想({_jst_date(note['created_at'])})", note["note"]]
     return "\n".join(lines)
+
+
+def _load_notes(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT note, created_at FROM item_notes WHERE item_id = ? ORDER BY created_at, id",
+        (item_id,),
+    ).fetchall()
+
+
+def _jst_date(created_at: str) -> str:
+    """UTC の created_at('...Z')を JST 日付に(表示は他の日付系と同じ JST 基準)。"""
+    dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    return (dt + timedelta(hours=9)).strftime("%Y-%m-%d")
 
 
 def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.Row]:

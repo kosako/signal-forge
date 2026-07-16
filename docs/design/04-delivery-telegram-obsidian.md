@@ -59,6 +59,7 @@
 
 - デーモンは owner からの**平文メッセージ中の http/https URL をすべて抽出**し、`sources`(type=manual)経由で `items` に投入。既存 URL(**canonical_url 一致のみ。**content_hash は使わない — manual は本文が無く空ハッシュになるため。01 §5〜6 / 02 §4)は再投入せず「投入済み」と返信。
 - 応答例: `✅ 1件受け付けました。明朝のダイジェストで分析します`。URL を含まないメッセージには `URL を送ると翌朝のダイジェスト候補になります` と定型応答(コマンド体系は作らない — MVP の操作は URL 投入だけで足りる)。
+- **感想キャプチャ(GH#92)**: メッセージが digest の**記事メッセージへのリプライ**(`reply_to_message.message_id` が `digest_messages` の item 行に一致)で本文があれば、URL 投入でなく**感想**として `item_notes` に記録し「📝 感想を記録しました」と ack。この経路では URL 抽出をしない(感想内の URL は感想の一部)。ヘッダ・追い掛け等**台帳に無いメッセージへのリプライ・非リプライは従来の URL 投入フロー**。KPI(reaction)には記帳しない。Obsidian への投影は朝バッチ export(§7)。
 
 ## 6. 認可
 
@@ -96,6 +97,8 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 …
 ## 示唆
 …(自分への示唆 1文)
+## 感想(YYYY-MM-DD)
+…(Telegram リプライの感想。GH#92。0件なら節ごと出ない・複数件は節を重ねる)
 <!-- GENERATED:END -->
 
 (この下は手書きメモ領域。再生成でも保持される)
@@ -104,11 +107,12 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 - **frontmatter の生成規則**: 外部由来文字列(title・url)を含むため、文字列連結で組み立てず **YAML シリアライザで生成する**(`yaml.safe_dump`。クオート形式はシリアライザ任せで、必要な値だけ適切にクオート・エスケープされる。改行・引用符入りタイトルによる frontmatter 破壊や任意キー偽造 — 例: フェーズ2で意味を持つ `reaction` の注入 — を構造的に防ぐ)。
 - **GENERATED マーカーの防御**: GENERATED 領域へ書き込む前に、生成コンテンツ(LLM 出力は untrusted 本文の影響下にある)から `<!-- GENERATED:BEGIN -->` / `<!-- GENERATED:END -->` のマーカー文字列を除去してから書く(境界誤認による手書きメモ破壊の防止)。
 - **再生成ポリシー**: ファイルが存在すれば GENERATED マーカー内だけ置換、frontmatter は機械管理キーのみ更新 — 手書きメモを絶対に壊さないための境界。マーカー欠損時は上書きせず `.conflict.md` を並置して警告(fail-safe)。
+- **感想の投影(GH#92)**: 感想の正本は `item_notes`(01)で、GENERATED 領域の「## 感想」節は **DB の純関数**(全感想を毎回描画 = 再生成・再 export で消えない)。既配信 item に感想が付いた場合は export 段の追加パス(`export_pending_notes`)が `digest_messages`→`digests` で digest_date(=ノート名)を解決して該当ノートだけ再描画し、`exported_at` で差分管理する。感想を GENERATED 領域内で直接編集した場合は次回再描画で DB 側の内容に戻る(編集は手書き領域で)。
 - **反応の書き戻し**: MVP では実施しない(signals は SQLite のみ、PROPOSAL のスコープ)。frontmatter `reaction` と GENERATED 領域の分離が済んでいるため、フェーズ2では「frontmatter の1キー更新」だけで実現できる — これが本設計で仕込む唯一の拡張点。
 - **保持ポリシー**: Obsidian に置くのは自作要約+メタデータ+URL+(RSS/manual のみ)抜粋。X 由来は本文・抜粋を置かない — **確定(Day 0 の Developer Agreement 確認 2026-07-06、Issue #2)**。規約上は自分専用・非公開への抜粋表示自体は許諾範囲だが、Obsidian は恒久保存層であり「X 側の削除・変更との同期」義務(Policy: Content compliance)を構造的に満たせないため緩和しない。恒久保存してよいのは Post ID / URL / 自作要約(analyses.summary)+メタまで。位置情報は本文と切り離して保存しない(Agreement III.E。現設計は geo フィールドを取得自体しないので追加対応なし)。
 
 ## 8. 他コンポーネントとの境界
 
 - 入力: `digest` コンポーネントが `digests` 行(Markdown + item_ids)を確定してから本層を呼ぶ。本層は選別・要約に関与しない。
-- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
+- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `item_notes`(感想。GH#92)/ `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
 - 失敗時: 配信失敗・Vault 書込失敗は watchdog(設計 05 想定)への通知対象。本層は例外を握りつぶさず終了コードで返す。

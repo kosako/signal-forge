@@ -20,7 +20,7 @@ from app.config import Config
 from app.connectors.base import Connector
 from app.delivery import create_api, deliver_digest, is_telegram_configured
 from app.digest.builder import generate_digest, today_jst
-from app.export import export_digest
+from app.export import export_digest, export_pending_notes
 from app.extraction import extract_pending
 from app.http import HttpClient
 from app.purge import purge_expired
@@ -166,6 +166,8 @@ def _export_today(
 ) -> None:
     # digest 段が skip(生成済み)でも当日分を export する(再実行の冪等性)
     export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id)
+    # 既配信 item に付いた感想(Telegram リプライ)を該当ノートへ投影(GH#92)
+    export_pending_notes(conn, config, logger, run_id=run_id)
 
 
 def _deliver_today(

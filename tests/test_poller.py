@@ -9,7 +9,7 @@ import pytest
 from app.config import Config, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
-from app.delivery.poller import OFFSET_KEY, RECONNECT_BACKOFF_S
+from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
 from app.delivery.telegram import LONG_POLL_S, reaction_keyboard
 from tests.test_delivery import add_digest, add_item
 
@@ -523,3 +523,106 @@ def test_run_poller_fails_fast_on_permanent_db_error(conn, tmp_path) -> None:
     conn.execute("DROP TABLE telegram_state")
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         run_poller(conn, make_config(tmp_path), FakeApi([[]]), logger)
+
+
+# --- 感想キャプチャ(digest 記事メッセージへのリプライ。GH#92)---
+
+
+def make_reply_update(
+    text: object, reply_message_id: object, *, update_id: int = 1, from_id: int = OWNER_ID
+) -> dict:
+    update = make_message_update(text, update_id=update_id, from_id=from_id)
+    update["message"]["reply_to_message"] = {"message_id": reply_message_id}
+    return update
+
+
+def add_delivered_item(conn, url: str, *, message_id: int) -> int:
+    """配信済み(digest_messages に記事メッセージが台帳登録済み)の item を作る。"""
+    item_id = add_item(conn, url)
+    digest_id = add_digest(conn, [item_id])
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+        (digest_id, item_id, message_id),
+    )
+    conn.commit()
+    return item_id
+
+
+def test_reply_to_item_message_records_note_not_urls(conn, tmp_path) -> None:
+    item_id = add_delivered_item(conn, "https://a/article", message_id=500)
+    api = FakeApi([[
+        make_reply_update("これ試したい。https://tool.example と組み合わせると良さそう", 500)
+    ]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = conn.execute("SELECT * FROM item_notes").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == item_id
+    assert rows[0]["note"].startswith("これ試したい。")
+    assert rows[0]["exported_at"] is None  # 朝バッチ export が反映(差分管理)
+    assert manual_items(conn) == []  # 感想内の URL は投入しない(感想の一部)
+    assert api.sent == [
+        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+    ]
+
+
+def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> None:
+    item_id = add_item(conn, "https://a/article")
+    digest_id = add_digest(conn, [item_id])
+    conn.execute(  # ヘッダメッセージ(item_id IS NULL)
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, NULL, 400)",
+        (digest_id,),
+    )
+    conn.commit()
+    api = FakeApi([[
+        make_reply_update("https://example.com/a", 400, update_id=1),  # ヘッダへのリプライ
+        make_reply_update("感想のつもり", 999, update_id=2),  # 台帳に無い message_id
+        make_reply_update("   ", 400, update_id=3),  # 空白のみ → 従来フロー
+    ]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert len(manual_items(conn)) == 1  # ヘッダへのリプライは URL 投入として扱う
+    assert api.sent[1] == (CHAT_ID, NO_URL_GUIDE)
+    assert api.sent[2] == (CHAT_ID, NO_URL_GUIDE)
+
+
+def test_reply_with_malformed_reply_to_is_url_flow(conn, tmp_path) -> None:
+    # 外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
+    # 台帳側に一致しうる行(500・1)を用意し、型不正が「たまたま不一致」でなく
+    # 型検査で弾かれていることを確認する
+    add_delivered_item(conn, "https://a/article", message_id=500)
+    second = add_item(conn, "https://a/second")
+    conn.execute(  # 同一 digest に2本目の記事メッセージ(message_id=1)を台帳登録
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) "
+        "SELECT digest_id, ?, 1 FROM digest_messages LIMIT 1",
+        (second,),
+    )
+    conn.commit()
+    api = FakeApi([[
+        make_reply_update("感想テキスト", "500", update_id=1),  # 文字列(SQLite 型親和で一致しうる)
+        # bool は int の派生型で ID 1 に一致しうる(Codex should)。素通りさせない
+        make_reply_update("感想テキスト", True, update_id=2),
+    ]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert api.sent == [(CHAT_ID, NO_URL_GUIDE), (CHAT_ID, NO_URL_GUIDE)]
+
+
+def test_reply_in_other_chat_not_matched_to_dm_ledger(conn, tmp_path) -> None:
+    # message_id は chat 単位(Codex must): owner が別チャットで同じ message_id に
+    # 返信しても、owner DM の台帳と突合してはならない(誤記帳防止)→ 従来 URL フロー
+    add_delivered_item(conn, "https://a/article", message_id=500)
+    update = make_reply_update("グループでの感想", 500)
+    update["message"]["chat"] = {"id": CHAT_ID + 1}  # owner DM 以外の chat
+    with_url = make_reply_update("グループから https://example.com/g", 500, update_id=2)
+    with_url["message"]["chat"] = {"id": CHAT_ID + 1}
+    api = FakeApi([[update, with_url]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert api.sent[0] == (CHAT_ID + 1, NO_URL_GUIDE)
+    # 従来の URL 投入フローへ正しくフォールスルーする(感想扱いで握られない)
+    assert len(manual_items(conn)) == 1
+    assert api.sent[1] == (CHAT_ID + 1, "✅ 1件受け付けました。明朝のダイジェストで分析します")
