@@ -354,6 +354,20 @@ def test_build_x_connector_signs_requests() -> None:
     assert all(r.headers.get("authorization", "").startswith("OAuth ") for r in seen)
 
 
+@pytest.mark.parametrize(
+    "note_tweet",
+    [None, "not-a-dict", {}, {"text": ""}, {"text": None}],  # 非 dict・text 欠落/空
+)
+def test_tweet_full_text_falls_back_to_text(note_tweet) -> None:
+    # GH#94(Codex should): note_tweet の異常形はすべて従来の text にフォールバック
+    from app.connectors.x import tweet_full_text
+
+    t: dict = {"id": "1", "text": "従来テキスト"}
+    if note_tweet is not None:
+        t["note_tweet"] = note_tweet
+    assert tweet_full_text(t) == "従来テキスト"
+
+
 def test_note_tweet_full_text_preferred() -> None:
     # GH#94: 長文ポストは note_tweet の全文を raw_content に(text は280字切り詰め)。
     # note_tweet が無い普通のポストは従来どおり text
