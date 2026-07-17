@@ -352,3 +352,21 @@ def test_build_x_connector_signs_requests() -> None:
     conn._session._client = httpx.Client(transport=httpx.MockTransport(handler))
     conn.fetch(make_source(), {})
     assert all(r.headers.get("authorization", "").startswith("OAuth ") for r in seen)
+
+
+def test_note_tweet_full_text_preferred() -> None:
+    # GH#94: 長文ポストは note_tweet の全文を raw_content に(text は280字切り詰め)。
+    # note_tweet が無い普通のポストは従来どおり text
+    long = tweet("900", "先頭280字で切られたテキスト…")
+    long["note_tweet"] = {"text": "全文テキスト。" * 100}
+    seen: list[httpx.Request] = []
+    result = connector_from(
+        [(200, page([long, tweet("899", "普通のポスト")]), {})], seen=seen
+    ).fetch(make_source(), {})
+
+    by_id = {i.external_id: i for i in result.items}
+    assert by_id["900"].raw_content == "全文テキスト。" * 100
+    assert by_id["899"].raw_content == "普通のポスト"
+    timeline = next(r for r in seen if "timelines" in str(r.url))
+    fields = parse_qs(urlsplit(str(timeline.url)).query)["tweet.fields"][0]
+    assert "note_tweet" in fields  # フィールドを実際に要求している

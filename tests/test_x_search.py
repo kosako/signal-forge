@@ -211,3 +211,17 @@ def test_split_budget() -> None:
     assert _split_budget(35, 3) == [12, 12, 11]
     assert _split_budget(30, 3) == [10, 10, 10]
     assert _split_budget(35, 1) == [35]
+
+
+def test_search_note_tweet_full_text_preferred() -> None:
+    # GH#94: 検索でも note_tweet の全文を raw_content に
+    long = tweet("900", "切り詰めテキスト…")
+    long["note_tweet"] = {"text": "検索の全文。" * 100}
+    seen: list[httpx.Request] = []
+    conn = connector_from({"ai": [(200, page([long]), {})]}, slots=["ai"], seen=seen)
+    result = conn.fetch(make_source(), {})
+
+    (item,) = result.items
+    assert item.raw_content == "検索の全文。" * 100
+    fields = parse_qs(urlsplit(str(seen[0].url)).query)["tweet.fields"][0]
+    assert "note_tweet" in fields

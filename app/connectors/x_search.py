@@ -37,12 +37,14 @@ from app.connectors.x import (
     raise_for_auth,
     rate_limit_exhausted,
     status_error,
+    tweet_full_text,
 )
 from app.models import Source
 
 SEARCH_URL = f"{API_BASE}/tweets/search/recent"
-# RT・リプライはクエリ演算子で除外済みのため referenced_tweets 等は要らない
-TWEET_FIELDS = "created_at,author_id"
+# RT・リプライはクエリ演算子で除外済みのため referenced_tweets 等は要らない。
+# note_tweet = 長文ポストの全文(GH#94。ホームTL と同じ理由)
+TWEET_FIELDS = "created_at,author_id,note_tweet"
 EXPANSIONS = "author_id"
 
 
@@ -178,6 +180,6 @@ def _to_raw_item(tweet: dict, users: dict[str, str], query: str) -> RawItem:
         title=None,  # tweet に title はない(本文は raw_content)
         author=users.get(tweet.get("author_id")),
         published_at=parse_created_at(tweet.get("created_at")),
-        raw_content=tweet.get("text"),
+        raw_content=tweet_full_text(tweet),
         meta={"query": query},  # どのスロットが拾ったか(週次レビューの再配分材料)
     )

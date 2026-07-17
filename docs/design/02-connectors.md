@@ -46,7 +46,7 @@ class Connector(Protocol):
 
 > **ADR 0001(2026-07-10)で拡張・訂正**: Day 0 実測(実効単価 ≈ $0.004/件・rate limit home 180/15min)を受け、X ソースは「ホームTLのみ」から **ホームTL + AI 検索(`/2/tweets/search/recent`・3スロット固定)** に拡張(検索の詳細は ADR 0001 / Issue #57)。旧記載の rate limit「5 req/15min」「単価 $0.005 想定」は下記のとおり実測値に更新。読取コストは**ホームTL + 検索の合算日次上限**で月 $20 以内に管理する(3スロット固定はクエリ本数の上限でありコスト上限ではない。ADR 0001「予算配分」)。
 
-- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results`(上限100。残枠が100未満なら `daily_read_cap - reads` = cap を1件も超えないため), `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,entities`, `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは下記「AI 検索」(Issue #57 で追加)。
+- **エンドポイント**: `GET /2/users/:id/timelines/reverse_chronological`(逆時系列ホームTL)。パラメータ: `max_results`(上限100。残枠が100未満なら `daily_read_cap - reads` = cap を1件も超えないため), `since_id`, `pagination_token`, `tweet.fields=created_at,author_id,referenced_tweets,in_reply_to_user_id,note_tweet`(note_tweet = 長文ポストの全文。text の280字切り詰めで記事系の中身が analyze に渡らない問題の解消 = GH#94。同一読取のフィールド追加で課金不変), `expansions=author_id`。実効単価 **≈ $0.004/件**(Day 0 実測。PROPOSAL §Day 0 ゲート)。AI 検索エンドポイントは下記「AI 検索」(Issue #57 で追加)。
 - **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。実測 $0.004 なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
 - **rate limit**: **実測 home 180/15min**(Day 0。旧記載 5/15min は誤り)。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。実測上は cap 130 が rate limit の制約を受けない。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
@@ -56,7 +56,7 @@ class Connector(Protocol):
 
 ### AI 検索(`connectors/x_search.py`・Issue #57)
 
-- **エンドポイント**: `GET /2/tweets/search/recent`。パラメータ: `query`(スロット + 自動付加演算子), `max_results`(10〜100。**下限 10 は API 仕様**), `since_id`, `next_token`(検索は `pagination_token` でなく `next_token`), `tweet.fields=created_at,author_id`, `expansions=author_id`(RT/リプライはクエリ演算子で除外済みのため referenced_tweets は要らない)。認証はホームTL と同じ OAuth 1.0a(既存4キー。Bearer は使わず認証経路を1本に保つ)。署名・リトライは共有トランスポート(`XApiSession`)。
+- **エンドポイント**: `GET /2/tweets/search/recent`。パラメータ: `query`(スロット + 自動付加演算子), `max_results`(10〜100。**下限 10 は API 仕様**), `since_id`, `next_token`(検索は `pagination_token` でなく `next_token`), `tweet.fields=created_at,author_id,note_tweet`(note_tweet はホームTL と同じ理由 = GH#94), `expansions=author_id`(RT/リプライはクエリ演算子で除外済みのため referenced_tweets は要らない)。認証はホームTL と同じ OAuth 1.0a(既存4キー。Bearer は使わず認証経路を1本に保つ)。署名・リトライは共有トランスポート(`XApiSession`)。
 - **スロット**: config `[x_search].slots`(**最大3・入れ替え式**。ADR 0001)。4本以上・重複・空文字・自動付加分込み512字超(Basic tier のクエリ長上限)は ConfigError で fail fast。**slots 空 = 検索無効**(コネクタを配線しない)。スロット自動更新は作らない(更新提案は S2 = #59 の人間承認ゲート)。
 - **クエリの自動付加**: 各スロットに `-is:retweet -is:reply` を付加し、RT・リプライを**課金前にサーバ側で除外**する。ホームTL の「RT は元ツイへ正規化・他人宛リプライ除外」と方針整合で、取ってから捨てると読取課金が無駄になるため。`lang:` 等の演算子はスロット側に書いてよい。スレッド(著者の自己リプライ)も落ちるが MVP はノイズ削減を優先(RawItem.meta に `{"query": スロット}` を記録し、週次の再配分材料にする)。
 - **予算**: `[x_search].daily_read_cap`(既定35)をスロット数で均等割(端数は先頭から。35 → 12/12/11)。スロット間の再配分はしない(多産クエリが他スロットを飢えさせない)。残枠が 10(max_results 下限)を切ったらそのスロットは打ち切り(**cap はハード上限**。超過方向に丸めない)。**ホームTL との合算は `[x].combined_daily_read_cap`(既定165)が単一ノブ**で、内訳合計が超えると起動時 ConfigError(ADR 0001 予算配分)。
