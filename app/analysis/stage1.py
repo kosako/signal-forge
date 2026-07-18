@@ -41,7 +41,11 @@ def preselect(
     """
     rows = conn.execute(
         """
-        SELECT items.*, sources.type AS source_type, sources.config AS source_config
+        SELECT items.*, sources.type AS source_type,
+               EXISTS (
+                 SELECT 1 FROM x_signals
+                 WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+               ) AS is_bookmarked
         FROM items
         JOIN sources ON sources.id = items.source_id
         WHERE items.status = 'new'
@@ -53,10 +57,10 @@ def preselect(
     survivors: list[sqlite3.Row] = []
     bookmarks: list[sqlite3.Row] = []
     for row in rows:
-        if _is_bookmark(row):
+        if row["is_bookmarked"]:
             # ブックマークは本人意思の保存アイテム(GH#99)。manual と同じ理屈で
             # stale(過去ツイートが本体)・x_noise を適用しない。blocklist(明示 NG)
-            # だけは通す
+            # だけは通す。判定は x_signals の紐付け(既存 item への合流でも失われない)
             reason = _rule_blocklist(row, config)
             if reason:
                 _skip(conn, row["id"], reason)
@@ -84,14 +88,6 @@ def preselect(
 
     logger.info("事前選別 完了", extra={"run_id": run_id, "stage": "analyze", "extra": counts})
     return PreselectResult(counts=counts, selected_ids=selected_ids)
-
-
-def _is_bookmark(row: sqlite3.Row) -> bool:
-    """ブックマーク保存アイテム判定(sources.config の mode。GH#99)。"""
-    if row["source_type"] != "x" or not row["source_config"]:
-        return False
-    parsed = json.loads(row["source_config"])  # DDL の json_valid CHECK 済み
-    return isinstance(parsed, dict) and parsed.get("mode") == "bookmark"
 
 
 def _skip(conn: sqlite3.Connection, item_id: int, reason: str) -> None:

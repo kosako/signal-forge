@@ -172,13 +172,22 @@ def test_bookmark_items_bypass_stale_noise_and_cap(conn, tmp_path) -> None:
                         title=None, published=old, payload={"raw_content": "短い"})
     bm_block = add_item(conn, "https://spam.example/x", source_id=bm_source,
                         title=None, published=old)
+    # 合流ケース(GH#99 レビュー指摘): RSS 由来の既存 item にブックマークが紐付いても
+    # 属性が失われない(判定は x_signals の紐付け)
+    bm_merged = add_item(conn, "https://blog.example/rss", published=old)
     fresh = add_item(conn, "https://ok.example/a", published=iso(datetime.now(UTC)))
+    for tweet_id, item_id in (("t1", bm_stale), ("t2", bm_block), ("t3", bm_merged)):
+        conn.execute(
+            "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', ?, ?)",
+            (tweet_id, item_id),
+        )
 
     config = make_config(tmp_path, block_domains=("spam.example",), daily_llm_limit=1)
     result = preselect(conn, config, logger)
 
     # cap(1件)は通常ソースにのみ効き、ブックマークは cap 外で必ず採用
     assert bm_stale in result.selected_ids
+    assert bm_merged in result.selected_ids  # RSS 合流でも stale を適用しない
     assert fresh in result.selected_ids
     # blocklist(明示 NG)はブックマークにも適用
     assert skip_reasons(conn)["https://spam.example/x"] == ("skipped", "blocklist")

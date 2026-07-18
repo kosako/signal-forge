@@ -158,7 +158,11 @@ def test_degraded_judgement_ignores_bookmark_items(conn, tmp_path) -> None:
     bm_source = conn.execute(
         "SELECT id FROM sources WHERE name = 'x:bookmark'"
     ).fetchone()["id"]
-    add_analyzed(conn, "https://a/bm", source_id=bm_source, relevance=90)  # 非 degraded
+    bm = add_analyzed(conn, "https://a/bm", source_id=bm_source, relevance=90)  # 非 degraded
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', 't1', ?)",
+        (bm,),
+    )
     a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
 
     digest_id = generate_digest(conn, make_config(tmp_path), logger)

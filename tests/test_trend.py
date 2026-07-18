@@ -186,5 +186,9 @@ def test_trend_candidates_exclude_bookmark_items(conn) -> None:
         "'codex-cli', 'm', 'analyze-v001', 'sha256:bm')",
         (bm_item,),
     )
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', 't1', ?)",
+        (bm_item,),
+    )
     ids = [row["item_id"] for row in _fetch_today_items(conn)]
     assert bm_item not in ids
