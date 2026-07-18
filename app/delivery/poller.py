@@ -381,7 +381,17 @@ def _edit_markup_best_effort(
         and isinstance(message.get("message_id"), int)
         and isinstance(chat_id, int)
     ):
-        api.edit_message_reply_markup(chat_id, message["message_id"], markup)
+        try:
+            api.edit_message_reply_markup(chat_id, message["message_id"], markup)
+        except DeliveryError as e:
+            # 同一ボタンの再押下は markup 不変で Telegram が 400「message is not
+            # modified」を返す。冪等な再押下は成功扱いにする(GH#55)
+            if "message is not modified" not in str(e):
+                raise
+            logger.info(
+                "markup 不変のため ✓ 反映を skip(同一ボタン再押下)",
+                extra={"stage": "poll"},
+            )
     else:
         logger.warning(
             "message/chat の形が不正なため ✓ 反映を skip", extra={"stage": "poll"}
