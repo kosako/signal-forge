@@ -306,9 +306,10 @@ def x_source_mode(source: Source) -> str:
     if unknown:
         raise FatalError(f"X ソース '{source.name}' の config に不明なキー: {', '.join(unknown)}")
     mode = parsed.get("mode")
-    if mode not in ("home", "search"):
+    if mode not in ("home", "search", "bookmark"):
         raise FatalError(
-            f"X ソース '{source.name}' の config.mode が不正: {mode!r}(home / search のみ)"
+            f"X ソース '{source.name}' の config.mode が不正: {mode!r}"
+            "(home / search / bookmark のみ)"
         )
     return mode
 
@@ -329,6 +330,13 @@ class XRouter:
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         mode = x_source_mode(source_row)
+        if mode == "bookmark":
+            # item 化は x_signals 段の担当(GH#99)。この行は items の帰属専用で
+            # enabled=0 が正。誤って enabled 化されても黙って home に化けず fail fast
+            raise FatalError(
+                f"X ソース '{source_row.name}' は mode=bookmark(collect 対象外。"
+                "enabled=0 に戻すこと)"
+            )
         if mode == "search":
             if self._search is None:
                 raise FatalError(

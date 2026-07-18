@@ -384,3 +384,10 @@ def test_note_tweet_full_text_preferred() -> None:
     timeline = next(r for r in seen if "timelines" in str(r.url))
     fields = parse_qs(urlsplit(str(timeline.url)).query)["tweet.fields"][0]
     assert "note_tweet" in fields  # フィールドを実際に要求している
+
+
+def test_router_rejects_bookmark_row_as_collect_target() -> None:
+    # bookmark 行は items の帰属専用(GH#99)。collect に来たら黙って home に化けず fail fast
+    router = XRouter(home=_StubConnector(), search=_StubConnector())
+    with pytest.raises(FatalError, match="mode=bookmark"):
+        router.fetch(make_source(config='{"mode": "bookmark"}'), {})

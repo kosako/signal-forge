@@ -161,6 +161,12 @@ def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[R
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE items.status = 'analyzed'
+          -- ブックマーク紐付けのある item は digest 候補でない(ランキングと同じ除外。
+          -- 合流ケースでも属性が残るよう x_signals の紐付けで判定。GH#99)
+          AND NOT EXISTS (
+            SELECT 1 FROM x_signals
+            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+          )
         ORDER BY items.id
         """
     ).fetchall()

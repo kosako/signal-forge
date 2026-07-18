@@ -129,3 +129,26 @@ def test_selection_ignores_non_analyzed_items(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1")
     conn.execute("UPDATE items SET status = 'digested'")
     assert rank_for_digest(conn, make_config(tmp_path)) == []
+
+
+def test_bookmark_items_excluded_from_ranking(conn, tmp_path) -> None:
+    # ブックマーク保存アイテムは must-include の別枠であり ranking 不参加(GH#99)
+    conn.execute(
+        """INSERT INTO sources (type, name, config, enabled)
+           VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    bm_source = conn.execute(
+        "SELECT id FROM sources WHERE name = 'x:bookmark'"
+    ).fetchone()["id"]
+    add_analyzed(conn, "https://a/normal", relevance=50)
+    bm = add_analyzed(conn, "https://a/bookmark", source_id=bm_source, relevance=99)
+    # 合流ケース: RSS 由来 item にブックマークが紐付いた場合も除外(GH#99 レビュー指摘)
+    merged = add_analyzed(conn, "https://a/merged-rss", relevance=95)
+    for tweet_id, item_id in (("t1", bm), ("t2", merged)):
+        conn.execute(
+            "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', ?, ?)",
+            (tweet_id, item_id),
+        )
+
+    selected = rank_for_digest(conn, make_config(tmp_path))
+    assert [item.canonical_url for item in selected] == ["https://a/normal"]

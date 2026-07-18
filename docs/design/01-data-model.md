@@ -298,11 +298,12 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 
 - 同一アイテムへの再タップは行を追加し、**集計は created_at 最新の行を採用**。理由: 上書きせず履歴を残すと、👍校正(遅延スポットチェック)の乖離分析材料になる。
 - 受信デーモンは callback の `from.id` を allowlist 照合してから書き込む(認可は設計 04 Telegram の責務。本テーブルは認可済みデータのみ格納)。
-### X 興味シグナル(x_signals・migration 004。GH#58 S1b / ADR 0001)
+### X 興味シグナル(x_signals・migration 004 + 007。GH#58 S1b / ADR 0001 / GH#99)
 
-Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探索**シグナル(X 上の自分の行動)を別テーブルで持つ(ADR 0001「探索と活用を区別」)。tweet_id ベースで items を参照しない(ブックマーク等は collect 経路に乗っていない tweet が普通)。
+Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探索**シグナル(X 上の自分の行動)を別テーブルで持つ(ADR 0001「探索と活用を区別」)。like / self_rt は tweet_id ベースで items を参照しない(collect 経路に乗っていない tweet が普通)。**bookmark だけは保存アイテムとして items にも登録し、`item_id`(migration 007)で紐付ける**(GH#99。取込時に item 化。外部リンク付きはリンク先を canonical_url に、リンクなしはツイート URL。帰属先は enabled=0 の sources 行 `x:bookmark` = mode "bookmark")。
 
 - `kind`: `bookmark`(🔖・強)/ `like`(❤️・弱)/ `self_rt`(🔁・強。RT 元ツイートの id・著者を記録)
+- `item_id`(NULL 可): bookmark の保存アイテム参照(GH#99)。like / self_rt と item 化導入前の既存 bookmark 行は NULL(過去分は `--backfill --kind bookmark` の再読取で遡って紐付く)
 - `UNIQUE (kind, tweet_id)` + INSERT OR IGNORE で再観測を吸収(差分検出は「新→旧に読み既知 id 到達で打ち切り」。bookmarks / liked_tweets は since_id 非対応のため)
 - `observed_at` = 初回観測時刻。`bookmarked_at` 等を API が提供しないため、**直近性の代理**とする(cold start の --backfill 一括取込分は「直近」として扱えない制約を含む)
 - `text_excerpt`(≤280字)は **TTL キャッシュのみ**(purge が `x_cache_ttl_days` で NULL 化。§6 の X 本文非保持ポリシー準拠)。恒久保存は id・著者・時刻

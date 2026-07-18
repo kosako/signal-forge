@@ -224,13 +224,28 @@ def x_signals(
         min=5,
         help="--backfill 時の kind ごと読取上限(最悪コスト = 3 × limit × 単価。GH#84)",
     ),
+    kind: list[str] = typer.Option(
+        [],
+        "--kind",
+        help="対象 kind を限定(bookmark / like / self_rt。複数可・既定 = 全種)。"
+        "過去ブックマークの item 化 backfill 等、読取を 1 kind に絞る用途(GH#99)",
+    ),
 ) -> None:
     """X 興味シグナル(🔖ブックマーク・❤️いいね・🔁自RT)を取り込む(S1b = GH#58)。"""
     import httpx
 
     from app.config import load_config, load_env
     from app.connectors.x_oauth2 import ENV_CLIENT_SECRET, XOAuth2Session
-    from app.connectors.x_signals import collect_x_signals
+    from app.connectors.x_signals import KIND_ENDPOINTS, collect_x_signals
+
+    unknown_kinds = sorted(set(kind) - set(KIND_ENDPOINTS))
+    if unknown_kinds:
+        typer.echo(
+            f"--kind が不正: {', '.join(unknown_kinds)}"
+            f"(有効値: {', '.join(KIND_ENDPOINTS)})",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     from app.db import apply_migrations, connect
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
@@ -257,7 +272,12 @@ def x_signals(
             client_secret=env.get(ENV_CLIENT_SECRET),
         )
         totals = collect_x_signals(
-            conn, config, session, logger, backfill_limit=limit if backfill else None
+            conn,
+            config,
+            session,
+            logger,
+            backfill_limit=limit if backfill else None,
+            kinds=tuple(kind) or None,
         )
     typer.echo(f"reads={totals['api_reads']} new_signals={totals['new_signals']}")
 

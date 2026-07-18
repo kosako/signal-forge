@@ -112,6 +112,12 @@ def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE a.degraded = 0 AND a.analyzed_at >= ? AND a.analyzed_at < ?
+          -- ブックマークは過去の任意時点の内容のため「今日のトレンド」に混ぜない
+          -- (合流ケースでも属性が残るよう x_signals の紐付けで判定。GH#99)
+          AND NOT EXISTS (
+            SELECT 1 FROM x_signals
+            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+          )
         ORDER BY a.relevance_score DESC, items.id
         """,
         (start, end),

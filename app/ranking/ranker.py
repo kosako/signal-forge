@@ -56,6 +56,13 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE items.status = 'analyzed'
+          -- ブックマーク紐付けのある item はランキング不参加(must-include の別枠。
+          -- 判定は x_signals の紐付け = 既存 item への合流(RSS 等と canonical 重複)
+          -- でも属性が失われない。GH#99)
+          AND NOT EXISTS (
+            SELECT 1 FROM x_signals
+            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+          )
         ORDER BY items.id
         """
     ).fetchall()

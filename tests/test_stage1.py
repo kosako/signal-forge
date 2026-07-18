@@ -156,3 +156,39 @@ def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
     result = preselect(conn, make_config(tmp_path), logger)
     assert result.counts["selected"] == 1  # degraded 分析に回る(除外しない)
     assert result.selected_ids == [item_id]
+
+
+def test_bookmark_items_bypass_stale_noise_and_cap(conn, tmp_path) -> None:
+    # ブックマーク保存アイテムは本人意思: stale / x_noise / daily_cap を適用しない(GH#99)
+    conn.execute(
+        """INSERT INTO sources (type, name, config, enabled)
+           VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    bm_source = conn.execute(
+        "SELECT id FROM sources WHERE name = 'x:bookmark'"
+    ).fetchone()["id"]
+    old = iso(datetime.now(UTC) - timedelta(hours=200))  # 72h 超(通常は stale)
+    bm_stale = add_item(conn, "https://x.com/i/web/status/1", source_id=bm_source,
+                        title=None, published=old, payload={"raw_content": "短い"})
+    bm_block = add_item(conn, "https://spam.example/x", source_id=bm_source,
+                        title=None, published=old)
+    # 合流ケース(GH#99 レビュー指摘): RSS 由来の既存 item にブックマークが紐付いても
+    # 属性が失われない(判定は x_signals の紐付け)
+    bm_merged = add_item(conn, "https://blog.example/rss", published=old)
+    fresh = add_item(conn, "https://ok.example/a", published=iso(datetime.now(UTC)))
+    for tweet_id, item_id in (("t1", bm_stale), ("t2", bm_block), ("t3", bm_merged)):
+        conn.execute(
+            "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', ?, ?)",
+            (tweet_id, item_id),
+        )
+
+    config = make_config(tmp_path, block_domains=("spam.example",), daily_llm_limit=1)
+    result = preselect(conn, config, logger)
+
+    # cap(1件)は通常ソースにのみ効き、ブックマークは cap 外で必ず採用
+    assert bm_stale in result.selected_ids
+    assert bm_merged in result.selected_ids  # RSS 合流でも stale を適用しない
+    assert fresh in result.selected_ids
+    # blocklist(明示 NG)はブックマークにも適用
+    assert skip_reasons(conn)["https://spam.example/x"] == ("skipped", "blocklist")
+    assert bm_block not in result.selected_ids
