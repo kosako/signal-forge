@@ -400,6 +400,34 @@ def test_update_failure_does_not_kill_batch(conn, tmp_path) -> None:
     ).fetchone()["value"] == "3"
 
 
+def test_repress_not_modified_is_tolerated_without_error(conn, tmp_path, caplog) -> None:
+    # 同一ボタン再押下は markup 不変で Telegram が 400「message is not modified」を
+    # 返す。冪等な再押下は成功扱いにし ERROR ログを出さない(GH#55)
+    a = add_item(conn, "https://a/1")
+    add_digest(conn, [a])
+
+    class NotModifiedApi(FakeApi):
+        def edit_message_reply_markup(self, chat_id, message_id, reply_markup):
+            raise DeliveryError(
+                "Telegram editMessageReplyMarkup が失敗: HTTP 400: Bad Request: "
+                "message is not modified: specified new message content and reply "
+                "markup are exactly the same as a current content and reply markup "
+                "of the message"
+            )
+
+    api = NotModifiedApi([[make_callback_update(a, "up")]])
+    with caplog.at_level(logging.INFO):
+        poll_once(conn, make_config(tmp_path), api, logger)
+
+    # 記帳と answer は完了扱いのまま、ERROR ログは出ない
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 1
+    assert api.answered == [("cb1", "👍 記録しました")]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()["value"] == "2"  # offset も進む
+
+
 def test_insert_failure_answers_warning(conn, tmp_path) -> None:
     # signals INSERT 自体の失敗(DB 故障相当)は「⚠️ 記録失敗、もう一度」で伝える
     # (設計 04 §3 の「DB 書込失敗時のみ ⚠️」の実 INSERT 失敗経路)
