@@ -41,7 +41,9 @@ from app.models import Source
 
 API_BASE = "https://api.twitter.com/2"
 MAX_RESULTS = 100  # 1ページ上限(設計 02 §2)
-TWEET_FIELDS = "created_at,author_id,referenced_tweets,in_reply_to_user_id"
+# note_tweet = 長文ポストの全文(GH#94)。text は280字で切り詰められるため、記事系
+# コンテンツの中身を analyze に渡すには必須。同一読取のフィールド追加で課金は不変
+TWEET_FIELDS = "created_at,author_id,referenced_tweets,in_reply_to_user_id,note_tweet"
 EXPANSIONS = "author_id"
 TIMEOUT_S = 30
 _ENV_KEYS = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")
@@ -264,9 +266,21 @@ def _to_raw_item(tweet: dict, users: dict[str, str], me_id: str) -> RawItem | No
         title=None,  # tweet に title はない(本文は raw_content)
         author=users.get(tweet.get("author_id")),
         published_at=parse_created_at(tweet.get("created_at")),
-        raw_content=tweet.get("text"),
+        raw_content=tweet_full_text(tweet),
         meta={"retweet": retweeted_id is not None, "reply": in_reply_to is not None},
     )
+
+
+def tweet_full_text(tweet: dict) -> str | None:
+    """本文は note_tweet(長文ポストの全文)優先・無ければ従来の text(GH#94)。
+
+    RT された長文ポストの元ツイ全文は referenced_tweets.id expansion が要るため対象外
+    (Issue #94 の境界)。検索コネクタと共用。
+    """
+    note = tweet.get("note_tweet")
+    if isinstance(note, dict) and note.get("text"):
+        return note["text"]
+    return tweet.get("text")
 
 
 def parse_created_at(value: str | None) -> datetime | None:
