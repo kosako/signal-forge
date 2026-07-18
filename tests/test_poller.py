@@ -575,16 +575,17 @@ def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> Non
     )
     conn.commit()
     api = FakeApi([[
-        make_reply_update("https://example.com/a", 400, update_id=1),  # ヘッダへのリプライ
-        make_reply_update("感想のつもり", 999, update_id=2),  # 台帳に無い message_id
-        make_reply_update("   ", 400, update_id=3),  # 空白のみ → 従来フロー
+        make_reply_update("感想のつもり", 999, update_id=1),  # 台帳に無い message_id
+        make_reply_update("   ", 400, update_id=2),  # 空白のみ → 従来フロー
+        make_reply_update("https://example.com/a", 999, update_id=3),  # 台帳外 + URL
     ]])
     poll_once(conn, make_config(tmp_path), api, logger)
 
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
-    assert len(manual_items(conn)) == 1  # ヘッダへのリプライは URL 投入として扱う
+    assert conn.execute("SELECT count(*) FROM digest_notes").fetchone()[0] == 0
+    assert api.sent[0] == (CHAT_ID, NO_URL_GUIDE)
     assert api.sent[1] == (CHAT_ID, NO_URL_GUIDE)
-    assert api.sent[2] == (CHAT_ID, NO_URL_GUIDE)
+    assert len(manual_items(conn)) == 1  # 台帳外へのリプライは URL 投入として扱う
 
 
 def test_reply_with_malformed_reply_to_is_url_flow(conn, tmp_path) -> None:
@@ -626,3 +627,28 @@ def test_reply_in_other_chat_not_matched_to_dm_ledger(conn, tmp_path) -> None:
     # 従来の URL 投入フローへ正しくフォールスルーする(感想扱いで握られない)
     assert len(manual_items(conn)) == 1
     assert api.sent[1] == (CHAT_ID + 1, "✅ 1件受け付けました。明朝のダイジェストで分析します")
+
+
+def test_reply_to_header_records_digest_note(conn, tmp_path) -> None:
+    # GH#96: ヘッダ(item_id IS NULL)へのリプライは日次感想として digest_notes へ
+    item_id = add_item(conn, "https://a/article")
+    digest_id = add_digest(conn, [item_id])
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, NULL, 400)",
+        (digest_id,),
+    )
+    conn.commit()
+    api = FakeApi([[make_reply_update("今日は全体的にツール寄りで良かった", 400)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = conn.execute("SELECT * FROM digest_notes").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["digest_id"] == digest_id
+    assert rows[0]["note"] == "今日は全体的にツール寄りで良かった"
+    assert rows[0]["exported_at"] is None
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert manual_items(conn) == []  # URL フローに落ちない
+    assert api.sent == [(
+        CHAT_ID,
+        "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します",
+    )]
