@@ -62,7 +62,10 @@ def generate_digest(
                     old_ids,
                 )
             conn.execute("DELETE FROM digest_messages WHERE digest_id = ?", (existing["id"],))
-            conn.execute("DELETE FROM digests WHERE id = ?", (existing["id"],))
+            # digests 行は DELETE せず id を維持して下の UPDATE で上書きする。
+            # digest_notes(日次感想 = 恒久記録。GH#96)が digest_id を参照しており、
+            # DELETE は FK 違反(CASCADE にすると感想が消える)。置換後も同じ
+            # digest_date への感想として意味が保たれるため id 維持が正しい
 
         # 全候補の最新分析が degraded なら通常ランキングを使わない(min_score=0 等の
         # 許容設定でも degraded 配信の契約を守る)
@@ -75,22 +78,46 @@ def generate_digest(
         trend = None if degraded_digest else trend_markdown
         markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest, trend=trend)
         item_ids = [item.item_id for item in ranked]
-        digest_id = conn.execute(
-            """
-            INSERT INTO digests
-                (digest_date, run_id, status, markdown, item_ids, item_count, trend_markdown)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                digest_date,
-                run_id,
-                "degraded" if degraded_digest else "ok",
-                markdown,
-                json.dumps(item_ids),
-                len(item_ids),
-                trend,
-            ),
-        ).lastrowid
+        if existing:
+            # --force 置換は id 維持の上書き。配信状態は新規行と同じ初期値へ戻す
+            # (戻さないと置換後の deliver が「配信済み」として skip する)
+            conn.execute(
+                """
+                UPDATE digests SET
+                    run_id = ?,
+                    generated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                    status = ?, markdown = ?, item_ids = ?, item_count = ?,
+                    delivery_status = 'pending', sent_at = NULL, trend_markdown = ?
+                WHERE id = ?
+                """,
+                (
+                    run_id,
+                    "degraded" if degraded_digest else "ok",
+                    markdown,
+                    json.dumps(item_ids),
+                    len(item_ids),
+                    trend,
+                    existing["id"],
+                ),
+            )
+            digest_id = existing["id"]
+        else:
+            digest_id = conn.execute(
+                """
+                INSERT INTO digests
+                    (digest_date, run_id, status, markdown, item_ids, item_count, trend_markdown)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    digest_date,
+                    run_id,
+                    "degraded" if degraded_digest else "ok",
+                    markdown,
+                    json.dumps(item_ids),
+                    len(item_ids),
+                    trend,
+                ),
+            ).lastrowid
         for item_id in item_ids:
             conn.execute("UPDATE items SET status = 'digested' WHERE id = ?", (item_id,))
         conn.execute("COMMIT")

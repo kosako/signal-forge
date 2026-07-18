@@ -390,3 +390,24 @@ def test_export_pending_digest_notes_projects_daily(conn, tmp_path) -> None:
 
     export_pending_notes(conn, config, logger)  # 冪等
     assert daily.read_text() == text
+
+
+def test_export_pending_digest_notes_conflict_keeps_pending(conn, tmp_path) -> None:
+    # GH#96(Codex should): Daily の conflict 退避時も exported_at を立てない(#93 と同契約)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    daily = tmp_path / "vault" / "SignalForge" / "Daily" / "2026-07-06.md"
+    daily.write_text(daily.read_text().replace("<!-- GENERATED:END -->", ""))  # マーカー破壊
+    add_digest_note(conn, digest_id, "翌日に書いた感想")
+
+    export_pending_notes(conn, config, logger)
+    pending = conn.execute(
+        "SELECT count(*) FROM digest_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    assert pending == 1  # 未反映のまま(翌 run で再試行)
+    conflict = daily.with_suffix(".conflict.md")
+    assert conflict.exists()
+    assert "翌日に書いた感想" in conflict.read_text()  # 感想自体は退避側に保全

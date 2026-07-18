@@ -74,6 +74,28 @@ def test_second_run_skips_force_replaces(conn, tmp_path) -> None:
     assert len(ids) == 2
 
 
+def test_force_replace_preserves_digest_notes_and_resets_delivery(conn, tmp_path) -> None:
+    # GH#96(Codex must SF-PR97-001): 感想(digest_notes)が付いた digest の --force
+    # 置換が FK 違反にならず、感想は同じ digest_date の感想として保持される
+    add_analyzed(conn, "https://a/1", relevance=90)
+    config = make_config(tmp_path)
+    first = generate_digest(conn, config, logger)
+    conn.execute(
+        "INSERT INTO digest_notes (digest_id, note) VALUES (?, '全体の感想')", (first,)
+    )
+    conn.execute(
+        "UPDATE digests SET delivery_status = 'sent', sent_at = 'x' WHERE id = ?", (first,)
+    )
+    conn.commit()
+
+    replaced = generate_digest(conn, config, logger, force=True)
+    assert replaced == first  # id 維持の上書き(参照の安定)
+    note = conn.execute("SELECT digest_id, note FROM digest_notes").fetchone()
+    assert (note["digest_id"], note["note"]) == (first, "全体の感想")  # 感想は保持
+    row = conn.execute("SELECT delivery_status, sent_at FROM digests").fetchone()
+    assert (row["delivery_status"], row["sent_at"]) == ("pending", None)  # 配信状態は初期化
+
+
 def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1", relevance=10)  # min_score 未満
     digest_id = generate_digest(conn, make_config(tmp_path), logger)
