@@ -96,6 +96,28 @@ def test_force_replace_preserves_digest_notes_and_resets_delivery(conn, tmp_path
     assert (row["delivery_status"], row["sent_at"]) == ("pending", None)  # 配信状態は初期化
 
 
+def test_force_replace_then_deliver_resends_all(conn, tmp_path) -> None:
+    # Codex should(PR #97): --force + deliver の契約(台帳作り直し・全通再送)を直接保護
+    from app.config import TelegramConfig
+    from app.delivery import deliver_digest
+    from tests.test_delivery import ApiRecorder
+
+    add_analyzed(conn, "https://a/1", relevance=90)
+    config = make_config(tmp_path)
+    tg_config = Config(config_dir=tmp_path, telegram=TelegramConfig(owner_chat_id=777))
+    digest_id = generate_digest(conn, config, logger)
+    deliver_digest(conn, tg_config, ApiRecorder().api(), digest_id, logger)
+    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 2  # ヘッダ+1件
+
+    assert generate_digest(conn, config, logger, force=True) == digest_id
+    second = ApiRecorder()
+    deliver_digest(conn, tg_config, second.api(), digest_id, logger)
+    assert len(second.requests) == 2  # ヘッダ + 全 item が再送される(skip しない)
+    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 2  # 台帳作り直し
+    row = conn.execute("SELECT delivery_status FROM digests").fetchone()
+    assert row["delivery_status"] == "sent"
+
+
 def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1", relevance=10)  # min_score 未満
     digest_id = generate_digest(conn, make_config(tmp_path), logger)

@@ -37,19 +37,22 @@ def generate_digest(
     trend_markdown: 「今日のトレンド」節(GH#75)。付加機能なので None 可(節を省く)。
     """
     digest_date = today_jst()
-    existing = conn.execute(
-        "SELECT id, item_ids FROM digests WHERE digest_date = ?", (digest_date,)
-    ).fetchone()
-    if existing and not force:
-        logger.info(
-            "digest 生成済みのため skip(置換は --force)",
-            extra={"run_id": run_id, "stage": "digest"},
-        )
-        return None
-
-    # 置換の準備(旧採用 item の復帰)から新 digest 確定までを同一トランザクションで行う
+    # 置換の準備(旧採用 item の復帰)から新 digest 確定までを同一トランザクションで行う。
+    # existing の読みもロック取得後に行う(取得前の読みだと、並行実行時に stale な
+    # item_ids を基準に置換してしまう。id 維持の UPDATE 化で UNIQUE 衝突による
+    # 検出も効かないため、読み自体をロック内に置く。Codex must)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        existing = conn.execute(
+            "SELECT id, item_ids FROM digests WHERE digest_date = ?", (digest_date,)
+        ).fetchone()
+        if existing and not force:
+            conn.execute("COMMIT")  # 変更なしで閉じる
+            logger.info(
+                "digest 生成済みのため skip(置換は --force)",
+                extra={"run_id": run_id, "stage": "digest"},
+            )
+            return None
         if existing:
             # --force 置換: 旧 digest 採用 item を候補(analyzed)に戻してから再ランキング
             # (戻さないと旧採用分が新 digest から黙って消える)。配信台帳も作り直す
