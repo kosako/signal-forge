@@ -129,3 +129,19 @@ def test_selection_ignores_non_analyzed_items(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1")
     conn.execute("UPDATE items SET status = 'digested'")
     assert rank_for_digest(conn, make_config(tmp_path)) == []
+
+
+def test_bookmark_items_excluded_from_ranking(conn, tmp_path) -> None:
+    # ブックマーク保存アイテムは must-include の別枠であり ranking 不参加(GH#99)
+    conn.execute(
+        """INSERT INTO sources (type, name, config, enabled)
+           VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    bm_source = conn.execute(
+        "SELECT id FROM sources WHERE name = 'x:bookmark'"
+    ).fetchone()["id"]
+    add_analyzed(conn, "https://a/normal", relevance=50)
+    add_analyzed(conn, "https://a/bookmark", source_id=bm_source, relevance=99)
+
+    selected = rank_for_digest(conn, make_config(tmp_path))
+    assert [item.canonical_url for item in selected] == ["https://a/normal"]

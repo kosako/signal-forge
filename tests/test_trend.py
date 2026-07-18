@@ -159,3 +159,32 @@ def test_prior_day_analyses_excluded(conn) -> None:
         )
     result = TrendSummary(themes=[TrendTheme(label="x", summary="y", item_ids=[1])])
     assert synthesize_trend(conn, FakeEngine(result), logger) is None
+
+
+def test_trend_candidates_exclude_bookmark_items(conn) -> None:
+    # ブックマークは過去の任意時点の内容のため「今日のトレンド」に混ぜない(GH#99)
+    from app.analysis.trend import _fetch_today_items
+
+    conn.execute(
+        """INSERT INTO sources (type, name, config, enabled)
+           VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    bm_source = conn.execute(
+        "SELECT id FROM sources WHERE name = 'x:bookmark'"
+    ).fetchone()["id"]
+    add_analyzed(conn, "https://a/normal", topic="t1", title_ja="通常")
+    bm_item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash, status) "
+        "VALUES (?, 'https://a/bm', 'https://a/bm', 'sha256:b', 'analyzed')",
+        (bm_source,),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO analyses (item_id, title_ja, summary, category, topic, relevance_score, "
+        "novelty, negative_labels, recommendation_reason, implication, degraded, engine, model, "
+        "prompt_version, input_hash) "
+        "VALUES (?, 'BM', '要約', '課題直結', 't1', 90, 'new', '[]', '理由', '示唆', 0, "
+        "'codex-cli', 'm', 'analyze-v001', 'sha256:bm')",
+        (bm_item,),
+    )
+    ids = [row["item_id"] for row in _fetch_today_items(conn)]
+    assert bm_item not in ids

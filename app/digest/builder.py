@@ -161,6 +161,8 @@ def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[R
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE items.status = 'analyzed'
+          -- ブックマーク保存アイテムは digest 候補でない(ランキングと同じ除外。GH#99)
+          AND COALESCE(json_extract(sources.config, '$.mode'), '') <> 'bookmark'
         ORDER BY items.id
         """
     ).fetchall()

@@ -112,6 +112,8 @@ def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE a.degraded = 0 AND a.analyzed_at >= ? AND a.analyzed_at < ?
+          -- ブックマークは過去の任意時点の内容のため「今日のトレンド」に混ぜない(GH#99)
+          AND COALESCE(json_extract(sources.config, '$.mode'), '') <> 'bookmark'
         ORDER BY a.relevance_score DESC, items.id
         """,
         (start, end),

@@ -1,7 +1,13 @@
-"""X 興味シグナル取込(S1b = GH#58 / ADR 0001)。
+"""X 興味シグナル取込(S1b = GH#58 / ADR 0001)+ ブックマークの item 化(GH#99)。
 
 自分の X 行動(🔖ブックマーク・❤️いいね・🔁自RT)を探索シグナルとして x_signals に
-記録する。digest には流さない(items に書かない = collect 経路から独立)。
+記録する。like / self_rt はシグナルのみ(items に書かない = collect 経路から独立)。
+🔖ブックマークだけは「保存アイテム」として items にも登録する(GH#99):
+- 外部リンク付きツイート: 先頭の外部リンクを canonical_url に(記事本体を恒久保存。
+  本文は extract 段が取得する)
+- リンクなしツイート: ツイート URL を canonical_url に(type='x' の TTL 規約に従う)
+- 帰属先は enabled=0 の sources 行 'x:bookmark'(mode=bookmark。collect 対象外)。
+  digest ランキング・トレンドには参加しない(除外は ranker / builder / trend 側)
 
 - 認証は 3 種とも OAuth 2.0(XOAuth2Session)に統一(ADR 0001「認証経路を1本に保つ」。
   自RT は OAuth1 でも取れるが、S1a で組んだ OAuth2 に相乗りさせる実装選択)
@@ -26,19 +32,45 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
+from datetime import datetime
+from urllib.parse import urlsplit
 
+from app.collect import RAW_CONTENT_MAX_CHARS
 from app.config import X_SIGNALS_MIN_PAGE, Config
 from app.connectors.base import FatalError
-from app.connectors.x import raise_for_auth, rate_limit_exhausted
+from app.connectors.x import raise_for_auth, rate_limit_exhausted, tweet_full_text
 from app.connectors.x_oauth2 import USERS_ME_URL, XOAuth2Error, XOAuth2Session
+from app.db import insert_item_with_dedup
+from app.normalize import (
+    UrlError,
+    content_hash,
+    is_dedup_eligible,
+    normalize_text_for_hash,
+    normalize_url,
+)
 
 API_BASE = "https://api.x.com/2"
 PAGE_MAX = 100  # 各エンドポイントの 1 ページ上限
 EXCERPT_MAX = 280  # text_excerpt の上限(TTL キャッシュ。恒久保存しない)
-TWEET_FIELDS = "created_at,author_id,referenced_tweets"
+# note_tweet = 長文の全文(GH#94 と同じ理由)/ entities = 外部リンク(item 化の
+# canonical_url 素材。GH#99)。フィールド追加は同一読取のため課金は不変
+TWEET_FIELDS = "created_at,author_id,referenced_tweets,note_tweet,entities"
 EXPANSIONS = "author_id,referenced_tweets.id,referenced_tweets.id.author_id"
+
+BOOKMARK_SOURCE_NAME = "x:bookmark"  # item の帰属先(enabled=0 = collect 対象外)
+
+# 引用・メディア・自己リンクは「外部記事」でない(canonical 素材から除外)
+_INTERNAL_LINK_HOSTS = {
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "t.co",
+    "pic.twitter.com",
+}
 
 KIND_ENDPOINTS = {  # 取込は強シグナル優先の順(collect_x_signals のループ順)
     "bookmark": "/users/{me_id}/bookmarks",
@@ -59,11 +91,14 @@ def collect_x_signals(
     *,
     run_id: str | None = None,
     backfill_limit: int | None = None,
+    kinds: tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     """3 種のシグナルを cap 内で取込み、x_signal_runs に 1 行記録して集計を返す。
 
     backfill_limit を渡すと cold start モード: 既知到達で打ち切らず、日次 cap の
     代わりに **kind ごと**の読取上限として適用する(最悪コスト = 3 × limit × 単価)。
+    kinds で対象 kind を限定できる(既定 = 全種。過去ブックマークの再読取 backfill 等、
+    コストを 1 kind に絞る用途。GH#99)。
     """
     backfill = backfill_limit is not None
     me_id = _get_me_id(session)
@@ -71,6 +106,8 @@ def collect_x_signals(
     outcomes: dict[str, str] = {}  # 試行した kind → 'ok' | 'failed'(skip は含めない)
     errors: list[str] = []
     for kind in KIND_ENDPOINTS:
+        if kinds is not None and kind not in kinds:
+            continue
         if backfill:
             remaining = backfill_limit  # kind ごとに独立の上限(日次 cap と共有しない)
         else:
@@ -158,6 +195,8 @@ def _collect_kind(
     (c) next_token なし (d) rate limit 残 0(429 は待たない)。
     """
     url = API_BASE + KIND_ENDPOINTS[kind].format(me_id=me_id)
+    # ブックマークは items にも登録する(GH#99)。帰属先 sources 行はページ処理前に確保
+    bookmark_source_id = ensure_bookmark_source(conn) if kind == "bookmark" else None
     since_id = _load_cursor(conn, kind) if kind == "self_rt" else None
     max_wrapper_id = 0  # self_rt のカーソル素材(自分のタイムライン上の最大 tweet id)
     next_token: str | None = None
@@ -210,6 +249,10 @@ def _collect_kind(
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (kind, *row, run_id),
                 ).rowcount
+                if kind == "bookmark":
+                    # 新規シグナルに加え、既知だが item 未紐付けの行(item 化導入前の
+                    # 既存シグナルを backfill 再読取した場合)も遡って item 化する
+                    _link_bookmark_item(conn, bookmark_source_id, tweet, users)
                 if inserted:
                     page_new += 1
                 elif not backfill and kind != "self_rt":
@@ -290,3 +333,136 @@ def _to_signal_row(
         (source.get("text") or "")[:EXCERPT_MAX] or None,
         source.get("created_at"),
     )
+
+
+# --- ブックマークの item 化(GH#99) ---
+
+
+def ensure_bookmark_source(conn: sqlite3.Connection) -> int:
+    """ブックマーク item の帰属先 sources 行を保証して id を返す。
+
+    enabled=0 で登録する(collect の走査対象外。item 化は本モジュールが x_signals 段で
+    行うため、collect の「type → Connector 1:1」契約に bookmark を持ち込まない)。
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (type, name, config, enabled) "
+        """VALUES ('x', ?, '{"mode": "bookmark"}', 0)""",
+        (BOOKMARK_SOURCE_NAME,),
+    )
+    return conn.execute(
+        "SELECT id FROM sources WHERE name = ?", (BOOKMARK_SOURCE_NAME,)
+    ).fetchone()["id"]
+
+
+def _link_bookmark_item(
+    conn: sqlite3.Connection, source_id: int, tweet: dict, users: dict[str, str]
+) -> None:
+    """シグナル行に item を紐付ける(未紐付けのときだけ item 化する = 冪等)。"""
+    row = conn.execute(
+        "SELECT item_id FROM x_signals WHERE kind = 'bookmark' AND tweet_id = ?",
+        (str(tweet["id"]),),
+    ).fetchone()
+    if row is None or row["item_id"] is not None:
+        return  # 行が無い(INSERT 直後なので想定外)/ 紐付け済み
+    item_id = _itemize_bookmark(conn, source_id, tweet, users)
+    conn.execute(
+        "UPDATE x_signals SET item_id = ? WHERE kind = 'bookmark' AND tweet_id = ?",
+        (item_id, str(tweet["id"])),
+    )
+
+
+def _itemize_bookmark(
+    conn: sqlite3.Connection, source_id: int, tweet: dict, users: dict[str, str]
+) -> int:
+    """ブックマークを保存アイテムとして items へ登録し、live な item id を返す。
+
+    - 外部リンク付き: 先頭の外部リンクを canonical に。本文はリンク先記事が本体のため
+      raw_content は持たず extract 段に取得させる(ツイート文は x_signals.text_excerpt
+      に TTL キャッシュ済み)
+    - リンクなし: ツイート URL を canonical に、全文(note_tweet 優先)を raw_content に
+    - canonical / (source, external_id) の既存行・dedup 親がある場合はそこへ合流する
+    """
+    tweet_url = f"https://x.com/i/web/status/{tweet['id']}"  # normalize_url が status id で統一
+    link = _first_external_link(tweet)
+    url = link or tweet_url
+    raw_content = None if link else tweet_full_text(tweet)
+    try:
+        canonical = normalize_url(url)
+    except UrlError:
+        # expanded_url が不正形でも保存は成立させる(ツイート URL にフォールバック)
+        url = tweet_url
+        raw_content = tweet_full_text(tweet)
+        canonical = normalize_url(url)
+
+    normalized_text = normalize_text_for_hash(None, raw_content)
+    payload: dict[str, object] = {"meta": {"bookmark": True}}
+    if raw_content:
+        payload["raw_content"] = raw_content[:RAW_CONTENT_MAX_CHARS]
+    author_id = tweet.get("author_id")
+    outcome = insert_item_with_dedup(
+        conn,
+        source_id=source_id,
+        external_id=str(tweet["id"]),
+        url=url,
+        canonical_url=canonical,
+        title=None,  # tweet に title はない(表示は analyze の title_ja が担う)
+        author=users.get(author_id),
+        published_at=_iso_created_at(tweet.get("created_at")),
+        raw_payload=json.dumps(payload, ensure_ascii=False),
+        content_hash=content_hash(normalized_text),
+        dedup_eligible=is_dedup_eligible(normalized_text),
+    )
+    item_id = outcome.item_id
+    if item_id is None:
+        # ignored = UNIQUE 既存(canonical_url か (source_id, external_id))へ合流
+        existing = conn.execute(
+            "SELECT id FROM items WHERE canonical_url = ?", (canonical,)
+        ).fetchone() or conn.execute(
+            "SELECT id FROM items WHERE source_id = ? AND external_id = ?",
+            (source_id, str(tweet["id"])),
+        ).fetchone()
+        if existing is None:  # UNIQUE 衝突源は上の2つのみ(構造上到達しない)
+            raise XSignalsError(f"bookmark item の既存行が引けない: {canonical}")
+        item_id = existing["id"]
+    return _resolve_live_item(conn, item_id)
+
+
+def _first_external_link(tweet: dict) -> str | None:
+    """entities.urls(note_tweet 側含む)から最初の外部リンクを返す(無ければ None)。"""
+    urls: list[dict] = []
+    entities = tweet.get("entities")
+    if isinstance(entities, dict):
+        urls += [u for u in entities.get("urls", []) if isinstance(u, dict)]
+    note = tweet.get("note_tweet")
+    if isinstance(note, dict) and isinstance(note.get("entities"), dict):
+        urls += [u for u in note["entities"].get("urls", []) if isinstance(u, dict)]
+    for entry in urls:
+        expanded = entry.get("expanded_url") or entry.get("url")
+        if not expanded:
+            continue
+        host = (urlsplit(expanded).hostname or "").lower()
+        if host in _INTERNAL_LINK_HOSTS or host.endswith(".twimg.com"):
+            continue
+        return expanded
+    return None
+
+
+def _resolve_live_item(conn: sqlite3.Connection, item_id: int) -> int:
+    """duplicate 化された item は dedup 親(live な item)に解決する(2層 dedup は1段)。"""
+    row = conn.execute(
+        "SELECT dup_of_item_id FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if row is not None and row["dup_of_item_id"] is not None:
+        return row["dup_of_item_id"]
+    return item_id
+
+
+def _iso_created_at(value: str | None) -> str | None:
+    """X の created_at("…T09:08:43.000Z")を items.published_at の形式に揃える。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None  # 不正な日付は published_at だけ落とす(item 化は止めない)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")

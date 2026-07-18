@@ -321,3 +321,127 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
     totals = collect_x_signals(conn, make_config(tmp_path), make(), logger)
     assert totals["new_signals"] == 0
     assert conn.execute("SELECT count(*) FROM x_signals").fetchone()[0] == 2
+
+
+# --- ブックマークの item 化(GH#99) ---
+
+
+def linked_tw(tweet_id: str, expanded_url: str, text: str = "記事の紹介 https://t.co/x") -> dict:
+    tweet = tw(tweet_id, text=text)
+    tweet["entities"] = {
+        "urls": [{"url": "https://t.co/x", "expanded_url": expanded_url}]
+    }
+    return tweet
+
+
+def item_for(conn, tweet_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT items.* FROM x_signals JOIN items ON items.id = x_signals.item_id
+        WHERE x_signals.kind = 'bookmark' AND x_signals.tweet_id = ?
+        """,
+        (tweet_id,),
+    ).fetchone()
+
+
+def test_bookmark_with_link_itemized_as_article(conn, tmp_path) -> None:
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    item = item_for(conn, "b1")
+    assert item is not None
+    assert item["canonical_url"] == "https://example.com/post"
+    # 本体はリンク先記事: raw_content を持たず extract 段に取得させる
+    assert '"raw_content"' not in (item["raw_payload"] or "")
+    source = conn.execute(
+        "SELECT * FROM sources WHERE id = ?", (item["source_id"],)
+    ).fetchone()
+    assert source["name"] == "x:bookmark"
+    assert source["enabled"] == 0  # collect 対象外(帰属専用)
+
+
+def test_bookmark_without_link_itemized_as_tweet_url(conn, tmp_path) -> None:
+    session = session_with([page(tw("b1", text="リンクなしの学び"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    item = item_for(conn, "b1")
+    assert item is not None
+    assert "/status/b1" in item["canonical_url"]
+    assert "リンクなしの学び" in item["raw_payload"]  # 全文が本文(extract が使う)
+    assert item["published_at"] == "2026-07-13T00:00:00Z"  # created_at を items 形式へ
+
+
+def test_bookmark_internal_link_falls_back_to_tweet_url(conn, tmp_path) -> None:
+    # 引用など x.com 内リンクだけのツイートは「外部記事」ではない
+    session = session_with(
+        [page(linked_tw("b1", "https://x.com/someone/status/123"))], []
+    )
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = item_for(conn, "b1")
+    assert "/status/b1" in item["canonical_url"]
+
+
+def test_bookmark_note_tweet_link_and_full_text(conn, tmp_path) -> None:
+    long_text = "長文の全文" * 60
+    tweet = tw("b1", text="切り詰め280字")
+    tweet["note_tweet"] = {
+        "text": long_text,
+        "entities": {"urls": [{"expanded_url": "https://blog.example.com/a"}]},
+    }
+    session = session_with([page(tweet)], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = item_for(conn, "b1")
+    assert item["canonical_url"] == "https://blog.example.com/a"  # note 側 entities も見る
+
+
+def test_bookmark_merges_into_existing_item(conn, tmp_path) -> None:
+    # 同じ記事が RSS で取込済みなら、新規 item を作らずそこへ紐付ける
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    source_id = conn.execute("SELECT id FROM sources WHERE name='feed'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (?, 'https://example.com/post', 'https://example.com/post', '')",
+        (source_id,),
+    )
+    existing_id = conn.execute("SELECT id FROM items").fetchone()["id"]
+
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 1
+    linked = conn.execute(
+        "SELECT item_id FROM x_signals WHERE tweet_id = 'b1'"
+    ).fetchone()
+    assert linked["item_id"] == existing_id
+
+
+def test_backfill_relinks_known_signal_without_item(conn, tmp_path) -> None:
+    # item 化導入前の既存シグナル(item_id NULL)を backfill 再読取で遡って item 化
+    conn.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', 'b_old')")
+    session = session_with([page(linked_tw("b_old", "https://example.com/old"))], [], [])
+    collect_x_signals(
+        conn, make_config(tmp_path), session, logger,
+        backfill_limit=10, kinds=("bookmark",),
+    )
+    item = item_for(conn, "b_old")
+    assert item is not None
+    assert item["canonical_url"] == "https://example.com/old"
+
+
+def test_kinds_filter_reads_only_requested_endpoints(conn, tmp_path) -> None:
+    session = session_with([page(tw("b1"))], [page(tw("l1"))], [page(tw("s1"))])
+    totals = collect_x_signals(
+        conn, make_config(tmp_path), session, logger, kinds=("bookmark",)
+    )
+    assert totals["api_reads"] == 1
+    assert calls_to(session, "/liked_tweets") == []
+    assert calls_to(session, "42/tweets") == []
+
+
+def test_like_and_self_rt_are_not_itemized(conn, tmp_path) -> None:
+    session = session_with([], [page(tw("l1"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT item_id FROM x_signals WHERE tweet_id = 'l1'"
+    ).fetchone()["item_id"] is None

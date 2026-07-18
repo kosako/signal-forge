@@ -147,3 +147,21 @@ def test_mixed_degraded_and_ok_is_normal_digest(conn, tmp_path) -> None:
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert row["status"] == "ok"
     assert json.loads(row["item_ids"]) == [ok]
+
+
+def test_degraded_judgement_ignores_bookmark_items(conn, tmp_path) -> None:
+    # 非 degraded のブックマークが残っていても「候補全滅」の判定を歪めない(GH#99)
+    conn.execute(
+        """INSERT INTO sources (type, name, config, enabled)
+           VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    bm_source = conn.execute(
+        "SELECT id FROM sources WHERE name = 'x:bookmark'"
+    ).fetchone()["id"]
+    add_analyzed(conn, "https://a/bm", source_id=bm_source, relevance=90)  # 非 degraded
+    a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "degraded"  # 通常候補は全滅 → degraded 配信
+    assert json.loads(row["item_ids"]) == [a]  # ブックマークは載らない

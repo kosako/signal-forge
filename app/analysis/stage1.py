@@ -41,7 +41,8 @@ def preselect(
     """
     rows = conn.execute(
         """
-        SELECT items.*, sources.type AS source_type FROM items
+        SELECT items.*, sources.type AS source_type, sources.config AS source_config
+        FROM items
         JOIN sources ON sources.id = items.source_id
         WHERE items.status = 'new'
         ORDER BY items.id
@@ -50,7 +51,19 @@ def preselect(
 
     counts = {"selected": 0, "blocklist": 0, "stale": 0, "x_noise": 0, "daily_cap": 0}
     survivors: list[sqlite3.Row] = []
+    bookmarks: list[sqlite3.Row] = []
     for row in rows:
+        if _is_bookmark(row):
+            # ブックマークは本人意思の保存アイテム(GH#99)。manual と同じ理屈で
+            # stale(過去ツイートが本体)・x_noise を適用しない。blocklist(明示 NG)
+            # だけは通す
+            reason = _rule_blocklist(row, config)
+            if reason:
+                _skip(conn, row["id"], reason)
+                counts[reason] += 1
+            else:
+                bookmarks.append(row)
+            continue
         reason = _rule_blocklist(row, config) or _rule_stale(row, config) or _rule_x_noise(row)
         if reason:
             _skip(conn, row["id"], reason)
@@ -58,7 +71,9 @@ def preselect(
         else:
             survivors.append(row)
 
-    selected = _rule_daily_cap(survivors, config.analysis.daily_llm_limit)
+    # ブックマークは daily_cap の外で必ず採用(件数は x_signals の日次 cap /
+    # backfill --limit で既に有界)。cap は従来どおり他ソースにのみ適用する
+    selected = bookmarks + _rule_daily_cap(survivors, config.analysis.daily_llm_limit)
     selected_ids = [row["id"] for row in selected]
     selected_id_set = set(selected_ids)
     for row in survivors:
@@ -69,6 +84,14 @@ def preselect(
 
     logger.info("事前選別 完了", extra={"run_id": run_id, "stage": "analyze", "extra": counts})
     return PreselectResult(counts=counts, selected_ids=selected_ids)
+
+
+def _is_bookmark(row: sqlite3.Row) -> bool:
+    """ブックマーク保存アイテム判定(sources.config の mode。GH#99)。"""
+    if row["source_type"] != "x" or not row["source_config"]:
+        return False
+    parsed = json.loads(row["source_config"])  # DDL の json_valid CHECK 済み
+    return isinstance(parsed, dict) and parsed.get("mode") == "bookmark"
 
 
 def _skip(conn: sqlite3.Connection, item_id: int, reason: str) -> None:

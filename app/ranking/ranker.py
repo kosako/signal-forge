@@ -56,6 +56,8 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE items.status = 'analyzed'
+          -- ブックマーク保存アイテムはランキング不参加(must-include の別枠。GH#99)
+          AND COALESCE(json_extract(sources.config, '$.mode'), '') <> 'bookmark'
         ORDER BY items.id
         """
     ).fetchall()

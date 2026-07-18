@@ -282,15 +282,27 @@ def _x_mode_consistency_warns(conn: sqlite3.Connection, config: Config) -> list[
 
     counts = {"home": 0, "search": 0}
     invalid: list[str] = []
+    enabled_bookmark: list[str] = []
     for row in conn.execute("SELECT * FROM sources WHERE type = 'x' AND enabled = 1"):
         source = Source.from_row(row)
         try:
-            counts[x_source_mode(source)] += 1
+            mode = x_source_mode(source)
         except FatalError:
             invalid.append(source.name)
+            continue
+        if mode == "bookmark":
+            # bookmark 行は items の帰属専用(GH#99)。enabled だと collect が失敗する
+            enabled_bookmark.append(source.name)
+            continue
+        counts[mode] += 1
     warns = []
     if invalid:
         warns.append(f"config(mode)が不正な X ソース行: {', '.join(invalid)}")
+    if enabled_bookmark:
+        warns.append(
+            f"mode=bookmark 行が enabled: {', '.join(enabled_bookmark)}"
+            "(collect 対象外。enabled=0 に戻すこと)"
+        )
     if config.x_search.slots and counts["search"] == 0:
         warns.append(
             "[x_search].slots 設定済みだが mode=search のソース行が無い(検索は収集されない)"

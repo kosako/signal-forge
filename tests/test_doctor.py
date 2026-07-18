@@ -771,3 +771,23 @@ def test_month_cost_summary_includes_x_signal_runs(config_dir, tmp_path) -> None
     summary = month_cost_summary(conn, load_config(config_dir))
     conn.close()
     assert summary["x_usd"] == pytest.approx(0.06)  # S1b 取込コストも月次見込みに載る
+
+
+def test_x_mode_consistency_flags_enabled_bookmark_row(tmp_path) -> None:
+    # bookmark 行(GH#99)は enabled=0 が正。enabled 化は collect 失敗源として WARN
+    from app.config import Config
+    from app.doctor import _x_mode_consistency_warns
+
+    conn = connect(tmp_path / "intel.db")
+    apply_migrations(conn, tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO sources (type, name, config, enabled) "
+        """VALUES ('x', 'x:bookmark', '{"mode": "bookmark"}', 0)"""
+    )
+    config = Config(config_dir=tmp_path)
+    assert _x_mode_consistency_warns(conn, config) == []  # enabled=0 は正常(WARN なし)
+
+    conn.execute("UPDATE sources SET enabled = 1 WHERE name = 'x:bookmark'")
+    warns = _x_mode_consistency_warns(conn, config)
+    assert any("mode=bookmark 行が enabled" in w for w in warns)
+    conn.close()
