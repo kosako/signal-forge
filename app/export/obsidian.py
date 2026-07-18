@@ -73,15 +73,8 @@ def export_digest(
         ):
             conflicts += 1
 
-    daily_name = digest["digest_date"]
-    daily_front = {
-        "date": digest["digest_date"],
-        "item_count": digest["item_count"],
-        "degraded": digest["status"] == "degraded",
-    }
-    links_section = "\n\n## ノート\n" + "\n".join(wikilinks) if wikilinks else ""
-    daily_body = digest["markdown"] + links_section
-    if not _write_note(daily_dir / f"{daily_name}.md", daily_front, daily_body):
+    daily_front, daily_body = _daily_note_content(conn, digest, wikilinks)
+    if not _write_note(daily_dir / f"{digest['digest_date']}.md", daily_front, daily_body):
         conflicts += 1
 
     if conflicts:
@@ -102,11 +95,12 @@ def export_pending_notes(
     *,
     run_id: str | None = None,
 ) -> None:
-    """未反映の感想(item_notes.exported_at IS NULL)を該当 item ノートへ投影する(GH#92)。
+    """未反映の感想を該当ノートへ投影する(item = GH#92 / digest = GH#96)。
 
-    感想は配信済みメッセージへのリプライでしか生まれないため、ノート名の digest_date は
+    感想は配信済みメッセージへのリプライでしか生まれないため、item ノート名の digest_date は
     digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
-    その item は配信済み)。再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
+    その item は配信済み)。digest 感想は digests.digest_date で直接 Daily を特定する。
+    再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
     """
     if config.obsidian.vault_path is None:
         raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
@@ -122,9 +116,19 @@ def export_pending_notes(
         GROUP BY item_notes.item_id
         """
     ).fetchall()
-    if not pending:
+    pending_digests = conn.execute(
+        """
+        SELECT digests.*, MAX(digest_notes.id) AS max_note_id
+        FROM digest_notes
+        JOIN digests ON digests.id = digest_notes.digest_id
+        WHERE digest_notes.exported_at IS NULL
+        GROUP BY digests.id
+        """
+    ).fetchall()
+    if not pending and not pending_digests:
         return
-    items_dir = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder / "Items"
+    base = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
+    items_dir = base / "Items"
     items_dir.mkdir(parents=True, exist_ok=True)
     conflicts = 0
     for entry in pending:
@@ -154,6 +158,20 @@ def export_pending_notes(
             (entry["item_id"], entry["max_note_id"]),
         )
         conn.commit()
+    daily_dir = base / "Daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    for digest in pending_digests:
+        front, body = _daily_note_content(conn, digest, _daily_wikilinks(conn, digest))
+        if not _write_note(daily_dir / f"{digest['digest_date']}.md", front, body):
+            # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
+            conflicts += 1
+            continue
+        conn.execute(
+            "UPDATE digest_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE digest_id = ? AND exported_at IS NULL AND id <= ?",
+            (digest["id"], digest["max_note_id"]),
+        )
+        conn.commit()
     if conflicts:
         logger.warning(
             f"GENERATED マーカー欠損のため {conflicts} 件を .conflict.md に退避",
@@ -161,7 +179,11 @@ def export_pending_notes(
         )
     logger.info(
         "感想の投影完了",
-        extra={"run_id": run_id, "stage": "export", "extra": {"items": len(pending)}},
+        extra={
+            "run_id": run_id,
+            "stage": "export",
+            "extra": {"items": len(pending), "digests": len(pending_digests)},
+        },
     )
 
 
@@ -209,6 +231,41 @@ def _load_notes(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
         "SELECT note, created_at FROM item_notes WHERE item_id = ? ORDER BY created_at, id",
         (item_id,),
     ).fetchall()
+
+
+def _daily_note_content(
+    conn: sqlite3.Connection, digest: sqlite3.Row, wikilinks: list[str]
+) -> tuple[dict, str]:
+    """Daily ノートの frontmatter と GENERATED 本文(export_digest と追いパスで共用)。
+
+    「## 感想」節はダイジェストへのリプライ(digest_notes。GH#96)を DB の純関数として
+    投影する(再生成・再 export で消えない)。
+    """
+    front = {
+        "date": digest["digest_date"],
+        "item_count": digest["item_count"],
+        "degraded": digest["status"] == "degraded",
+    }
+    links_section = "\n\n## ノート\n" + "\n".join(wikilinks) if wikilinks else ""
+    notes = conn.execute(
+        "SELECT note, created_at FROM digest_notes WHERE digest_id = ? "
+        "ORDER BY created_at, id",
+        (digest["id"],),
+    ).fetchall()
+    notes_section = "".join(
+        f"\n\n## 感想({_jst_date(note['created_at'])})\n{note['note']}" for note in notes
+    )
+    return front, digest["markdown"] + links_section + notes_section
+
+
+def _daily_wikilinks(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[str]:
+    """digest の item_ids から wikilink 一覧を再計算する(追いパス用。配信順を維持)。"""
+    item_ids = json.loads(digest["item_ids"])
+    rows = _load_items(conn, item_ids) if item_ids else []
+    return [
+        f"[[{_item_note_name(digest['digest_date'], row['item_id'], row['title'])}]]"
+        for row in rows
+    ]
 
 
 def _jst_date(created_at: str) -> str:

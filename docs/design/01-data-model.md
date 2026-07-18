@@ -24,6 +24,7 @@ sources 1 ──< items ──1 documents              (本文キャッシュ、
 signals(kind='survey_*') … item_id NULL(日単位の回答)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送用)
+digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
 telegram_state                                 (getUpdates offset 等の単一行KV)
 schema_migrations                              (マイグレーション台帳。ランナーが管理)
 ```
@@ -197,11 +198,24 @@ CREATE TABLE item_notes (
 CREATE INDEX ix_item_notes_item ON item_notes(item_id);
 CREATE INDEX ix_item_notes_pending ON item_notes(item_id) WHERE exported_at IS NULL;
 
+-- 日次感想(ダイジェストのヘッダメッセージへのリプライ。GH#96 / migration 006)。
+-- item_notes の相似形。正本は本テーブル、Obsidian の Daily ノート(GENERATED 領域
+-- 「## 感想」節)は DB の純関数として投影。KPI・シグナル未接続(活用は後決め)。
+CREATE TABLE digest_notes (
+  id          INTEGER PRIMARY KEY,
+  digest_id   INTEGER NOT NULL REFERENCES digests(id),
+  note        TEXT    NOT NULL,
+  created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  exported_at TEXT                          -- Obsidian へ反映済みか(NULL = 未反映)
+) STRICT;
+CREATE INDEX ix_digest_notes_digest ON digest_notes(digest_id);
+CREATE INDEX ix_digest_notes_pending ON digest_notes(digest_id) WHERE exported_at IS NULL;
+
 -- manual ソースは1行固定(手動URL投入の親)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(感想 = Telegram リプライの正本。GH#92 / migration 005)の4つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)の5つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 

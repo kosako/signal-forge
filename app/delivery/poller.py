@@ -423,11 +423,12 @@ def _handle_message(
             logger.warning("chat の形が不正なため返信を skip", extra={"stage": "poll"})
 
     text = message.get("text")
-    # digest の記事メッセージへのリプライ = 感想キャプチャ(GH#92)。感想の正本は
-    # item_notes(Obsidian へは朝バッチ export が投影)。この経路では URL 取込をしない
-    # (感想内の URL は感想の一部)。記事以外へのリプライ・非リプライは従来の URL 投入へ。
-    # message_id は chat 単位のため owner DM(配信先 chat)からのリプライに限定する
-    # (別チャットの同一 message_id との衝突 = 誤記帳を防ぐ。Codex must)
+    # digest メッセージへのリプライ = 感想キャプチャ(記事 = GH#92 / ヘッダ = GH#96)。
+    # 感想の正本は item_notes / digest_notes(Obsidian へは朝バッチ export が投影)。
+    # この経路では URL 取込をしない(感想内の URL は感想の一部)。台帳に無いメッセージへの
+    # リプライ・非リプライは従来の URL 投入へ。message_id は chat 単位のため owner DM
+    # (配信先 chat)からのリプライに限定する(別チャットの同一 message_id との衝突 =
+    # 誤記帳を防ぐ。Codex must)
     if (
         isinstance(text, str)
         and text.strip()
@@ -445,6 +446,18 @@ def _handle_message(
                 extra={"stage": "poll", "item_id": note_item_id},
             )
             reply("📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+            return
+        note_digest_id = _replied_digest_id(conn, message.get("reply_to_message"))
+        if note_digest_id is not None:
+            conn.execute(
+                "INSERT INTO digest_notes (digest_id, note) VALUES (?, ?)",
+                (note_digest_id, text.strip()),
+            )
+            conn.commit()
+            logger.info("ダイジェスト感想を記録", extra={"stage": "poll"})
+            reply(
+                "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します"
+            )
             return
 
     urls = _URL_RE.findall(text) if isinstance(text, str) else []
@@ -524,18 +537,31 @@ def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
 
     外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
     digest_messages は owner chat にしか送っていないため message_id 単独で一意に引ける。
-    ヘッダ(item_id IS NULL)・台帳に無いメッセージ(追い掛け・アンケート等)は対象外。
+    ヘッダは _replied_digest_id(GH#96)・台帳に無いメッセージ(追い掛け・アンケート等)は
+    対象外。
     """
+    row = _replied_ledger_row(conn, replied, "item_id IS NOT NULL")
+    return row["item_id"] if row else None
+
+
+def _replied_digest_id(conn: sqlite3.Connection, replied: object) -> int | None:
+    """リプライ先が digest のヘッダメッセージなら digest_id を返す(GH#96)。"""
+    row = _replied_ledger_row(conn, replied, "item_id IS NULL")
+    return row["digest_id"] if row else None
+
+
+def _replied_ledger_row(
+    conn: sqlite3.Connection, replied: object, where: str
+) -> sqlite3.Row | None:
     if not isinstance(replied, dict):
         return None
     message_id = replied.get("message_id")
     if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
         return None
-    row = conn.execute(
-        "SELECT item_id FROM digest_messages WHERE message_id = ? AND item_id IS NOT NULL",
+    return conn.execute(
+        f"SELECT digest_id, item_id FROM digest_messages WHERE message_id = ? AND {where}",
         (message_id,),
     ).fetchone()
-    return row["item_id"] if row else None
 
 
 def _digest_date_of_item(conn: sqlite3.Connection, item_id: int) -> str | None:
