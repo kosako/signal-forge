@@ -244,3 +244,16 @@ def test_bookmark_on_already_digested_item_still_listed(conn, tmp_path) -> None:
     third = generate_digest(conn, config, logger)
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (third,)).fetchone()
     assert json.loads(row["bookmark_item_ids"]) == []  # 台帳掲載済み → 再掲しない
+
+
+def test_bookmark_markdown_link_escapes_structure(conn, tmp_path) -> None:
+    # 外部由来 title の []・URL の () で保存節の Markdown 構造を壊さない(レビュー P2)
+    bm = add_analyzed(
+        conn, "https://b/a_(1)", relevance=10, title_ja="題 [注記] あり"
+    )
+    link_bookmark(conn, bm, "t1", "2026-07-18T00:00:00Z")
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    md = conn.execute(
+        "SELECT markdown FROM digests WHERE id = ?", (digest_id,)
+    ).fetchone()[0]
+    assert "- [題 \\[注記\\] あり](https://b/a_%281%29)" in md

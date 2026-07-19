@@ -252,6 +252,13 @@ def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[R
     ]
 
 
+def _md_link(title: str, url: str) -> str:
+    """Markdown リンクを安全に組む(外部由来 title の []・URL の () で構造を壊さない)。"""
+    safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    safe_url = url.replace("(", "%28").replace(")", "%29")
+    return f"[{safe_title}]({safe_url})"
+
+
 def _render_markdown(
     digest_date: str,
     items: list[RankedItem],
@@ -271,7 +278,7 @@ def _render_markdown(
         lines.append(f"## 🔖 保存({len(bookmarks)}件)")
         for row in bookmarks[:BOOKMARK_SECTION_MAX]:
             title = row["title_ja"] or row["title"] or row["canonical_url"]
-            lines.append(f"- [{title}]({row['canonical_url']})")
+            lines.append(f"- {_md_link(title, row['canonical_url'])}")
         if len(bookmarks) > BOOKMARK_SECTION_MAX:
             lines.append(
                 f"- …他 {len(bookmarks) - BOOKMARK_SECTION_MAX} 件(Items ノートに保存済み)"
