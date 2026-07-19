@@ -58,7 +58,8 @@ def export_digest(
     digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     if digest is None:
         raise ExportError(f"digests.id={digest_id} がない")
-    item_ids = json.loads(digest["item_ids"])
+    # 🔖 保存節の item(GH#99)も配信 item と同様に Items ノート化する(=「保存」の実体)
+    item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
 
     wikilinks = []
@@ -260,12 +261,17 @@ def _daily_note_content(
 
 def _daily_wikilinks(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[str]:
     """digest の item_ids から wikilink 一覧を再計算する(追いパス用。配信順を維持)。"""
-    item_ids = json.loads(digest["item_ids"])
+    item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
     return [
         f"[[{_item_note_name(digest['digest_date'], row['item_id'], row['title'])}]]"
         for row in rows
     ]
+
+
+def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
+    """配信 item + 🔖 保存節 item(GH#99)。順序 = 配信順 → 保存順。"""
+    return json.loads(digest["item_ids"]) + json.loads(digest["bookmark_item_ids"] or "[]")
 
 
 def _jst_date(created_at: str) -> str:

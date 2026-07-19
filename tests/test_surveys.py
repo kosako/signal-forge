@@ -512,3 +512,44 @@ def test_run_poller_fires_timers_each_cycle(conn, tmp_path) -> None:
     )
     assert [t for _, t in api.sent if "巡回した?" in t]  # タイマー経由で送信された
     assert api.sent[0][0] == CHAT_ID
+
+
+def test_dig_backlog_includes_x_bookmarks(conn, tmp_path) -> None:
+    # GH#99: X ブックマークの保存アイテムも未消化一覧に合流する。followup_dig=yes で
+    # 消え、dig 反応と両方ある item は 1 行に dedupe
+    silence_watchdog(conn)
+    older = "2026-07-10"
+
+    bm_only = add_item(conn, "https://b/only", title="ブクマのみ")
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
+        "VALUES ('bookmark', 't1', ?, '2026-07-18T00:00:00Z')",
+        (bm_only,),
+    )
+    bm_done = add_item(conn, "https://b/done", title="ブクマ深掘り済み")
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
+        "VALUES ('bookmark', 't2', ?, '2026-07-18T00:00:00Z')",
+        (bm_done,),
+    )
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', ?)",
+        (bm_done, older),
+    )
+    both = add_item(conn, "https://b/both", title="ブクマと🔖両方")
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
+        "VALUES ('bookmark', 't3', ?, '2026-07-01T00:00:00Z')",
+        (both,),
+    )
+    add_dig_reaction(conn, both, older)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, jst_now("21:30"))
+
+    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    assert "(2件)" in backlog  # dedupe 済み(bm_only + both)
+    assert "ブクマのみ" in backlog
+    assert "ブクマと🔖両方" in backlog
+    assert "ブクマ深掘り済み" not in backlog  # followup_dig=yes で消える

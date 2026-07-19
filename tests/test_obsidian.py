@@ -55,11 +55,14 @@ def add_digested(
     return item_id
 
 
-def add_digest(conn, item_ids, *, date="2026-07-06", status="ok") -> int:
+def add_digest(
+    conn, item_ids, *, date="2026-07-06", status="ok", bookmark_item_ids=None
+) -> int:
     return conn.execute(
-        "INSERT INTO digests (digest_date, status, markdown, item_ids, item_count) "
-        "VALUES (?, ?, '# ダイジェスト本文', ?, ?)",
-        (date, status, json.dumps(item_ids), len(item_ids)),
+        "INSERT INTO digests (digest_date, status, markdown, item_ids, item_count, "
+        "bookmark_item_ids) VALUES (?, ?, '# ダイジェスト本文', ?, ?, ?)",
+        (date, status, json.dumps(item_ids), len(item_ids),
+         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None),
     ).lastrowid
 
 
@@ -411,3 +414,21 @@ def test_export_pending_digest_notes_conflict_keeps_pending(conn, tmp_path) -> N
     conflict = daily.with_suffix(".conflict.md")
     assert conflict.exists()
     assert "翌日に書いた感想" in conflict.read_text()  # 感想自体は退避側に保全
+
+
+def test_bookmark_items_exported_as_notes_and_wikilinks(conn, tmp_path) -> None:
+    # 🔖 保存節の item(GH#99)も Items ノート化され Daily の wikilink に載る
+    normal = add_digested(conn, "https://a/1", title="通常記事")
+    bm = add_digested(conn, "https://b/1", title="ブクマ記事", title_ja="保存の見出し")
+    digest_id = add_digest(conn, [normal], bookmark_item_ids=[bm])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    notes = sorted(p.name for p in (base / "Items").glob("*.md"))
+    assert len(notes) == 2
+    assert any("ブクマ記事" in name for name in notes)
+    daily = (base / "Daily" / "2026-07-06.md").read_text()
+    assert sum(1 for line in daily.splitlines() if line.startswith("[[")) == 2
+    front = read_front(base / "Items" / next(n for n in notes if "ブクマ記事" in n))
+    assert front["title"] == "保存の見出し"

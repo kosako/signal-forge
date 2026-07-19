@@ -23,6 +23,7 @@ from datetime import datetime
 import httpx
 
 from app.config import Config
+from app.digest.builder import BOOKMARK_SECTION_MAX
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
@@ -36,6 +37,10 @@ ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸�
 # タイトルは RSS 由来で長さ未検証。異常に長い1件で Telegram の 4096 字上限を超えて
 # 配信全体が failed になるのを防ぐ(通常のタイトルはこの上限に届かない)
 TITLE_MAX_CHARS = 300
+
+# 🔖 保存節(GH#99)のタイトル上限。ヘッダ 1 通に同梱するため短めに取り、可視テキストを
+# 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
+BOOKMARK_TITLE_MAX_CHARS = 80
 
 _WEEKDAYS_JA = "月火水木金土日"
 
@@ -215,7 +220,9 @@ def deliver_digest(
     sent = 0
     try:
         if not header_sent:
-            message_id = api.send_message(chat_id, _header_text(digest))
+            message_id = api.send_message(
+                chat_id, _header_text(digest, _load_bookmark_rows(conn, digest))
+            )
             _record_message(conn, digest_id, None, message_id)
             sent += 1
         for position, row in enumerate(items, start=1):
@@ -272,7 +279,7 @@ def escape_attr(value: str) -> str:
     return escape_text(value).replace('"', "&quot;").replace("'", "&#x27;")
 
 
-def _header_text(digest: sqlite3.Row) -> str:
+def _header_text(digest: sqlite3.Row, bookmark_rows: list[sqlite3.Row] = ()) -> str:
     date = datetime.strptime(digest["digest_date"], "%Y-%m-%d")
     weekday = _WEEKDAYS_JA[date.weekday()]
     header = (
@@ -284,7 +291,37 @@ def _header_text(digest: sqlite3.Row) -> str:
         # trend はプレーンテキスト。HTML(parse_mode=HTML)へ載せる前に必ず escape する
         # (LLM 生成の <>& で配信全体が 400 で落ちるのを防ぐ)
         header += "\n\n" + escape_text(digest["trend_markdown"])
+    if bookmark_rows:  # 🔖 保存節(must-include の別枠。GH#99)
+        lines = [f"🔖 保存({len(bookmark_rows)}件)"]
+        for position, row in enumerate(bookmark_rows[:BOOKMARK_SECTION_MAX], start=1):
+            title = escape_and_truncate(
+                (row["title_ja"] or row["title"] or row["canonical_url"]).strip(),
+                BOOKMARK_TITLE_MAX_CHARS,
+            )
+            lines.append(f'{position}. <a href="{escape_attr(row["canonical_url"])}">{title}</a>')
+        if len(bookmark_rows) > BOOKMARK_SECTION_MAX:
+            lines.append(f"(他 {len(bookmark_rows) - BOOKMARK_SECTION_MAX} 件は Items ノートへ)")
+        header += "\n\n" + "\n".join(lines)
     return header
+
+
+def _load_bookmark_rows(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[sqlite3.Row]:
+    """digests.bookmark_item_ids の表示素材を保存順のまま返す(GH#99)。"""
+    ids = json.loads(digest["bookmark_item_ids"] or "[]")
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""
+        SELECT items.id AS item_id, items.title, items.canonical_url,
+               (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
+                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
+        FROM items WHERE items.id IN ({placeholders})
+        """,
+        ids,
+    ).fetchall()
+    by_id = {row["item_id"]: row for row in rows}
+    return [by_id[i] for i in ids if i in by_id]
 
 
 def _item_text(position: int, row: sqlite3.Row) -> str:
