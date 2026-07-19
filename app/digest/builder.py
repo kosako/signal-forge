@@ -84,10 +84,12 @@ def generate_digest(
             if not degraded_digest:
                 ranked = rank_for_digest(conn, config)
 
-            # 🔖 保存節(GH#99): ランキング外の must-include 別枠。未掲載(analyzed)の
-            # ブックマーク item を保存順(新しい順)で全件載せる。リンク列で分析に
-            # 依存しないため degraded 配信でも付ける
-            bookmarks = _pending_bookmark_items(conn)
+            # 🔖 保存節(GH#99): ランキング外の must-include 別枠。台帳(bookmark_item_ids)
+            # 未掲載のブックマーク item を保存順(新しい順)で全件載せる。リンク列で
+            # 分析に依存しないため degraded 配信でも付ける
+            bookmarks = _pending_bookmark_items(
+                conn, exclude_digest_id=existing["id"] if existing else None
+            )
             # トレンド節は degraded 配信では付けない(分析が無いため意味を成さない)
             trend = None if degraded_digest else trend_markdown
             markdown = _render_markdown(
@@ -168,11 +170,16 @@ def generate_digest(
     return digest_id
 
 
-def _pending_bookmark_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """未掲載(analyzed)のブックマーク保存アイテムを保存順(新しい順)で返す(GH#99)。
+def _pending_bookmark_items(
+    conn: sqlite3.Connection, *, exclude_digest_id: int | None = None
+) -> list[sqlite3.Row]:
+    """🔖 保存節に未掲載のブックマーク保存アイテムを保存順(新しい順)で返す(GH#99)。
 
-    ランキング候補クエリはブックマーク紐付きを除外しているため(ranker / 上の全滅判定)、
-    ここに来るのは 🔖 保存節の対象だけ。掲載後は digested になり翌日以降は載らない。
+    掲載済み判定は item の status でなく **bookmark_item_ids 台帳**で行う。配信済み
+    (digested)の既存 item に後からブックマークが付く合流ケースでも、保存節・export に
+    必ず一度は現れるため(status 基準だと恒久に落ちる。Codex レビュー P2)。
+    --force 置換では自分自身の旧台帳を除外して再導出する(exclude_digest_id)。
+    status は analyzed / digested のみ(分析前・blocklist skip・error は掲載しない)。
     """
     return conn.execute(
         """
@@ -183,13 +190,21 @@ def _pending_bookmark_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                 WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
                ) AS marked_at
         FROM items
-        WHERE items.status = 'analyzed'
+        WHERE items.status IN ('analyzed', 'digested')
           AND EXISTS (
             SELECT 1 FROM x_signals
             WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
           )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM digests, json_each(digests.bookmark_item_ids) AS listed
+            WHERE digests.bookmark_item_ids IS NOT NULL
+              AND digests.id <> COALESCE(?, -1)
+              AND listed.value = items.id
+          )
         ORDER BY marked_at DESC, items.id DESC
-        """
+        """,
+        (exclude_digest_id,),
     ).fetchall()
 
 

@@ -220,3 +220,27 @@ def test_force_replace_reincludes_bookmark_items(conn, tmp_path) -> None:
     replaced = generate_digest(conn, config, logger, force=True)
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (replaced,)).fetchone()
     assert json.loads(row["bookmark_item_ids"]) == [bm]  # 置換後も節から消えない
+
+
+def test_bookmark_on_already_digested_item_still_listed(conn, tmp_path) -> None:
+    # 合流ケース(GH#99 レビュー P2): 配信済み(digested)の既存 item に後から
+    # ブックマークが付いても、保存節に一度は必ず載る(status 基準だと恒久に落ちる)
+    config = make_config(tmp_path)
+    old = add_analyzed(conn, "https://a/old", relevance=90)
+    first = generate_digest(conn, config, logger)
+    assert first is not None
+    assert conn.execute(
+        "SELECT status FROM items WHERE id = ?", (old,)
+    ).fetchone()["status"] == "digested"
+
+    link_bookmark(conn, old, "t1", "2026-07-18T00:00:00Z")  # 配信後にブックマーク
+    conn.execute("DELETE FROM digests")  # 翌日相当(digest_date UNIQUE を回避)
+    second = generate_digest(conn, config, logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (second,)).fetchone()
+    assert json.loads(row["bookmark_item_ids"]) == [old]  # 保存節に載る
+
+    conn.execute("DELETE FROM digests WHERE id <> ?", (second,))
+    conn.execute("UPDATE digests SET digest_date = '2000-01-01'")  # さらに翌日相当
+    third = generate_digest(conn, config, logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (third,)).fetchone()
+    assert json.loads(row["bookmark_item_ids"]) == []  # 台帳掲載済み → 再掲しない
