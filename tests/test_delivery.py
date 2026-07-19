@@ -55,11 +55,14 @@ def add_item(
     return item_id
 
 
-def add_digest(conn, item_ids, *, status="ok", trend_markdown=None) -> int:
+def add_digest(
+    conn, item_ids, *, status="ok", trend_markdown=None, bookmark_item_ids=None
+) -> int:
     return conn.execute(
         "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status, "
-        "trend_markdown) VALUES (?, '# md', ?, ?, ?, ?)",
-        (today_jst(), json.dumps(item_ids), len(item_ids), status, trend_markdown),
+        "trend_markdown, bookmark_item_ids) VALUES (?, '# md', ?, ?, ?, ?, ?)",
+        (today_jst(), json.dumps(item_ids), len(item_ids), status, trend_markdown,
+         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None),
     ).lastrowid
 
 
@@ -391,3 +394,30 @@ def test_huge_title_is_truncated_and_delivery_succeeds(conn, tmp_path) -> None:
     assert "…" in text.splitlines()[0]  # タイトルが切り詰められている
     assert text.endswith("💡 示唆。")  # 示唆は残る
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
+
+
+def test_header_includes_bookmark_section_with_escaped_links(conn, tmp_path) -> None:
+    # 🔖 保存節(GH#99)はヘッダ 1 通に同梱。リンクは属性エスケープ・表示は上限つき
+    a = add_item(conn, "https://a/1")
+    bm = add_item(conn, "https://blog.example/a?x=1&y=2", title=None, title_ja="保存記事<A>")
+    digest_id = add_digest(conn, [a], bookmark_item_ids=[bm])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert "🔖 保存(1件)" in header
+    assert '<a href="https://blog.example/a?x=1&amp;y=2">' in header  # 属性エスケープ
+    assert "保存記事&lt;A&gt;" in header  # テキストノードもエスケープ
+    assert "件のダイジェスト" not in header.split("🔖")[1]  # 節はヘッダ末尾に付く
+
+
+def test_header_bookmark_section_caps_display(conn, tmp_path) -> None:
+    ids = [add_item(conn, f"https://b/{i}", title=f"保存{i}") for i in range(12)]
+    digest_id = add_digest(conn, [], bookmark_item_ids=ids)
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert "🔖 保存(12件)" in header
+    assert "(他 2 件は Items ノートへ)" in header
+    assert "保存11" not in header  # 11・12 件目は表示しない(保存0〜9 の 10 件)

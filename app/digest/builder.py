@@ -18,6 +18,9 @@ from app.ranking import RankedItem, rank_for_digest
 
 JST = timezone(timedelta(hours=9))
 
+# 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
+BOOKMARK_SECTION_MAX = 10
+
 
 def today_jst() -> str:
     return datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d")
@@ -47,16 +50,20 @@ def generate_digest(
     digest_id: int | None = None
     try:
         existing = conn.execute(
-            "SELECT id, item_ids FROM digests WHERE digest_date = ?", (digest_date,)
+            "SELECT id, item_ids, bookmark_item_ids FROM digests WHERE digest_date = ?",
+            (digest_date,),
         ).fetchone()
         skipped = bool(existing and not force)
         if skipped:
             conn.execute("COMMIT")  # 変更なしで閉じる
         else:
             if existing:
-                # --force 置換: 旧 digest 採用 item を候補(analyzed)に戻してから再ランキング
-                # (戻さないと旧採用分が新 digest から黙って消える)。配信台帳も作り直す
-                old_ids = json.loads(existing["item_ids"])
+                # --force 置換: 旧 digest 採用 item(🔖保存節の分も)を候補(analyzed)に
+                # 戻してから再ランキング(戻さないと旧採用分が新 digest から黙って消える)。
+                # 配信台帳も作り直す
+                old_ids = json.loads(existing["item_ids"]) + json.loads(
+                    existing["bookmark_item_ids"] or "[]"
+                )
                 if old_ids:
                     placeholders = ",".join("?" * len(old_ids))
                     conn.execute(
@@ -77,10 +84,19 @@ def generate_digest(
             if not degraded_digest:
                 ranked = rank_for_digest(conn, config)
 
+            # 🔖 保存節(GH#99): ランキング外の must-include 別枠。台帳(bookmark_item_ids)
+            # 未掲載のブックマーク item を保存順(新しい順)で全件載せる。リンク列で
+            # 分析に依存しないため degraded 配信でも付ける
+            bookmarks = _pending_bookmark_items(
+                conn, exclude_digest_id=existing["id"] if existing else None
+            )
             # トレンド節は degraded 配信では付けない(分析が無いため意味を成さない)
             trend = None if degraded_digest else trend_markdown
-            markdown = _render_markdown(digest_date, ranked, degraded=degraded_digest, trend=trend)
+            markdown = _render_markdown(
+                digest_date, ranked, degraded=degraded_digest, trend=trend, bookmarks=bookmarks
+            )
             item_ids = [item.item_id for item in ranked]
+            bookmark_item_ids = [row["item_id"] for row in bookmarks]
             if existing:
                 # --force 置換は id 維持の上書き。配信状態は新規行と同じ初期値へ戻す
                 # (戻さないと置換後の deliver が「配信済み」として skip する)
@@ -90,7 +106,8 @@ def generate_digest(
                         run_id = ?,
                         generated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
                         status = ?, markdown = ?, item_ids = ?, item_count = ?,
-                        delivery_status = 'pending', sent_at = NULL, trend_markdown = ?
+                        delivery_status = 'pending', sent_at = NULL, trend_markdown = ?,
+                        bookmark_item_ids = ?
                     WHERE id = ?
                     """,
                     (
@@ -100,6 +117,7 @@ def generate_digest(
                         json.dumps(item_ids),
                         len(item_ids),
                         trend,
+                        json.dumps(bookmark_item_ids),
                         existing["id"],
                     ),
                 )
@@ -109,8 +127,8 @@ def generate_digest(
                     """
                     INSERT INTO digests
                         (digest_date, run_id, status, markdown, item_ids, item_count,
-                         trend_markdown)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         trend_markdown, bookmark_item_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         digest_date,
@@ -120,9 +138,10 @@ def generate_digest(
                         json.dumps(item_ids),
                         len(item_ids),
                         trend,
+                        json.dumps(bookmark_item_ids),
                     ),
                 ).lastrowid
-            for item_id in item_ids:
+            for item_id in item_ids + bookmark_item_ids:
                 conn.execute("UPDATE items SET status = 'digested' WHERE id = ?", (item_id,))
             conn.execute("COMMIT")
     except BaseException:
@@ -141,10 +160,52 @@ def generate_digest(
         extra={
             "run_id": run_id,
             "stage": "digest",
-            "extra": {"items": len(item_ids), "degraded": degraded_digest},
+            "extra": {
+                "items": len(item_ids),
+                "bookmarks": len(bookmark_item_ids),
+                "degraded": degraded_digest,
+            },
         },
     )
     return digest_id
+
+
+def _pending_bookmark_items(
+    conn: sqlite3.Connection, *, exclude_digest_id: int | None = None
+) -> list[sqlite3.Row]:
+    """🔖 保存節に未掲載のブックマーク保存アイテムを保存順(新しい順)で返す(GH#99)。
+
+    掲載済み判定は item の status でなく **bookmark_item_ids 台帳**で行う。配信済み
+    (digested)の既存 item に後からブックマークが付く合流ケースでも、保存節・export に
+    必ず一度は現れるため(status 基準だと恒久に落ちる。Codex レビュー P2)。
+    --force 置換では自分自身の旧台帳を除外して再導出する(exclude_digest_id)。
+    status は analyzed / digested のみ(分析前・blocklist skip・error は掲載しない)。
+    """
+    return conn.execute(
+        """
+        SELECT items.id AS item_id, items.title, items.canonical_url,
+               (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
+                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja,
+               (SELECT MAX(observed_at) FROM x_signals
+                WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+               ) AS marked_at
+        FROM items
+        WHERE items.status IN ('analyzed', 'digested')
+          AND EXISTS (
+            SELECT 1 FROM x_signals
+            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM digests, json_each(digests.bookmark_item_ids) AS listed
+            WHERE digests.bookmark_item_ids IS NOT NULL
+              AND digests.id <> COALESCE(?, -1)
+              AND listed.value = items.id
+          )
+        ORDER BY marked_at DESC, items.id DESC
+        """,
+        (exclude_digest_id,),
+    ).fetchall()
 
 
 def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[RankedItem]:
@@ -191,8 +252,20 @@ def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[R
     ]
 
 
+def _md_link(title: str, url: str) -> str:
+    """Markdown リンクを安全に組む(外部由来 title の []・URL の () で構造を壊さない)。"""
+    safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    safe_url = url.replace("(", "%28").replace(")", "%29")
+    return f"[{safe_title}]({safe_url})"
+
+
 def _render_markdown(
-    digest_date: str, items: list[RankedItem], *, degraded: bool, trend: str | None = None
+    digest_date: str,
+    items: list[RankedItem],
+    *,
+    degraded: bool,
+    trend: str | None = None,
+    bookmarks: list[sqlite3.Row] = (),
 ) -> str:
     lines = [f"# 朝のダイジェスト {digest_date}", ""]
     if degraded:
@@ -200,6 +273,16 @@ def _render_markdown(
         lines.append("")
     if trend:  # 「今日のトレンド」節を全体感として冒頭に(GH#75)
         lines.append(trend)
+        lines.append("")
+    if bookmarks:  # 🔖 保存節(must-include の別枠。GH#99)
+        lines.append(f"## 🔖 保存({len(bookmarks)}件)")
+        for row in bookmarks[:BOOKMARK_SECTION_MAX]:
+            title = row["title_ja"] or row["title"] or row["canonical_url"]
+            lines.append(f"- {_md_link(title, row['canonical_url'])}")
+        if len(bookmarks) > BOOKMARK_SECTION_MAX:
+            lines.append(
+                f"- …他 {len(bookmarks) - BOOKMARK_SECTION_MAX} 件(Items ノートに保存済み)"
+            )
         lines.append("")
     if not items:
         lines.append("本日は基準(min_score)を満たすアイテムがありませんでした。")

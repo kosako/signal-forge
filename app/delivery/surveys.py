@@ -214,28 +214,46 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
 
 
 def _pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """未消化 🔖 の累計: 最新 reaction が 🔖 のままで、深掘り実施(followup_dig=yes)が
-    記録されていないアイテム(GH#88)。「いいえ」回答済みは残す(まだ深掘っていない)。
-    新しい 🔖 が上(直近の関心を先頭に)。"""
+    """未消化 🔖 の累計: Telegram の 🔖 反応と X ブックマーク(GH#99)を合流した
+    深掘り候補一覧(GH#88)。
+
+    - Telegram 側: 最新 reaction が 🔖 のまま(「いいえ」回答済みは残す = まだ深掘って
+      いない)
+    - X 側: bookmark 紐付けのある保存アイテム。Telegram の訂正(👎等)があっても
+      X 上のブックマークが実在する限り候補に残す
+    - どちらも深掘り実施(followup_dig=yes)の記録で消える。両方に該当する item は
+      1 行(マーク時刻は新しい方)。新しいマークが上(直近の関心を先頭に)
+    """
     return conn.execute(
         """
+        WITH marked AS (
+          SELECT s.item_id, s.created_at AS marked_at
+          FROM signals AS s
+          WHERE s.kind = 'reaction' AND s.value = 'dig'
+            AND s.id = (
+              SELECT id FROM signals AS s2
+              WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
+              ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
+            )
+          UNION ALL
+          SELECT xs.item_id, MAX(xs.observed_at) AS marked_at
+          FROM x_signals AS xs
+          WHERE xs.kind = 'bookmark' AND xs.item_id IS NOT NULL
+          GROUP BY xs.item_id
+        )
         SELECT items.id AS item_id, items.title, items.canonical_url,
                (SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
-                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
-        FROM signals AS s
-        JOIN items ON items.id = s.item_id
-        WHERE s.kind = 'reaction' AND s.value = 'dig'
-          AND s.id = (
-            SELECT id FROM signals AS s2
-            WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
-            ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
-          )
-          AND NOT EXISTS (
+                ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja,
+               MAX(marked.marked_at) AS marked_at
+        FROM marked
+        JOIN items ON items.id = marked.item_id
+        WHERE NOT EXISTS (
             SELECT 1 FROM signals AS f
-            WHERE f.kind = 'followup_dig' AND f.item_id = s.item_id
+            WHERE f.kind = 'followup_dig' AND f.item_id = marked.item_id
               AND f.value = 'yes'
           )
-        ORDER BY s.created_at DESC, s.id DESC
+        GROUP BY items.id
+        ORDER BY marked_at DESC, items.id DESC
         """
     ).fetchall()
 

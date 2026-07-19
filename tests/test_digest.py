@@ -169,3 +169,91 @@ def test_degraded_judgement_ignores_bookmark_items(conn, tmp_path) -> None:
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert row["status"] == "degraded"  # 通常候補は全滅 → degraded 配信
     assert json.loads(row["item_ids"]) == [a]  # ブックマークは載らない
+
+
+def link_bookmark(conn, item_id: int, tweet_id: str, observed_at: str) -> None:
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
+        "VALUES ('bookmark', ?, ?, ?)",
+        (tweet_id, item_id, observed_at),
+    )
+
+
+def test_bookmark_section_rendered_and_marked_digested(conn, tmp_path) -> None:
+    # 🔖 保存節(GH#99): ランキング外の別枠として全件掲載・保存順(新しい順)・digested 化
+    normal = add_analyzed(conn, "https://a/normal", relevance=90)
+    bm_old = add_analyzed(conn, "https://b/old", relevance=10, title_ja="古い保存")
+    bm_new = add_analyzed(conn, "https://b/new", relevance=10, title_ja="新しい保存")
+    link_bookmark(conn, bm_old, "t1", "2026-07-10T00:00:00Z")
+    link_bookmark(conn, bm_new, "t2", "2026-07-18T00:00:00Z")
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert json.loads(row["item_ids"]) == [normal]  # ランキングには混ざらない
+    assert json.loads(row["bookmark_item_ids"]) == [bm_new, bm_old]  # 保存順(新しい順)
+    assert "## 🔖 保存(2件)" in row["markdown"]
+    assert "[新しい保存](https://b/new)" in row["markdown"]
+    statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
+    assert statuses == {"digested"}  # 節の掲載で digested(翌日は載らない)
+
+
+def test_bookmark_section_caps_display_but_records_all(conn, tmp_path) -> None:
+    ids = []
+    for i in range(12):
+        item = add_analyzed(conn, f"https://b/{i}", relevance=10)
+        link_bookmark(conn, item, f"t{i}", f"2026-07-{i + 1:02d}T00:00:00Z")
+        ids.append(item)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert len(json.loads(row["bookmark_item_ids"])) == 12  # 記録は全件
+    assert "…他 2 件" in row["markdown"]  # 表示は上限 10 + 件数
+
+
+def test_force_replace_reincludes_bookmark_items(conn, tmp_path) -> None:
+    bm = add_analyzed(conn, "https://b/1", relevance=10, title_ja="保存")
+    link_bookmark(conn, bm, "t1", "2026-07-18T00:00:00Z")
+    config = make_config(tmp_path)
+    first = generate_digest(conn, config, logger)
+    assert first is not None
+
+    replaced = generate_digest(conn, config, logger, force=True)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (replaced,)).fetchone()
+    assert json.loads(row["bookmark_item_ids"]) == [bm]  # 置換後も節から消えない
+
+
+def test_bookmark_on_already_digested_item_still_listed(conn, tmp_path) -> None:
+    # 合流ケース(GH#99 レビュー P2): 配信済み(digested)の既存 item に後から
+    # ブックマークが付いても、保存節に一度は必ず載る(status 基準だと恒久に落ちる)
+    config = make_config(tmp_path)
+    old = add_analyzed(conn, "https://a/old", relevance=90)
+    first = generate_digest(conn, config, logger)
+    assert first is not None
+    assert conn.execute(
+        "SELECT status FROM items WHERE id = ?", (old,)
+    ).fetchone()["status"] == "digested"
+
+    link_bookmark(conn, old, "t1", "2026-07-18T00:00:00Z")  # 配信後にブックマーク
+    conn.execute("DELETE FROM digests")  # 翌日相当(digest_date UNIQUE を回避)
+    second = generate_digest(conn, config, logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (second,)).fetchone()
+    assert json.loads(row["bookmark_item_ids"]) == [old]  # 保存節に載る
+
+    conn.execute("DELETE FROM digests WHERE id <> ?", (second,))
+    conn.execute("UPDATE digests SET digest_date = '2000-01-01'")  # さらに翌日相当
+    third = generate_digest(conn, config, logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (third,)).fetchone()
+    assert json.loads(row["bookmark_item_ids"]) == []  # 台帳掲載済み → 再掲しない
+
+
+def test_bookmark_markdown_link_escapes_structure(conn, tmp_path) -> None:
+    # 外部由来 title の []・URL の () で保存節の Markdown 構造を壊さない(レビュー P2)
+    bm = add_analyzed(
+        conn, "https://b/a_(1)", relevance=10, title_ja="題 [注記] あり"
+    )
+    link_bookmark(conn, bm, "t1", "2026-07-18T00:00:00Z")
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    md = conn.execute(
+        "SELECT markdown FROM digests WHERE id = ?", (digest_id,)
+    ).fetchone()[0]
+    assert "- [題 \\[注記\\] あり](https://b/a_%281%29)" in md
