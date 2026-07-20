@@ -553,3 +553,43 @@ def test_dig_backlog_includes_x_bookmarks(conn, tmp_path) -> None:
     assert "ブクマのみ" in backlog
     assert "ブクマと🔖両方" in backlog
     assert "ブクマ深掘り済み" not in backlog  # followup_dig=yes で消える
+
+
+# --- 未消化一覧の深掘り指定動線(GH#104) ---
+
+
+def test_dig_backlog_uses_item_ids_and_reply_hint(conn, tmp_path) -> None:
+    # 番号は表示位置の連番でなく item id(リプライ指定の安定性。設計 06 §2)
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    item = add_item(conn, "https://a/fresh", title="候補記事")
+    add_dig_reaction(conn, item, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    assert f"{item}. " in backlog  # item id が行頭の番号
+    assert f"「{item} を◯◯の観点で」" in backlog  # 実在 id でリプライ例を示す
+    assert f"「{item} はパス」" in backlog
+
+
+def test_dig_backlog_message_id_recorded_in_ledger(conn, tmp_path) -> None:
+    # リプライ先の認識用に message_id を台帳へ(GH#104)
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    item = add_item(conn, "https://a/fresh")
+    add_dig_reaction(conn, item, yesterday)
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    texts = [t for _, t in api.sent]
+    backlog_position = next(i for i, t in enumerate(texts) if "未消化の深掘り候補" in t)
+    rows = conn.execute("SELECT * FROM dig_backlog_messages").fetchall()
+    assert len(rows) == 1
+    # FakeApi の message_id は 900 + 送信順(1始まり)
+    assert rows[0]["message_id"] == 900 + backlog_position + 1
+    assert rows[0]["sent_date"] == now.strftime("%Y-%m-%d")

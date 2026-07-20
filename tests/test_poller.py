@@ -680,3 +680,98 @@ def test_reply_to_header_records_digest_note(conn, tmp_path) -> None:
         CHAT_ID,
         "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します",
     )]
+
+
+# --- 未消化一覧へのリプライ = 深掘り指定(GH#104) ---
+
+BACKLOG_MSG_ID = 640
+
+
+def add_dig_candidate(conn, url: str, *, backlog_message_id: int = BACKLOG_MSG_ID) -> int:
+    """未消化候補(🔖 reaction 済み)と一覧メッセージの台帳行を作る。"""
+    item_id = add_item(conn, url)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'dig', '2026-07-19')",
+        (item_id,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO dig_backlog_messages (message_id, sent_date) "
+        "VALUES (?, '2026-07-19')",
+        (backlog_message_id,),
+    )
+    return item_id
+
+
+def test_dig_reply_registers_request_with_angle(conn, tmp_path) -> None:
+    item = add_dig_candidate(conn, "https://a/1")
+    api = FakeApi([[make_reply_update(f"{item} を承認フローの観点で", BACKLOG_MSG_ID)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert (row["status"], row["source"], row["angle"]) == (
+        "queued", "request", "承認フローの観点で",
+    )
+    assert row["requested_at"] is not None
+    assert api.sent == [(CHAT_ID, f"🔍 {item} を登録しました(観点: 承認フローの観点で)")]
+
+
+def test_dig_reply_pass_and_request_combined(conn, tmp_path) -> None:
+    first = add_dig_candidate(conn, "https://a/1")
+    second = add_dig_candidate(conn, "https://a/2")
+    api = FakeApi([[make_reply_update(f"{first} はパス、あと {second} も", BACKLOG_MSG_ID)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    statuses = {
+        row["item_id"]: row["status"]
+        for row in conn.execute("SELECT item_id, status FROM dig_queue")
+    }
+    assert statuses == {first: "passed", second: "queued"}
+    text = api.sent[0][1]
+    assert f"⏭️ {first} を深掘り対象から外しました" in text
+    assert f"🔍 {second} を登録しました(観点なし)" in text
+
+
+def test_dig_reply_without_valid_numbers_gets_guide(conn, tmp_path) -> None:
+    add_dig_candidate(conn, "https://a/1")
+    api = FakeApi([[make_reply_update("9999 をパスで", BACKLOG_MSG_ID)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    from app.delivery.poller import DIG_REPLY_GUIDE
+
+    assert api.sent == [(CHAT_ID, DIG_REPLY_GUIDE)]
+
+
+def test_dig_reply_does_not_hijack_url_ingestion(conn, tmp_path) -> None:
+    # 台帳にないメッセージへのリプライは従来どおり URL 投入経路へ
+    add_dig_candidate(conn, "https://a/1")
+    api = FakeApi([[make_reply_update("https://example.com/article", 999)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    assert manual_items(conn) != []
+
+
+def test_dig_reply_accepts_queued_id_not_in_pending(conn, tmp_path) -> None:
+    # 一覧から消えていてもキュー在籍なら指定できる(パス済みの復帰など)
+    item = add_item(conn, "https://a/queued-only")
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source) VALUES (?, 'passed', 'request')",
+        (item,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO dig_backlog_messages (message_id, sent_date) "
+        "VALUES (?, '2026-07-19')",
+        (BACKLOG_MSG_ID,),
+    )
+    api = FakeApi([[make_reply_update(f"{item} を再検討の観点で", BACKLOG_MSG_ID)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert (row["status"], row["angle"]) == ("queued", "再検討の観点で")

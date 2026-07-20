@@ -32,12 +32,14 @@ from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     READ_MIN_CHOICES,
     followup_keyboard,
+    pending_dig_items,
     q1_keyboard,
     q2_keyboard,
     run_due_timers,
     survey_deadline,
 )
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
+from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.digest.builder import JST
 from app.normalize import (
     content_hash,
@@ -469,6 +471,11 @@ def _handle_message(
                 "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します"
             )
             return
+        # 未消化 🔖 一覧へのリプライ = 深掘り指定(GH#104 / 設計 06 §2)。
+        # 感想ルートと同じく owner DM 限定(message_id は chat 単位のため)
+        if _replied_dig_backlog(conn, message.get("reply_to_message")):
+            _handle_dig_reply(conn, text.strip(), reply, logger)
+            return
 
     urls = _URL_RE.findall(text) if isinstance(text, str) else []
     if not urls:
@@ -540,6 +547,69 @@ def _ingest_manual_urls(
         else:
             known += 1
     return inserted, known
+
+
+DIG_REPLY_GUIDE = (
+    "一覧の番号で指定してください。例: 「3664 を◯◯の観点で」= 登録 / 「3664 はパス」= 除外"
+)
+
+
+def _handle_dig_reply(
+    conn: sqlite3.Connection,
+    text: str,
+    reply: Callable[[str], None],
+    logger: logging.Logger,
+) -> None:
+    """未消化一覧へのリプライを深掘りキューへ反映し、結果を確認応答する(GH#104)。
+
+    指定できる番号 = 未消化候補 ∪ キュー在籍(過去にキュー入りした item はパス・
+    再指定のため一覧から消えていても受け付ける)。候補にない番号は本文(観点の一部)
+    扱いで無視されるため、確認応答に「何が登録されたか」を必ず列挙する(黙って
+    落とさない)。
+    """
+    valid_ids = {row["item_id"] for row in pending_dig_items(conn)} | queue_item_ids(conn)
+    instructions = parse_dig_reply(text, valid_ids)
+    if not instructions:
+        reply(DIG_REPLY_GUIDE)
+        return
+    apply_instructions(conn, instructions)
+    conn.commit()
+    lines = []
+    for instruction in instructions:
+        if instruction.action == "pass":
+            lines.append(f"⏭️ {instruction.item_id} を深掘り対象から外しました")
+        elif instruction.angle:
+            lines.append(
+                f"🔍 {instruction.item_id} を登録しました(観点: {instruction.angle})"
+            )
+        else:
+            lines.append(f"🔍 {instruction.item_id} を登録しました(観点なし)")
+    reply("\n".join(lines))
+    logger.info(
+        "深掘り指定を記録",
+        extra={
+            "stage": "poll",
+            "extra": {
+                "requests": sum(1 for i in instructions if i.action == "request"),
+                "passes": sum(1 for i in instructions if i.action == "pass"),
+            },
+        },
+    )
+
+
+def _replied_dig_backlog(conn: sqlite3.Connection, replied: object) -> bool:
+    """リプライ先が未消化 🔖 一覧のメッセージか(台帳照合。GH#104)。"""
+    if not isinstance(replied, dict):
+        return False
+    message_id = replied.get("message_id")
+    if type(message_id) is not int:  # bool 除外(_replied_ledger_row と同じ理由)
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        is not None
+    )
 
 
 def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
