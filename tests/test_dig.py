@@ -168,3 +168,19 @@ def test_dig_queue_cascades_on_item_delete(conn) -> None:
     enqueue_bookmark(conn, item)
     conn.execute("DELETE FROM items WHERE id = ?", (item,))
     assert queue_row(conn, item) is None
+
+
+def test_reply_on_bookmark_row_keeps_origin_source(conn) -> None:
+    """source は初回投入の経路で不変(migration 009 / Codex レビュー反映)。
+
+    明示指定の事実は requested_at / status が担い、起源(自動で入ったか)を
+    上書きで失わない。
+    """
+    item = add_plain_item(conn, "https://a/1")
+    enqueue_bookmark(conn, item)
+    apply_instructions(conn, [DigInstruction(item, "request", angle="検証の観点")])
+    row = queue_row(conn, item)
+    assert (row["source"], row["status"]) == ("bookmark", "queued")
+    assert row["requested_at"] is not None  # 明示指定は requested_at で判別
+    apply_instructions(conn, [DigInstruction(item, "pass")])
+    assert queue_row(conn, item)["source"] == "bookmark"

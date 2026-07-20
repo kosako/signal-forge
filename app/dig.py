@@ -100,6 +100,8 @@ def apply_instructions(
       なければ既存を保持(「3664 も」= 優先度だけ上げる)
     - pass: status を passed に。観点・requested_at は保持する(後で request 復帰した
       とき前回の観点が生きる)
+    - source は初回投入の経路のまま変えない(migration 009 の契約。明示指定の有無は
+      requested_at / status が担う)
     """
     for instruction in instructions:
         if instruction.action == "pass":

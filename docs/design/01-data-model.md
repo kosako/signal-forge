@@ -327,7 +327,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 ### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009。GH#104 / 設計 06 §2〜3)
 
-夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(`source='bookmark'`。backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が `source='request'` で upsert する。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。
+夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。
 
 - `item_id` UNIQUE(1 item 1 行。状態遷移で履歴を持たない — 観点は最新だけあれば調査に足りる)、items へ ON DELETE CASCADE
 - `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す

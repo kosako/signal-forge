@@ -1,6 +1,8 @@
 -- GH#104: 深掘りキュー(設計 06 §2〜3)— 夜の入口。
--- 新規 🔖 は無条件でキュー入り(source='bookmark')、一覧へのリプライ指定は
--- source='request'。実行(status='done' への遷移)は朝の調査段(GH#105)が担う。
+-- source は**初回投入の経路で以後不変**: 新規 🔖 の自動投入 = 'bookmark'、
+-- リプライ指定で新規作成 = 'request'。既存行へのリプライ操作では変えない(起源
+-- 情報は上書きすると復元不能。「明示指定された」ことは requested_at で導出する)。
+-- 実行(status='done' への遷移)は朝の調査段(GH#105)が担う。
 -- パスは深掘りキューからの除外のみで、未消化一覧の表示には影響しない。
 CREATE TABLE dig_queue (
   id            INTEGER PRIMARY KEY,
