@@ -445,3 +445,54 @@ def test_like_and_self_rt_are_not_itemized(conn, tmp_path) -> None:
     assert conn.execute(
         "SELECT item_id FROM x_signals WHERE tweet_id = 'l1'"
     ).fetchone()["item_id"] is None
+
+
+# --- 深掘りキューへの自動投入(GH#104) ---
+
+
+def dig_queue_row(conn, item_id):
+    return conn.execute(
+        "SELECT * FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()
+
+
+def test_new_bookmark_enqueued_for_dig(conn, tmp_path) -> None:
+    # 新規 🔖 は無条件でキュー入り(設計 06 §3)
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    item = item_for(conn, "b1")
+    row = dig_queue_row(conn, item["id"])
+    assert (row["status"], row["source"]) == ("queued", "bookmark")
+    assert row["requested_at"] is None  # 自動投入 = 優先順位は新着順のみ
+
+
+def test_backfill_bookmark_not_enqueued(conn, tmp_path) -> None:
+    # backfill 再読取(過去分)は自動キューの対象外 = リプライ指定時のみ(設計 06 §3)
+    conn.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', 'b_old')")
+    session = session_with([page(linked_tw("b_old", "https://example.com/old"))], [], [])
+    collect_x_signals(
+        conn, make_config(tmp_path), session, logger,
+        backfill_limit=10, kinds=("bookmark",),
+    )
+    item = item_for(conn, "b_old")
+    assert item is not None  # item 化は行う
+    assert dig_queue_row(conn, item["id"]) is None  # キューには積まない
+
+
+def test_new_bookmark_enqueue_targets_merged_item(conn, tmp_path) -> None:
+    # RSS 取込済み記事への合流時は、キューも live item(合流先)を指す
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    source_id = conn.execute("SELECT id FROM sources WHERE name='feed'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (?, 'https://example.com/post', 'https://example.com/post', '')",
+        (source_id,),
+    )
+    existing_id = conn.execute("SELECT id FROM items").fetchone()["id"]
+
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    row = dig_queue_row(conn, existing_id)
+    assert row is not None and row["source"] == "bookmark"

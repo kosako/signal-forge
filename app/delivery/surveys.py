@@ -123,9 +123,17 @@ def send_evening_survey(
         "📝 今朝のダイジェストを読むのにかかった時間は?\n(ざっくりでOK)",
         reply_markup=q2_keyboard(date_compact),
     )
-    backlog = _pending_dig_items(conn)
+    backlog = pending_dig_items(conn)
     if backlog:  # 0件の日は送らない(GH#88)
-        api.send_message(chat_id, _dig_backlog_text(backlog))
+        message_id = api.send_message(chat_id, _dig_backlog_text(backlog))
+        # リプライ先の認識用台帳(GH#104)。過去の一覧へのリプライも有効にするため
+        # 蓄積する(REPLACE は getUpdates 再配達等での同一 id 再送に対する冪等)
+        conn.execute(
+            "INSERT OR REPLACE INTO dig_backlog_messages (message_id, sent_date) "
+            "VALUES (?, ?)",
+            (message_id, now.strftime("%Y-%m-%d")),
+        )
+        conn.commit()
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
         api.send_message(
@@ -151,14 +159,24 @@ def _linked_title(row: sqlite3.Row, budget: int) -> str:
 
 
 def _dig_backlog_text(rows: list[sqlite3.Row]) -> str:
-    """未消化 🔖 一覧(1通)。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。"""
+    """未消化 🔖 一覧(1通)。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
+
+    番号は item id(GH#104)。表示位置の連番だと日ごとに変わり、リプライ指定
+    「3664 を◯◯の観点で」が翌日以降の一覧や記憶と食い違うため、安定な id を使う。
+    """
     lines = [f"🔖 未消化の深掘り候補({len(rows)}件)"]
     lines += [
-        f"{position}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
-        for position, row in enumerate(rows[:DIG_BACKLOG_MAX_ITEMS], start=1)
+        f"{row['item_id']}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
+        for row in rows[:DIG_BACKLOG_MAX_ITEMS]
     ]
     if len(rows) > DIG_BACKLOG_MAX_ITEMS:
         lines.append(f"(他 {len(rows) - DIG_BACKLOG_MAX_ITEMS} 件)")
+    example_id = rows[0]["item_id"]
+    lines.append("")
+    lines.append(
+        f"↩️ このメッセージへのリプライで指定: 「{example_id} を◯◯の観点で」= "
+        f"朝の深掘りに登録 / 「{example_id} はパス」= 深掘り対象から外す"
+    )
     return "\n".join(lines)
 
 
@@ -213,7 +231,7 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
     ).fetchall()
 
 
-def _pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """未消化 🔖 の累計: Telegram の 🔖 反応と X ブックマーク(GH#99)を合流した
     深掘り候補一覧(GH#88)。
 

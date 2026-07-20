@@ -44,6 +44,7 @@ from app.connectors.base import FatalError
 from app.connectors.x import raise_for_auth, rate_limit_exhausted, tweet_full_text
 from app.connectors.x_oauth2 import USERS_ME_URL, XOAuth2Error, XOAuth2Session
 from app.db import insert_item_with_dedup
+from app.dig import enqueue_bookmark
 from app.normalize import (
     UrlError,
     content_hash,
@@ -251,8 +252,12 @@ def _collect_kind(
                 ).rowcount
                 if kind == "bookmark":
                     # 新規シグナルに加え、既知だが item 未紐付けの行(item 化導入前の
-                    # 既存シグナルを backfill 再読取した場合)も遡って item 化する
-                    _link_bookmark_item(conn, bookmark_source_id, tweet, users)
+                    # 既存シグナルを backfill 再読取した場合)も遡って item 化する。
+                    # 深掘りキューへの自動投入は新規取込のみ(backfill = 過去分は
+                    # リプライ指定時だけ。GH#104 / 設計 06 §3)
+                    _link_bookmark_item(
+                        conn, bookmark_source_id, tweet, users, enqueue=not backfill
+                    )
                 if inserted:
                     page_new += 1
                 elif not backfill and kind != "self_rt":
@@ -355,9 +360,19 @@ def ensure_bookmark_source(conn: sqlite3.Connection) -> int:
 
 
 def _link_bookmark_item(
-    conn: sqlite3.Connection, source_id: int, tweet: dict, users: dict[str, str]
+    conn: sqlite3.Connection,
+    source_id: int,
+    tweet: dict,
+    users: dict[str, str],
+    *,
+    enqueue: bool = False,
 ) -> None:
-    """シグナル行に item を紐付ける(未紐付けのときだけ item 化する = 冪等)。"""
+    """シグナル行に item を紐付ける(未紐付けのときだけ item 化する = 冪等)。
+
+    enqueue=True のとき、新規に紐付けた item を深掘りキューへ自動投入する
+    (🔖 = 「後でしっかり見たい」の意思表示。GH#104 / 設計 06 §3)。紐付け済みの
+    行は再投入しない(キュー判断は item 化時に一度だけ)。
+    """
     row = conn.execute(
         "SELECT item_id FROM x_signals WHERE kind = 'bookmark' AND tweet_id = ?",
         (str(tweet["id"]),),
@@ -369,6 +384,8 @@ def _link_bookmark_item(
         "UPDATE x_signals SET item_id = ? WHERE kind = 'bookmark' AND tweet_id = ?",
         (item_id, str(tweet["id"])),
     )
+    if enqueue:
+        enqueue_bookmark(conn, item_id)
 
 
 def _itemize_bookmark(
