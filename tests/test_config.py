@@ -284,3 +284,21 @@ def test_x_signals_weights_reject_non_finite(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[x_signals]\nhalf_life_days = nan\n"))
     with pytest.raises(ConfigError, match="weight_like"):
         load_config(write_config(tmp_path, "[x_signals]\nweight_like = inf\n"))
+
+
+def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
+    assert load_config(tmp_path).dig.daily_cap == 2  # 設計 06 §3 の既定
+    config = load_config(
+        write_config(tmp_path, "[dig]\ndaily_cap = 0\nreasoning_effort = \"high\"\n")
+    )
+    assert config.dig.daily_cap == 0
+    assert config.dig.reasoning_effort == "high"
+
+
+def test_dig_rejects_bad_values(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="reasoning_effort"):
+        load_config(write_config(tmp_path, "[dig]\nreasoning_effort = \"ultra\"\n"))
+    with pytest.raises(ConfigError, match=r"\[dig\].daily_cap"):
+        load_config(write_config(tmp_path, "[dig]\ndaily_cap = -1\n"))
+    with pytest.raises(ConfigError, match=r"\[dig\].timeout_s"):
+        load_config(write_config(tmp_path, "[dig]\ntimeout_s = 0\n"))

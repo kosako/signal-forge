@@ -594,6 +594,28 @@ def test_reply_to_item_message_records_note_not_urls(conn, tmp_path) -> None:
     ]
 
 
+def test_reply_to_dig_card_records_note(conn, tmp_path) -> None:
+    """深掘り概要カード(dig_results)へのリプライも感想として拾う(GH#105。
+    take / 続き要求への分類・ノート還流は GH#106)。"""
+    item_id = add_item(conn, "https://a/article")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', 700)",
+        (item_id,),
+    )
+    conn.commit()
+    api = FakeApi([[make_reply_update("判定軸が面白い。もっと掘りたい", 700)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = conn.execute("SELECT * FROM item_notes").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == item_id
+    assert rows[0]["note"] == "判定軸が面白い。もっと掘りたい"
+    assert api.sent == [
+        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+    ]
+
+
 def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> None:
     item_id = add_item(conn, "https://a/article")
     digest_id = add_digest(conn, [item_id])

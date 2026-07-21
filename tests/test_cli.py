@@ -5,7 +5,7 @@ from app.cli import app
 runner = CliRunner()
 
 ALL_COMMANDS = (
-    "collect", "extract", "analyze", "digest", "deliver", "poll", "run", "doctor",
+    "collect", "extract", "analyze", "digest", "deliver", "dig", "poll", "run", "doctor",
     "x-auth", "x-signals", "x-insights",
 )
 

@@ -298,3 +298,44 @@ def test_x_signals_stage_fails_loud_when_enabled_but_unconfigured(conn, tmp_path
     )
     assert "x_signals" in failures
     assert "digest" not in failures  # 後続の段は継続
+
+
+def test_dig_stage_failure_is_isolated(conn, tmp_path) -> None:
+    # 材料不足のリプライ指定は dig 段の失敗になる(GH#105)が、後続の段は継続する
+    item_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://q/1', 'https://q/1', 'sha256:q')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, requested_at) "
+        "VALUES (?, 'queued', 'request', '2026-07-21T00:00:00Z')",
+        (item_id,),
+    )
+    failures = run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert "dig" in failures
+    assert "purge" not in failures and "backup" not in failures
+
+
+def test_dig_stage_absent_when_cap_zero(conn, tmp_path) -> None:
+    from dataclasses import replace
+
+    from app.config import DigConfig
+
+    item_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://q/1', 'https://q/1', 'sha256:q')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, requested_at) "
+        "VALUES (?, 'queued', 'request', '2026-07-21T00:00:00Z')",
+        (item_id,),
+    )
+    config = replace(make_config(tmp_path), dig=DigConfig(daily_cap=0))
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert failures == []  # 段ごと省かれ、材料不足でも失敗しない

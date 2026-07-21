@@ -28,7 +28,7 @@ GENERATED_END = "<!-- GENERATED:END -->"
 
 EXCERPT_MAX_CHARS = 300  # RSS/manual の抜粋の長さ(恒久保存は要約が正本で、抜粋は補助)
 
-_FORBIDDEN_IN_SLUG = re.compile(r'[/\\:*?"<>|#^\[\]\s]+')
+FORBIDDEN_IN_SLUG = re.compile(r'[/\\:*?"<>|#^\[\]\s]+')
 _FRONT_MATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 
 # ユーザー所有キー: 生成側は初期値を置くだけで、再生成時に上書きしない(設計 04 §7)
@@ -193,7 +193,7 @@ def export_pending_notes(
 
 def _item_note_name(digest_date: str, item_id: int, title: str | None) -> str:
     """`YYYYMMDD-{item_id}-{slug}`。slug 衝突は item_id が一意性を担保するので無害。"""
-    slug = _FORBIDDEN_IN_SLUG.sub("-", title or "untitled").strip("-")[:40]
+    slug = FORBIDDEN_IN_SLUG.sub("-", title or "untitled").strip("-")[:40]
     return f"{digest_date.replace('-', '')}-{item_id}-{slug}"
 
 
@@ -319,7 +319,7 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
     """
     generated_body = _strip_markers(generated_body)
     if not path.exists():
-        _atomic_write(path, _render(frontmatter, generated_body))
+        atomic_write(path, _render(frontmatter, generated_body))
         return True
 
     existing = path.read_text(encoding="utf-8")
@@ -352,7 +352,7 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
     pre = existing[m.end() : begin]  # BEGIN より前の手書きも verbatim 保持
     post = existing[end + len(GENERATED_END) :]
     content = (
-        _render_frontmatter(merged)
+        render_frontmatter(merged)
         + pre
         + GENERATED_BEGIN
         + "\n"
@@ -361,7 +361,7 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
         + GENERATED_END
         + post
     )
-    _atomic_write(path, content)
+    atomic_write(path, content)
     return True
 
 
@@ -372,7 +372,7 @@ def _write_conflict(path: Path, content: str) -> bool:
     while candidate.exists():
         candidate = path.with_suffix(f".conflict-{counter}.md")
         counter += 1
-    _atomic_write(candidate, content)
+    atomic_write(candidate, content)
     return False
 
 
@@ -384,7 +384,7 @@ def _parse_frontmatter(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _render_frontmatter(frontmatter: dict) -> str:
+def render_frontmatter(frontmatter: dict) -> str:
     # 文字列連結で組み立てず YAML シリアライザで生成(改行・引用符入りタイトルによる
     # frontmatter 破壊や任意キー偽造を構造的に防ぐ。設計 04 §7)
     front = yaml.safe_dump(
@@ -395,7 +395,7 @@ def _render_frontmatter(frontmatter: dict) -> str:
 
 def _render(frontmatter: dict, generated_body: str) -> str:
     return (
-        _render_frontmatter(frontmatter)
+        render_frontmatter(frontmatter)
         + GENERATED_BEGIN
         + "\n"
         + generated_body
@@ -410,7 +410,7 @@ def _strip_markers(content: str) -> str:
     return content.replace(GENERATED_BEGIN, "").replace(GENERATED_END, "")
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: str) -> None:
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
