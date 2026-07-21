@@ -99,7 +99,10 @@ class DigCandidate:
     item_id: int
     angle: str | None
     requested: bool  # リプライ指定(requested_at あり)
-    queue_updated_at: str  # 選定時点の dig_queue.updated_at(done 化の compare-and-set 用)
+    # done 化の compare-and-set 用スナップショット(updated_at は秒解像度のため、
+    # 同一秒内の更新も検出できるよう status 以外の実値も比較する。Codex P2)
+    queue_updated_at: str
+    queue_requested_at: str | None
     title: str | None
     author: str | None
     published_at: str | None
@@ -130,7 +133,7 @@ def run_dig_stage(
     failures: list[str] = []
 
     if remaining > 0:
-        selected, skipped_requested = _select_candidates(conn, config, remaining)
+        selected, skipped_requested = _select_candidates(conn, config, remaining, day)
         failures.extend(
             f"item {c.item_id}: リプライ指定だが本文の抽出材料がない(パスするか手動対応)"
             for c in skipped_requested
@@ -181,12 +184,15 @@ def _digs_on(conn: sqlite3.Connection, day: str) -> int:
 
 
 def _select_candidates(
-    conn: sqlite3.Connection, config: Config, limit: int
+    conn: sqlite3.Connection, config: Config, limit: int, day: str
 ) -> tuple[list[DigCandidate], list[DigCandidate]]:
     """優先順に材料十分な candidate を limit 件選ぶ。
 
     戻り値 = (選定, 材料不足のリプライ指定)。材料不足の自動選出は枠を消費せず
     静かに残す(未消化一覧に見えている。ここで毎朝 ERROR を出すとノイズになる)。
+    同日に実行済みの item は選ばない(done 直後の再指定を同日中に再実行すると
+    ノート名が衝突し、カードが古いノートを指しうる。Codex P2。翌朝に掘られる =
+    「夜選ぶ → 朝届く」のリズム通り)。
     """
     rows = conn.execute(
         """
@@ -202,8 +208,13 @@ def _select_candidates(
             WHERE item_id = q.item_id AND degraded = 0
         )
         WHERE q.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM dig_results r
+            WHERE r.item_id = q.item_id AND date(r.created_at, '+9 hours') = ?
+          )
         ORDER BY (q.requested_at IS NULL), q.requested_at DESC, q.enqueued_at DESC
-        """
+        """,
+        (day,),
     ).fetchall()
     selected: list[DigCandidate] = []
     skipped_requested: list[DigCandidate] = []
@@ -215,6 +226,7 @@ def _select_candidates(
             angle=row["angle"],
             requested=row["requested_at"] is not None,
             queue_updated_at=row["updated_at"],
+            queue_requested_at=row["requested_at"],
             title=row["title"],
             author=row["author"],
             published_at=row["published_at"],
@@ -295,12 +307,20 @@ def _dig_one(
         )
         # compare-and-set: 生成中(分オーダー)に poller がこの行を更新していたら
         # (再指定 = queued + 新観点 / パス)、done で上書きせずユーザー操作を優先する
-        # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う
+        # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う。
+        # updated_at は秒解像度で同一秒内の更新を見逃すため、status / angle /
+        # requested_at の実値も比較する(全て同値の更新は意味的に no-op。Codex P2)
         done = conn.execute(
             "UPDATE dig_queue SET status = 'done', "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-            "WHERE item_id = ? AND updated_at = ?",
-            (candidate.item_id, candidate.queue_updated_at),
+            "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
+            "  AND angle IS ? AND requested_at IS ?",
+            (
+                candidate.item_id,
+                candidate.queue_updated_at,
+                candidate.angle,
+                candidate.queue_requested_at,
+            ),
         ).rowcount
         conn.execute("COMMIT")
     except BaseException:

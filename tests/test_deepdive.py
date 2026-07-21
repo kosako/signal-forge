@@ -150,7 +150,7 @@ def test_select_priority_requested_then_new(conn, config) -> None:
     enqueue(conn, auto_new, enqueued_at="2026-07-21T00:00:00Z")
     enqueue(conn, requested, angle="承認フロー", requested_at="2026-07-19T00:00:00Z")
 
-    selected, skipped = _select_candidates(conn, config, 2)
+    selected, skipped = _select_candidates(conn, config, 2, "2026-07-22")
     assert [c.item_id for c in selected] == [requested, auto_new]
     assert skipped == []
 
@@ -163,7 +163,7 @@ def test_select_skips_auto_without_material_but_reports_requested(conn, config) 
     enqueue(conn, no_body_requested, requested_at="2026-07-19T00:00:00Z")
     enqueue(conn, ok_auto)
 
-    selected, skipped = _select_candidates(conn, config, 2)
+    selected, skipped = _select_candidates(conn, config, 2, "2026-07-22")
     assert [c.item_id for c in selected] == [ok_auto]
     assert [c.item_id for c in skipped] == [no_body_requested]
     # 材料不足の自動選出は枠も失敗も消費せずキューに残る
@@ -176,8 +176,25 @@ def test_select_skips_auto_without_material_but_reports_requested(conn, config) 
 def test_select_short_body_is_insufficient(conn, config) -> None:
     item = add_item(conn, "https://a.example/1", body="短い")
     enqueue(conn, item)
-    selected, skipped = _select_candidates(conn, config, 2)
+    selected, skipped = _select_candidates(conn, config, 2, "2026-07-22")
     assert selected == [] and skipped == []
+
+
+def test_select_excludes_item_already_dug_today(conn, config) -> None:
+    # done 直後の同日再指定は選ばない(ノート名衝突でカードが古いノートを指す。
+    # Codex P2)。翌日は選ばれる
+    item = add_item(conn, "https://a.example/1")
+    enqueue(conn, item, requested_at="2026-07-22T07:00:00Z")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at,"
+        " published_at, message_id)"
+        " VALUES (?, 'n', 'カード', '2026-07-21T22:00:00Z', '2026-07-21T22:00:01Z', 900)",
+        (item,),
+    )  # created_at は UTC。+9h で JST 2026-07-22 = 同日実行済み
+    selected, _ = _select_candidates(conn, config, 2, "2026-07-22")
+    assert selected == []
+    selected_next, _ = _select_candidates(conn, config, 2, "2026-07-23")
+    assert [c.item_id for c in selected_next] == [item]
 
 
 # --- 実行(生成・ノート・台帳・カード) ---
@@ -352,6 +369,38 @@ def test_requeue_during_generation_is_preserved(conn, config) -> None:
     assert len(api.sent) == 1  # 今回の生成物は公開・送信される
 
 
+def test_requeue_in_same_second_is_still_detected(conn, config) -> None:
+    # updated_at は秒解像度。同一秒内の再指定(updated_at が同値のまま angle 等が
+    # 変わる)も CAS が実値比較で検出する(Codex P2)
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    original = conn.execute(
+        "SELECT updated_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()["updated_at"]
+
+    class SameSecondRequeue(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            conn.execute(  # updated_at を変えずに角度だけ更新(同一秒の書込を再現)
+                "UPDATE dig_queue SET angle = '同秒の新観点',"
+                " requested_at = '2026-07-22T06:40:00Z' WHERE item_id = ?",
+                (item,),
+            )
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, SameSecondRequeue())
+
+    run_dig_stage(conn, config, factory, FakeApi(), logger, today="2026-07-22")
+
+    row = conn.execute(
+        "SELECT status, angle, updated_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()
+    assert row["updated_at"] == original  # 前提: タイムスタンプでは区別できない状況
+    assert row["status"] == "queued" and row["angle"] == "同秒の新観点"
+
+
 def test_card_note_path_is_html_escaped(conn, config) -> None:
     # タイトル由来 slug の `&` は FORBIDDEN_IN_SLUG の対象外で note_name に残る。
     # parse_mode=HTML で未エスケープだと送信が 400 で恒久失敗する(Codex P1)
@@ -480,7 +529,7 @@ def test_without_telegram_cards_stay_pending(conn, config) -> None:
 def test_prompt_fences_body_and_includes_angle(conn, config) -> None:
     item = add_item(conn, "https://blog.example/post", body="{{nonce}} を含む本文 " + BODY)
     enqueue(conn, item, angle="この観点")
-    selected, _ = _select_candidates(conn, config, 1)
+    selected, _ = _select_candidates(conn, config, 1, "2026-07-22")
     prompt = build_dig_prompt(config, selected[0], "source-note")
 
     assert "<<<DATA-" in prompt and "DATA-" in prompt
@@ -494,7 +543,7 @@ def test_prompt_fences_body_and_includes_angle(conn, config) -> None:
 def test_prompt_auto_brief_and_tweet_quote_policy(conn, config) -> None:
     item = add_item(conn, "https://x.com/u/status/9")
     enqueue(conn, item)
-    selected, _ = _select_candidates(conn, config, 1)
+    selected, _ = _select_candidates(conn, config, 1, "2026-07-22")
     prompt = build_dig_prompt(config, selected[0], None)
 
     assert AUTO_BRIEF in prompt
@@ -510,7 +559,7 @@ def test_prompt_truncates_long_body(conn, config) -> None:
     )
     item = add_item(conn, "https://blog.example/post", body="あ" * 1000)
     enqueue(conn, item)
-    selected, _ = _select_candidates(conn, config_small, 1)
+    selected, _ = _select_candidates(conn, config_small, 1, "2026-07-22")
     prompt = build_dig_prompt(config_small, selected[0], None)
     assert "長さ上限で切り詰め" in prompt
 
