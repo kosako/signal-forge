@@ -41,7 +41,7 @@ from app.analysis.analyzer import sanitize, sanitize_body
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
-from app.delivery.telegram import TelegramApi, escape_and_truncate
+from app.delivery.telegram import TelegramApi, escape_and_truncate, escape_text
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 
 JST = timezone(timedelta(hours=9))
@@ -559,9 +559,10 @@ def _card_text(
     suffix = ""
     if source_note_name is not None:
         suffix = "(対訳あり)" if "対訳" in source_note_name else "(原文ノートあり)"
-    note_line = (
-        f"📄 ノート: {config.obsidian.folder}/{DEEPDIVE_FOLDER}/{note_name}.md{suffix}"
-    )
+    # note_name はタイトル由来 slug を含み `&` 等が残る(FORBIDDEN_IN_SLUG の対象外)。
+    # parse_mode=HTML で送るため未エスケープだと送信自体が 400 で恒久失敗する(Codex P1)
+    note_path = escape_text(f"{config.obsidian.folder}/{DEEPDIVE_FOLDER}/{note_name}.md")
+    note_line = f"📄 ノート: {note_path}{suffix}"
     return (
         f"🔎 深掘り #{candidate.item_id}「{title}」{original}\n"
         f"✍️ 書き手: {escape_and_truncate(draft.writer_stance, _CARD_STANCE_MAX)}\n"
@@ -579,5 +580,7 @@ def _card_text(
 
 
 def _is_tweet_url(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
+    # canonical_url の正規化(01 §4)は www を剥がさないため、ここで剥がしてから
+    # 判定する(www.x.com がポリシー判定をすり抜けて本文が恒久保存される穴。Codex P1)
+    host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
     return host in _TWEET_HOSTS

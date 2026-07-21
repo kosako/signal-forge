@@ -262,6 +262,34 @@ def test_dig_tweet_body_has_no_source_note(conn, config) -> None:
     assert row["source_note_name"] is None
 
 
+def test_dig_www_tweet_url_is_also_tweet_body(conn, config) -> None:
+    # 正規化は www を剥がさない。www 付きが GH#2 をすり抜けない(Codex P1)
+    item = add_item(conn, "https://www.x.com/user/status/2", title=None, language="ja")
+    enqueue(conn, item)
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+
+    notes = [p.name for p in deepdive_dir(config).glob("*.md")]
+    assert len(notes) == 1 and "深掘り" in notes[0]
+    assert conn.execute("SELECT source_note_name FROM dig_results").fetchone()[
+        "source_note_name"
+    ] is None
+
+
+def test_card_note_path_is_html_escaped(conn, config) -> None:
+    # タイトル由来 slug の `&` は FORBIDDEN_IN_SLUG の対象外で note_name に残る。
+    # parse_mode=HTML で未エスケープだと送信が 400 で恒久失敗する(Codex P1)
+    item = add_item(conn, "https://blog.example/rd", title="R&D Report", language="ja")
+    enqueue(conn, item)
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+
+    card = api.sent[0][1]
+    assert "R&amp;D-Report" in card  # ノート行はエスケープ済み
+    assert "-R&D-Report" not in card  # 生の & を含むパスを送らない
+
+
 def test_daily_cap_and_rerun_idempotency(conn, config) -> None:
     items = [add_item(conn, f"https://a.example/{i}") for i in range(3)]
     for i in items:
