@@ -276,6 +276,30 @@ def test_dig_www_tweet_url_is_also_tweet_body(conn, config) -> None:
     ] is None
 
 
+def test_existing_note_survives_rerun_after_crash(conn, config) -> None:
+    # 書込→記帳の間で中断 → キューは queued のまま次回 run が同名を再生成する。
+    # 公開済みノート(take が書かれうる)を上書きしない(Codex P1)
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    slug = "Sample-Article-Title"
+    existing = deepdive_dir(config)
+    existing.mkdir(parents=True, exist_ok=True)
+    note_path = existing / f"20260722-{item}-{slug}-深掘り.md"
+    note_path.write_text("前回生成の本文\n\n### take\n手書きの take")
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+
+    assert "手書きの take" in note_path.read_text()  # 上書きされない
+    # 記帳・カード送信は完了する(体験は前に進む)
+    assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 1
+    assert (
+        conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item,)).fetchone()[
+            "status"
+        ]
+        == "done"
+    )
+
+
 def test_card_note_path_is_html_escaped(conn, config) -> None:
     # タイトル由来 slug の `&` は FORBIDDEN_IN_SLUG の対象外で note_name に残る。
     # parse_mode=HTML で未エスケープだと送信が 400 で恒久失敗する(Codex P1)

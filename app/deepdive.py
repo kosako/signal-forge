@@ -20,6 +20,8 @@
 あれば段としては失敗にする(#74 と同じ「進めるものは進め、止まったことは通知」)。
 ノート生成(vault 書込)とカード送信の間の失敗は dig_results(migration 010)が
 吸収する: 生成済みは再生成せず、未送信カード(message_id IS NULL)だけを再送する。
+書込と記帳の間の中断は「既存ノートを上書きしない」(_publish_note)で、公開済み
+ノートに書かれた take を再実行から守る。
 """
 
 from __future__ import annotations
@@ -252,12 +254,16 @@ def _dig_one(
 
     draft = _generate_draft(config, engine_factory, candidate, source_note_name)
 
-    atomic_write(
+    _publish_note(
         deepdive_dir / f"{note_name}.md",
         _explainer_note(candidate, draft, source_note_name),
+        logger,
+        run_id,
     )
     if source_note_name is not None and source_note_body is not None:
-        atomic_write(deepdive_dir / f"{source_note_name}.md", source_note_body)
+        _publish_note(
+            deepdive_dir / f"{source_note_name}.md", source_note_body, logger, run_id
+        )
 
     card_text = _card_text(config, candidate, draft, note_name, source_note_name)
 
@@ -450,6 +456,26 @@ def _split_paragraphs(text: str, chunk_chars: int) -> list[str]:
 
 
 # --- ノート・カードのレンダリング(書込先は vault/<folder>/DeepDive/ に限定) ---
+
+
+def _publish_note(
+    path: Path, content: str, logger: logging.Logger, run_id: str | None
+) -> None:
+    """既存ノートは上書きしない(Codex P1)。
+
+    ノート書込と台帳記帳の間で中断すると、キューが queued のまま次回 run が同名
+    ノートを再生成する。公開済みノートにはユーザーが take を書き込みうるため、
+    盲目的な上書きは take 領域の破壊になる。atomic_write は部分ファイルを残さない
+    ので、既存ファイル = 過去の完全な生成物。それを正として新規生成分は破棄する
+    (LLM コストの重複はこの稀な経路の許容コスト)。
+    """
+    if path.exists():
+        logger.warning(
+            f"既存の DeepDive ノートを保持(再生成分は破棄): {path.name}",
+            extra={"run_id": run_id, "stage": "dig"},
+        )
+        return
+    atomic_write(path, content)
 
 
 def _deepdive_dir(config: Config) -> Path:
