@@ -214,6 +214,8 @@ def test_dig_happy_path_en_article(conn, config) -> None:
     assert result["item_id"] == item
     assert result["angle"] == "承認フローの観点で"
     assert result["message_id"] == 901
+    assert result["published_at"] is not None
+    assert result["note_markdown"] is None  # 公開後は本文列を持たない(軽量化)
     queue = conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
     assert queue["status"] == "done"
 
@@ -276,28 +278,78 @@ def test_dig_www_tweet_url_is_also_tweet_body(conn, config) -> None:
     ] is None
 
 
-def test_existing_note_survives_rerun_after_crash(conn, config) -> None:
-    # 書込→記帳の間で中断 → キューは queued のまま次回 run が同名を再生成する。
-    # 公開済みノート(take が書かれうる)を上書きしない(Codex P1)
+def test_unpublished_note_published_from_ledger_without_llm(conn, config) -> None:
+    # 生成記帳→公開の間で中断 → 次回 run は台帳の本文から書き出す(LLM 再呼び出しなし)
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, source_note_name, card_text,"
+        " note_markdown, source_note_markdown)"
+        " VALUES (?, 'n-深掘り', 'n-対訳', 'カード', '解説本文', '対訳本文')",
+        (item,),
+    )
+    conn.commit()
+    api = FakeApi()
+    engines: dict[str, ScriptedEngine] = {}
+
+    run_dig_stage(conn, config, make_factory(engines), api, logger, today="2026-07-23")
+
+    assert engines == {}  # LLM は呼ばれない(キューは空)
+    assert (deepdive_dir(config) / "n-深掘り.md").read_text() == "解説本文"
+    assert (deepdive_dir(config) / "n-対訳.md").read_text() == "対訳本文"
+    row = conn.execute("SELECT * FROM dig_results").fetchone()
+    assert row["published_at"] is not None
+    assert row["note_markdown"] is None and row["source_note_markdown"] is None  # 軽量化
+    assert api.sent == [(10, "カード")]  # 公開後に送信
+
+
+def test_existing_note_not_overwritten_on_publish_retry(conn, config) -> None:
+    # 公開→published_at 記帳の間で中断 → 再書出は既存ノート(take が書かれうる)を
+    # 上書きしない(Codex P1)。write-ahead により内容は同一生成物
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+        " VALUES (?, 'n-深掘り', 'カード', '再書出の本文')",
+        (item,),
+    )
+    conn.commit()
+    target = deepdive_dir(config)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "n-深掘り.md").write_text("公開済みの本文\n\n### take\n手書きの take")
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+    assert "手書きの take" in (target / "n-深掘り.md").read_text()
+    assert conn.execute("SELECT published_at FROM dig_results").fetchone()[
+        "published_at"
+    ] is not None
+
+
+def test_requeue_during_generation_is_preserved(conn, config) -> None:
+    # 生成中(分オーダー)に poller が再指定 → 無条件 done で消さない(Codex P1)
     item = add_item(conn, "https://blog.example/post", language="ja")
     enqueue(conn, item)
-    slug = "Sample-Article-Title"
-    existing = deepdive_dir(config)
-    existing.mkdir(parents=True, exist_ok=True)
-    note_path = existing / f"20260722-{item}-{slug}-深掘り.md"
-    note_path.write_text("前回生成の本文\n\n### take\n手書きの take")
 
-    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+    class RequeueDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            conn.execute(
+                "UPDATE dig_queue SET angle = '新しい観点', status = 'queued',"
+                " requested_at = '2026-07-22T21:00:00Z',"
+                " updated_at = '2026-07-22T21:00:00Z' WHERE item_id = ?",
+                (item,),
+            )
+            return super().complete_structured(prompt, schema, timeout_s)
 
-    assert "手書きの take" in note_path.read_text()  # 上書きされない
-    # 記帳・カード送信は完了する(体験は前に進む)
-    assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 1
-    assert (
-        conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item,)).fetchone()[
-            "status"
-        ]
-        == "done"
-    )
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, RequeueDuringGeneration())
+
+    api = FakeApi()
+    run_dig_stage(conn, config, factory, api, logger, today="2026-07-22")
+
+    row = conn.execute("SELECT status, angle FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert row["status"] == "queued" and row["angle"] == "新しい観点"  # 再指定が生きる
+    assert len(api.sent) == 1  # 今回の生成物は公開・送信される
 
 
 def test_card_note_path_is_html_escaped(conn, config) -> None:
@@ -382,7 +434,8 @@ def test_item_failure_isolated_but_stage_fails(conn, config) -> None:
 def test_pending_card_resent_without_regeneration(conn, config) -> None:
     item = add_item(conn, "https://a.example/1")
     conn.execute(
-        "INSERT INTO dig_results (item_id, note_name, card_text) VALUES (?, 'n', 'カード本文')",
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
+        " VALUES (?, 'n', 'カード本文', '2026-07-22T21:40:00Z')",
         (item,),
     )
     conn.commit()
@@ -400,7 +453,8 @@ def test_pending_card_resent_without_regeneration(conn, config) -> None:
 def test_send_failure_is_loud_and_card_stays_pending(conn, config) -> None:
     item = add_item(conn, "https://a.example/1")
     conn.execute(
-        "INSERT INTO dig_results (item_id, note_name, card_text) VALUES (?, 'n', 'カード')",
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
+        " VALUES (?, 'n', 'カード', '2026-07-22T21:40:00Z')",
         (item,),
     )
     conn.commit()

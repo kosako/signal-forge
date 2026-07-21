@@ -18,10 +18,11 @@
 
 障害の局所化: item 単位で隔離し、1 件の失敗で他の件・他の段を止めない。失敗が
 あれば段としては失敗にする(#74 と同じ「進めるものは進め、止まったことは通知」)。
-ノート生成(vault 書込)とカード送信の間の失敗は dig_results(migration 010)が
-吸収する: 生成済みは再生成せず、未送信カード(message_id IS NULL)だけを再送する。
-書込と記帳の間の中断は「既存ノートを上書きしない」(_publish_note)で、公開済み
-ノートに書かれた take を再実行から守る。
+中断耐性は dig_results(migration 010)への write-ahead で作る: LLM 生成物
+(ノート本文・カード文)を先に台帳へ記帳し、ファイル公開(published_at)→
+カード送信(message_id)を台帳から再開する。どこで中断しても再実行は同一生成物の
+続きだけを行い、ノートとカードの生成元が食い違わない。既存ノートは上書きしない
+(_publish_note。公開済みノートに書かれた take を守る)。
 """
 
 from __future__ import annotations
@@ -98,6 +99,7 @@ class DigCandidate:
     item_id: int
     angle: str | None
     requested: bool  # リプライ指定(requested_at あり)
+    queue_updated_at: str  # 選定時点の dig_queue.updated_at(done 化の compare-and-set 用)
     title: str | None
     author: str | None
     published_at: str | None
@@ -118,7 +120,11 @@ def run_dig_stage(
     run_id: str | None = None,
     today: str | None = None,  # JST の YYYY-MM-DD(テスト注入用)
 ) -> None:
-    """調査段の本体。生成 → ノート書込 → 台帳記帳 → 未送信カード送信。"""
+    """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
+
+    3 段はそれぞれ台帳(dig_results)から再開可能で、どこで中断しても再実行は
+    同一生成物の続きだけを行う(LLM 再呼び出し・生成物の食い違いを起こさない)。
+    """
     day = today or datetime.now(JST).strftime("%Y-%m-%d")
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
@@ -145,6 +151,9 @@ def run_dig_stage(
             "dig: 本日の上限に到達済み(生成なし)",
             extra={"run_id": run_id, "stage": "dig"},
         )
+
+    # 未公開ノートの書出(過去の中断分を含む)
+    failures.extend(_publish_pending_notes(conn, config, logger, run_id))
 
     # 未送信カード(過去の中断分を含む)の送信。Telegram 未設定なら台帳に残す
     if api is not None:
@@ -181,7 +190,7 @@ def _select_candidates(
     """
     rows = conn.execute(
         """
-        SELECT q.item_id, q.angle, q.requested_at,
+        SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
                i.title, i.author, i.published_at, i.canonical_url,
                d.extracted_text, d.language,
                a.title_ja, a.summary
@@ -205,6 +214,7 @@ def _select_candidates(
             item_id=row["item_id"],
             angle=row["angle"],
             requested=row["requested_at"] is not None,
+            queue_updated_at=row["updated_at"],
             title=row["title"],
             author=row["author"],
             published_at=row["published_at"],
@@ -231,8 +241,13 @@ def _dig_one(
     logger: logging.Logger,
     run_id: str | None,
 ) -> None:
-    """1 item の深掘り: LLM 生成 → ノート書込 → 台帳記帳(短トランザクション)。"""
-    deepdive_dir = _deepdive_dir(config)  # vault 未設定は LLM 生成(分オーダー)前に検知
+    """1 item の深掘り: LLM 生成 → 生成物を台帳へ write-ahead(短トランザクション)。
+
+    ファイル公開・カード送信はここでは行わない(_publish_pending_notes /
+    _send_pending_cards が台帳から実行する)。生成と公開・送信を分けるのは、
+    中断後の再実行が**同一生成物**から続きだけを行うため(ノートとカードの
+    生成元が食い違わない。Codex P2)。
+    """
     date_prefix = day.replace("-", "")
     slug = FORBIDDEN_IN_SLUG.sub("-", candidate.title or "untitled").strip("-")[:40]
     note_name = f"{date_prefix}-{candidate.item_id}-{slug}-深掘り"
@@ -253,18 +268,7 @@ def _dig_one(
             )
 
     draft = _generate_draft(config, engine_factory, candidate, source_note_name)
-
-    _publish_note(
-        deepdive_dir / f"{note_name}.md",
-        _explainer_note(candidate, draft, source_note_name),
-        logger,
-        run_id,
-    )
-    if source_note_name is not None and source_note_body is not None:
-        _publish_note(
-            deepdive_dir / f"{source_note_name}.md", source_note_body, logger, run_id
-        )
-
+    note_body = _explainer_note(candidate, draft, source_note_name)
     card_text = _card_text(config, candidate, draft, note_name, source_note_name)
 
     # 生成は分オーダーだが、記帳は短く(poller と DB を共有するため)。
@@ -274,8 +278,9 @@ def _dig_one(
         conn.execute(
             """
             INSERT INTO dig_results
-              (item_id, run_id, note_name, source_note_name, angle, card_text)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (item_id, run_id, note_name, source_note_name, angle, card_text,
+               note_markdown, source_note_markdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate.item_id,
@@ -284,22 +289,80 @@ def _dig_one(
                 source_note_name,
                 candidate.angle,
                 card_text,
+                note_body,
+                source_note_body,
             ),
         )
-        # 生成中にユーザーがパスした場合も done にする(掘った事実を優先。カードは届く)
-        conn.execute(
+        # compare-and-set: 生成中(分オーダー)に poller がこの行を更新していたら
+        # (再指定 = queued + 新観点 / パス)、done で上書きせずユーザー操作を優先する
+        # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う
+        done = conn.execute(
             "UPDATE dig_queue SET status = 'done', "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE item_id = ?",
-            (candidate.item_id,),
-        )
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE item_id = ? AND updated_at = ?",
+            (candidate.item_id, candidate.queue_updated_at),
+        ).rowcount
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    if done == 0:
+        logger.info(
+            f"生成中にキューが更新されたため状態を保持 item={candidate.item_id}",
+            extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
+        )
     logger.info(
         f"deepdive 生成 item={candidate.item_id} note={note_name}",
         extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
     )
+
+
+def _publish_pending_notes(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> list[str]:
+    """未公開ノート(過去の中断分を含む)を台帳の本文から vault へ書き出す。
+
+    公開後は本文列を NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。
+    """
+    failures: list[str] = []
+    rows = conn.execute(
+        "SELECT id, item_id, note_name, source_note_name, note_markdown,"
+        " source_note_markdown FROM dig_results WHERE published_at IS NULL ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        try:
+            deepdive_dir = _deepdive_dir(config)
+            if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
+                _publish_note(
+                    deepdive_dir / f"{row['note_name']}.md",
+                    row["note_markdown"],
+                    logger,
+                    run_id,
+                )
+            if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
+                _publish_note(
+                    deepdive_dir / f"{row['source_note_name']}.md",
+                    row["source_note_markdown"],
+                    logger,
+                    run_id,
+                )
+        except Exception as e:
+            logger.error(
+                f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                exc_info=True,
+            )
+            failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
+            continue
+        conn.execute(
+            "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+            " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
+            (row["id"],),
+        )
+    return failures
 
 
 def _send_pending_cards(
@@ -309,10 +372,11 @@ def _send_pending_cards(
     logger: logging.Logger,
     run_id: str | None,
 ) -> list[str]:
-    """未送信カードを送り message_id を記帳する。送信ごとに commit(中断耐性)。"""
+    """未送信カードを送り message_id を記帳する(公開済みの行だけ。1 件ごとに永続化)。"""
     failures: list[str] = []
     rows = conn.execute(
-        "SELECT id, item_id, card_text FROM dig_results WHERE message_id IS NULL ORDER BY id"
+        "SELECT id, item_id, card_text FROM dig_results "
+        "WHERE message_id IS NULL AND published_at IS NOT NULL ORDER BY id"
     ).fetchall()
     for row in rows:
         try:
@@ -463,15 +527,15 @@ def _publish_note(
 ) -> None:
     """既存ノートは上書きしない(Codex P1)。
 
-    ノート書込と台帳記帳の間で中断すると、キューが queued のまま次回 run が同名
-    ノートを再生成する。公開済みノートにはユーザーが take を書き込みうるため、
+    公開(ファイル書出)と published_at 記帳の間で中断すると、次回 run が同じ
+    ノートを再書出する。公開済みノートにはユーザーが take を書き込みうるため、
     盲目的な上書きは take 領域の破壊になる。atomic_write は部分ファイルを残さない
-    ので、既存ファイル = 過去の完全な生成物。それを正として新規生成分は破棄する
-    (LLM コストの重複はこの稀な経路の許容コスト)。
+    ので、既存ファイル = 完全な公開済みノート。それを正として再書出は破棄する
+    (write-ahead により内容は同一生成物なので、失われるのは何もない)。
     """
     if path.exists():
         logger.warning(
-            f"既存の DeepDive ノートを保持(再生成分は破棄): {path.name}",
+            f"既存の DeepDive ノートを保持(再書出は破棄): {path.name}",
             extra={"run_id": run_id, "stage": "dig"},
         )
         return

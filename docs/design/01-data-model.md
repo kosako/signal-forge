@@ -336,12 +336,16 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 ### 深掘り実行結果(dig_results・migration 010。GH#105 / 設計 06 §4〜5)
 
-朝の調査段の実行台帳(1 実行 = 1 行)。ノート生成(vault 書込)とカード送信の間で
-中断しても、再実行が「生成済みを再生成せず・未送信カードだけ送る」ための正本。
+朝の調査段の実行台帳(1 実行 = 1 行)。LLM 生成物(ノート本文・カード文)を先に
+ここへ **write-ahead** し、ファイル公開(`published_at`)→ カード送信(`message_id`)を
+台帳から再開する。どの段で中断しても再実行は同一生成物の続きだけを行い、ノートと
+カード・観点の生成元が食い違わない。
 
-- `note_name` / `source_note_name` = 生成した解説 / 原文・対訳ノートのファイル名(拡張子なし。`source_note_name` NULL = ツイート本文のみ等でソースノート無し)
-- `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
+- `note_name` / `source_note_name` = 解説 / 原文・対訳ノートのファイル名(拡張子なし。`source_note_name` NULL = ツイート本文のみ等でソースノート無し)
+- `note_markdown` / `source_note_markdown` = 公開までの本文一時保持。公開時に NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。既存ファイルは公開時に上書きしない(公開済みノートの take 保護)
+- `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(公開済みの行だけ次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
 - `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
+- キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる)
 
 ## 8. digests
 
