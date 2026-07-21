@@ -392,7 +392,14 @@ def _send_pending_cards(
     logger: logging.Logger,
     run_id: str | None,
 ) -> list[str]:
-    """未送信カードを送り message_id を記帳する(公開済みの行だけ。1 件ごとに永続化)。"""
+    """未送信カードを送り message_id を記帳する(公開済みの行だけ。1 件ごとに永続化)。
+
+    送信成功と記帳の間で中断すると同一カードが再送されうるが、これは digest 配信
+    (deliver_digest = 送信 → digest_messages 記帳)と同じ、**設計として許容済みの
+    稀な二重送信**(設計 05 §8。2026-07-08 監査で「無配信より二重送信」に倒すと
+    確定)。fail-closed(記帳先行)にすると中断時に未達のまま送信済み扱いになり、
+    通知の欠落 = 沈黙障害の方が実害が大きい。
+    """
     failures: list[str] = []
     rows = conn.execute(
         "SELECT id, item_id, card_text FROM dig_results "
