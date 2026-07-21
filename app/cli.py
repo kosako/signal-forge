@@ -166,6 +166,37 @@ def deliver(
     typer.echo("配信済み(skip)" if sent == 0 else f"配信完了({sent}通)")
 
 
+@app.command()
+def dig(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """深掘りキューから本日分を調査し、DeepDive ノート生成+概要カード送信(GH#105)。"""
+    from app.analysis.llm import create_engine
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.deepdive import run_dig_stage
+    from app.delivery import create_api, is_telegram_configured
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+    if config.dig.daily_cap <= 0:
+        typer.echo("[dig].daily_cap = 0(調査段は無効)")
+        raise typer.Exit(code=0)
+    api = create_api(env) if is_telegram_configured(config, env) else None
+    run_dig_stage(
+        conn,
+        config,
+        lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+        api,
+        logger,
+    )
+    typer.echo("dig 完了(生成・送信の内訳はログ参照)")
+
+
 @app.command(name="x-auth")
 def x_auth(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),

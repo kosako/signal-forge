@@ -91,6 +91,27 @@ class DigestConfig:
     max_items: int = 10  # 「無効日3日連続なら5に削減」の運用ノブ(設計 03 §6)
 
 
+# codex の model_reasoning_effort の語彙(実在値のみ。タイポで黙って既定に
+# 落ちる事故を config 検証で止める)
+DIG_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+@dataclass(frozen=True)
+class DigConfig:
+    """朝の調査段(GH#105 / 設計 06 §3〜4)。
+
+    daily_cap は「1 日に掘る上限」(JST 暦日。同日の再実行では残枠だけ掘る)。
+    0 = 調査段無効(段ごと省く。x_signals と同じ流儀)。
+    """
+
+    daily_cap: int = 2  # 設計 06 §3 の既定
+    reasoning_effort: str = "medium"  # 解説ノート生成の effort(対訳は low 固定)
+    timeout_s: int = 600  # LLM 1 呼び出しの上限(解説・対訳チャンク共通)
+    body_max_chars: int = 40_000  # 解説生成に渡す本文の上限(超過は切り詰め注記)
+    translation_max_chars: int = 24_000  # 対訳対象の本文上限(超過分は打ち切り注記)
+    min_body_chars: int = 200  # これ未満は材料不足(自動選出は skip・指定は失敗)
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     engine: str = "codex-cli"  # 仮決定(Issue #3)。値は _LLM_ENGINES のいずれか
@@ -163,6 +184,7 @@ class Config:
     x_search: XSearchConfig = field(default_factory=XSearchConfig)
     x_signals: XSignalsConfig = field(default_factory=XSignalsConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
+    dig: DigConfig = field(default_factory=DigConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
@@ -197,6 +219,7 @@ _SECTIONS = {
     "x_search": XSearchConfig,
     "x_signals": XSignalsConfig,
     "digest": DigestConfig,
+    "dig": DigConfig,
     "llm": LLMConfig,
     "retention": RetentionConfig,
     "budget": BudgetConfig,
@@ -302,8 +325,17 @@ def _validate(path: Path, config: Config) -> None:
         )
     if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
         raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
+    if config.dig.reasoning_effort not in DIG_EFFORTS:
+        raise ConfigError(
+            f"{path}: [dig].reasoning_effort は {'/'.join(DIG_EFFORTS)} のいずれか: "
+            f"{config.dig.reasoning_effort!r}"
+        )
     positives = [
         ("x", "daily_read_cap", config.x.daily_read_cap),
+        ("dig", "timeout_s", config.dig.timeout_s),
+        ("dig", "body_max_chars", config.dig.body_max_chars),
+        ("dig", "translation_max_chars", config.dig.translation_max_chars),
+        ("dig", "min_body_chars", config.dig.min_body_chars),
         ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),
         ("x_search", "daily_read_cap", config.x_search.daily_read_cap),
         ("digest", "max_items", config.digest.max_items),
@@ -317,6 +349,7 @@ def _validate(path: Path, config: Config) -> None:
     ]
     nonnegatives = [
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),
+        ("dig", "daily_cap", config.dig.daily_cap),
         ("ranking", "min_score", config.ranking.min_score),
         ("ranking", "negative_penalty", config.ranking.negative_penalty),
         ("ranking", "freshness_penalty_24_48", config.ranking.freshness_penalty_24_48),

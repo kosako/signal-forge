@@ -1,7 +1,10 @@
 """intel run — 朝バッチの直列実行(設計 00 §2・§6)。
 
 順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ extract → analyze →
-digest → export → deliver → purge → backup(backup は設計 05 §5 の「朝バッチ末尾」)。
+digest → export → deliver → dig(cap > 0 のときのみ。GH#105)→ purge → backup
+(backup は設計 05 §5 の「朝バッチ末尾」)。dig を deliver の後に置くのは、
+ダイジェスト配信を深掘り生成(分オーダー)で遅らせないため。purge より前なのは
+X 由来 documents の TTL 失効前に本文を材料として使うため。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
 段の失敗はその段で捕捉して記録し、後続の段は実行する。失敗が1つでもあれば
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
@@ -69,6 +72,8 @@ def run_pipeline(
             "Telegram 未設定のため deliver 段を skip",
             extra={"run_id": run_id, "stage": "deliver"},
         )
+    if config.dig.daily_cap > 0:  # 0 = 調査段無効(段ごと省く。x_signals と同じ流儀)
+        stage("dig", lambda: _dig(conn, config, env, logger, run_id))
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
     stage("backup", lambda: backup_daily(conn, config, logger, run_id=run_id))
 
@@ -158,6 +163,32 @@ def _analyze(
     result = preselect(conn, config, logger, run_id=run_id)
     analyze_selected(
         conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
+    )
+
+
+def _dig(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    logger: logging.Logger,
+    run_id: str,
+) -> None:
+    """dig 段(GH#105)。エンジンは effort 可変で生成する(解説 = config / 対訳 = low)。
+
+    Telegram 未設定でもノート生成は行い、カードは台帳(dig_results)に未送信で残す
+    (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。
+    """
+    from app.analysis.llm import create_engine
+    from app.deepdive import run_dig_stage
+
+    api = create_api(env) if is_telegram_configured(config, env) else None
+    run_dig_stage(
+        conn,
+        config,
+        lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+        api,
+        logger,
+        run_id=run_id,
     )
 
 

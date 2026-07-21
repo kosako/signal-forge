@@ -42,7 +42,7 @@
 
 ### 2プロセスの責務分離
 
-- **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
+- **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ dig(深掘り調査。`[dig].daily_cap > 0` のときのみ。GH#105 / 設計 06)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。dig を deliver の後に置く理由: ダイジェスト配信を深掘り生成(分オーダー)で遅らせない。purge より前に置く理由: X 由来 documents の TTL 失効前に本文を材料に使う。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
 - **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
 
@@ -50,7 +50,7 @@
 
 ```text
 app/
-  cli.py          # Typer。intel collect/extract/analyze/digest/deliver/poll/run/doctor
+  cli.py          # Typer。intel collect/extract/analyze/digest/deliver/dig/poll/run/doctor
                   #   poll = 受信デーモン(long polling 常駐+内蔵タイマー)
                   #   doctor は --purge(期限切れ削除の単独実行)/ --cost(コスト集計の単発表示)を持つ
   config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
@@ -66,6 +66,8 @@ app/
   digest/         # digests(日本語 Markdown)を produce
   delivery/       # telegram.py(Bot API 直叩き・配信)、poller.py(受信デーモン)、
                   #   surveys.py(夜アンケート・watchdog・失敗通知)、state.py(telegram_state KV)
+  dig.py          # 深掘りキュー(夜の入口。GH#104。poller から import — 軽量に保つ)
+  deepdive.py     # 朝の調査段(GH#105。DeepDive ノート生成 + 概要カード。設計 06 §4〜5)
   export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
 prompts/          # バージョン付き .md(analyses.prompt_ver で追跡)
@@ -80,7 +82,7 @@ tests/
 
 ## 4. 設定・secrets 管理
 
-- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 読取上限(ホームTL `x.daily_read_cap`・検索 `x_search.daily_read_cap`・合算の単一ノブ `x.combined_daily_read_cap`。ADR 0001)、検索スロット `x_search.slots`(最大3・入れ替え式)、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
+- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 読取上限(ホームTL `x.daily_read_cap`・検索 `x_search.daily_read_cap`・合算の単一ノブ `x.combined_daily_read_cap`。ADR 0001)、検索スロット `x_search.slots`(最大3・入れ替え式)、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、深掘り調査段 `[dig]`(日次上限 `daily_cap` 既定2・0=無効、解説生成の `reasoning_effort`、LLM 1呼び出しの `timeout_s`、本文入力上限 `body_max_chars` / 対訳上限 `translation_max_chars`、材料不足しきい値 `min_body_chars`。GH#105 / 設計 06 §3〜4)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
 - **secrets**: `~/.config/intel/.env`(chmod 600)に X API キー・Telegram bot token。launchd の plist には secrets を書かない(plist は誰でも読めるため)。
 - **ANTHROPIC_API_KEY は launchd 実行環境に載せない**(理由: claude -p が API 課金へ無自覚フォールバックするのを設定で遮断)。API エンジンを明示使用する場合のみ .env に別名キーで持ち、AnthropicApiEngine 内でだけ環境へ渡す。
 - `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コスト見込みとクォータ消費率。
@@ -95,7 +97,7 @@ class LLMEngine(Protocol):
 ```
 
 - **MVP のスコープ**: LLMEngine Protocol +**第一候補エンジン1本**のみ実装する。**第一候補は `codex-cli` に仮決定(2026-07-06、Issue #3)**: (1) 無人自動化ユースケースを公式ドキュメントが明記し規約リスク最小 (2) 開発作業(Claude Code)とクォータを食い合わない (3) `-o`(output-last-message)/`--output-schema` で構造化出力が素直(15件バッチ実測でフェンスなしクリーン JSON) (4) read-only sandbox+作業ディレクトリ隔離が動的検査で機能。Week 1 の安定性実測(#9/#14)で最終確定する。複数エンジンの優先順リスト(`llm.engines`)・エンジンフォールバック・残り2実装(もう片方の CLI と `AnthropicApiEngine`)は**拡張点に降格**し、必要になった時点で追加する(理由: 1〜1.5週の工期に3実装+フォールバック網はテスト面と doctor 検査を3倍にする過剰装備。Protocol があるので後付けコストは低く、PROPOSAL の「API SDK へ1日で差し替え可能」要件は Protocol で満たす)。
-- **切替**: config.toml の `llm.engine = "codex-cli"`(単一指定。値は `codex-cli` / `claude-cli` / `anthropic-api`。01 の analyses.engine enum と同一語彙)。コード変更なしで差し替え可能。推論専用モードを設定できないエンジンは起動時に doctor が fail させる(理由: 「LLM に書込・送信権限を与えない」を宣言でなく構成で担保)。
+- **切替**: config.toml の `llm.engine = "codex-cli"`(単一指定。値は `codex-cli` / `claude-cli` / `anthropic-api`。01 の analyses.engine enum と同一語彙)。コード変更なしで差し替え可能。推論専用モードを設定できないエンジンは起動時に doctor が fail させる(理由: 「LLM に書込・送信権限を与えない」を宣言でなく構成で担保)。深掘り調査段(GH#105 / 設計 06 §4)も**同一エンジン・同一隔離**で呼び出す(effort のみ `[dig].reasoning_effort` で可変。vault 書込・Telegram 送信は LLM でなく orchestrator 側 Python の責務)。
 - **呼び出しの隔離仕様(推論専用モードの実体)**。「ツール disallow」の宣言だけでは、ユーザーの設定・MCP 由来ツールが生き残りうるため、以下を構成で強制する:
   1. `claude -p` は**専用の設定分離**で起動する: `--setting-sources ""` で user/project/local 設定(CLAUDE.md・settings.json)を読み込ませず、`--disallowedTools "*"` + `--strict-mcp-config`(MCP 空指定)でツールを全遮断する。**専用 CONFIG DIR/HOME 分離は使わない**(実測 2026-07-06、Issue #3: CONFIG DIR を分けると認証も分離され Not logged in で不成立)。出力は ```json フェンス付きで返るため、スキーマ検証前にフェンス除去を行う。
   2. `codex exec` は**作業ディレクトリを空の専用ディレクトリに固定**し、ネットワーク遮断サンドボックスで起動する(read-only でもファイル読み取りは可能なため、`.env`・SSH 鍵等が summary 経由で出力に流出する経路を作業ディレクトリ隔離で塞ぐ)。**認証は使い捨て CODEX_HOME(auth.json symlink のみ)で最小限見せる**が、read-only sandbox は同居する auth.json を summary 経由で流出させうる(Issue #54 で実測。symlink 経由の実体読取・絶対パス直読みを含む)。これを **permission profile の deny-read** で塞ぐ: `-s read-only` の代わりに `default_permissions` で名前付き profile を選び(`-s` を明示すると profile の filesystem deny が無視される・実測)、`[permissions.<name>].filesystem` に write を一切与えず network を空にして read-only 相当の隔離を保ったまま、**CODEX_HOME と実 `~/.codex` の読取を deny** する。codex 自身の auth 読取は sandbox 外で行われるため認証は維持される。

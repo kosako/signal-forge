@@ -613,14 +613,34 @@ def _replied_dig_backlog(conn: sqlite3.Connection, replied: object) -> bool:
 
 
 def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
-    """リプライ先が digest の記事メッセージなら item_id を返す(GH#92)。
+    """リプライ先が digest の記事メッセージ / 深掘り概要カードなら item_id を返す。
 
     外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
-    digest_messages は owner chat にしか送っていないため message_id 単独で一意に引ける。
-    ヘッダは _replied_digest_id(GH#96)・台帳に無いメッセージ(追い掛け・アンケート等)は
-    対象外。
+    digest_messages / dig_results は owner chat にしか送っていないため message_id 単独で
+    一意に引ける。ヘッダは _replied_digest_id(GH#96)・台帳に無いメッセージ
+    (追い掛け・アンケート等)は対象外。
+
+    概要カード(GH#105)へのリプライも当面は感想(item_notes)として記録する:
+    take / 続き要求への分類・DeepDive ノートへの還流は GH#106 のスコープで、ここで
+    拾っておかないとリプライが恒久に失われる(GH#92 で旧 poller が消費したリプライを
+    遡及できなかった教訓)。
     """
     row = _replied_ledger_row(conn, replied, "item_id IS NOT NULL")
+    if row is not None:
+        return row["item_id"]
+    return _replied_dig_card_item_id(conn, replied)
+
+
+def _replied_dig_card_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
+    """リプライ先が深掘り概要カード(dig_results)なら item_id を返す(GH#105)。"""
+    if not isinstance(replied, dict):
+        return None
+    message_id = replied.get("message_id")
+    if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
+        return None
+    row = conn.execute(
+        "SELECT item_id FROM dig_results WHERE message_id = ?", (message_id,)
+    ).fetchone()
     return row["item_id"] if row else None
 
 

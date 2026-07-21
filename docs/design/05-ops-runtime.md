@@ -10,7 +10,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ### 1.1 朝バッチ `com.intel.morning`
 
-- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→extract→analyze→digest→export→deliver→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。
+- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→x_signals→extract→analyze→digest→export→deliver→dig→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。dig 段(GH#105)は 1 件あたり分オーダーの LLM 生成を含むため、`telegram.watchdog_time`(07:15)は「06:30 起動 + 既存段 + dig 上限件数 × 数分」を見込んだ余裕であることに注意(既定 daily_cap=2 で収まる想定。上限を増やすときは watchdog_time と合わせて見直す)。
 - `StartCalendarInterval`: 06:30 JST(配信 7:00 の30分前。LLM バッチと X ページングの余裕をみる)。
 - **再起動方針: 自動再実行しない**。`intel run` は冪等(sources のカーソル管理+items の content_hash 重複排除)なので失敗時は手動 `intel run` で安全に再走できる。自動リトライを launchd に持たせない理由: 二重課金・二重配信の検知より、watchdog 通知→手動再走の方が単純で事故が少ない。
 - スリープ対策: `sudo pmset repeat wakeorpoweron MTWRFSU 06:25:00`。StartCalendarInterval はスリープ中スキップされるため wake を先に確保する。

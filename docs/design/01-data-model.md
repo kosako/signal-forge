@@ -215,7 +215,7 @@ CREATE INDEX ix_digest_notes_pending ON digest_notes(digest_id) WHERE exported_a
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)の7つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)の8つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -333,6 +333,15 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
 - `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)
 - `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先の認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
+
+### 深掘り実行結果(dig_results・migration 010。GH#105 / 設計 06 §4〜5)
+
+朝の調査段の実行台帳(1 実行 = 1 行)。ノート生成(vault 書込)とカード送信の間で
+中断しても、再実行が「生成済みを再生成せず・未送信カードだけ送る」ための正本。
+
+- `note_name` / `source_note_name` = 生成した解説 / 原文・対訳ノートのファイル名(拡張子なし。`source_note_name` NULL = ツイート本文のみ等でソースノート無し)
+- `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
+- `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
 
 ## 8. digests
 

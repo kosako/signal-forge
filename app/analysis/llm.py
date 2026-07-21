@@ -269,14 +269,15 @@ def _ephemeral_codex_home(base: Path) -> str:
     return str(home)
 
 
-def create_engine(engine_name: str) -> LLMEngine:
+def create_engine(engine_name: str, *, model_reasoning_effort: str = "low") -> LLMEngine:
     """config `llm.engine` からエンジンを生成する。
 
     config は語彙(enum)の検証のみ。未実装エンジンはここで fail fast する
-    (doctor の未実装エンジン検査は #21)。
+    (doctor の未実装エンジン検査は #21)。effort の既定 low は analyze 段の
+    現行契約(呼び出し側が用途に応じて上げる。調査段 = GH#105)。
     """
     if engine_name == "codex-cli":
-        return CodexCliEngine()
+        return CodexCliEngine(model_reasoning_effort=model_reasoning_effort)
     raise LLMError(
         f"エンジン {engine_name!r} は未実装(MVP は codex-cli のみ。claude-cli / "
         "anthropic-api は拡張点。設計 00 §5)"
