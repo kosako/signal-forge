@@ -121,7 +121,9 @@ def run_dig_stage(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
-    today: str | None = None,  # JST の YYYY-MM-DD(テスト注入用)
+    # JST の YYYY-MM-DD(テスト注入用)。差し替わるのは暦日だけで dig_results.created_at は
+    # 実時刻で入るため、上限・同日判定を試すときは実際の日付を渡す(GH#119)
+    today: str | None = None,
 ) -> None:
     """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
 
