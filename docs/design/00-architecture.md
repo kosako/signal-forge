@@ -126,6 +126,6 @@ class LLMEngine(Protocol):
 
 ## 7. 拡張点(設計はしない、口だけ確保)
 
-- **フェーズ2 `research_tasks`**: 🔖 signal を入力に research_tasks テーブル(新規マイグレーション)を追加し、受信デーモンがキュー投入、別プロセスが消化する形を想定。既存テーブルへの変更は不要になるよう、signals は item_id+種別+記録日時を正規化済み。
+- **フェーズ2 深掘り(実装済み。正本は設計 06)**: 深掘りキュー `dig_queue`(migrations/009)と調査結果の台帳 `dig_results`(migrations/010)で実装した。調査は別プロセスでなく朝バッチの dig 段(§2)で消化する。履歴: 当初は 🔖 signal を入力に `research_tasks` テーブルを追加し、受信デーモンがキュー投入・別プロセスが消化する形を想定していた(既存テーブルへの変更が不要になるよう、signals は item_id+種別+記録日時を正規化済み)。
 - **ランキング自動調整**: analyses(プロンプト ver・入力 hash)と signals が揃っているため、将来のフィードバックループは読み取り専用の新モジュール追加で足りる。
 - **サーバー移行**: launchd への依存は plist 2枚に閉じており、cron/systemd への置換で済む。SQLite・ファイル設定・long polling はそのまま可搬。Obsidian export だけがローカルパス前提のため、移行時は Vault 同期方式の再検討が必要——それ以上の抽象化は今はしない(理由: YAGNI、Mac mini 運用が当面の正)。
