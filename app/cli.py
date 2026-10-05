@@ -367,7 +367,11 @@ def run(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
     force_digest: bool = typer.Option(False, "--force", help="当日 digest を置換再生成する"),
 ) -> None:
-    """朝バッチ: collect→extract→analyze→digest→export→deliver→purge→backup を直列実行。"""
+    """朝バッチ: collect→x_signals→extract→analyze→digest→export→deliver→dig→purge→backup。
+
+    各段を直列実行する。x_signals は config の x_signals.daily_read_cap > 0、dig は
+    dig.daily_cap > 0 のときのみ(段の順序の正本は設計 00 §2)。
+    """
     from ulid import ULID
 
     from app.analysis.llm import create_engine

@@ -1,4 +1,4 @@
-"""TTL purge — 朝バッチの最終ステップ(設計 01 §6 の削除ジョブ)。
+"""TTL purge — 朝バッチの backup の直前の段(設計 01 §6 の削除ジョブ)。
 
 1. documents の期限切れ削除(expires_at <= now)
 2. items.raw_payload の NULL 化は documents から独立して、fetched_at + ソース別 TTL
