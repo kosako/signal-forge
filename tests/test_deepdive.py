@@ -423,6 +423,10 @@ def test_daily_cap_and_rerun_idempotency(conn, config) -> None:
 
     run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
     assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 2
+    # created_at は SQLite の実時刻で入るので、注入した日 (JST 2026-07-22) の時刻へ揃える
+    # (揃えないと実行日によって同日の実行が数えられず、残枠が戻る。GH#119)
+    conn.execute("UPDATE dig_results SET created_at = '2026-07-21T22:00:00Z'")
+    conn.commit()
 
     # 同日の再実行は残枠 0 = 生成なし(送信済みカードの再送もなし)
     run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
