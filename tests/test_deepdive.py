@@ -2,7 +2,6 @@
 
 import logging
 import sqlite3
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,7 +10,6 @@ from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.deepdive import (
     AUTO_BRIEF,
-    JST,
     DigDraft,
     DigError,
     TranslationChunk,
@@ -418,26 +416,25 @@ def test_card_note_path_is_html_escaped(conn, config) -> None:
 
 
 def test_daily_cap_and_rerun_idempotency(conn, config) -> None:
-    # 上限は created_at(SQLite の実時刻)の JST 暦日で数えるので、注入する日も実際の
-    # 今日にする(固定の日付だと、その日以外は同日の実行が数えられず残枠が戻る。GH#119)
-    now = datetime.now(JST)
-    today = now.strftime("%Y-%m-%d")
-    tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     items = [add_item(conn, f"https://a.example/{i}") for i in range(3)]
     for i in items:
         enqueue(conn, i)
     api = FakeApi()
 
-    run_dig_stage(conn, config, make_factory({}), api, logger, today=today)
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
     assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 2
+    # created_at は SQLite の実時刻で入るので、注入した日 (JST 2026-07-22) の時刻へ揃える
+    # (揃えないと実行日によって同日の実行が数えられず、残枠が戻る。GH#119)
+    conn.execute("UPDATE dig_results SET created_at = '2026-07-21T22:00:00Z'")
+    conn.commit()
 
     # 同日の再実行は残枠 0 = 生成なし(送信済みカードの再送もなし)
-    run_dig_stage(conn, config, make_factory({}), api, logger, today=today)
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
     assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 2
     assert len(api.sent) == 2
 
     # 翌日は残り 1 件が掘られる
-    run_dig_stage(conn, config, make_factory({}), api, logger, today=tomorrow)
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
     assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 3
 
 
