@@ -168,7 +168,7 @@ updated: 2026-07-05
 ## 5. プロンプトのバージョン管理
 
 - `prompts/analyze-vNNN.md`。**既存版は編集禁止・変更は新番号で追加**。理由: analyses.prompt_version と KPI の対応を後から比較可能に保つ。
-- 使用版は config.toml `analysis.prompt_version = "v001"`。analyses には prompt_version・model・入力 hash・推定コストを必ず記録(共通規約のカラム)。
+- 使用版は module の定数で固定する(本分析は `app/analysis/analyzer.py` の `PROMPT_VERSION`、トレンドは `app/analysis/trend.py` の同名定数)。版を上げるときは新番号の prompt file を追加して定数を更新する(config.toml では切り替えない。`[analysis]` に未定義のキーを書くと config 読込が ConfigError で止まる)。analyses には prompt_version・model・入力 hash・推定コストを必ず記録(共通規約のカラム)。
 - 関心プロファイルは版管理しない(updated 日付のみ)。プロンプト構造の変更と基準内容の変更を分離する。
 
 ## 6. ランキング式(app/ranking/)
