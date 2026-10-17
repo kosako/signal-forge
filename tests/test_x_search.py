@@ -1,3 +1,5 @@
+import logging
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -6,12 +8,21 @@ import pytest
 from app.config import X_SEARCH_QUERY_SUFFIX
 from app.connectors.base import FatalError, RetryableError
 from app.connectors.x import XCredentials
-from app.connectors.x_search import XSearchConnector, _split_budget
+from app.connectors.x_search import XSearchConnector, _snowflake_time, _split_budget
 from app.models import Source
 
 CREDS = XCredentials(
     api_key="ck", api_secret="cs", access_token="at", access_token_secret="ats"
 )
+# 小さい id("900" 等)の snowflake 時刻 = 基準時刻。既定の時計をここに置き、既存テストの
+# since_id を「新しい」扱いにする(7 日窓の判定は実時刻の id を使うテストで別に検証する)
+SNOWFLAKE_EPOCH = datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=UTC)
+NOW = datetime(2026, 10, 17, 13, 49, tzinfo=UTC)
+
+
+def snowflake_at(when: datetime) -> str:
+    """その時刻に生成された tweet id(下位 22 ビットは 0)。"""
+    return str((int(when.timestamp() * 1000) - 1288834974657) << 22)
 
 
 def make_source(**overrides) -> Source:
@@ -47,7 +58,7 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
 
 
 def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
-                   unit_price=0.004, seen=None) -> XSearchConnector:
+                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
     200 応答は max_results で data を切り詰めて実 API の挙動を模す。"""
@@ -79,6 +90,7 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price,
         sleep=lambda _s: None,
+        now=lambda: now,
     )
 
 
@@ -121,6 +133,83 @@ def test_since_id_passed_and_kept_when_no_results() -> None:
     assert result.stats.api_reads == 0
     assert result.next_cursor == {"since_id": "900"}  # 取得ゼロなら据え置き
     assert parse_qs(urlsplit(str(seen[0].url)).query)["since_id"] == ["900"]
+
+
+def test_stale_since_id_is_dropped_and_cursor_advances(caplog) -> None:
+    # 停止明け(GH#121): 50 日前の since_id を送ると search/recent が毎日 400 を返し、
+    # watermark が永久に進まない。外して取得し、取れた最大 id へ進める
+    seen: list[httpx.Request] = []
+    stale = snowflake_at(NOW - timedelta(days=50))
+    fresh = snowflake_at(NOW - timedelta(hours=1))
+    pages = {"ai": [(200, page([tweet(fresh)]), {})]}
+    with caplog.at_level(logging.WARNING, logger="intel"):
+        result = connector_from(pages, slots=("ai",), seen=seen, now=NOW).fetch(
+            make_source(), {"since_id": stale}
+        )
+    assert "since_id" not in parse_qs(urlsplit(str(seen[0].url)).query)
+    assert result.next_cursor == {"since_id": fresh}
+    assert any("7 日窓" in r.getMessage() for r in caplog.records)
+
+
+def test_snowflake_time_matches_x_api_cutoff() -> None:
+    # 実 API の 400 応答「created after 2026-10-10T13:49Z ... larger than 2108917857743011840」
+    assert _snowflake_time("2108917857743011840").replace(second=0, microsecond=0) == datetime(
+        2026, 10, 10, 13, 49, tzinfo=UTC
+    )
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        pytest.param(
+            {"a": [(200, page([tweet(snowflake_at(NOW))]), {})], "b": [(503, {}, {})]},
+            id="partial-failure",
+        ),
+        pytest.param(
+            {
+                "a": [
+                    (
+                        200,
+                        page([tweet(snowflake_at(NOW))], next_token="tok1"),
+                        {"x-rate-limit-remaining": "0"},
+                    )
+                ],
+                "b": [(200, page([]), {})],
+            },
+            id="rate-limit",
+        ),
+        pytest.param({"a": [(200, page([]), {})], "b": [(200, page([]), {})]}, id="no-results"),
+    ],
+)
+def test_stale_since_id_is_kept_in_cursor_when_not_advanced(pages) -> None:
+    # 外すのは送信だけ。打ち切り・0 件では保存値を据え置く(設計 02 §2。次回も同じ判定で外れる)
+    stale = snowflake_at(NOW - timedelta(days=50))
+    seen: list[httpx.Request] = []
+    result = connector_from(pages, slots=("a", "b"), seen=seen, now=NOW).fetch(
+        make_source(), {"since_id": stale}
+    )
+    assert all("since_id" not in parse_qs(urlsplit(str(r.url)).query) for r in seen)
+    assert result.next_cursor == {"since_id": stale}
+
+
+@pytest.mark.parametrize(
+    ("age", "sent"),
+    [
+        # 仕様値(6 日)を実装の定数とは独立に書く(定数の書き換えを検出するため)
+        (timedelta(days=6) - timedelta(minutes=1), True),  # 窓の端より手前 = そのまま使う
+        (timedelta(days=6), True),  # ちょうど 6 日 = まだ使う(「より古い」で外す)
+        (timedelta(days=6) + timedelta(minutes=1), False),  # 窓の端より古い = 外す
+    ],
+)
+def test_since_id_age_boundary(age: timedelta, sent: bool) -> None:
+    seen: list[httpx.Request] = []
+    since_id = snowflake_at(NOW - age)
+    pages = {"ai": [(200, page([]), {})]}
+    connector_from(pages, slots=("ai",), seen=seen, now=NOW).fetch(
+        make_source(), {"since_id": since_id}
+    )
+    query = parse_qs(urlsplit(str(seen[0].url)).query)
+    assert (query.get("since_id") == [since_id]) is sent
 
 
 def test_no_cursor_and_no_results_returns_empty_cursor() -> None:
