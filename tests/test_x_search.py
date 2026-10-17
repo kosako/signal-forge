@@ -8,12 +8,7 @@ import pytest
 from app.config import X_SEARCH_QUERY_SUFFIX
 from app.connectors.base import FatalError, RetryableError
 from app.connectors.x import XCredentials
-from app.connectors.x_search import (
-    SINCE_ID_MAX_AGE,
-    XSearchConnector,
-    _snowflake_time,
-    _split_budget,
-)
+from app.connectors.x_search import XSearchConnector, _snowflake_time, _split_budget
 from app.models import Source
 
 CREDS = XCredentials(
@@ -164,10 +159,46 @@ def test_snowflake_time_matches_x_api_cutoff() -> None:
 
 
 @pytest.mark.parametrize(
+    "pages",
+    [
+        pytest.param(
+            {"a": [(200, page([tweet(snowflake_at(NOW))]), {})], "b": [(503, {}, {})]},
+            id="partial-failure",
+        ),
+        pytest.param(
+            {
+                "a": [
+                    (
+                        200,
+                        page([tweet(snowflake_at(NOW))], next_token="tok1"),
+                        {"x-rate-limit-remaining": "0"},
+                    )
+                ],
+                "b": [(200, page([]), {})],
+            },
+            id="rate-limit",
+        ),
+        pytest.param({"a": [(200, page([]), {})], "b": [(200, page([]), {})]}, id="no-results"),
+    ],
+)
+def test_stale_since_id_is_kept_in_cursor_when_not_advanced(pages) -> None:
+    # 外すのは送信だけ。打ち切り・0 件では保存値を据え置く(設計 02 §2。次回も同じ判定で外れる)
+    stale = snowflake_at(NOW - timedelta(days=50))
+    seen: list[httpx.Request] = []
+    result = connector_from(pages, slots=("a", "b"), seen=seen, now=NOW).fetch(
+        make_source(), {"since_id": stale}
+    )
+    assert all("since_id" not in parse_qs(urlsplit(str(r.url)).query) for r in seen)
+    assert result.next_cursor == {"since_id": stale}
+
+
+@pytest.mark.parametrize(
     ("age", "sent"),
     [
-        (SINCE_ID_MAX_AGE - timedelta(minutes=1), True),  # 窓の端より手前 = そのまま使う
-        (SINCE_ID_MAX_AGE + timedelta(minutes=1), False),  # 窓の端より古い = 外す
+        # 仕様値(6 日)を実装の定数とは独立に書く(定数の書き換えを検出するため)
+        (timedelta(days=6) - timedelta(minutes=1), True),  # 窓の端より手前 = そのまま使う
+        (timedelta(days=6), True),  # ちょうど 6 日 = まだ使う(「より古い」で外す)
+        (timedelta(days=6) + timedelta(minutes=1), False),  # 窓の端より古い = 外す
     ],
 )
 def test_since_id_age_boundary(age: timedelta, sent: bool) -> None:

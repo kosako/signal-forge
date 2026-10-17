@@ -83,9 +83,10 @@ class XSearchConnector:
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
-        since_id = cursor.get("since_id")
+        stored_since = cursor.get("since_id")
+        since_id = stored_since  # 送る値。外しても保存値は据え置き用に残す(次回も同じ判定で外れる)
         if since_id and _snowflake_time(since_id) < self._now() - SINCE_ID_MAX_AGE:
-            # 据え置くと毎日 400 で watermark が永久に進まない(GH#121)。外して新しい側から取り直す
+            # 送ると毎日 400 で watermark が永久に進まない(GH#121)。外して新しい側から取り直す
             logging.getLogger("intel").warning(
                 "検索の since_id が 7 日窓の端より古い。since_id なしで取得する",
                 extra={"source_id": source_row.id, "extra": {"since_id": since_id}},
@@ -115,7 +116,7 @@ class XSearchConnector:
         # 途中打ち切りで進めると未実行スロットのその日ぶんが恒久欠落する(据え置きなら
         # 翌日再取得され UNIQUE で吸収)。スロット内の予算打ち切りで捨てる古い側は
         # ホームTL と同じく追わない(設計 02 §2)
-        next_since = str(max(all_ids)) if all_ids and not stopped else since_id
+        next_since = str(max(all_ids)) if all_ids and not stopped else stored_since
         return FetchResult(
             items=items,
             next_cursor={"since_id": next_since} if next_since else {},
