@@ -11,6 +11,9 @@
   ときだけ進める**: 途中打ち切りで進めると未実行スロットのその日ぶんが watermark の背後に
   隠れて恒久欠落するため、打ち切り時は据え置き(翌日、旧 watermark から再取得して UNIQUE で
   吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。
+- search/recent は直近 7 日より古い since_id を 400 で拒否する。停止明けで watermark が窓の外に
+  出ると毎日 400 で永久に進まないため、窓の端に近い(SINCE_ID_MAX_AGE より古い)since_id は
+  外して取得する(GH#121。窓の外の欠落は API 上取り戻せない)。
 - 打ち切り・失敗はホームTL と同じ方針: rate limit 残 0 で全体打ち切り / 累計 0 件での
   HTTP 失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
@@ -19,8 +22,10 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -46,6 +51,14 @@ SEARCH_URL = f"{API_BASE}/tweets/search/recent"
 # note_tweet = 長文ポストの全文(GH#94。ホームTL と同じ理由)
 TWEET_FIELDS = "created_at,author_id,note_tweet"
 EXPANSIONS = "author_id"
+# search/recent が受け付ける since_id は直近 7 日(実測の 400 応答で確認・GH#121)。
+# run の所要時間と時計のずれに 1 日の余裕を取る(この古さなら予算はどのみち新しい側で埋まる)
+SINCE_ID_MAX_AGE = timedelta(days=6)
+_SNOWFLAKE_EPOCH_MS = 1288834974657  # tweet id(snowflake)の時刻の基準 = 2010-11-04T01:42:54.657Z
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class XSearchConnector:
@@ -60,15 +73,24 @@ class XSearchConnector:
         daily_read_cap: int,
         unit_price_usd: float,
         sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._session = XApiSession(client=client, credentials=credentials, sleep=sleep)
         self._slots = slots
         self._daily_read_cap = daily_read_cap
         self._unit_price = unit_price_usd
+        self._now = now
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
         since_id = cursor.get("since_id")
+        if since_id and _snowflake_time(since_id) < self._now() - SINCE_ID_MAX_AGE:
+            # 据え置くと毎日 400 で watermark が永久に進まない(GH#121)。外して新しい側から取り直す
+            logging.getLogger("intel").warning(
+                "検索の since_id が 7 日窓の端より古い。since_id なしで取得する",
+                extra={"source_id": source_row.id, "extra": {"since_id": since_id}},
+            )
+            since_id = None
         users: dict[str, str] = {}
         fetched: list[tuple[str, list[dict]]] = []  # (スロットのクエリ, tweets)
         reads = 0
@@ -165,6 +187,11 @@ def build_x_search_connector(
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price_usd,
     )
+
+
+def _snowflake_time(tweet_id: str) -> datetime:
+    """tweet id の上位ビット(22 ビット右シフト)に入っている生成時刻(ms)。"""
+    return datetime.fromtimestamp(((int(tweet_id) >> 22) + _SNOWFLAKE_EPOCH_MS) / 1000, UTC)
 
 
 def _split_budget(total: int, n: int) -> list[int]:
