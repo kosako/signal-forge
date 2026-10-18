@@ -10,7 +10,8 @@
 # app/connectors/base.py
 @dataclass(frozen=True)
 class RawItem:
-    external_id: str          # ソース内の自然キー(tweet id / RSS guid / URL)
+    external_id: str | None   # ソース内の自然キー(tweet id / RSS guid)。無ければ None
+                              #   (guid の無い RSS は collect が正規化 URL の hash で補う。§3)
     url: str                  # 正規化前URL。正規化は collect 側で一元化
     title: str | None
     author: str | None
@@ -18,17 +19,18 @@ class RawItem:
     raw_content: str | None   # ソースが本文を同梱する場合のみ(RSS content 等)。抽出層へのヒント。
                               #   collect が items.raw_payload(01 §6 の JSON 形・サイズ上限あり)に
                               #   保存し、extraction は DB 経由で参照する(直接受け渡ししない)
-    meta: dict                # ソース固有情報(retweet種別など)。JSON保存
+    meta: dict = field(default_factory=dict)  # ソース固有情報(RT 種別など)。JSON保存
 
 @dataclass(frozen=True)
 class FetchResult:
     items: list[RawItem]
     next_cursor: dict         # sources.cursor に JSON 保存する不透明な辞書
-    stats: FetchStats         # items_fetched, api_reads(collect_runs へ記録)+ http_status, duration_ms(ログのみ)
+    stats: FetchStats         # items_fetched, api_reads, estimated_cost_usd(collect_runs へ記録)
+                              #   + http_status, duration_ms(ログのみ)
 
 class Connector(Protocol):
     source_type: str          # "x" | "rss"
-    def fetch(self, source_row: SourceRow, cursor: dict) -> FetchResult: ...
+    def fetch(self, source_row: Source, cursor: dict) -> FetchResult: ...   # Source は app.models
 ```
 
 - **fetch は読み取り専用・副作用なし**(DB に触らない)。items への書き込み・URL正規化・重複排除・カーソル保存はすべて `intel collect` が行う。理由: 冪等性の担保箇所を1箇所に集約し、コネクタ追加時にバグ面を増やさない。
@@ -110,7 +112,7 @@ class Connector(Protocol):
 
 ## 3. RSS コネクタ(`connectors/rss.py`)
 
-- **取得**: httpx で GET し、レスポンスボディを feedparser に渡す(feedparser 内蔵HTTPは使わない。理由: timeout・UA・エラー分類・条件付きGETを全コネクタで httpx に統一)。timeout 15s。
+- **取得**: httpx で GET し、レスポンスボディを feedparser に渡す(feedparser 内蔵HTTPは使わない。理由: timeout・UA・エラー分類・条件付きGETを全コネクタで httpx に統一)。timeout とリトライは設計 05 §8 の共通規約(connect 10s / read 30s)。
 - **条件付き GET**: `cursor = {"etag": str|None, "last_modified": str|None}` を保存し、`If-None-Match` / `If-Modified-Since` を送る。304 は正常 no-op(collect_runs に `status='ok'`・`items_fetched=0` で記録。error 列には書かない正常系。01 の status CHECK に値を増やさない)。
 - **重複排除キー**: entry の `id`(guid)を external_id に。無ければ正規化 URL の hash にフォールバック。
 - **raw_content**: `content` / `summary` があれば RawItem.raw_content に同梱。全文フィードなら本文抽出の HTTP を節約できる(使うかは extraction 層が判断)。
@@ -119,13 +121,13 @@ class Connector(Protocol):
 
 ## 4. 手動 URL コネクタ(Telegram 投入フロー)
 
-手動URLは **Connector を実装しない**。受信デーモン(delivery/telegram.py 側)が直接 items に書く。理由: 「巡回して取る」モデルに合わないものを fetch() に無理に対称化しない。
+手動URLは **Connector を実装しない**。受信デーモン(`delivery/poller.py`)が直接 items に書く。理由: 「巡回して取る」モデルに合わないものを fetch() に無理に対称化しない。
 
 フロー:
 
 1. 受信デーモンが message を受信 → **owner allowlist 検証**(不一致は記録のみで破棄。PROPOSAL §Telegram 実装仕様)。
-2. テキストから URL を抽出(http/https のみ。複数あれば各々投入)。URL が無い message は夜アンケート等の他ハンドラへ。
-3. **canonical_url のみ**で既存照会。既存なら「取り込み済み」と返信して終了(冪等)。content_hash は照会に使わない(manual は本文が無く正規化テキストが空になるため、空ハッシュ一致で別 URL まで duplicate 化する。01 §5〜6)。
+2. owner chat からのリプライは先に振り分け、URL を取り込まない: 深掘りカード・その返事へのリプライ(質問・感想。設計 06 §6)、ダイジェストの記事・ヘッダへのリプライ(感想。設計 04)、未消化一覧へのリプライ(深掘りの指定。設計 06 §2)。それ以外のメッセージからテキストの URL を抽出する(http/https のみ。複数あれば各々投入)。URL が無ければ案内文(URL を送ると翌朝のダイジェスト候補になる)を返す。夜アンケートの回答はボタン(callback)で受けるので、メッセージの経路には来ない。
+3. **canonical_url のみ**で既存照会。既存なら「投入済みです」と返信して終了(冪等)。content_hash は照会に使わない(manual は本文が無く正規化テキストが空になるため、空ハッシュ一致で別 URL まで duplicate 化する。01 §5〜6)。
 4. 新規なら `items` に source=manual(sources の固定1行)・`status='new'`(01 の状態語彙に従う。専用の pending 状態は持たない)で INSERT し、「受け付けた。明朝のダイジェストで分析される」と即返信。
 5. 本文抽出・分析は**翌朝バッチに乗せる**(即時分析しない。理由: LLM 呼び出し経路を朝バッチ1本に保ち、クォータ・コスト・障害面を増やさない。急ぎで読むなら人がそのまま開けばよい)。
 

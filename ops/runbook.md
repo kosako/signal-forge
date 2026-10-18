@@ -1,7 +1,16 @@
-# 運用 runbook — launchd セットアップ(plan #22)
+# 運用 runbook — セットアップ・復旧・secrets・X 連携(plan #22 から拡張)
 
-設計正本: [../docs/design/05-ops-runtime.md](../docs/design/05-ops-runtime.md) §1(構成の理由は設計側)。
+設計正本: [../docs/design/05-ops-runtime.md](../docs/design/05-ops-runtime.md)(構成の理由は設計側)。
 本書は手を動かす手順のみ。時刻の前提: システムのタイムゾーンが JST であること。
+
+節の番号はコードのメッセージが参照しているので変えない。
+
+- §1〜§5: launchd のセットアップ(plist の生成、bootstrap、スリープ対策、Full Disk Access、確認)
+- §6: 配信時刻の変更
+- §7: バックアップと復旧
+- §8: secrets のローテーション
+- §9〜§10: X OAuth 2.0 のセットアップと興味シグナルの取り込み
+- §11: 深掘りカードへの質問への返事(既存のインストールの更新を含む)
 
 ## 前提
 
