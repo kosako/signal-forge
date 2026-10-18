@@ -1,4 +1,4 @@
-"""intel doctor — 構成不備・故障・コスト超過の検査(設計 05 §2 の13項目)。
+"""intel doctor — 構成不備・故障・コスト超過の検査(設計 05 §2 の14項目)。
 
 - 終了コード: 全 OK=0 / WARN のみ=0 / FAIL あり=1
 - 各検査は独立に実行し、1つの失敗で残りを止めない(検査自体の例外はその項目の FAIL)
@@ -60,7 +60,7 @@ def run_doctor(
     x_oauth1_probe: Callable[[dict[str, str]], str] | None = None,
     x_oauth2_probe: Callable[[Config, dict[str, str], Path], str] | None = None,
 ) -> list[CheckResult]:
-    """13項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
+    """14項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
     environ = dict(os.environ) if environ is None else environ
     home = Path.home() if home is None else home
 
@@ -126,6 +126,7 @@ def run_doctor(
                 "X OAuth2 token",
                 lambda: _check_x_oauth2(config, env, config_dir, x_oauth2_probe),
             ),
+            (14, "ソース死活", lambda: _check_source_health(conn, config)),
         ]
         done = {r.number for r in results}
         for number, name, check in checks:
@@ -724,6 +725,32 @@ def _check_ttl_leftovers(
             "(purge 経路の故障疑い。intel doctor --purge で削除可)",
         )
     return CheckResult(11, "TTL 残存", "PASS", "TTL 超過の残存なし")
+
+
+def _check_source_health(
+    conn: sqlite3.Connection | None, config: Config | None
+) -> CheckResult:
+    """#14 連続失敗がしきい値以上の enabled なソース(設計 02 §2・§3)。自動 disable はしない。"""
+    if conn is None or config is None or not _table_exists(conn, "sources"):
+        return CheckResult(14, "ソース死活", "WARN", "config/DB 未初期化のため算出不可")
+    from app.collect import RSS_FAILURE_ALERT, X_FAILURE_ALERT, source_failure_alerts
+
+    alerts = [
+        f"RSS{alert}(死亡疑い)"
+        for alert in source_failure_alerts(conn, "rss", RSS_FAILURE_ALERT)
+    ]
+    if config.x.enabled:  # X を止めている間は回数が進まない(止める前の回数で警告し続けない)
+        alerts = [
+            f"X{alert}" for alert in source_failure_alerts(conn, "x", X_FAILURE_ALERT)
+        ] + alerts
+    if alerts:
+        return CheckResult(
+            14,
+            "ソース死活",
+            "WARN",
+            " / ".join(alerts) + "。直すか sources.enabled=0 で止める",
+        )
+    return CheckResult(14, "ソース死活", "PASS", "連続失敗のソースなし")
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:

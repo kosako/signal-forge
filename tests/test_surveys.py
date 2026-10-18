@@ -1,12 +1,13 @@
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from app.config import Config, TelegramConfig
+from app.config import Config, TelegramConfig, XConfig
 from app.db import apply_migrations, connect
 from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poller
 from app.delivery.state import get_state
@@ -335,6 +336,90 @@ def test_watchdog_retries_after_send_failure(conn, tmp_path) -> None:
     run_due_timers(conn, config, api, logger, jst_now("07:16"))  # 次周期で成功
     assert len(api.sent) == 1
     assert get_state(conn, STATE_WATCHDOG_NOTIFIED) is not None
+
+
+# --- watchdog: X ソースの連続失敗(GH#124 / 設計 02 §2) ---
+
+X_400 = "FatalError: X が HTTP 400: https://api.twitter.com/2/tweets/search/recent"
+
+
+def add_source(
+    conn, type_: str, name: str, failures: int, *, enabled: int = 1, error: str = X_400
+) -> None:
+    conn.execute(
+        "INSERT INTO sources (type, name, enabled, consecutive_failures, last_error) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (type_, name, enabled, failures, error),
+    )
+
+
+def x_config(tmp_path: Path, *, enabled: bool = True) -> Config:
+    return replace(make_config(tmp_path), x=XConfig(enabled=enabled))
+
+
+def test_watchdog_notifies_x_source_failing_three_times(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    add_source(conn, "x", "x:search", 3)
+    api = FakeApi()
+    config = x_config(tmp_path)
+    now = jst_now("07:15")
+
+    run_due_timers(conn, config, api, logger, now)
+    run_due_timers(conn, config, api, logger, now)  # 同一種別1日1通
+
+    assert len(api.sent) == 1
+    text = api.sent[0][1]
+    assert "「x:search」が 3 回連続で失敗" in text
+    assert "HTTP 400" in text
+    assert "sources.enabled=0" in text
+    assert "intel run" not in text  # 再走では直らない問題に再走を勧めない
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) == now.strftime("%Y-%m-%d")
+
+
+@pytest.mark.parametrize(
+    ("type_", "failures", "enabled", "x_enabled"),
+    [
+        ("x", 2, 1, True),  # しきい値未満
+        ("x", 9, 0, True),  # 人が止めたソース
+        ("x", 9, 1, False),  # X ごと止めている間は回数が進まない(古い回数で鳴らさない)
+        ("rss", 30, 1, True),  # RSS は doctor #14 のみ(設計 02 §3)
+    ],
+)
+def test_watchdog_silent_for_sources_not_to_alert(
+    conn, tmp_path, type_, failures, enabled, x_enabled
+) -> None:
+    silence_watchdog(conn)
+    add_source(conn, type_, "src", failures, enabled=enabled)
+    api = FakeApi()
+    run_due_timers(conn, x_config(tmp_path, enabled=x_enabled), api, logger, jst_now("07:15"))
+    assert api.sent == []
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) is None  # 問題なし = 通知枠を消費しない
+
+
+def test_watchdog_combines_digest_and_source_problems(conn, tmp_path) -> None:
+    add_source(conn, "x", "x:home", 4)
+    add_source(conn, "x", "x:search", 5)
+    api = FakeApi()  # digest 未生成
+    run_due_timers(conn, x_config(tmp_path), api, logger, jst_now("07:15"))
+
+    assert len(api.sent) == 1  # 同一種別1日1通 = 1通にまとめる
+    lines = api.sent[0][1].split("\n")
+    assert len(lines) == 3
+    assert "未生成" in lines[0] and "intel run" in lines[0]
+    assert "「x:home」が 4 回" in lines[1]
+    assert "「x:search」が 5 回" in lines[2]
+
+
+def test_watchdog_escapes_and_truncates_source_error(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    add_source(conn, "x", "x:<home>", 3, error="E: <b>" + "x" * 500)
+    api = FakeApi()
+    run_due_timers(conn, x_config(tmp_path), api, logger, jst_now("07:15"))
+
+    text = api.sent[0][1]
+    assert "<b>" not in text and "&lt;b&gt;" in text  # parse_mode=HTML で壊れない
+    assert "「x:&lt;home&gt;」" in text
+    assert "x" * 200 not in text and "…" in text
 
 
 # --- callback: 夜アンケート回答(q1/q2) ---
