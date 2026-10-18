@@ -300,13 +300,17 @@ def test_owner_save_just_before_append_is_kept(conn, config, monkeypatch) -> Non
     answered(conn, dig_id, "結論はこう", 926, "take")
     path = note_path(config, conn, dig_id)
     edited = NOTE + "\n本人がいま書いたメモ\n"
-    real_open = dig_take.os.open
+    real_write = dig_take.os.write
+    saved = []
 
-    def save_then_open(target, flags, *args, **kwargs):
-        path.write_text(edited, encoding="utf-8")
-        return real_open(target, flags, *args, **kwargs)
+    def save_then_write(fd, data):
+        if not saved:  # ノートを読み終えた後、最初の書き込みの直前
+            with path.open("a", encoding="utf-8") as f:  # エディタの保存(同じファイルへの書き足し)
+                f.write("\n本人がいま書いたメモ\n")
+            saved.append(True)
+        return real_write(fd, data)
 
-    monkeypatch.setattr(dig_take.os, "open", save_then_open)
+    monkeypatch.setattr(dig_take.os, "write", save_then_write)
     assert record_takes(conn, config, logger) == 1
     text = path.read_text(encoding="utf-8")
     assert text.startswith(edited)
@@ -403,4 +407,29 @@ def test_folder_swapped_for_symlink_is_never_written(conn, config, tmp_path, swa
         conn.execute("UPDATE dig_questions SET take_recorded_at = NULL")
         record_takes(conn, config, logger)
         assert victim.read_text(encoding="utf-8") == "外のファイル\n"
+
+
+@pytest.mark.parametrize("cut", [1, 2, 20])
+def test_partial_write_into_empty_note_is_completed(conn, config, monkeypatch, cut) -> None:
+    # 空のノートに書きかけた(ファイルの先頭から始まる書きかけ)も、続きだけを足す
+    dig_id = add_dig(conn, config, note=NOTE)
+    path = note_path(config, conn, dig_id)
+    path.write_text("", encoding="utf-8")
+    answered(conn, dig_id, "空のノートへの結論", 932, "take")
+    real_write = dig_take.os.write
+    calls = []
+
+    def short_then_fail(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, data[:cut])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dig_take.os, "write", short_then_fail)
+    assert record_takes(conn, config, logger) == 0
+    monkeypatch.setattr(dig_take.os, "write", real_write)
+    assert record_takes(conn, config, logger) == 1
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("**take**(") and text.count("記録番号") == 1
+    assert text.endswith("空のノートへの結論\n")
 

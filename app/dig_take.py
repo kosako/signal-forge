@@ -188,7 +188,8 @@ def _remaining(current: bytes, body: bytes) -> bytes:
     if body in current:
         return b""
     for k in range(min(len(body) - 1, len(current)), 0, -1):
-        if current.endswith(b"\n" + body[:k]):
+        # 行頭 = 改行の直後か、ファイルの先頭(空のノートに書きかけた場合)
+        if current.endswith(b"\n" + body[:k]) or current == body[:k]:
             return body[k:]
     if not current or current.endswith(b"\n\n"):
         return body
