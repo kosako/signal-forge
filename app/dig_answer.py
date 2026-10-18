@@ -237,11 +237,16 @@ def _deepdive_dir(config: Config) -> Path | None:
 
 
 def _read_note(deepdive_dir: Path | None, note_name: str) -> str | None:
-    # note_name は調査段が付けた名前(台帳由来)。念のため DeepDive の外を指す名前は読まない
-    if deepdive_dir is None or Path(note_name).name != note_name:
+    # note_name は調査段が付けた名前(台帳由来)。念のため DeepDive の外を指すもの(`../` を
+    # 含む名前や、外への symlink)は読まない。symlink を辿った後の実体の置き場所で判定する
+    if deepdive_dir is None:
         return None
     try:
-        return (deepdive_dir / f"{note_name}.md").read_text(encoding="utf-8", errors="replace")
+        base = deepdive_dir.resolve(strict=True)
+        path = (deepdive_dir / f"{note_name}.md").resolve(strict=True)
+        if path.parent != base or not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 

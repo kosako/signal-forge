@@ -305,6 +305,72 @@ def test_note_name_outside_deepdive_is_not_read(conn, config) -> None:
     assert "(解説ノートが見つからない)" in engine.prompts[0]
 
 
+def test_note_symlink_outside_deepdive_is_not_read(conn, config) -> None:
+    # 名前が正しくても、DeepDive の外を指す symlink の実体は読まない
+    dig_id = add_dig(conn, config, note=None)
+    secret = Path(config.obsidian.vault_path) / "secret.md"
+    secret.write_text("vault の別の場所の内容", encoding="utf-8")
+    note_name = conn.execute(
+        "SELECT note_name FROM dig_results WHERE id = ?", (dig_id,)
+    ).fetchone()[0]
+    deepdive = Path(config.obsidian.vault_path) / "SignalForge" / "DeepDive"
+    (deepdive / f"{note_name}.md").symlink_to(secret)
+    ask(conn, dig_id, "質問", 71)
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, Sender(), logger)
+
+    assert "vault の別の場所の内容" not in engine.prompts[0]
+    assert "(解説ノートが見つからない)" in engine.prompts[0]
+
+
+def test_answer_and_failure_are_committed_before_sending(conn, config, tmp_path) -> None:
+    # write-ahead: 送る時点で、答え(または失敗)は別の接続から見える形で記帳済み
+    dig_id = add_dig(conn, config)
+    ask(conn, dig_id, "答えられる質問", 71)
+    ask(conn, dig_id, "答えられない質問", 72)
+    seen: list[tuple[str, str | None]] = []
+
+    def checking_sender(reply_to: int, text: str) -> int:
+        other = connect(tmp_path / "intel.db")
+        row = other.execute(
+            "SELECT status, answer FROM dig_questions WHERE question_message_id = ?",
+            (reply_to,),
+        ).fetchone()
+        other.close()
+        seen.append((row["status"], row["answer"]))
+        return 900 + reply_to
+
+    # 2 件目は 1 回目もリトライも失敗させる
+    engine = Engine(fail_on={2, 3})
+    assert answer_pending(conn, config, engine.factory, checking_sender, logger) == 2
+    assert seen == [("answered", "返事1"), ("failed", None)]
+
+
+@pytest.mark.parametrize(
+    ("trigger_when", "fail_on"),
+    [
+        ("UPDATE OF status ON dig_questions WHEN NEW.status = 'answered'", set()),
+        ("UPDATE OF status ON dig_questions WHEN NEW.status = 'failed'", {1, 2}),
+        ("UPDATE OF answer_message_id ON dig_questions", set()),
+    ],
+)
+def test_db_error_stops_the_run(conn, config, trigger_when, fail_on) -> None:
+    # 記帳に失敗したら同じ質問を作り直し続けない(pending のまま回り続けない)
+    dig_id = add_dig(conn, config)
+    ask(conn, dig_id, "質問", 71)
+    conn.execute(
+        f"CREATE TRIGGER boom BEFORE {trigger_when} BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    engine = Engine(fail_on=fail_on)
+
+    with pytest.raises(sqlite3.Error, match="boom"):
+        answer_pending(conn, config, engine.factory, Sender(), logger)
+
+    # 答えを作る呼び出しは 1 件分だけ(失敗時は同じエンジンで 1 リトライ)
+    assert len(engine.prompts) == (2 if fail_on else 1)
+
+
 def test_nothing_pending_does_nothing(conn, config) -> None:
     engine, sender = Engine(), Sender()
     assert answer_pending(conn, config, engine.factory, sender, logger) == 0
