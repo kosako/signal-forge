@@ -39,7 +39,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   - x_signals は `[x_signals].daily_read_cap > 0`、dig は `[dig].daily_cap > 0` のときだけ動く。deliver は Telegram が完全に未設定(`owner_chat_id` も bot token も無い)なら WARN を出して飛ばす。片方だけの設定は設定ミスとして deliver 段が失敗する。
   - 段の失敗はその段で止め、後の段は続ける。失敗した段があれば(Telegram が完全に未設定でなければ)Telegram に知らせ、exit 1 で終わる。
   - export を deliver より前に置くので、Telegram が失敗しても Obsidian への蓄積は済む。
-  - 冪等なので再実行してよい。配信済みのダイジェストは送り直さない。
+  - 冪等なので再実行してよい。配信済みのダイジェストは送り直さない(`--force` を付けたときを除く)。
 - **受信デーモン `intel poll`**: Telegram から次のものを受けて DB に記録する。
   - 反応ボタン(👍 価値あり / 🔖 深掘り / ✅ 既知 / 👎 不要)。
   - URL のメッセージ。手動投入として items に入り、翌朝のダイジェストで分析される。
@@ -142,7 +142,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 | `collect` | 全ソース(X・RSS)から items を取り込む | |
 | `extract` | items から本文を抜き出し documents を作る | |
 | `analyze` | 事前選別と LLM の本分析で analyses を作る | 関心プロファイルが必要 |
-| `digest` | ランキングして日本語ダイジェストを作る | `--force` 生成済みでも当日分を作り直す |
+| `digest` | ランキングして日本語ダイジェストを作る | `--force` 生成済みでも当日分を作り直す。配信状態も未配信に戻るので、次の deliver で送り直す |
 | `deliver` | 当日のダイジェストを Telegram に配信する | 当日分が無ければ exit 1 |
 | `dig` | 深掘りキューの本日分を調べ、DeepDive ノートと概要カードを出す | `[dig].daily_cap = 0` なら何もしない。関心プロファイルが必要 |
 | `answer` | 深掘りカードへの質問に答え、Telegram で返す | 通常は poller が起動する。同時に 1 つだけ動く。関心プロファイルが必要 |
@@ -150,7 +150,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 | `x-signals` | X の興味シグナル(ブックマーク・いいね・自分の RT)を取り込む | `--backfill` 初回の種まき(`--limit N` で kind ごとの件数。既定 100)/ `--kind bookmark\|like\|self_rt` |
 | `x-insights` | X の興味シグナルの週次インサイトを表示する | 読み取り専用(migration も当てない) |
 | `poll` | 受信デーモン(long polling で常駐、内蔵タイマー付き) | 通常は launchd が起動する |
-| `run` | 朝バッチの全段を順に実行する | `--force` 当日のダイジェストを作り直す |
+| `run` | 朝バッチの全段を順に実行する | `--force` 当日のダイジェストを作り直し、Telegram にも送り直す |
 | `doctor` | 14 項目を検査する。FAIL があれば exit 1 | `--purge` 期限切れの削除だけを行う / `--cost` 当月コストだけを表示する |
 
 doctor の各項目は [設計 05 §2](docs/design/05-ops-runtime.md)。
