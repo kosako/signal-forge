@@ -20,7 +20,7 @@
 |---|------|------|------|
 | 1 | 静的 NG リスト | config.toml の `analysis.block_domains` / `analysis.block_keywords`(タイトル部分一致)→ 除外 | 明白なノイズに LLM を使わない |
 | 2 | 鮮度 | published_at が 72h 超(manual ソースは適用外)→ 除外 | 朝ダイジェストの目的は速報性、手動投入は本人意思を優先 |
-| 3 | X ノイズ | リプライ・自 RT・本文 20 字未満かつリンク無し → 除外 | TL 固有の低情報量パターン |
+| 3 | X ノイズ | リプライ(コネクタが残した自分宛のもの)・自 RT(自分のリツイート)・本文 20 字未満かつリンク無し → 除外。判定は X ホームTL コネクタが書く `raw_payload.meta` の `reply` / `self_retweet` で行う。他人の RT は元ツイートに正規化した通常のポストとして残す(02 §2) | TL 固有の低情報量パターン。自 RT は本人が既に見たもの |
 | 4 | 日次上限 | 残件が `analysis.daily_llm_limit`(既定 150 件)超 → published_at 降順で切り、ソース間はラウンドロビンで多様性を保って採用 | コストとクォータの上限執行点 |
 
 extraction_status=failed の items は除外**しない**(タイトル+メタで degraded 分析に回す。PROPOSAL 準拠)。

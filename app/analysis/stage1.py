@@ -127,14 +127,16 @@ def _hours_ago_iso(hours: int) -> str:
 def _rule_x_noise(row: sqlite3.Row) -> str | None:
     """規則3: X の低情報量パターン(リプライ・自RT・短文でリンク無し)。
 
-    meta のキー(is_reply / is_self_repost)は X コネクタ(plan #15)が書く契約。
+    meta のキー(reply / self_retweet)は X ホームTL コネクタ(app/connectors/x.py の
+    _to_raw_item)が書く契約。reply はコネクタが残した自分宛のリプライ、self_retweet は自分の RT。
+    他人の RT(meta.retweet)は元ツイに正規化した通常のポストとして残す(設計 02 §2)。
     """
     if row["source_type"] != "x":
         return None
     meta = {}
     if row["raw_payload"]:
         meta = json.loads(row["raw_payload"]).get("meta", {})
-    if meta.get("is_reply") or meta.get("is_self_repost"):
+    if meta.get("reply") or meta.get("self_retweet"):
         return "x_noise"
     body = ""
     if row["raw_payload"]:

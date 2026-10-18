@@ -50,7 +50,7 @@ class Connector(Protocol):
 - **カーソル**: `cursor = {"since_id": str}`。ページングは `pagination_token` で新→旧に辿り、(a) since_id に到達、(b) **日次取得上限**(config `x.daily_read_cap`、コスト逆算値。実測 $0.004 なら 130)到達、(c) rate limit 残なし、のいずれかで打ち切る。打ち切りで捨てるのは古い側であり、見逃し防止は非目標なので許容。次回 since_id は**今回取得した最大 tweet id**(打ち切り時も同じ。古い側の穴を追わない)。
 - **rate limit**: **実測 home 180/15min**(Day 0。旧記載 5/15min は誤り)。`x-rate-limit-remaining` を見て残0なら打ち切り(15分待ちはしない。朝バッチ1回で取り切れる量に cap を設計する前提)。実測上は cap 130 が rate limit の制約を受けない。
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
-- **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外(meta に記録)。理由: ノイズ率対策の最安の一手。
+- **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外。meta に `retweet` / `reply` / `self_retweet`(自分の RT)を記録し、自分宛のリプライと自分の RT は事前選別の規則 3 が除外する(03 §2)。1 回の取得で同じ元ツイートが複数回出たら(他人の RT と自分の RT など)1 行にまとめ、どれかが自分の RT なら `self_retweet` を立てる(collect の重複排除は先着の meta だけを残すため、並び順で除外が変わらないように)。前日までの取得や検索ソースで先に入った行は書き換えない。理由: ノイズ率対策の最安の一手。
 - **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。**確定済み(2026-07-06、Issue #2)**: `x_cache_ttl_days=7`、X 由来の抜粋は Obsidian に置かない(詳細は 01 §6 / 04 §7)。
 - **縮退**: consecutive_failures ≥ 3 で doctor #14 が WARN、watchdog が Telegram に通知(自動 disable はしない。理由: 勝手に情報源が消えるより通知して人が `sources.enabled=0` を切る方が安全)。watchdog は直すか止めるまで毎朝 1 通(同一種別 1 日 1 通。設計 05 §4)。collect はソースの失敗を run の失敗にしないため、朝バッチ失敗通知には載らない(GH#124)。`x.enabled=false` の間は回数が進まないので知らせない。X 停止中もパイプラインはソース非依存で RSS+手動URLで継続。
 

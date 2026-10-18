@@ -21,7 +21,7 @@ import json
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -123,9 +123,9 @@ class XConnector:
         started = time.monotonic()
         me_id = self._get_me_id()
         tweets, users, reads, http_status = self._fetch_timeline(me_id, cursor.get("since_id"))
-        items = [
+        items = _merge_same_original([
             item for tweet in tweets if (item := _to_raw_item(tweet, users, me_id)) is not None
-        ]
+        ])
         # 次回 since_id は今回取得した最大 tweet id(打ち切っても古い側の穴は追わない。設計 02 §2)
         next_since = (
             str(max(int(t["id"]) for t in tweets)) if tweets else cursor.get("since_id")
@@ -267,8 +267,29 @@ def _to_raw_item(tweet: dict, users: dict[str, str], me_id: str) -> RawItem | No
         author=users.get(tweet.get("author_id")),
         published_at=parse_created_at(tweet.get("created_at")),
         raw_content=tweet_full_text(tweet),
-        meta={"retweet": retweeted_id is not None, "reply": in_reply_to is not None},
+        # self_retweet = 自分の RT(本人が既に見たもの)。Stage 1 の規則 3 が reply と合わせて除外する
+        # (設計 03 §2)。他人の RT は元ツイに正規化して残す
+        meta={
+            "retweet": retweeted_id is not None,
+            "reply": in_reply_to is not None,
+            "self_retweet": retweeted_id is not None and tweet.get("author_id") == me_id,
+        },
     )
+
+
+def _merge_same_original(items: list[RawItem]) -> list[RawItem]:
+    """同じ元ツイートを指す行(RT の正規化で external_id が重なる)を 1 行にまとめる。
+
+    先に出た行(新しい側)を残し、どれかが自分の RT なら self_retweet を立てる。collect の
+    重複排除は先着の meta だけを残すので、ここでまとめないと規則 3 の除外が並び順で変わる
+    (GH#133)。前日までの取得や検索ソースで先に入った行は書き換えない(設計 02 §2)。
+    """
+    merged: dict[str, RawItem] = {}
+    for item in items:
+        kept = merged.setdefault(item.external_id, item)
+        if kept is not item and item.meta.get("self_retweet"):
+            merged[item.external_id] = replace(kept, meta={**kept.meta, "self_retweet": True})
+    return list(merged.values())
 
 
 def tweet_full_text(tweet: dict) -> str | None:
