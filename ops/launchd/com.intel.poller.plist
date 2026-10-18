@@ -6,6 +6,8 @@
   - KeepAlive: クラッシュしても callback の取りこぼしを最小化するため常時復帰
   - 連続クラッシュは ThrottleInterval 30 で launchd が抑制(検知は doctor #8 / watchdog)
   - 夜アンケート・watchdog はこのプロセスの内蔵タイマー(時刻は config.toml)
+  - PATH には uv に加え codex の dir(__CODEX_DIR__)を入れる。深掘りカードへの質問に返事する
+    `intel answer`(このプロセスが起動する子。GH#126)が codex を subprocess 起動するため(#72)
 -->
 <plist version="1.0">
 <dict>
@@ -27,7 +29,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/bin:/bin:/usr/sbin:/sbin:__UV_DIR__</string>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:__UV_DIR__:__CODEX_DIR__</string>
     <key>HOME</key>
     <string>__HOME__</string>
   </dict>

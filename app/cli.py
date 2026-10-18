@@ -504,3 +504,7 @@ def doctor(
 
 def main() -> None:
     app()
+
+
+if __name__ == "__main__":  # poller が `python -m app.cli answer` で起動する(GH#126)
+    main()

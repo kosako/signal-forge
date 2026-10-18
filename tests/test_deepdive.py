@@ -2,6 +2,7 @@
 
 import logging
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -413,6 +414,25 @@ def test_card_note_path_is_html_escaped(conn, config) -> None:
     card = api.sent[0][1]
     assert "R&amp;D-Report" in card  # ノート行はエスケープ済み
     assert "-R&D-Report" not in card  # 生の & を含むパスを送らない
+
+
+@pytest.mark.parametrize(
+    ("answer_daily_cap", "guide"),
+    [
+        (20, "💬 リプライで質問すると答えます。感想・結論は take として記録します"),
+        (0, "💬 リプライが take として記録されます"),  # 返事をしない設定では従来の案内
+    ],
+)
+def test_card_guide_follows_answer_setting(conn, config, answer_daily_cap, guide) -> None:
+    # 質問への返事(GH#126)の有無に合わせてカード末尾の案内を変える
+    item = add_item(conn, "https://a.example/1")
+    enqueue(conn, item)
+    api = FakeApi()
+    config = replace(config, dig=replace(config.dig, answer_daily_cap=answer_daily_cap))
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+
+    assert api.sent[0][1].endswith(guide)
 
 
 def test_daily_cap_and_rerun_idempotency(conn, config) -> None:

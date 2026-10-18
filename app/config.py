@@ -113,6 +113,8 @@ class DigConfig:
     # カードへの質問への返事(GH#126)。スマホで待つので effort は既定 low(応答の速さ優先)
     answer_reasoning_effort: str = "low"
     answer_source_max_chars: int = 30_000  # 返事の材料に渡す原文/対訳ノートの上限
+    # 1 日に受け付ける質問の上限(JST 暦日。暴走と費用の歯止め)。0 = 返事をしない(記録だけ)
+    answer_daily_cap: int = 20
 
 
 @dataclass(frozen=True)
@@ -355,6 +357,7 @@ def _validate(path: Path, config: Config) -> None:
     nonnegatives = [
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),
         ("dig", "daily_cap", config.dig.daily_cap),
+        ("dig", "answer_daily_cap", config.dig.answer_daily_cap),
         ("ranking", "min_score", config.ranking.min_score),
         ("ranking", "negative_penalty", config.ranking.negative_penalty),
         ("ranking", "freshness_penalty_24_48", config.ranking.freshness_penalty_24_48),

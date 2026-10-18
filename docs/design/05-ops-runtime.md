@@ -21,6 +21,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - `ProgramArguments`: `[uv, run, intel, poll]`(Telegram long polling 常駐。ボタン反応・手動 URL・夜アンケートを受信し signals / items に記録)。
 - **再起動方針: `KeepAlive: true` + `ThrottleInterval: 30`**。クラッシュしても callback query の取りこぼしを最小化するため常時復帰。連続クラッシュ(30秒間に再起動が繰り返される状態)は launchd が抑制し、doctor と watchdog で検知する。
 - 夜アンケート送信(**21:30 JST 仮**、config で変更可。設計 04 §4 と同一方式・同一時刻)と watchdog(7:15 JST に digests の当日行を確認、無ければ失敗通知)はポーラー内のタイマーで実行する。`telegram.watchdog_time` は**配信時刻+15分程度に設定する前提**(それ以前だと朝バッチ未完の時点で確認が走り誤通知になる)。理由: plist を2枚に抑え、Telegram 送信経路を1プロセスに集約するため(別 launchd ジョブによる `--survey` 起動は採らない)。送信ロジック自体は `delivery/telegram.py` の関数(実装の置き場は 04 が正本)。
+- **深掘りカードへの質問への返事(GH#126)**: カード(とその返事)へのリプライを受けたポーラーは、質問を台帳 `dig_questions` に積み、`intel answer` を**別プロセス**(`python -m app.cli answer`)で起動する。LLM の待ち(数十秒〜数分)で受信と内蔵タイマーを止めないため。子は別セッションで動かし(ポーラーの再起動で作りかけの返事を道連れにしない)、子の側の flock で同時に 1 つに絞る。ポーラーは各周期の見回りで、答えていない質問が残っていれば起動し直し、送れていない返事だけなら 10 分おきに再送を起動する。子の詳細ログは `answer.log`。このため poller.plist の PATH にも codex の dir を入れる(#72 と同じ理由)。1 日の上限は `[dig].answer_daily_cap`(既定 20。0 = 返事をせず記録だけ)。
 
 ### 1.3 事前セットアップ(doctor で検査)
 

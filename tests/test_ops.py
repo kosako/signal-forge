@@ -9,7 +9,7 @@ OPS_DIR = Path(__file__).resolve().parent.parent / "ops" / "launchd"
 PLACEHOLDERS = {
     "__UV_BIN__": "/opt/homebrew/bin/uv",
     "__UV_DIR__": "/opt/homebrew/bin",
-    "__CODEX_DIR__": "/opt/homebrew/codex-bin",  # morning のみ(analyze が codex を起動)
+    "__CODEX_DIR__": "/opt/homebrew/codex-bin",  # analyze(morning)と intel answer(poller の子)
     "__REPO_DIR__": "/tmp/repo",
     "__HOME__": "/tmp/home",
 }
@@ -51,8 +51,8 @@ def test_poller_plist_contract() -> None:
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] == 30
     assert set(plist["EnvironmentVariables"]) == {"PATH", "HOME"}
-    # poller は codex を使わないため codex dir は PATH に入れない(morning のみ・#72)
-    assert "/opt/homebrew/codex-bin" not in plist["EnvironmentVariables"]["PATH"]
+    # poller が起動する `intel answer`(GH#126)も codex を使う。無いと返事が全件失敗する(#72)
+    assert "/opt/homebrew/codex-bin" in plist["EnvironmentVariables"]["PATH"]
     # poller は常駐+内蔵タイマー。カレンダー起動を持たない(設計 05 §1.2)
     assert "StartCalendarInterval" not in plist
 

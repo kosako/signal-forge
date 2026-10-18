@@ -28,7 +28,6 @@ from app.analysis.analyzer import sanitize_body
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
-from app.deepdive import DEEPDIVE_FOLDER
 
 PROMPT_VERSION = "dig-answer-v001"
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -53,6 +52,53 @@ class DigAnswer(BaseModel):
 
     kind: Literal["question", "take", "both"]
     answer: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
+
+
+def enqueue_question(
+    conn: sqlite3.Connection, dig_result_id: int, question: str, question_message_id: int
+) -> int:
+    """質問を台帳に積む(返事は answer_pending が作る)。トランザクションは呼び出し側が張る。"""
+    return conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (?, ?, ?)",
+        (dig_result_id, question, question_message_id),
+    ).lastrowid
+
+
+def question_received(conn: sqlite3.Connection, question_message_id: int) -> bool:
+    """そのリプライを質問として受け付け済みか(再配達で 2 回積まない。migration 012)。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_questions WHERE question_message_id = ?", (question_message_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def questions_on(conn: sqlite3.Connection, day: str) -> int:
+    """その JST 暦日に受け付けた質問の数(1 日の上限の判定。created_at は UTC 保存)。"""
+    return conn.execute(
+        "SELECT count(*) AS n FROM dig_questions WHERE date(created_at, '+9 hours') = ?",
+        (day,),
+    ).fetchone()["n"]
+
+
+def has_pending(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute("SELECT 1 FROM dig_questions WHERE status = 'pending' LIMIT 1").fetchone()
+        is not None
+    )
+
+
+def has_unsent(conn: sqlite3.Connection) -> bool:
+    """返事(または失敗の知らせ)を作ったが送れていない行があるか。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_questions "
+            "WHERE status <> 'pending' AND answer_message_id IS NULL LIMIT 1"
+        ).fetchone()
+        is not None
+    )
 
 
 def answer_pending(
@@ -231,6 +277,9 @@ def _history(conn: sqlite3.Connection, dig_result_id: int, before_id: int, nonce
 
 
 def _deepdive_dir(config: Config) -> Path | None:
+    # 呼び出し時に import する(deepdive → delivery → poller → 本モジュールの循環を避ける)
+    from app.deepdive import DEEPDIVE_FOLDER
+
     if config.obsidian.vault_path is None:
         return None
     return Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder / DEEPDIVE_FOLDER
