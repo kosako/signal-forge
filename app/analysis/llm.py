@@ -9,6 +9,8 @@
     経路が残る。deny-read でその経路(symlink 経由の実体読取・絶対パス直読みを含む)を塞ぐ
   - 空の専用作業ディレクトリに固定(read でも `.env`・SSH 鍵等が要約経由で出力に流出する
     経路を隔離で塞ぐ)
+  - 外へ届く・実行するツール(アカウント側の接続サービス・Web・ブラウザ・shell・コード
+    実行など)を機能ごと無効化する(GH#129。sandbox の外で動くツールは上の遮断で止まらない)
   - プロンプトは argv でなく stdin 渡し(ps でのプロンプト露出と shell 解釈事故の防止)
   - subprocess の環境変数は PATH/HOME のみ(ANTHROPIC_API_KEY を構造的に載せない)
 - 出力は Pydantic でスキーマ検証。検証失敗・タイムアウトは LLMError に正規化し、
@@ -123,7 +125,8 @@ class CodexCliEngine:
                 self._codex_bin,
                 "exec",
                 "--skip-git-repo-check",
-                "--ephemeral",  # ユーザーの config.toml を読まない(認証は CODEX_HOME)
+                # セッションを保存しない(ユーザー設定の遮断は使い捨て CODEX_HOME が担う)
+                "--ephemeral",
                 # read-only sandbox は読取を許すため `-s read-only` の代わりに permission
                 # profile を使う。profile なら read-only 相当(書込・network 遮断)を保ったまま
                 # CODEX_HOME/実 ~/.codex の読取を deny できる(Issue #54)。`-s` を明示すると
@@ -135,6 +138,7 @@ class CodexCliEngine:
                 # 退化して deny-read だけ失われる(= #54 に静かに逆戻り)経路を塞ぐ(実測)
                 "--strict-config",
                 *_isolation_profile_args(codex_home),
+                *_disabled_tool_args(),
                 # -a/--ask-for-approval はトップレベル専用で exec では使えない(実測)。
                 # exec では config override で承認を止める
                 "-c",
@@ -174,6 +178,10 @@ class CodexCliEngine:
                 # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。
                 # 例外(=ログ)には制御文字を除去した末尾200字だけを載せる
                 tail = re.sub(r"[\x00-\x1f\x7f]", " ", stderr_tail)[-200:]
+                if stderr_tail.lstrip().startswith(_CODEX_CONFIG_ERRORS):
+                    # 起動引数(無効化する feature 名・profile キー)を codex が受け付けない
+                    # = 版の不一致。リトライでも回復しない環境障害として扱う(GH#129)
+                    raise LLMUnavailableError(f"codex の起動設定エラー: {tail}")
                 raise LLMError(f"codex 非0終了({process.returncode}): {tail}")
             if not out_file.exists():
                 raise LLMError("codex が最終応答ファイルを書かなかった")
@@ -184,7 +192,8 @@ class CodexCliEngine:
 
         実ユーザーの HOME を渡すと、read-only sandbox はファイル読み取りを防がないため
         `~/.ssh` 等が要約経由で流出する経路が残る。HOME は空の workspace に差し替え、
-        codex の認証だけ CODEX_HOME で最小限見せる(auth 以外の設定は --ephemeral で遮断)。
+        codex の認証だけ CODEX_HOME で最小限見せる(CODEX_HOME には auth.json しか置かないので、
+        ユーザーの config.toml・MCP・hooks 等の設定は読まれない)。
         ANTHROPIC_API_KEY を含む他の環境変数は構造的に渡さない(設計 00 §4)。
         """
         return {
@@ -251,6 +260,44 @@ def _isolation_profile_args(codex_home: str) -> list[str]:
         "-c",
         f"permissions.{prof}.network={{}}",
     ]
+
+
+# codex exec の既定で有効な、外へ届く・実行するツールの機能(GH#129)。permission profile の
+# 書込・network 遮断は shell の実行には効くが、アカウント側の接続サービスや Web のツールは
+# sandbox の外で動くため止まらない(実測: 無効化前は多数のツールが見えていた)。外部本文を
+# 読む呼び出しで呼ばれないよう、機能ごと無効化する。--strict-config の下で未知の feature 名は
+# 起動エラーになる(黙って無視されず fail-closed)
+_DISABLED_FEATURES = (
+    "apps",  # アカウント側の接続サービス
+    "plugins",
+    "tool_suggest",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "view_image",  # ローカルの画像ファイルを読む
+    "shell_tool",
+    "unified_exec",
+    "code_mode_host",  # コード実行のホスト
+    "multi_agent",
+    "goals",
+    "sleep_tool",
+)
+
+
+# --strict-config の下で codex が起動引数を拒否したときの stderr の書き出し(実測)。
+# 先頭一致に限る: 起動設定の検査はプロンプトを読む前に終わるため、外部本文が混ざる
+# 余地のない位置で判定する
+_CODEX_CONFIG_ERRORS = ("Error: Unknown feature flag", "Error loading config")
+
+
+def _disabled_tool_args() -> list[str]:
+    """推論専用に要らないツールを機能ごと外す -c / --disable 群(GH#129)。"""
+    args: list[str] = []
+    for feature in _DISABLED_FEATURES:
+        args += ["--disable", feature]
+    return [*args, "-c", 'web_search="disabled"']
 
 
 def _ephemeral_codex_home(base: Path) -> str:
