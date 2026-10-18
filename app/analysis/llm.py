@@ -9,6 +9,8 @@
     経路が残る。deny-read でその経路(symlink 経由の実体読取・絶対パス直読みを含む)を塞ぐ
   - 空の専用作業ディレクトリに固定(read でも `.env`・SSH 鍵等が要約経由で出力に流出する
     経路を隔離で塞ぐ)
+  - 外へ届く・実行するツール(アカウント側の接続サービス・Web・ブラウザ・shell・コード
+    実行など)を機能ごと無効化する(GH#129。sandbox の外で動くツールは上の遮断で止まらない)
   - プロンプトは argv でなく stdin 渡し(ps でのプロンプト露出と shell 解釈事故の防止)
   - subprocess の環境変数は PATH/HOME のみ(ANTHROPIC_API_KEY を構造的に載せない)
 - 出力は Pydantic でスキーマ検証。検証失敗・タイムアウトは LLMError に正規化し、
@@ -135,6 +137,7 @@ class CodexCliEngine:
                 # 退化して deny-read だけ失われる(= #54 に静かに逆戻り)経路を塞ぐ(実測)
                 "--strict-config",
                 *_isolation_profile_args(codex_home),
+                *_disabled_tool_args(),
                 # -a/--ask-for-approval はトップレベル専用で exec では使えない(実測)。
                 # exec では config override で承認を止める
                 "-c",
@@ -251,6 +254,38 @@ def _isolation_profile_args(codex_home: str) -> list[str]:
         "-c",
         f"permissions.{prof}.network={{}}",
     ]
+
+
+# codex exec の既定で有効な、外へ届く・実行するツールの機能(GH#129)。permission profile の
+# 書込・network 遮断は shell の実行には効くが、アカウント側の接続サービスや Web のツールは
+# sandbox の外で動くため止まらない(実測: 無効化前は多数のツールが見えていた)。外部本文を
+# 読む呼び出しで呼ばれないよう、機能ごと無効化する。--strict-config の下で未知の feature 名は
+# 起動エラーになる(黙って無視されず fail-closed)
+_DISABLED_FEATURES = (
+    "apps",  # アカウント側の接続サービス
+    "plugins",
+    "tool_suggest",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "view_image",  # ローカルの画像ファイルを読む
+    "shell_tool",
+    "unified_exec",
+    "code_mode_host",  # コード実行のホスト
+    "multi_agent",
+    "goals",
+    "sleep_tool",
+)
+
+
+def _disabled_tool_args() -> list[str]:
+    """推論専用に要らないツールを機能ごと外す -c / --disable 群(GH#129)。"""
+    args: list[str] = []
+    for feature in _DISABLED_FEATURES:
+        args += ["--disable", feature]
+    return [*args, "-c", 'web_search="disabled"']
 
 
 def _ephemeral_codex_home(base: Path) -> str:

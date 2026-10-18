@@ -156,6 +156,11 @@ def test_engine_command_isolation_flags(tmp_path: Path) -> None:
     assert f'"{Path.home() / ".codex"}"="none"' in fs
     # -s read-only は付けない(profile が無効化されるため)
     assert "read-only" not in argv
+    # GH#129: sandbox の外で動くツール(接続サービス・Web 等)と実行系を機能ごと外す
+    disabled = {argv[i + 1] for i, a in enumerate(argv) if a == "--disable"}
+    for feature in ("apps", "browser_use", "computer_use", "shell_tool", "code_mode_host"):
+        assert feature in disabled
+    assert 'web_search="disabled"' in argv
 
 
 def test_engine_launch_failure_raises_unavailable(tmp_path: Path) -> None:
