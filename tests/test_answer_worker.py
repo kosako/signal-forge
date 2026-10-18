@@ -64,11 +64,14 @@ class Clock:
         return self.now
 
 
-def add_question(conn, *, status: str = "pending", answer_message_id: int | None = None) -> None:
+def add_question(
+    conn, *, status: str = "pending", answer_message_id: int | None = None,
+    kind: str | None = None,
+) -> None:
     conn.execute(
         "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, "
-        "answer, answer_message_id) VALUES (1, '質問', 81, ?, ?, ?)",
-        (status, None if status == "pending" else "返事", answer_message_id),
+        "kind, answer, answer_message_id) VALUES (1, '質問', 81, ?, ?, ?, ?)",
+        (status, kind, None if status == "pending" else "返事", answer_message_id),
     )
     conn.commit()
 
@@ -134,6 +137,31 @@ def test_sweep_retries_unsent_answers_with_backoff(conn, tmp_path) -> None:
     clock.now += 1
     worker.sweep(conn, logger)
     assert len(popen.calls) == 2
+
+
+def test_sweep_retries_unrecorded_takes_with_backoff(conn, tmp_path) -> None:
+    # 送れたが take を記録できていない(vault の障害など。GH#106)
+    add_question(conn, status="answered", answer_message_id=950, kind="take")
+    popen, clock = FakePopen(), Clock()
+    worker = AnswerWorker(tmp_path, popen=popen, clock=clock)
+
+    worker.sweep(conn, logger)
+    assert len(popen.calls) == 1
+    popen.procs[0].code = 0
+
+    clock.now += RETRY_UNSENT_S - 1
+    worker.sweep(conn, logger)
+    assert len(popen.calls) == 1  # 毎周期は起動しない
+
+    clock.now += 1
+    worker.sweep(conn, logger)
+    assert len(popen.calls) == 2  # 10 分たっても記録できていなければ起動し直す
+    popen.procs[1].code = 0
+
+    conn.execute("UPDATE dig_questions SET take_recorded_at = '2026-10-18T13:11:10Z'")
+    clock.now += RETRY_UNSENT_S
+    worker.sweep(conn, logger)
+    assert len(popen.calls) == 2  # 記録できたら起動しない
 
 
 def test_sent_answers_do_not_start(conn, tmp_path) -> None:

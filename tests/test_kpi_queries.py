@@ -206,6 +206,21 @@ def test_phase2_not_ready_with_unanswered_digs(conn) -> None:
     assert row["phase2_ready"] == 1  # 9件中5件 yes(>=50%)
 
 
+def test_phase2_counts_followups_of_bookmarked_items_only(conn) -> None:
+    # take の記録(GH#106)は 🔖 の無いアイテムにも followup_dig=yes を付ける。分子に入れない
+    item = add_delivered_item(conn, "https://a/x-bookmark-only")
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', '2026-07-02')",
+        (item,),
+    )
+    row = conn.execute(
+        (KPI_DIR / "06-phase2-boundary.sql").read_text(encoding="utf-8")
+    ).fetchone()
+    assert row["dig_total"] == 2
+    assert row["followup_yes"] == 1  # seed の 🔖 分だけ
+
+
 def test_weekly_summary_empty_window_returns_zeroes(tmp_path) -> None:
     # 直近7日に配信済み digest がなくても NULL でなく 0 を返す(fail-closed の判定を壊さない)
     db_path = tmp_path / "empty.db"

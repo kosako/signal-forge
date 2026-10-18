@@ -5,8 +5,8 @@
   作りかけの返事を道連れにしない(子の側の flock で同時に 1 つに絞るので重複しない)
 - 起動のきっかけ: 質問を台帳に積んだ直後(kick)と、各周期の見回り(sweep)。子が台帳を
   読み終えた直後に積まれた質問は、その子では拾われないため見回りで拾う
-- 送れていない返事だけが残っているときは RETRY_UNSENT_S おきにだけ起動する(送信先の
-  障害が続く間に毎周期起動しない)
+- 送れていない返事・記録できていない take(GH#106)だけが残っているときは RETRY_UNSENT_S
+  おきにだけ起動する(送信先や vault の障害が続く間に毎周期起動しない)
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from app.dig_answer import has_pending, has_unsent
+from app.dig_take import has_unrecorded_take
 
 RETRY_UNSENT_S = 600
 
@@ -51,13 +52,14 @@ class AnswerWorker:
             self._start(logger)
 
     def sweep(self, conn: sqlite3.Connection, logger: logging.Logger) -> None:
-        """各周期の見回り。答えていない質問・送れていない返事が残っていれば起動する。"""
+        """各周期の見回り。答えていない質問・送れていない返事・記録できていない take が
+        残っていれば起動する。"""
         if self._running(logger):
             return
         if has_pending(conn):
             self._start(logger)
             return
-        if has_unsent(conn) and (
+        if (has_unsent(conn) or has_unrecorded_take(conn)) and (
             self._last_unsent_start is None
             or self._clock() - self._last_unsent_start >= RETRY_UNSENT_S
         ):

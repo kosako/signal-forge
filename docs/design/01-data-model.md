@@ -294,7 +294,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 | `reaction` | `useful`(👍)/ `dig`(🔖)/ `known`(✅)/ `noise`(👎) | 必須 | そのアイテムを配信した digest_date |
 | `survey_patrol` | `yes` / `no`(巡回した?) | NULL | 質問対象日。翌日 12:00 JST までの遅延回答も対象日に帰属 |
 | `survey_read_min` | 分数の整数文字列 | NULL | 同上 |
-| `followup_dig` | `yes` / `no`(深掘りした?) | 必須(🔖済みアイテム) | 🔖を付けた日。**MVP で送信・記録する**(🔖翌日夜に追い掛け1通。設計 04 §4。フェーズ2境界の「50%深掘り」判定に必要) |
+| `followup_dig` | `yes` / `no`(深掘りした?) | 必須(🔖済みアイテム。take の記録では 🔖 の無い深掘りアイテムも) | 🔖を付けた日。**MVP で送信・記録する**(🔖翌日夜に追い掛け1通。設計 04 §4。フェーズ2境界の「50%深掘り」判定に必要)。深掘りカードへの take(GH#106)でも `yes` を記録する。🔖 の無いアイテムは take の日(KPI 06 の分子には入れない) |
 
 - 同一アイテムへの再タップは行を追加し、**集計は created_at 最新の行を採用**。理由: 上書きせず履歴を残すと、👍校正(遅延スポットチェック)の乖離分析材料になる。
 - 受信デーモンは callback の `from.id` を allowlist 照合してから書き込む(認可は設計 04 Telegram の責務。本テーブルは認可済みデータのみ格納)。
@@ -357,6 +357,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `dig_result_id` = どのカードへの質問か(スレッド)。カードへのリプライも返事へのリプライも同じカードに帰属させ、同じカードのそれまでのやり取りを返事の材料に含める
 - `question_message_id` = 本人のリプライの message_id。返事はこれへのリプライとして送る(owner DM 限定)。UNIQUE(migration 012): poller が台帳に積んだ後、offset を保存する前に止まると同じ update が再配達されるため、同じリプライを 2 回受け付けない
 - `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しで一緒に返させる(別の呼び出しを増やさない)。take の記録(GH#106)がこれを使う
+- `take_recorded_at`(migration 013)= take(`take` / `both`)を解説ノートと `followup_dig` に記録した時刻。NULL = 未記録で、次の `intel answer` が記録し直す(設計 06 §6)
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)
 

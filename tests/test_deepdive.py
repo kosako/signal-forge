@@ -420,7 +420,7 @@ def test_card_note_path_is_html_escaped(conn, config) -> None:
     ("answer_daily_cap", "guide"),
     [
         (20, "💬 リプライで質問すると答えます。感想・結論は take として記録します"),
-        (0, "💬 リプライが take として記録されます"),  # 返事をしない設定では従来の案内
+        (0, "💬 リプライは感想として記録されます"),  # 返事をしない設定では take を記録しない
     ],
 )
 def test_card_guide_follows_answer_setting(conn, config, answer_daily_cap, guide) -> None:

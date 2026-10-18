@@ -685,7 +685,8 @@ def _card_text(
     if config.dig.answer_daily_cap > 0:  # 質問への返事(GH#126)
         guide = "💬 リプライで質問すると答えます。感想・結論は take として記録します"
     else:
-        guide = "💬 リプライが take として記録されます"
+        # 返事をしない設定では LLM が分けないので、take としては記録しない(GH#106)
+        guide = "💬 リプライは感想として記録されます"
     return (
         f"🔎 深掘り #{candidate.item_id}「{title}」{original}\n"
         f"✍️ 書き手: {escape_and_truncate(draft.writer_stance, _CARD_STANCE_MAX)}\n"
