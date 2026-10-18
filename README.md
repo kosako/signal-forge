@@ -52,7 +52,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   1. 夜: 未消化一覧(Telegram の 🔖 と X のブックマーク)に自由文でリプライし、「番号 + 観点」か「パス」を指定する。X で新しくブックマークした投稿(x_signals 段が取り込んだもの)は、指定しなくてもキューに入る。Telegram の 🔖 ボタンは未消化一覧に載るだけで、キューには入らない。
   2. 朝: dig 段が 1 日の上限(既定 2 件)まで調べ、vault の `SignalForge/DeepDive/` に解説ノートと、原文ノート(日本語のソース)か対訳ノート(それ以外)を書く(ツイート本文だけのものは解説ノートのみ)。
   3. 概要カードを Telegram に送る。
-  4. カードへの質問: poller が質問を台帳に積み、`intel answer` を別プロセスで起動して返事をリプライで送る(1 日の上限は既定 20 件)。
+  4. カードへのリプライ: poller が台帳に積み、`intel answer` を別プロセスで起動して返事をリプライで送る(1 日の上限は既定 20 件)。LLM が結論・感想(take)と分けたリプライは、原文を解説ノートの末尾に足し、ノートの status を `take済` にする。
 - **データ**: SQLite が正本で、Obsidian は書き出し先。Daily / Items ノートの生成部分は SQLite のデータから export が書く(ノートに足した手書きメモは vault にしか無い)。DeepDive ノートだけは書き出した後に本文を DB に残さず、vault 側が恒久の置き場になる([設計 01 §7](docs/design/01-data-model.md)、[ADR 0004](docs/adr/0004-deepdive-in-agent-obsidian-substrate.md))。vault は intel のバックアップの対象外(runbook §7)なので、守るなら別に手当てする。
 - **LLM**: 使い捨ての `codex exec` を、ツールなし・ネットワーク遮断などで隔離して呼ぶ。今実装しているエンジンは `codex-cli` だけ([設計 00 §5](docs/design/00-architecture.md))。
 
@@ -235,7 +235,7 @@ repo 固有の決まり:
 | `app/digest/` | ダイジェストの生成 |
 | `app/delivery/` | Telegram の配信、受信デーモン、夜アンケートと watchdog と失敗通知、`intel answer` の起動 |
 | `app/export/` | Obsidian への書き出し |
-| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py` | 深掘りのキュー(夜の入口)、朝の調査段、カードへの質問への返事 |
+| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口)、朝の調査段、カードへの質問への返事、take の記録 |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
 | `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |

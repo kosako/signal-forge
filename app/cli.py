@@ -201,7 +201,7 @@ def dig(
 def answer(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
-    """深掘りカードへの質問に答え、Telegram で返事を送る(GH#126)。"""
+    """深掘りカードへの質問に答え、Telegram で返事を送る(GH#126)。take は記録する(GH#106)。"""
     import fcntl
 
     from app.analysis.llm import create_engine
@@ -210,6 +210,7 @@ def answer(
     from app.delivery import create_api, is_telegram_configured
     from app.delivery.telegram import ANSWER_TEXT_MAX_CHARS, escape_and_truncate
     from app.dig_answer import answer_pending
+    from app.dig_take import record_takes
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
@@ -241,7 +242,9 @@ def answer(
             ),
             logger,
         )
-    typer.echo(f"answer 完了(送信 {sent} 通)")
+        # 返事を送った後に記録する(本人を待たせない)。前回の実行で記録できなかった分も含む
+        recorded = record_takes(conn, config, logger)
+    typer.echo(f"answer 完了(送信 {sent} 通・take の記録 {recorded} 件)")
 
 
 @app.command(name="x-auth")

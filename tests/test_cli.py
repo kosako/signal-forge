@@ -57,3 +57,42 @@ def test_answer_exits_quietly_while_another_runs(tmp_path) -> None:
     assert result.exit_code == 0
     assert "別の answer が実行中" in result.output
     assert not (tmp_path / "intel.db").exists()
+
+
+def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
+    # 返事を送った後に take を記録する(GH#106)。送る返事が無くても前回の残りを記録する
+    from app import logs
+    from app.db import apply_migrations, connect
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    vault = tmp_path / "vault"
+    (vault / "SignalForge" / "DeepDive").mkdir(parents=True)
+    (vault / "SignalForge" / "DeepDive" / "note.md").write_text(
+        "---\nstatus: take待ち\n---\n本文\n", encoding="utf-8"
+    )
+    with (tmp_path / "config.toml").open("a", encoding="utf-8") as f:
+        f.write(f'[obsidian]\nvault_path = "{vault}"\n')
+    conn = connect(tmp_path / "intel.db")
+    apply_migrations(conn, tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    conn.execute(
+        "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 2, 'https://a/1', 'https://a/1', 'sha256:x')"
+    )
+    conn.execute(
+        "INSERT INTO dig_results (id, item_id, note_name, card_text, message_id) "
+        "VALUES (1, 1, 'note', 'カード', 700)"
+    )
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, kind, "
+        "answer, answer_message_id) VALUES (1, '結論はこう', 81, 'answered', 'take', '返事', 82)"
+    )
+    conn.close()
+
+    result = runner.invoke(app, ["answer", "--config-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "送信 0 通・take の記録 1 件" in result.output
+    text = (vault / "SignalForge" / "DeepDive" / "note.md").read_text(encoding="utf-8")
+    assert "status: take済" in text and "結論はこう" in text
