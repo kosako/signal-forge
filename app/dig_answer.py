@@ -65,6 +65,16 @@ def enqueue_question(
     ).lastrowid
 
 
+def question_received(conn: sqlite3.Connection, question_message_id: int) -> bool:
+    """そのリプライを質問として受け付け済みか(再配達で 2 回積まない。migration 012)。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_questions WHERE question_message_id = ?", (question_message_id,)
+        ).fetchone()
+        is not None
+    )
+
+
 def questions_on(conn: sqlite3.Connection, day: str) -> int:
     """その JST 暦日に受け付けた質問の数(1 日の上限の判定。created_at は UTC 保存)。"""
     return conn.execute(

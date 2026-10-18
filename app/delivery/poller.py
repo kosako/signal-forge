@@ -41,7 +41,7 @@ from app.delivery.surveys import (
 )
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
-from app.dig_answer import enqueue_question, questions_on
+from app.dig_answer import enqueue_question, question_received, questions_on
 from app.digest.builder import JST
 from app.normalize import (
     content_hash,
@@ -88,9 +88,11 @@ def run_poller(
     logger.info("poller 起動", extra={"stage": "poll"})
     while not should_stop():
         try:
+            # 質問への返事の取りこぼしを拾う(GH#126)。受信やタイマーが失敗する周期でも
+            # 終わった子の回収と起動し直しを止めないよう、周期の最初に行う
+            answer_worker.sweep(conn, logger)
             run_due_timers(conn, config, api, logger, now_fn())
             poll_once(conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker)
-            answer_worker.sweep(conn, logger)  # 質問への返事の取りこぼしを拾う(GH#126)
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
@@ -687,9 +689,14 @@ def _handle_dig_card_reply(
     返事を作って送る(LLM の待ちで受信を止めない)。上限を超えた日・上限 0 は記録だけ。
     """
     dig_result_id, item_id = thread
+    message_id = message.get("message_id")
+    if type(message_id) is int and question_received(conn, message_id):
+        # 台帳に積んだ後、offset を保存する前に止まると同じ update が再配達される。
+        # 受け付け済みなら何もしない(感想も返事も二重にしない)
+        logger.info("受け付け済みの質問の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
+        return
     conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, text))
     cap = config.dig.answer_daily_cap
-    message_id = message.get("message_id")
     if cap <= 0 or type(message_id) is not int:
         conn.commit()
         logger.info("感想を記録", extra={"stage": "poll", "item_id": item_id})

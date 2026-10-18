@@ -723,7 +723,30 @@ def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
     assert worker.kicks == 0
 
 
-def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path) -> None:
+def test_redelivered_card_reply_is_not_queued_twice(conn, tmp_path) -> None:
+    # 台帳に積んだ後、offset を保存する前に止まると同じ update が再配達される
+    _item_id, _dig_id = add_dig_card(conn)
+    update = card_reply("質問", 700)
+    api, worker = FakeApi([[update], [update]]), FakeWorker()
+    config = answer_config(tmp_path)
+
+    poll_once(conn, config, api, logger, answer_worker=worker)
+    conn.execute("DELETE FROM telegram_state")  # offset を保存できなかった状態
+    poll_once(conn, config, api, logger, answer_worker=worker)
+
+    assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
+    assert len(api.sent) == 1
+    assert worker.kicks == 1
+
+
+@pytest.mark.parametrize("fail_updates", [False, True])
+def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path, fail_updates) -> None:
+    # 受信が失敗する周期でも見回る(終わった子の回収・起動し直しを止めない)
+    class FailingApi(FakeApi):
+        def get_updates(self, offset):
+            raise DeliveryError("接続失敗")
+
     worker = FakeWorker()
     calls = {"n": 0}
 
@@ -732,8 +755,8 @@ def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path) -> None:
         return calls["n"] > 2  # 2周で停止
 
     run_poller(
-        conn, make_config(tmp_path), FakeApi(), logger,
-        should_stop=should_stop, answer_worker=worker,
+        conn, make_config(tmp_path), FailingApi() if fail_updates else FakeApi(), logger,
+        sleep=lambda _s: None, should_stop=should_stop, answer_worker=worker,
     )
     assert worker.sweeps == 2
 

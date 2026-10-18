@@ -189,3 +189,25 @@ Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の
    最悪コスト = 3 kind × N × $0.004(既定 100 なら ≤ $1.2。GH#84)
 3. 以降は**朝バッチが毎日差分を自動取込**(x_signals 段)。確認は
    `sqlite3 ~/.local/share/intel/intel.db "SELECT kind, count(*) FROM x_signals GROUP BY kind"`
+
+## 11. 深掘りカードへの質問への返事(GH#126・設計 05 §1.2)
+
+poller が起動する `intel answer` は codex を使う。poller.plist の PATH に codex の dir が
+無いと、返事は全件「答えを作れませんでした」になる(#72 と同じ理由)。plist は**コピー配置**
+なので、コードを更新して poller を再起動しただけでは古い PATH のまま残る。
+
+**既存のインストールを更新するとき**(PATH に codex の dir が入る前の poller.plist を使っている場合):
+
+1. §1 を実行して plist を再生成・コピーする(morning.plist も同じ内容で上書きされる)。
+2. poller を入れ直す(morning は次回起動で新しい plist を読むので入れ直し不要):
+   ```sh
+   launchctl bootout "gui/$(id -u)/com.intel.poller"
+   launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.poller.plist"
+   launchctl print "gui/$(id -u)/com.intel.poller" | grep -A3 "environment"   # PATH に codex の dir
+   ```
+3. 確認: 深掘りカードにリプライし、「📝 記録しました。返事を作っています」の後に返事が届くこと。
+   ログは `~/.local/state/intel/logs/answer.log`(子の起動失敗・異常終了は `poller.log`)。
+
+- 古い PATH のまま受け付けた質問は「答えを作れませんでした」で確定し、自動では作り直さない。
+  更新後にもう一度リプライする。
+- 1 日の上限は `[dig].answer_daily_cap`(既定 20)。`0` にすると返事をせず感想の記録だけになる。
