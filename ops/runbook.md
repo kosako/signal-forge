@@ -212,6 +212,6 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
   更新後にもう一度リプライする。
 - 1 日の上限は `[dig].answer_daily_cap`(既定 20)。`0` にすると返事をせず感想の記録だけになる。
 - take の記録(GH#106): LLM が結論・感想(take)と分けたリプライは、`intel answer` が返事を送った後に
-  解説ノートの末尾へ原文を足し、ノートの status を `take済` にする。vault に書けないときは
+  解説ノートの末尾へ原文を足す(ノートは書き直さず追記だけ。frontmatter の status は変えない)。vault に書けないときは
   `answer.log` に ERROR が出て、poller が 10 分おきに `intel answer` を起動して再試行する
   (poller を入れ直すまでは、次にリプライしたときにだけ再試行する)。

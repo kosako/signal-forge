@@ -60,7 +60,8 @@ def test_answer_exits_quietly_while_another_runs(tmp_path) -> None:
 
 
 def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
-    # 返事を送った後に take を記録する(GH#106)。送る返事が無くても前回の残りを記録する
+    # 返事を送った後に take を記録する(GH#106)。送る時点では未記録で、同じ実行の終わりに記録済み
+    import app.delivery as delivery
     from app import logs
     from app.db import apply_migrations, connect
 
@@ -86,13 +87,26 @@ def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
     )
     conn.execute(
         "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, kind, "
-        "answer, answer_message_id) VALUES (1, '結論はこう', 81, 'answered', 'take', '返事', 82)"
+        "answer) VALUES (1, '結論はこう', 81, 'answered', 'take', '返事')"  # 返事は未送信
     )
     conn.close()
+    recorded_at_send: list = []
+
+    class Api:
+        def send_message(self, chat_id, text, *, reply_to_message_id=None):
+            check = connect(tmp_path / "intel.db")
+            recorded_at_send.append(
+                check.execute("SELECT take_recorded_at FROM dig_questions").fetchone()[0]
+            )
+            check.close()
+            return 82
+
+    monkeypatch.setattr(delivery, "create_api", lambda env: Api())
 
     result = runner.invoke(app, ["answer", "--config-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "送信 0 通・take の記録 1 件" in result.output
+    assert recorded_at_send == [None]  # 送った時点ではまだ記録していない
+    assert "送信 1 通・take の記録 1 件" in result.output
     text = (vault / "SignalForge" / "DeepDive" / "note.md").read_text(encoding="utf-8")
-    assert "status: take済" in text and "結論はこう" in text
+    assert "結論はこう" in text

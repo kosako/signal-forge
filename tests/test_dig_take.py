@@ -74,7 +74,7 @@ def followups(conn, item_id) -> list[tuple]:
     return [tuple(r) for r in rows]
 
 
-def test_take_appended_status_marked_and_followup(conn, config) -> None:
+def test_take_appended_and_followup_recorded(conn, config) -> None:
     dig_id = add_dig(conn, config, note=NOTE)
     question_id = answered(conn, dig_id, "判定軸が面白い。\n自分の運用にも使う", 900, "take")
     assert has_unrecorded_take(conn)
@@ -82,8 +82,7 @@ def test_take_appended_status_marked_and_followup(conn, config) -> None:
     assert record_takes(conn, config, logger) == 1
 
     text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
-    assert text.startswith("---\nid: 1\nkind: deepdive\nstatus: take済\n---\n")
-    assert "本文。status: take待ち" in text  # frontmatter の外は書き換えない
+    assert text.startswith(NOTE)  # 今ある中身(frontmatter の status も)は書き換えない
     assert text.endswith(
         "(この下は手書きメモ・take 領域)\n"
         "\n**take**(2026-10-18 22:00・Telegram のリプライ)\n\n"
@@ -144,13 +143,6 @@ def test_followup_uses_bookmark_date_and_is_not_duplicated(conn, config) -> None
     assert followups(conn, item_id) == [("yes", "2026-10-15")]  # 🔖 を付けた日・1 回だけ
 
 
-def test_status_changed_by_owner_is_kept(conn, config) -> None:
-    dig_id = add_dig(conn, config, note=NOTE.replace("status: take待ち\n---", "status: 保留\n---"))
-    answered(conn, dig_id, "結論", 908, "take")
-    assert record_takes(conn, config, logger) == 1
-    assert "status: 保留" in note_path(config, conn, dig_id).read_text(encoding="utf-8")
-
-
 def test_missing_note_still_records_followup(conn, config, caplog) -> None:
     dig_id = add_dig(conn, config, note=NOTE)
     note_path(config, conn, dig_id).unlink()  # 本人が動かした・消した
@@ -181,21 +173,22 @@ def test_write_failure_is_retried_next_run(conn, config, monkeypatch, caplog) ->
     other_id = add_dig(conn, config, note=NOTE, url="https://a.example/2")
     answered(conn, dig_id, "書けない take", 911, "take")
     answered(conn, other_id, "書ける take", 912, "take")
-    real_replace = dig_take._replace_if_unchanged
+    broken = note_path(config, conn, dig_id)
+    real_open = dig_take.os.open
 
-    def flaky(path, original, content):
-        if "書けない take" in content:
+    def flaky(path, flags, *args):
+        if Path(path) == broken:
             raise PermissionError("vault に書けない")
-        real_replace(path, original, content)
+        return real_open(path, flags, *args)
 
-    monkeypatch.setattr(dig_take, "_replace_if_unchanged", flaky)
+    monkeypatch.setattr(dig_take.os, "open", flaky)
     with caplog.at_level(logging.ERROR):
         assert record_takes(conn, config, logger) == 1  # 1 件の失敗は他を止めない
     assert "次の実行で再試行" in caplog.text
     assert followups(conn, item_of(conn, dig_id)) == []
     assert has_unrecorded_take(conn)
 
-    monkeypatch.setattr(dig_take, "_replace_if_unchanged", real_replace)
+    monkeypatch.setattr(dig_take.os, "open", real_open)
     assert record_takes(conn, config, logger) == 1
     assert "書けない take" in note_path(config, conn, dig_id).read_text(encoding="utf-8")
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
@@ -245,58 +238,6 @@ def test_unsent_reply_is_not_recorded_until_sent(conn, config) -> None:
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
 
 
-def test_owner_save_between_read_and_replace_is_kept(conn, config, monkeypatch, caplog) -> None:
-    # 読んだ後に本人がノートを保存したら置き換えない(本人の編集を消さない)。次の実行で書く
-    dig_id = add_dig(conn, config, note=NOTE)
-    answered(conn, dig_id, "結論はこう", 916, "take")
-    path = note_path(config, conn, dig_id)
-    edited = NOTE + "\n本人がいま書いたメモ\n"
-    real_mkstemp = dig_take.tempfile.mkstemp
-
-    def save_while_writing(*args, **kwargs):
-        path.write_text(edited, encoding="utf-8")  # 読んだ後・置き換える前に本人が保存
-        return real_mkstemp(*args, **kwargs)
-
-    monkeypatch.setattr(dig_take.tempfile, "mkstemp", save_while_writing)
-    with caplog.at_level(logging.WARNING):
-        assert record_takes(conn, config, logger) == 0
-    assert "次の実行に回す" in caplog.text
-    assert path.read_text(encoding="utf-8") == edited
-    assert followups(conn, item_of(conn, dig_id)) == []
-    assert has_unrecorded_take(conn)
-    assert [p.name for p in path.parent.iterdir() if p.name.endswith(".tmp")] == []
-
-    monkeypatch.setattr(dig_take.tempfile, "mkstemp", real_mkstemp)
-    assert record_takes(conn, config, logger) == 1
-    text = path.read_text(encoding="utf-8")
-    assert "本人がいま書いたメモ" in text and "結論はこう" in text
-
-
-def test_empty_frontmatter_does_not_touch_body(conn, config) -> None:
-    note = "---\n---\n本文\n\n---\nstatus: take待ち\n---\n"
-    dig_id = add_dig(conn, config, note=note)
-    answered(conn, dig_id, "結論", 917, "take")
-    assert record_takes(conn, config, logger) == 1
-    text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
-    assert text.startswith(note)  # 本文の status 行は frontmatter ではない
-
-
-def test_undecodable_note_is_left_and_later_takes_are_recorded(conn, config, caplog) -> None:
-    broken_id = add_dig(conn, config, note=NOTE)
-    path = note_path(config, conn, broken_id)
-    path.write_bytes(b"---\nstatus: take\x8a\x82\n---\n")
-    other_id = add_dig(conn, config, note=NOTE, url="https://a.example/2")
-    answered(conn, broken_id, "読めないノートへの take", 918, "take")
-    answered(conn, other_id, "読めるノートへの take", 919, "take")
-
-    with caplog.at_level(logging.WARNING):
-        assert record_takes(conn, config, logger) == 2
-    assert "UTF-8 で読めない" in caplog.text
-    assert path.read_bytes() == b"---\nstatus: take\x8a\x82\n---\n"  # ファイルは変えない
-    assert "読めるノートへの take" in note_path(config, conn, other_id).read_text(encoding="utf-8")
-    assert not has_unrecorded_take(conn)
-
-
 def test_take_on_bookmarked_item_counts_in_kpi_06(conn, config) -> None:
     # followup_dig=yes は「深掘りした」の記録。🔖 の付いたアイテムでは KPI 06 の分子に入る
     dig_id = add_dig(conn, config, note=NOTE)
@@ -313,59 +254,6 @@ def test_take_on_bookmarked_item_counts_in_kpi_06(conn, config) -> None:
     assert record_takes(conn, config, logger) == 1
     after = conn.execute(kpi.read_text(encoding="utf-8")).fetchone()
     assert (after["dig_total"], after["followup_yes"], after["dig_execution_pct"]) == (1, 1, 100.0)
-
-
-def test_owner_save_right_before_swap_is_put_back(conn, config, monkeypatch) -> None:
-    # 読み直しの後・入れ替えの直前に本人が保存しても、入れ替えた版を見て戻す
-    dig_id = add_dig(conn, config, note=NOTE)
-    answered(conn, dig_id, "結論はこう", 921, "take")
-    path = note_path(config, conn, dig_id)
-    edited = NOTE + "\n入れ替えの直前に書いたメモ\n"
-    real_swap = dig_take._swap
-    calls = []
-
-    def save_then_swap(a, b):
-        if not calls:
-            path.write_text(edited, encoding="utf-8")
-        calls.append((a, b))
-        real_swap(a, b)
-
-    monkeypatch.setattr(dig_take, "_swap", save_then_swap)
-    assert record_takes(conn, config, logger) == 0
-    assert len(calls) == 2  # 入れ替えて、本人の版を戻した
-    assert path.read_text(encoding="utf-8") == edited
-    assert has_unrecorded_take(conn)
-    assert sorted(p.name for p in path.parent.iterdir()) == sorted(
-        [path.name, f"{path.stem}-source.md"]
-    )
-
-
-def test_saves_on_both_sides_of_the_swap_keep_every_version(conn, config, monkeypatch) -> None:
-    # 実際には起きない間隔の連続保存でも、どの版も消さない(片方を復旧用の名前で残す)
-    dig_id = add_dig(conn, config, note=NOTE)
-    answered(conn, dig_id, "結論", 922, "take")
-    path = note_path(config, conn, dig_id)
-    real_swap = dig_take._swap
-    saves = iter([NOTE + "\n一回目の保存\n", NOTE + "\n二回目の保存\n"])
-
-    def save_then_swap(a, b):
-        path.write_text(next(saves), encoding="utf-8")
-        real_swap(a, b)
-
-    monkeypatch.setattr(dig_take, "_swap", save_then_swap)
-    assert record_takes(conn, config, logger) == 0
-    texts = [p.read_text(encoding="utf-8") for p in path.parent.glob(f"{path.stem}*.md")]
-    assert any("一回目の保存" in t for t in texts)
-    assert any("二回目の保存" in t for t in texts)
-    assert has_unrecorded_take(conn)
-
-
-def test_unclosed_frontmatter_does_not_touch_body(conn, config) -> None:
-    note = "---\n本文\nstatus: take待ち\n"
-    dig_id = add_dig(conn, config, note=note)
-    answered(conn, dig_id, "結論", 923, "take")
-    assert record_takes(conn, config, logger) == 1
-    assert note_path(config, conn, dig_id).read_text(encoding="utf-8").startswith(note)
 
 
 def test_missing_vault_folder_is_retried_not_given_up(conn, config, caplog) -> None:
@@ -385,3 +273,49 @@ def test_missing_vault_folder_is_retried_not_given_up(conn, config, caplog) -> N
     moved.rename(deepdive)
     assert record_takes(conn, config, logger) == 1
     assert "結論" in note_path(config, conn, dig_id).read_text(encoding="utf-8")
+
+
+def test_append_only_never_replaces_or_rewrites_the_note(conn, config) -> None:
+    # 本人のノートは書き換えない: ファイルの実体(inode)も今ある中身もそのまま、末尾に足すだけ
+    note = "---\n---\n本文\n\n---\nstatus: take待ち\n---\n本人のメモ(末尾に改行なし)"
+    dig_id = add_dig(conn, config, note=note)
+    answered(conn, dig_id, "結論", 925, "take")
+    path = note_path(config, conn, dig_id)
+    inode = path.stat().st_ino
+
+    assert record_takes(conn, config, logger) == 1
+    assert path.stat().st_ino == inode
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(note + "\n")  # 末尾に改行が無ければ足してから書く
+    assert text.count("status: take待ち") == 1
+
+
+def test_owner_save_just_before_append_is_kept(conn, config, monkeypatch) -> None:
+    # 読んだ後・追記の直前に本人が保存しても、その中身は残り、take はその後ろに付く
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論はこう", 926, "take")
+    path = note_path(config, conn, dig_id)
+    edited = NOTE + "\n本人がいま書いたメモ\n"
+    real_open = dig_take.os.open
+
+    def save_then_open(target, flags, *args):
+        path.write_text(edited, encoding="utf-8")
+        return real_open(target, flags, *args)
+
+    monkeypatch.setattr(dig_take.os, "open", save_then_open)
+    assert record_takes(conn, config, logger) == 1
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(edited)
+    assert text.rstrip().endswith("-->") and "結論はこう" in text
+
+
+def test_non_utf8_note_is_appended_without_touching_its_bytes(conn, config) -> None:
+    dig_id = add_dig(conn, config, note=NOTE)
+    path = note_path(config, conn, dig_id)
+    path.write_bytes(b"---\nstatus: take\x8a\x82\n---\n")
+    answered(conn, dig_id, "結論", 927, "take")
+
+    assert record_takes(conn, config, logger) == 1
+    data = path.read_bytes()
+    assert data.startswith(b"---\nstatus: take\x8a\x82\n---\n")
+    assert "結論".encode() in data
