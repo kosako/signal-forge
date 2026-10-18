@@ -313,3 +313,75 @@ def test_take_on_bookmarked_item_counts_in_kpi_06(conn, config) -> None:
     assert record_takes(conn, config, logger) == 1
     after = conn.execute(kpi.read_text(encoding="utf-8")).fetchone()
     assert (after["dig_total"], after["followup_yes"], after["dig_execution_pct"]) == (1, 1, 100.0)
+
+
+def test_owner_save_right_before_swap_is_put_back(conn, config, monkeypatch) -> None:
+    # 読み直しの後・入れ替えの直前に本人が保存しても、入れ替えた版を見て戻す
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論はこう", 921, "take")
+    path = note_path(config, conn, dig_id)
+    edited = NOTE + "\n入れ替えの直前に書いたメモ\n"
+    real_swap = dig_take._swap
+    calls = []
+
+    def save_then_swap(a, b):
+        if not calls:
+            path.write_text(edited, encoding="utf-8")
+        calls.append((a, b))
+        real_swap(a, b)
+
+    monkeypatch.setattr(dig_take, "_swap", save_then_swap)
+    assert record_takes(conn, config, logger) == 0
+    assert len(calls) == 2  # 入れ替えて、本人の版を戻した
+    assert path.read_text(encoding="utf-8") == edited
+    assert has_unrecorded_take(conn)
+    assert sorted(p.name for p in path.parent.iterdir()) == sorted(
+        [path.name, f"{path.stem}-source.md"]
+    )
+
+
+def test_saves_on_both_sides_of_the_swap_keep_every_version(conn, config, monkeypatch) -> None:
+    # 実際には起きない間隔の連続保存でも、どの版も消さない(片方を復旧用の名前で残す)
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論", 922, "take")
+    path = note_path(config, conn, dig_id)
+    real_swap = dig_take._swap
+    saves = iter([NOTE + "\n一回目の保存\n", NOTE + "\n二回目の保存\n"])
+
+    def save_then_swap(a, b):
+        path.write_text(next(saves), encoding="utf-8")
+        real_swap(a, b)
+
+    monkeypatch.setattr(dig_take, "_swap", save_then_swap)
+    assert record_takes(conn, config, logger) == 0
+    texts = [p.read_text(encoding="utf-8") for p in path.parent.glob(f"{path.stem}*.md")]
+    assert any("一回目の保存" in t for t in texts)
+    assert any("二回目の保存" in t for t in texts)
+    assert has_unrecorded_take(conn)
+
+
+def test_unclosed_frontmatter_does_not_touch_body(conn, config) -> None:
+    note = "---\n本文\nstatus: take待ち\n"
+    dig_id = add_dig(conn, config, note=note)
+    answered(conn, dig_id, "結論", 923, "take")
+    assert record_takes(conn, config, logger) == 1
+    assert note_path(config, conn, dig_id).read_text(encoding="utf-8").startswith(note)
+
+
+def test_missing_vault_folder_is_retried_not_given_up(conn, config, caplog) -> None:
+    # vault が一時的に使えない(DeepDive の置き場ごと無い)のは、ノートが消えたのとは分けて再試行する
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論", 924, "take")
+    deepdive = note_path(config, conn, dig_id).parent
+    moved = deepdive.with_name("DeepDive-unmounted")
+    deepdive.rename(moved)
+
+    with caplog.at_level(logging.ERROR):
+        assert record_takes(conn, config, logger) == 0
+    assert "次の実行で再試行" in caplog.text
+    assert followups(conn, item_of(conn, dig_id)) == []
+    assert has_unrecorded_take(conn)
+
+    moved.rename(deepdive)
+    assert record_takes(conn, config, logger) == 1
+    assert "結論" in note_path(config, conn, dig_id).read_text(encoding="utf-8")

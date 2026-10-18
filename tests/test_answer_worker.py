@@ -153,10 +153,15 @@ def test_sweep_retries_unrecorded_takes_with_backoff(conn, tmp_path) -> None:
     worker.sweep(conn, logger)
     assert len(popen.calls) == 1  # 毎周期は起動しない
 
-    conn.execute("UPDATE dig_questions SET take_recorded_at = '2026-10-18T13:01:10Z'")
     clock.now += 1
     worker.sweep(conn, logger)
-    assert len(popen.calls) == 1  # 記録できたら起動しない
+    assert len(popen.calls) == 2  # 10 分たっても記録できていなければ起動し直す
+    popen.procs[1].code = 0
+
+    conn.execute("UPDATE dig_questions SET take_recorded_at = '2026-10-18T13:11:10Z'")
+    clock.now += RETRY_UNSENT_S
+    worker.sweep(conn, logger)
+    assert len(popen.calls) == 2  # 記録できたら起動しない
 
 
 def test_sent_answers_do_not_start(conn, tmp_path) -> None:
