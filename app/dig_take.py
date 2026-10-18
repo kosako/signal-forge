@@ -14,7 +14,8 @@
   行い、書き換えない。末尾への追記(O_APPEND)は今ある中身に触れないので、本人の編集を消す
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
   frontmatter の status は書き換えない(1 行だけを書き換える手段はファイルの書き直ししか無いため。
-  本人が手で take済 にしてよい)。追記には質問 id の印を付け、やり直しで 2 回書かない
+  本人が手で take済 にしてよい)。追記の見出しに記録番号(質問 id)を入れ、やり直しで 2 回書かない
+  (途中まで書いて止まっていたら続きだけを足す)。確かめた DeepDive の置き場を fd で押さえて書く
 - 本人がノートを動かした・消したときは、ノートへの追記だけを諦める(原文は台帳と item_notes に
   残る)。vault に書けない一時的な失敗(DeepDive の置き場ごと見えないときを含む)は記録しない
   まま残し、次の実行で再試行する。どの失敗もその 1 件に閉じ、後の take は記録する
@@ -22,9 +23,12 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import logging
 import os
 import sqlite3
+import stat
 from pathlib import Path
 
 from app.config import Config
@@ -100,42 +104,86 @@ def record_takes(conn: sqlite3.Connection, config: Config, logger: logging.Logge
 
 
 def _append_to_note(deepdive_dir: Path | None, row: sqlite3.Row) -> None:
-    """ノートの末尾に take を足す(今ある中身は書き換えない)。"""
-    path = _note_path(deepdive_dir, row["note_name"])
-    marker = f"<!-- signal-forge:take q={row['id']} -->"
-    current = path.read_bytes()
-    if marker.encode("utf-8") in current:
-        return  # 前回の実行でノートには書けていた(台帳の記帳の前に止まった)
-    heading = f"**take**({row['take_time']}・Telegram のリプライ)"
-    block = f"\n{heading}\n\n{row['question']}\n\n{marker}\n"
-    if current and not current.endswith(b"\n"):
-        block = "\n" + block
-    # O_APPEND: 書く位置は常にその時点の末尾。O_NOFOLLOW: 確かめた後に symlink へ
-    # すり替えられても辿らない
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
-    try:
-        data = block.encode("utf-8")
-        while data:
-            data = data[os.write(fd, data):]
-    finally:
-        os.close(fd)
+    """ノートの末尾に take を足す(今ある中身は書き換えない)。
 
-
-def _note_path(deepdive_dir: Path | None, note_name: str) -> Path:
-    # 読む側(dig_answer._read_note)と同じく、DeepDive の外を指す名前・symlink は扱わない
+    確かめた DeepDive の置き場を fd で押さえ、その中のノートを開いて読み書きする(確かめた後に
+    置き場や途中のフォルダが symlink にすり替えられても、DeepDive の外には書かない)。
+    """
     if deepdive_dir is None:
         raise _NoteMissing("vault が未設定")
     # DeepDive の置き場そのものが無いのは、vault が一時的に使えない(外付けの取り外しなど)と
     # みて再試行に回す(FileNotFoundError をそのまま上げる)。置き場があってノートだけ無いのは
     # 本人が動かした・消した
     base = deepdive_dir.resolve(strict=True)
+    name = f"{row['note_name']}.md"
+    if os.sep in name or name.startswith("."):
+        raise _NoteMissing("ノート名が DeepDive の外を指す")
+    dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        path = (deepdive_dir / f"{note_name}.md").resolve(strict=True)
-    except FileNotFoundError as e:
-        raise _NoteMissing("ノートが見つからない") from e
-    if path.parent != base or not path.is_file():
-        raise _NoteMissing("ノートが DeepDive の外を指す")
-    return path
+        if _fd_path(dir_fd) != str(base):
+            raise OSError(errno.ESTALE, "DeepDive の置き場が確かめたときと違う", str(base))
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except FileNotFoundError as e:
+            raise _NoteMissing("ノートが見つからない") from e
+        except OSError as e:
+            if e.errno == errno.ELOOP:  # ノートが symlink(DeepDive の外を指しうる)
+                raise _NoteMissing("ノートが symlink") from e
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise _NoteMissing("ノートが通常のファイルでない")
+            data = _remaining(_read_all(fd), _take_block(row))
+            # O_APPEND: 書く位置は常にその時点の末尾(今ある中身には触れない)
+            while data:
+                data = data[os.write(fd, data):]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _take_block(row: sqlite3.Row) -> bytes:
+    """ノートに足す take の節。見出しの記録番号(質問 id)で、書いたかどうかを見分ける。
+
+    印に HTML コメントを使わない: 途中まで書いて止まると閉じていない `<!--` が残り、Obsidian で
+    その後ろが全部隠れるため。見出しの断片が残っても、ただの文字列で済む。
+    """
+    heading = f"**take**({row['take_time']}・Telegram のリプライ・記録番号 {row['id']})"
+    return f"\n{heading}\n\n{row['question']}\n".encode()
+
+
+def _remaining(current: bytes, block: bytes) -> bytes:
+    """block のうち、まだノートに無い部分を返す(途中まで書いて止まったときは続きだけ)。"""
+    anchor = block.split(b"\n", 2)[1]  # 見出しの行
+    i = current.find(anchor)
+    if i != -1:
+        written = current[i:]
+        expected = block[block.index(anchor):]
+        if expected.startswith(written):
+            return expected[len(written):]  # 途中まで書けていた: 続きだけを足す
+        return b""  # 書き終えている(後ろに本人が書き足した・書き換えたものは触らない)
+    # 見出しの途中で止まっていた: ノートの末尾が block の先頭と重なる分は書かない
+    for k in range(min(len(current), len(block) - 1), 2, -1):
+        if current.endswith(block[:k]):
+            return block[k:]
+    if current and not current.endswith(b"\n"):
+        return b"\n" + block
+    return block
+
+
+def _read_all(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while chunk := os.read(fd, 65536):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _fd_path(fd: int) -> str:
+    """開いた fd の実際のパス(macOS の F_GETPATH)。"""
+    raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+    return os.fsdecode(raw.split(b"\0", 1)[0])
 
 
 def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:

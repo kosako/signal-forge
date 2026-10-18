@@ -85,9 +85,8 @@ def test_take_appended_and_followup_recorded(conn, config) -> None:
     assert text.startswith(NOTE)  # 今ある中身(frontmatter の status も)は書き換えない
     assert text.endswith(
         "(この下は手書きメモ・take 領域)\n"
-        "\n**take**(2026-10-18 22:00・Telegram のリプライ)\n\n"
-        "判定軸が面白い。\n自分の運用にも使う\n\n"
-        f"<!-- signal-forge:take q={question_id} -->\n"
+        f"\n**take**(2026-10-18 22:00・Telegram のリプライ・記録番号 {question_id})\n\n"
+        "判定軸が面白い。\n自分の運用にも使う\n"
     )
     # 🔖 の無いアイテムは take の日(JST)
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
@@ -105,7 +104,7 @@ def test_question_and_failed_are_not_takes_but_both_is(conn, config) -> None:
     text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
     assert "これはどういう意味?" not in text
     assert "答えを作れなかった" not in text
-    assert f"面白い。でもこれは何?\n\n<!-- signal-forge:take q={both} -->" in text
+    assert f"記録番号 {both})\n\n面白い。でもこれは何?\n" in text
 
 
 def test_rerun_does_not_append_twice(conn, config) -> None:
@@ -117,14 +116,19 @@ def test_rerun_does_not_append_twice(conn, config) -> None:
 
 
 def test_written_note_but_unrecorded_ledger_is_not_appended_again(conn, config) -> None:
-    # ノートに書いた後、台帳に記帳する前に止まった: 印を見て追記をやり直さない
+    # ノートに書いた後、台帳に記帳する前に止まった: 見出しの記録番号を見て追記をやり直さない
     dig_id = add_dig(conn, config, note=NOTE)
-    question_id = answered(conn, dig_id, "結論はこう", 905, "take")
+    answered(conn, dig_id, "結論はこう", 905, "take")
+    assert record_takes(conn, config, logger) == 1
+    conn.execute("UPDATE dig_questions SET take_recorded_at = NULL")  # 記帳の前に止まった
+    conn.execute("DELETE FROM signals WHERE kind = 'followup_dig'")
     path = note_path(config, conn, dig_id)
-    path.write_text(NOTE + f"\n結論はこう\n\n<!-- signal-forge:take q={question_id} -->\n")
+    path.write_text(path.read_text(encoding="utf-8") + "\n本人が後ろに書き足したメモ\n")
 
     assert record_takes(conn, config, logger) == 1
-    assert path.read_text(encoding="utf-8").count("結論はこう") == 1
+    text = path.read_text(encoding="utf-8")
+    assert text.count("結論はこう") == 1
+    assert text.endswith("本人が後ろに書き足したメモ\n")
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
 
 
@@ -176,10 +180,10 @@ def test_write_failure_is_retried_next_run(conn, config, monkeypatch, caplog) ->
     broken = note_path(config, conn, dig_id)
     real_open = dig_take.os.open
 
-    def flaky(path, flags, *args):
-        if Path(path) == broken:
+    def flaky(target, flags, *args, **kwargs):
+        if str(target) == broken.name:  # DeepDive の置き場から開くノート
             raise PermissionError("vault に書けない")
-        return real_open(path, flags, *args)
+        return real_open(target, flags, *args, **kwargs)
 
     monkeypatch.setattr(dig_take.os, "open", flaky)
     with caplog.at_level(logging.ERROR):
@@ -298,15 +302,15 @@ def test_owner_save_just_before_append_is_kept(conn, config, monkeypatch) -> Non
     edited = NOTE + "\n本人がいま書いたメモ\n"
     real_open = dig_take.os.open
 
-    def save_then_open(target, flags, *args):
+    def save_then_open(target, flags, *args, **kwargs):
         path.write_text(edited, encoding="utf-8")
-        return real_open(target, flags, *args)
+        return real_open(target, flags, *args, **kwargs)
 
     monkeypatch.setattr(dig_take.os, "open", save_then_open)
     assert record_takes(conn, config, logger) == 1
     text = path.read_text(encoding="utf-8")
     assert text.startswith(edited)
-    assert text.rstrip().endswith("-->") and "結論はこう" in text
+    assert text.endswith("結論はこう\n")
 
 
 def test_non_utf8_note_is_appended_without_touching_its_bytes(conn, config) -> None:
@@ -319,3 +323,87 @@ def test_non_utf8_note_is_appended_without_touching_its_bytes(conn, config) -> N
     data = path.read_bytes()
     assert data.startswith(b"---\nstatus: take\x8a\x82\n---\n")
     assert "結論".encode() in data
+
+
+@pytest.mark.parametrize("cut", [3, 20, 100])  # 見出しの先頭 / 見出しの途中 / 本文の途中で止まる
+def test_partial_write_then_error_is_completed_without_duplication(
+    conn, config, monkeypatch, cut
+) -> None:
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "途中まで書いて止まった結論。続きの文がここにある", 928, "take")
+    path = note_path(config, conn, dig_id)
+    real_write = dig_take.os.write
+    calls = []
+
+    def short_then_fail(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, data[:cut])  # 短い書き込み
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dig_take.os, "write", short_then_fail)
+    assert record_takes(conn, config, logger) == 0
+    assert has_unrecorded_take(conn)
+
+    monkeypatch.setattr(dig_take.os, "write", real_write)
+    assert record_takes(conn, config, logger) == 1
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(NOTE)
+    assert text.count("記録番号") == 1
+    assert text.count("続きの文がここにある") == 1
+    assert text.endswith("続きの文がここにある\n")
+
+
+def test_deepdive_swapped_for_symlink_after_check_is_not_written(
+    conn, config, monkeypatch, tmp_path
+) -> None:
+    # 確かめた後に DeepDive の置き場が外への symlink にすり替えられても、外には書かない
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論", 929, "take")
+    deepdive = note_path(config, conn, dig_id).parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / note_path(config, conn, dig_id).name
+    victim.write_text("外のファイル\n", encoding="utf-8")
+    real_open = dig_take.os.open
+    swapped = []
+
+    def swap_then_open(target, flags, *args, **kwargs):
+        if not swapped:
+            deepdive.rename(deepdive.with_name("DeepDive-real"))
+            os.symlink(outside, deepdive)
+            swapped.append(True)
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(dig_take.os, "open", swap_then_open)
+    assert record_takes(conn, config, logger) == 0
+    assert victim.read_text(encoding="utf-8") == "外のファイル\n"
+    assert has_unrecorded_take(conn)
+
+
+def test_parent_folder_swapped_for_symlink_is_not_written(
+    conn, config, monkeypatch, tmp_path
+) -> None:
+    # 途中のフォルダ(SignalForge)がすり替えられた場合も、開いた置き場の実際のパスで見抜く
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論", 930, "take")
+    note = note_path(config, conn, dig_id)
+    signalforge = note.parent.parent
+    outside = tmp_path / "outside"
+    (outside / "DeepDive").mkdir(parents=True)
+    victim = outside / "DeepDive" / note.name
+    victim.write_text("外のファイル\n", encoding="utf-8")
+    real_open = dig_take.os.open
+    swapped = []
+
+    def swap_then_open(target, flags, *args, **kwargs):
+        if not swapped:
+            signalforge.rename(signalforge.with_name("SignalForge-real"))
+            os.symlink(outside, signalforge)
+            swapped.append(True)
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(dig_take.os, "open", swap_then_open)
+    assert record_takes(conn, config, logger) == 0
+    assert victim.read_text(encoding="utf-8") == "外のファイル\n"
+    assert has_unrecorded_take(conn)
