@@ -197,6 +197,53 @@ def dig(
     typer.echo("dig 完了(生成・送信の内訳はログ参照)")
 
 
+@app.command()
+def answer(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """深掘りカードへの質問に答え、Telegram で返事を送る(GH#126)。"""
+    import fcntl
+
+    from app.analysis.llm import create_engine
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.delivery import create_api, is_telegram_configured
+    from app.delivery.telegram import ANSWER_TEXT_MAX_CHARS, escape_and_truncate
+    from app.dig_answer import answer_pending
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    chat_id = config.telegram.owner_chat_id
+    if chat_id is None or not is_telegram_configured(config, env):
+        typer.echo("Telegram が未設定のため返事を送れない", err=True)
+        raise typer.Exit(code=1)
+    lock_path = config.db_path.with_name("answer.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        # 同時に 2 つ走ると同じ質問に 2 回答えうる。後から来た方は何もせず終わる
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            typer.echo("別の answer が実行中")
+            return
+        conn = connect(config.db_path)
+        apply_migrations(conn, config.db_path)
+        logger = setup_logging(DEFAULT_LOG_DIR, "answer.log")  # poller.log とはプロセスを分ける
+        api = create_api(env)
+        sent = answer_pending(
+            conn,
+            config,
+            lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+            lambda reply_to, text: api.send_message(
+                chat_id, escape_and_truncate(text, ANSWER_TEXT_MAX_CHARS),
+                reply_to_message_id=reply_to,
+            ),
+            logger,
+        )
+    typer.echo(f"answer 完了(送信 {sent} 通)")
+
+
 @app.command(name="x-auth")
 def x_auth(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),

@@ -421,3 +421,18 @@ def test_header_bookmark_section_caps_display(conn, tmp_path) -> None:
     assert "🔖 保存(12件)" in header
     assert "(他 2 件は Items ノートへ)" in header
     assert "保存11" not in header  # 11・12 件目は表示しない(保存0〜9 の 10 件)
+
+
+def test_send_message_reply_target(tmp_path) -> None:
+    # 質問への返事(GH#126)は質問のリプライへの返信で送る。返信先が消えていても送る
+    recorder = ApiRecorder()
+    api = recorder.api()
+
+    assert api.send_message(CHAT_ID, "返事", reply_to_message_id=55) == 101
+    assert api.send_message(CHAT_ID, "通常") == 102
+
+    assert json.loads(recorder.requests[0]["reply_parameters"]) == {
+        "message_id": 55,
+        "allow_sending_without_reply": True,
+    }
+    assert "reply_parameters" not in recorder.requests[1]

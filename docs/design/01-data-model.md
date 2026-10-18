@@ -215,7 +215,7 @@ CREATE INDEX ix_digest_notes_pending ON digest_notes(digest_id) WHERE exported_a
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)の8つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)の9つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -346,6 +346,19 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(公開済みの行だけ次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
 - `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる)
+
+### 深掘りカードへの質問と返事(dig_questions・migration 011。GH#126 / ADR 0005 / 設計 06 §6)
+
+概要カードへのリプライ(質問・感想)と、それへの返事の台帳(1 リプライ = 1 行)。返事は
+**write-ahead** で作る: 答え(または失敗)を先に記帳し(`status` を `answered` / `failed` へ)、
+送れたら `answer_message_id` を記帳する。どこで中断しても、次の `intel answer` は未送信の
+行の送信から再開し、同じ質問の答えを作り直さない。
+
+- `dig_result_id` = どのカードへの質問か(スレッド)。カードへのリプライも返事へのリプライも同じカードに帰属させ、同じカードのそれまでのやり取りを返事の材料に含める
+- `question_message_id` = 本人のリプライの message_id。返事はこれへのリプライとして送る(owner DM 限定)
+- `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しで一緒に返させる(別の呼び出しを増やさない)。take の記録(GH#106)がこれを使う
+- `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
+- 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)
 
 ## 8. digests
 
