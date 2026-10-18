@@ -7,10 +7,11 @@ from pathlib import Path
 import pytest
 
 from app.analysis.stage1 import preselect
-from app.collect import _raw_payload
+from app.collect import _raw_payload, collect_all
 from app.config import AnalysisConfig, Config
 from app.connectors.x import _to_raw_item
 from app.db import apply_migrations, connect
+from tests.test_x import connector_from, page, tweet
 
 logger = logging.getLogger("test-stage1")
 
@@ -130,6 +131,23 @@ def test_x_noise_rules(conn, tmp_path) -> None:
     assert rows["https://x.com/i/web/status/5"] == ("skipped", "x_noise")
     assert rows["https://x.com/i/web/status/6"] == ("new", None)
     assert rows["https://rss.example/short"] == ("new", None)
+
+
+@pytest.mark.parametrize("self_first", [True, False])
+def test_self_retweet_excluded_after_collect_in_either_order(conn, tmp_path, self_first) -> None:
+    # 自分の RT と他人の RT が同じ元ツイートを指すと、collect の重複排除で 1 行になる。
+    # どちらが先に並んでも規則 3 が落とす(GH#133)
+    conn.execute("UPDATE sources SET enabled = 0 WHERE type = 'rss'")
+    created = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")  # 鮮度の規則に掛けない
+    mine = tweet("910", f"RT @x: {LONG_TEXT}", author="me", created=created, retweeted="900")
+    other = tweet("911", f"RT @x: {LONG_TEXT}", author="a1", created=created, retweeted="900")
+    tweets = [mine, other] if self_first else [other, mine]
+    collect_all(conn, {"x": connector_from([(200, page(tweets), {})], me_id="me")}, logger)
+
+    counts = preselect(conn, make_config(tmp_path), logger).counts
+    assert counts["x_noise"] == 1
+    rows = conn.execute("SELECT status, skip_reason FROM items WHERE external_id = '900'")
+    assert [tuple(r) for r in rows] == [("skipped", "x_noise")]
 
 
 def test_daily_cap_round_robin_keeps_source_diversity(conn, tmp_path) -> None:
