@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from app.config import Config
 from app.db import insert_item_with_dedup
+from app.delivery.answer_worker import AnswerWorker
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     READ_MIN_CHOICES,
@@ -40,6 +41,7 @@ from app.delivery.surveys import (
 )
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
+from app.dig_answer import enqueue_question, questions_on
 from app.digest.builder import JST
 from app.normalize import (
     content_hash,
@@ -68,6 +70,7 @@ def run_poller(
     sleep: Callable[[float], None] = time.sleep,
     should_stop: Callable[[], bool] = lambda: False,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
+    answer_worker: AnswerWorker | None = None,
 ) -> None:
     """常駐ループ。失敗は即時再接続、連続失敗は30s間隔(設計 05 §8)。
 
@@ -80,11 +83,14 @@ def run_poller(
     if config.telegram.owner_chat_id is None:
         # 夜アンケート・watchdog の送信先(plan #19)。起動時に fail fast
         raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
+    if answer_worker is None:
+        answer_worker = AnswerWorker(config.config_dir)
     logger.info("poller 起動", extra={"stage": "poll"})
     while not should_stop():
         try:
             run_due_timers(conn, config, api, logger, now_fn())
-            poll_once(conn, config, api, logger, now_fn=now_fn)
+            poll_once(conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker)
+            answer_worker.sweep(conn, logger)  # 質問への返事の取りこぼしを拾う(GH#126)
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
@@ -108,6 +114,7 @@ def poll_once(
     logger: logging.Logger,
     *,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
+    answer_worker: AnswerWorker | None = None,
 ) -> int:
     """getUpdates 1回分を処理し、処理した update 数を返す。"""
     offset = _load_offset(conn, logger)
@@ -120,7 +127,9 @@ def poll_once(
         # 個別 update の処理失敗は poller を殺さず、offset を進めて次へ
         # (poison update を無限再処理しない。プロセス終了は launchd KeepAlive の責務)
         try:
-            handle_update(conn, config, api, update, logger, now_fn=now_fn)
+            handle_update(
+                conn, config, api, update, logger, now_fn=now_fn, answer_worker=answer_worker
+            )
         except Exception as e:
             logger.error(
                 f"update 処理失敗: {type(e).__name__}: {e}",
@@ -139,6 +148,7 @@ def handle_update(
     logger: logging.Logger,
     *,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
+    answer_worker: AnswerWorker | None = None,
 ) -> None:
     callback = update.get("callback_query")
     if isinstance(callback, dict):
@@ -146,7 +156,9 @@ def handle_update(
         return
     message = update.get("message")
     if isinstance(message, dict):
-        _handle_message(conn, config, api, message, logger)
+        _handle_message(
+            conn, config, api, message, logger, now=now_fn(), answer_worker=answer_worker
+        )
         return
     logger.info(
         "未対応の update 種別を破棄",
@@ -406,6 +418,9 @@ def _handle_message(
     api: TelegramApi,
     message: dict,
     logger: logging.Logger,
+    *,
+    now: datetime,
+    answer_worker: AnswerWorker | None = None,
 ) -> None:
     """owner メッセージからの URL 投入(設計 02 §4 / 04 §5)。"""
     sender = message.get("from")
@@ -446,6 +461,13 @@ def _handle_message(
         and text.strip()
         and chat_id == config.telegram.owner_chat_id
     ):
+        # 深掘りカード・その返事へのリプライ = 質問・感想(GH#126。take の記録は GH#106)
+        thread = _replied_dig_thread(conn, message.get("reply_to_message"))
+        if thread is not None:
+            _handle_dig_card_reply(
+                conn, config, thread, message, text.strip(), reply, logger, now, answer_worker
+            )
+            return
         note_item_id = _replied_item_id(conn, message.get("reply_to_message"))
         if note_item_id is not None:
             conn.execute(
@@ -613,35 +635,80 @@ def _replied_dig_backlog(conn: sqlite3.Connection, replied: object) -> bool:
 
 
 def _replied_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
-    """リプライ先が digest の記事メッセージ / 深掘り概要カードなら item_id を返す。
+    """リプライ先が digest の記事メッセージなら item_id を返す。
 
     外部 API 由来のネスト値は形を仮定しない(型不正は「記事へのリプライでない」扱い)。
-    digest_messages / dig_results は owner chat にしか送っていないため message_id 単独で
-    一意に引ける。ヘッダは _replied_digest_id(GH#96)・台帳に無いメッセージ
-    (追い掛け・アンケート等)は対象外。
-
-    概要カード(GH#105)へのリプライも当面は感想(item_notes)として記録する:
-    take / 続き要求への分類・DeepDive ノートへの還流は GH#106 のスコープで、ここで
-    拾っておかないとリプライが恒久に失われる(GH#92 で旧 poller が消費したリプライを
-    遡及できなかった教訓)。
+    digest_messages は owner chat にしか送っていないため message_id 単独で一意に引ける。
+    ヘッダは _replied_digest_id(GH#96)・深掘りカードとその返事は _replied_dig_thread
+    (GH#126)・台帳に無いメッセージ(追い掛け・アンケート等)は対象外。
     """
     row = _replied_ledger_row(conn, replied, "item_id IS NOT NULL")
-    if row is not None:
-        return row["item_id"]
-    return _replied_dig_card_item_id(conn, replied)
+    return row["item_id"] if row is not None else None
 
 
-def _replied_dig_card_item_id(conn: sqlite3.Connection, replied: object) -> int | None:
-    """リプライ先が深掘り概要カード(dig_results)なら item_id を返す(GH#105)。"""
+def _replied_dig_thread(conn: sqlite3.Connection, replied: object) -> tuple[int, int] | None:
+    """リプライ先が深掘り概要カードかその返事なら (dig_result_id, item_id) を返す(GH#126)。
+
+    どちらも owner chat にしか送っていないため message_id 単独で引ける。返事への
+    リプライは、その返事が答えたカードに帰属させる(同じカードのやり取りとして続ける)。
+    """
     if not isinstance(replied, dict):
         return None
     message_id = replied.get("message_id")
     if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
         return None
     row = conn.execute(
-        "SELECT item_id FROM dig_results WHERE message_id = ?", (message_id,)
+        "SELECT id, item_id FROM dig_results WHERE message_id = ?", (message_id,)
     ).fetchone()
-    return row["item_id"] if row else None
+    if row is None:
+        row = conn.execute(
+            "SELECT r.id, r.item_id FROM dig_questions q "
+            "JOIN dig_results r ON r.id = q.dig_result_id WHERE q.answer_message_id = ?",
+            (message_id,),
+        ).fetchone()
+    return (row["id"], row["item_id"]) if row is not None else None
+
+
+def _handle_dig_card_reply(
+    conn: sqlite3.Connection,
+    config: Config,
+    thread: tuple[int, int],
+    message: dict,
+    text: str,
+    reply: Callable[[str], None],
+    logger: logging.Logger,
+    now: datetime,
+    answer_worker: AnswerWorker | None,
+) -> None:
+    """深掘りカード・その返事へのリプライ(GH#126 / 設計 06 §6)。
+
+    感想としては従来どおり item_notes に記録する(take の記録 GH#106 まで、朝の export で
+    Obsidian に投影する)。そのうえで質問として台帳に積み、別プロセスの `intel answer` が
+    返事を作って送る(LLM の待ちで受信を止めない)。上限を超えた日・上限 0 は記録だけ。
+    """
+    dig_result_id, item_id = thread
+    conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, text))
+    cap = config.dig.answer_daily_cap
+    message_id = message.get("message_id")
+    if cap <= 0 or type(message_id) is not int:
+        conn.commit()
+        logger.info("感想を記録", extra={"stage": "poll", "item_id": item_id})
+        reply("📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+        return
+    if questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
+        conn.commit()
+        logger.warning(
+            f"質問の上限({cap} 件/日)に達したため返事を作らない",
+            extra={"stage": "poll", "item_id": item_id},
+        )
+        reply(f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません")
+        return
+    enqueue_question(conn, dig_result_id, text, message_id)
+    conn.commit()
+    logger.info("質問を受け付けた", extra={"stage": "poll", "item_id": item_id})
+    reply("📝 記録しました。返事を作っています(数分かかることがあります)")
+    if answer_worker is not None:
+        answer_worker.kick(logger)
 
 
 def _replied_digest_id(conn: sqlite3.Connection, replied: object) -> int | None:

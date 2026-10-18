@@ -21,7 +21,8 @@ UV_BIN="$(command -v uv)"
 [ -n "$UV_BIN" ] || { echo "uv が見つからない(PATH を確認)"; exit 1; }
 # 朝バッチの analyze は codex を subprocess 起動する。launchd の PATH に codex(と node)の
 # dir が無いと全チャンク「codex not found」で degraded になる(#72)。setup 時に解決して plist の
-# PATH に焼き込む。__CODEX_DIR__ は morning.plist のみで使う(poller は codex を使わない)。
+# PATH に焼き込む。poller が起動する `intel answer`(深掘りカードへの質問への返事。GH#126)も
+# codex を使うため、__CODEX_DIR__ は両方の plist で使う。
 CODEX_BIN="$(command -v codex)"
 [ -n "$CODEX_BIN" ] || { echo "codex が見つからない(PATH を確認 / codex login 済みか)"; exit 1; }
 # sed 置換のため、パスに sed / XML のメタ文字を含む環境は対象外(先に検知して止める)

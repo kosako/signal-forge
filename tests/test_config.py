@@ -294,6 +294,7 @@ def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
     assert config.dig.daily_cap == 0
     assert config.dig.reasoning_effort == "high"
     assert config.dig.answer_reasoning_effort == "low"  # 返事は応答の速さ優先(GH#126)
+    assert config.dig.answer_daily_cap == 20
 
 
 def test_dig_answer_rejects_bad_values(tmp_path: Path) -> None:
@@ -301,6 +302,8 @@ def test_dig_answer_rejects_bad_values(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[dig]\nanswer_reasoning_effort = \"ultra\"\n"))
     with pytest.raises(ConfigError, match=r"\[dig\].answer_source_max_chars"):
         load_config(write_config(tmp_path, "[dig]\nanswer_source_max_chars = 0\n"))
+    with pytest.raises(ConfigError, match=r"\[dig\].answer_daily_cap"):
+        load_config(write_config(tmp_path, "[dig]\nanswer_daily_cap = -1\n"))
 
 
 def test_dig_rejects_bad_values(tmp_path: Path) -> None:

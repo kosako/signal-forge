@@ -1,12 +1,13 @@
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
 
-from app.config import Config, TelegramConfig
+from app.config import Config, DigConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
 from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
@@ -614,6 +615,127 @@ def test_reply_to_dig_card_records_note(conn, tmp_path) -> None:
     assert api.sent == [
         (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
     ]
+
+
+class FakeWorker:
+    """AnswerWorker の代わり(別プロセスを起動しない)。呼び出しを記録する。"""
+
+    def __init__(self):
+        self.kicks = 0
+        self.sweeps = 0
+
+    def kick(self, logger) -> None:
+        self.kicks += 1
+
+    def sweep(self, conn, logger) -> None:
+        self.sweeps += 1
+
+
+def add_dig_card(conn, *, message_id: int = 700) -> tuple[int, int]:
+    item_id = add_item(conn, f"https://a/dig/{message_id}")
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', ?)",
+        (item_id, message_id),
+    ).lastrowid
+    conn.commit()
+    return item_id, dig_id
+
+
+def card_reply(text: str, reply_to: int, *, message_id: int = 81, update_id: int = 1) -> dict:
+    update = make_reply_update(text, reply_to, update_id=update_id)
+    update["message"]["message_id"] = message_id
+    return update
+
+
+def answer_config(tmp_path: Path, cap: int = 20) -> Config:
+    return replace(make_config(tmp_path), dig=DigConfig(answer_daily_cap=cap))
+
+
+def test_card_reply_is_recorded_and_queued_for_answer(conn, tmp_path) -> None:
+    # GH#126: カードへのリプライは感想として記録し、質問として台帳に積んで返事を起動する
+    item_id, dig_id = add_dig_card(conn)
+    api, worker = FakeApi([[card_reply("ユースケースがいまいちわからん", 700)]]), FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+
+    note = conn.execute("SELECT item_id, note FROM item_notes").fetchone()
+    assert (note["item_id"], note["note"]) == (item_id, "ユースケースがいまいちわからん")
+    q = conn.execute("SELECT * FROM dig_questions").fetchone()
+    assert (q["dig_result_id"], q["question"], q["question_message_id"], q["status"]) == (
+        dig_id, "ユースケースがいまいちわからん", 81, "pending"
+    )
+    assert api.sent == [(CHAT_ID, "📝 記録しました。返事を作っています(数分かかることがあります)")]
+    assert worker.kicks == 1
+
+
+def test_reply_to_answer_continues_the_same_card(conn, tmp_path) -> None:
+    item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, "
+        "answer, answer_message_id) VALUES (?, '最初', 81, 'answered', '返事', 950)",
+        (dig_id,),
+    )
+    conn.commit()
+    api, worker = FakeApi([[card_reply("続けての質問", 950, message_id=82)]]), FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+
+    rows = conn.execute("SELECT dig_result_id, question FROM dig_questions ORDER BY id").fetchall()
+    assert [(r["dig_result_id"], r["question"]) for r in rows] == [
+        (dig_id, "最初"), (dig_id, "続けての質問")
+    ]
+    assert conn.execute("SELECT item_id FROM item_notes").fetchone()[0] == item_id
+    assert worker.kicks == 1
+
+
+def test_card_reply_over_daily_cap_is_recorded_only(conn, tmp_path) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (?, '今日の 1 件目', 80)",
+        (dig_id,),
+    )
+    conn.commit()
+    api, worker = FakeApi([[card_reply("2 件目", 700)]]), FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path, cap=1), api, logger, answer_worker=worker)
+
+    assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 1
+    assert conn.execute("SELECT note FROM item_notes").fetchone()[0] == "2 件目"
+    assert api.sent == [
+        (CHAT_ID, "📝 記録しました。今日の返事の上限(1 件)に達したため、返事は作りません")
+    ]
+    assert worker.kicks == 0
+
+
+def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
+    item_id, _dig_id = add_dig_card(conn)
+    api, worker = FakeApi([[card_reply("感想", 700)]]), FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path, cap=0), api, logger, answer_worker=worker)
+
+    assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 0
+    assert conn.execute("SELECT item_id FROM item_notes").fetchone()[0] == item_id
+    assert api.sent == [
+        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+    ]
+    assert worker.kicks == 0
+
+
+def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path) -> None:
+    worker = FakeWorker()
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2  # 2周で停止
+
+    run_poller(
+        conn, make_config(tmp_path), FakeApi(), logger,
+        should_stop=should_stop, answer_worker=worker,
+    )
+    assert worker.sweeps == 2
 
 
 def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> None:

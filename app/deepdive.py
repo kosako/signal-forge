@@ -682,6 +682,10 @@ def _card_text(
     # parse_mode=HTML で送るため未エスケープだと送信自体が 400 で恒久失敗する(Codex P1)
     note_path = escape_text(f"{config.obsidian.folder}/{DEEPDIVE_FOLDER}/{note_name}.md")
     note_line = f"📄 ノート: {note_path}{suffix}"
+    if config.dig.answer_daily_cap > 0:  # 質問への返事(GH#126)
+        guide = "💬 リプライで質問すると答えます。感想・結論は take として記録します"
+    else:
+        guide = "💬 リプライが take として記録されます"
     return (
         f"🔎 深掘り #{candidate.item_id}「{title}」{original}\n"
         f"✍️ 書き手: {escape_and_truncate(draft.writer_stance, _CARD_STANCE_MAX)}\n"
@@ -694,7 +698,7 @@ def _card_text(
         f"{escape_and_truncate(draft.for_world, _CARD_FOR_WORLD_MAX)}\n"
         "\n"
         f"{note_line}\n"
-        "💬 リプライが take として記録されます"
+        f"{guide}"
     )
 
 
