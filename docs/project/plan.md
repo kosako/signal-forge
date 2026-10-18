@@ -1,6 +1,6 @@
 # プロジェクト計画: Signal Forge(A-lite MVP)
 
-ステータス: v1.1(2026-07-05、Codex 設計レビュー反映)/ 上位文書: [../PROPOSAL.md](../PROPOSAL.md)(齟齬時は PROPOSAL が優先)/ 設計正本: [../design/](../design/) 00〜05
+ステータス: v1.1(2026-07-05、Codex 設計レビュー反映)/ 上位文書: [../PROPOSAL.md](../PROPOSAL.md)(齟齬時は PROPOSAL が優先)/ 設計正本: [../design/](../design/) 00〜06
 
 本書は実行計画の**定義**の正本(マイルストーンの完了条件・Issue バックログ・進行ルール・リスク台帳・検証レビューの型)。GitHub Issue 起票時は本書の Issue 定義をそのまま転記する。
 
