@@ -177,6 +177,10 @@ class CodexCliEngine:
                 # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。
                 # 例外(=ログ)には制御文字を除去した末尾200字だけを載せる
                 tail = re.sub(r"[\x00-\x1f\x7f]", " ", stderr_tail)[-200:]
+                if stderr_tail.lstrip().startswith(_CODEX_CONFIG_ERRORS):
+                    # 起動引数(無効化する feature 名・profile キー)を codex が受け付けない
+                    # = 版の不一致。リトライでも回復しない環境障害として扱う(GH#129)
+                    raise LLMUnavailableError(f"codex の起動設定エラー: {tail}")
                 raise LLMError(f"codex 非0終了({process.returncode}): {tail}")
             if not out_file.exists():
                 raise LLMError("codex が最終応答ファイルを書かなかった")
@@ -278,6 +282,12 @@ _DISABLED_FEATURES = (
     "goals",
     "sleep_tool",
 )
+
+
+# --strict-config の下で codex が起動引数を拒否したときの stderr の書き出し(実測)。
+# 先頭一致に限る: 起動設定の検査はプロンプトを読む前に終わるため、外部本文が混ざる
+# 余地のない位置で判定する
+_CODEX_CONFIG_ERRORS = ("Error: Unknown feature flag", "Error loading config")
 
 
 def _disabled_tool_args() -> list[str]:

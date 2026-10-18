@@ -156,11 +156,16 @@ def test_engine_command_isolation_flags(tmp_path: Path) -> None:
     assert f'"{Path.home() / ".codex"}"="none"' in fs
     # -s read-only は付けない(profile が無効化されるため)
     assert "read-only" not in argv
-    # GH#129: sandbox の外で動くツール(接続サービス・Web 等)と実行系を機能ごと外す
+    # GH#129: sandbox の外で動くツール(接続サービス・Web 等)と実行系を機能ごと外す。
+    # 実測でツールが消えることを確かめた組み合わせを、実装の定数とは独立に固定する
     disabled = {argv[i + 1] for i, a in enumerate(argv) if a == "--disable"}
-    for feature in ("apps", "browser_use", "computer_use", "shell_tool", "code_mode_host"):
-        assert feature in disabled
-    assert 'web_search="disabled"' in argv
+    assert disabled == {
+        "apps", "plugins", "tool_suggest", "browser_use", "browser_use_external",
+        "in_app_browser", "computer_use", "image_generation", "view_image", "shell_tool",
+        "unified_exec", "code_mode_host", "multi_agent", "goals", "sleep_tool",
+    }
+    web = argv.index('web_search="disabled"')
+    assert argv[web - 1] == "-c"
 
 
 def test_engine_launch_failure_raises_unavailable(tmp_path: Path) -> None:
@@ -188,6 +193,31 @@ def test_engine_nonzero_exit_raises(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "echo boom >&2\nexit 3\n")
     with pytest.raises(LLMError, match="非0終了"):
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Error: Unknown feature flag: view_image",
+        "Error loading config.toml: unknown configuration field `x` in -c/--config override",
+    ],
+)
+def test_engine_config_rejection_is_unavailable(tmp_path: Path, stderr: str) -> None:
+    # GH#129: 無効化する feature 名や profile キーを codex が受け付けない = 版の不一致。
+    # 記事を degraded で進めないよう、リトライでも回復しない環境障害に分類する(GH#74)
+    codex = fake_codex(tmp_path, f"echo '{stderr}' >&2\nexit 1\n")
+    with pytest.raises(LLMUnavailableError, match="起動設定エラー"):
+        CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+
+
+def test_engine_config_error_text_later_in_stderr_stays_transient(tmp_path: Path) -> None:
+    # 先頭以外に現れた同じ文言(外部本文の混入がありうる位置)では分類を変えない
+    codex = fake_codex(
+        tmp_path, "echo boom >&2\necho 'Error: Unknown feature flag: x' >&2\nexit 1\n"
+    )
+    with pytest.raises(LLMError, match="非0終了") as excinfo:
+        CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+    assert not isinstance(excinfo.value, LLMUnavailableError)
 
 
 def test_engine_missing_output_raises(tmp_path: Path) -> None:
