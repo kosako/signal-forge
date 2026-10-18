@@ -325,11 +325,13 @@ def test_non_utf8_note_is_appended_without_touching_its_bytes(conn, config) -> N
     assert "結論".encode() in data
 
 
-@pytest.mark.parametrize("cut", [3, 20, 100])  # 見出しの先頭 / 見出しの途中 / 本文の途中で止まる
+@pytest.mark.parametrize("cut", [1, 2, 3, 20, 100])  # 見出しの先頭〜途中 / 本文の途中で止まる
+@pytest.mark.parametrize("ends_with_newline", [True, False])
 def test_partial_write_then_error_is_completed_without_duplication(
-    conn, config, monkeypatch, cut
+    conn, config, monkeypatch, cut, ends_with_newline
 ) -> None:
-    dig_id = add_dig(conn, config, note=NOTE)
+    note = NOTE if ends_with_newline else NOTE.rstrip("\n")
+    dig_id = add_dig(conn, config, note=note)
     answered(conn, dig_id, "途中まで書いて止まった結論。続きの文がここにある", 928, "take")
     path = note_path(config, conn, dig_id)
     real_write = dig_take.os.write
@@ -348,62 +350,57 @@ def test_partial_write_then_error_is_completed_without_duplication(
     monkeypatch.setattr(dig_take.os, "write", real_write)
     assert record_takes(conn, config, logger) == 1
     text = path.read_text(encoding="utf-8")
-    assert text.startswith(NOTE)
-    assert text.count("記録番号") == 1
-    assert text.count("続きの文がここにある") == 1
+    assert text.startswith(note)
+    tail = text[len(note):]
+    assert tail.lstrip("\n").startswith("**take**(")  # 断片を残さず、見出しから始まる
+    assert tail.count("*") == 4 and tail.count("記録番号") == 1
     assert text.endswith("続きの文がここにある\n")
 
 
-def test_deepdive_swapped_for_symlink_after_check_is_not_written(
-    conn, config, monkeypatch, tmp_path
+def test_partial_write_followed_by_other_text_is_not_taken_as_done(
+    conn, config, monkeypatch
 ) -> None:
-    # 確かめた後に DeepDive の置き場が外への symlink にすり替えられても、外には書かない
+    # 書きかけの後ろに本人がメモを足した: 書き終えたとはみなさず、節を丸ごと足す
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "途中まで書いて止まった結論。続きの文がここにある", 931, "take")
+    path = note_path(config, conn, dig_id)
+    real_write = dig_take.os.write
+    calls = []
+
+    def short_then_fail(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, data[:100])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dig_take.os, "write", short_then_fail)
+    assert record_takes(conn, config, logger) == 0
+    monkeypatch.setattr(dig_take.os, "write", real_write)
+    path.write_text(path.read_text(encoding="utf-8") + "\n本人のメモ\n", encoding="utf-8")
+
+    assert record_takes(conn, config, logger) == 1
+    text = path.read_text(encoding="utf-8")
+    assert "本人のメモ" in text
+    assert text.endswith("途中まで書いて止まった結論。続きの文がここにある\n")  # 欠けずに入る
+
+
+@pytest.mark.parametrize("swapped", ["SignalForge", "DeepDive"])
+def test_folder_swapped_for_symlink_is_never_written(conn, config, tmp_path, swapped) -> None:
+    # 途中のフォルダや置き場が外への symlink にすり替えられたままでも、やり直しても外には書かない
     dig_id = add_dig(conn, config, note=NOTE)
     answered(conn, dig_id, "結論", 929, "take")
-    deepdive = note_path(config, conn, dig_id).parent
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    victim = outside / note_path(config, conn, dig_id).name
-    victim.write_text("外のファイル\n", encoding="utf-8")
-    real_open = dig_take.os.open
-    swapped = []
-
-    def swap_then_open(target, flags, *args, **kwargs):
-        if not swapped:
-            deepdive.rename(deepdive.with_name("DeepDive-real"))
-            os.symlink(outside, deepdive)
-            swapped.append(True)
-        return real_open(target, flags, *args, **kwargs)
-
-    monkeypatch.setattr(dig_take.os, "open", swap_then_open)
-    assert record_takes(conn, config, logger) == 0
-    assert victim.read_text(encoding="utf-8") == "外のファイル\n"
-    assert has_unrecorded_take(conn)
-
-
-def test_parent_folder_swapped_for_symlink_is_not_written(
-    conn, config, monkeypatch, tmp_path
-) -> None:
-    # 途中のフォルダ(SignalForge)がすり替えられた場合も、開いた置き場の実際のパスで見抜く
-    dig_id = add_dig(conn, config, note=NOTE)
-    answered(conn, dig_id, "結論", 930, "take")
     note = note_path(config, conn, dig_id)
-    signalforge = note.parent.parent
+    folder = note.parent.parent if swapped == "SignalForge" else note.parent
     outside = tmp_path / "outside"
-    (outside / "DeepDive").mkdir(parents=True)
-    victim = outside / "DeepDive" / note.name
+    target = outside / "DeepDive" if swapped == "SignalForge" else outside
+    target.mkdir(parents=True)
+    victim = target / note.name
     victim.write_text("外のファイル\n", encoding="utf-8")
-    real_open = dig_take.os.open
-    swapped = []
+    folder.rename(folder.with_name(folder.name + "-real"))
+    os.symlink(outside, folder)
 
-    def swap_then_open(target, flags, *args, **kwargs):
-        if not swapped:
-            signalforge.rename(signalforge.with_name("SignalForge-real"))
-            os.symlink(outside, signalforge)
-            swapped.append(True)
-        return real_open(target, flags, *args, **kwargs)
+    for _ in range(2):
+        conn.execute("UPDATE dig_questions SET take_recorded_at = NULL")
+        record_takes(conn, config, logger)
+        assert victim.read_text(encoding="utf-8") == "外のファイル\n"
 
-    monkeypatch.setattr(dig_take.os, "open", swap_then_open)
-    assert record_takes(conn, config, logger) == 0
-    assert victim.read_text(encoding="utf-8") == "外のファイル\n"
-    assert has_unrecorded_take(conn)

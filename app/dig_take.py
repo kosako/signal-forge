@@ -15,7 +15,8 @@
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
   frontmatter の status は書き換えない(1 行だけを書き換える手段はファイルの書き直ししか無いため。
   本人が手で take済 にしてよい)。追記の見出しに記録番号(質問 id)を入れ、やり直しで 2 回書かない
-  (途中まで書いて止まっていたら続きだけを足す)。確かめた DeepDive の置き場を fd で押さえて書く
+  (途中まで書いて止まっていたら続きだけを足す)。書き込み先は vault から 1 段ずつ symlink を
+  辿らずに開く
 - 本人がノートを動かした・消したときは、ノートへの追記だけを諦める(原文は台帳と item_notes に
   残る)。vault に書けない一時的な失敗(DeepDive の置き場ごと見えないときを含む)は記録しない
   まま残し、次の実行で再試行する。どの失敗もその 1 件に閉じ、後の take は記録する
@@ -24,7 +25,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import logging
 import os
 import sqlite3
@@ -32,7 +32,6 @@ import stat
 from pathlib import Path
 
 from app.config import Config
-from app.dig_answer import _deepdive_dir
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 
@@ -70,7 +69,7 @@ def record_takes(conn: sqlite3.Connection, config: Config, logger: logging.Logge
         log_extra = {"stage": "answer", "item_id": row["item_id"],
                      "extra": {"question_id": row["id"]}}
         try:
-            _append_to_note(_deepdive_dir(config), row)
+            _append_to_note(config, row)
         except _NoteMissing as e:
             logger.warning(
                 f"解説ノートに take を書けなかった({e}。台帳と感想には残る)", extra=log_extra
@@ -103,25 +102,13 @@ def record_takes(conn: sqlite3.Connection, config: Config, logger: logging.Logge
     return recorded
 
 
-def _append_to_note(deepdive_dir: Path | None, row: sqlite3.Row) -> None:
-    """ノートの末尾に take を足す(今ある中身は書き換えない)。
-
-    確かめた DeepDive の置き場を fd で押さえ、その中のノートを開いて読み書きする(確かめた後に
-    置き場や途中のフォルダが symlink にすり替えられても、DeepDive の外には書かない)。
-    """
-    if deepdive_dir is None:
-        raise _NoteMissing("vault が未設定")
-    # DeepDive の置き場そのものが無いのは、vault が一時的に使えない(外付けの取り外しなど)と
-    # みて再試行に回す(FileNotFoundError をそのまま上げる)。置き場があってノートだけ無いのは
-    # 本人が動かした・消した
-    base = deepdive_dir.resolve(strict=True)
+def _append_to_note(config: Config, row: sqlite3.Row) -> None:
+    """ノートの末尾に take を足す(今ある中身は書き換えない)。"""
     name = f"{row['note_name']}.md"
     if os.sep in name or name.startswith("."):
         raise _NoteMissing("ノート名が DeepDive の外を指す")
-    dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    dir_fd = _open_deepdive(config)
     try:
-        if _fd_path(dir_fd) != str(base):
-            raise OSError(errno.ESTALE, "DeepDive の置き場が確かめたときと違う", str(base))
         try:
             fd = os.open(name, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, dir_fd=dir_fd)
         except FileNotFoundError as e:
@@ -133,7 +120,7 @@ def _append_to_note(deepdive_dir: Path | None, row: sqlite3.Row) -> None:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise _NoteMissing("ノートが通常のファイルでない")
-            data = _remaining(_read_all(fd), _take_block(row))
+            data = _remaining(_read_all(fd), _take_body(row))
             # O_APPEND: 書く位置は常にその時点の末尾(今ある中身には触れない)
             while data:
                 data = data[os.write(fd, data):]
@@ -143,33 +130,69 @@ def _append_to_note(deepdive_dir: Path | None, row: sqlite3.Row) -> None:
         os.close(dir_fd)
 
 
-def _take_block(row: sqlite3.Row) -> bytes:
+def _open_deepdive(config: Config) -> int:
+    """DeepDive の置き場を fd で開く。本人が設定した vault を起点に、その下のフォルダを 1 段ずつ
+    symlink を辿らずに開く(途中のフォルダが外への symlink でも、外の置き場を基準にしない)。
+
+    vault そのものが無い・途中のフォルダが無いのは、vault が一時的に使えない(外付けの取り外し
+    など)とみて再試行に回す(FileNotFoundError をそのまま上げる)。途中が symlink・フォルダで
+    ないときは、ノートへの追記を諦める。
+    """
+    # 呼び出し時に import する(deepdive → delivery → poller → answer_worker → 本モジュール
+    # の循環を避ける)
+    from app.deepdive import DEEPDIVE_FOLDER
+
+    if config.obsidian.vault_path is None:
+        raise _NoteMissing("vault が未設定")
+    root = Path(config.obsidian.vault_path).expanduser().resolve(strict=True)
+    parts = [*Path(config.obsidian.folder).parts, DEEPDIVE_FOLDER]
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or os.sep in part:
+                raise _NoteMissing("DeepDive の置き場の名前が不正")
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise _NoteMissing(
+                        f"DeepDive までのフォルダ {part} が symlink かフォルダでない"
+                    ) from e
+                raise
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _take_body(row: sqlite3.Row) -> bytes:
     """ノートに足す take の節。見出しの記録番号(質問 id)で、書いたかどうかを見分ける。
 
     印に HTML コメントを使わない: 途中まで書いて止まると閉じていない `<!--` が残り、Obsidian で
     その後ろが全部隠れるため。見出しの断片が残っても、ただの文字列で済む。
     """
     heading = f"**take**({row['take_time']}・Telegram のリプライ・記録番号 {row['id']})"
-    return f"\n{heading}\n\n{row['question']}\n".encode()
+    return f"{heading}\n\n{row['question']}\n".encode()
 
 
-def _remaining(current: bytes, block: bytes) -> bytes:
-    """block のうち、まだノートに無い部分を返す(途中まで書いて止まったときは続きだけ)。"""
-    anchor = block.split(b"\n", 2)[1]  # 見出しの行
-    i = current.find(anchor)
-    if i != -1:
-        written = current[i:]
-        expected = block[block.index(anchor):]
-        if expected.startswith(written):
-            return expected[len(written):]  # 途中まで書けていた: 続きだけを足す
-        return b""  # 書き終えている(後ろに本人が書き足した・書き換えたものは触らない)
-    # 見出しの途中で止まっていた: ノートの末尾が block の先頭と重なる分は書かない
-    for k in range(min(len(current), len(block) - 1), 2, -1):
-        if current.endswith(block[:k]):
-            return block[k:]
-    if current and not current.endswith(b"\n"):
-        return b"\n" + block
-    return block
+def _remaining(current: bytes, body: bytes) -> bytes:
+    """ノートに足す分を返す。
+
+    - 節がそのまま入っていれば何も足さない(書き終えている)
+    - 末尾が行頭からの節の書きかけなら、続きだけを足す(途中まで書いて止まった)
+    - それ以外(書きかけの後ろに本人のメモなどが続く場合を含む)は、空行を置いて節を丸ごと足す。
+      書きかけの断片は残るが、take は欠けずに入る
+    """
+    if body in current:
+        return b""
+    for k in range(min(len(body) - 1, len(current)), 0, -1):
+        if current.endswith(b"\n" + body[:k]):
+            return body[k:]
+    if not current or current.endswith(b"\n\n"):
+        return body
+    return (b"\n" if current.endswith(b"\n") else b"\n\n") + body
 
 
 def _read_all(fd: int) -> bytes:
@@ -178,12 +201,6 @@ def _read_all(fd: int) -> bytes:
     while chunk := os.read(fd, 65536):
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-def _fd_path(fd: int) -> str:
-    """開いた fd の実際のパス(macOS の F_GETPATH)。"""
-    raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-    return os.fsdecode(raw.split(b"\0", 1)[0])
 
 
 def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
