@@ -156,7 +156,19 @@ def test_retweet_normalizes_to_original() -> None:
     (rt,) = connector_from([(200, body, {})]).fetch(make_source(), {}).items
     assert rt.external_id == "42"  # 元ツイに寄せて dedup
     assert rt.url == "https://x.com/i/web/status/42"
-    assert rt.meta == {"retweet": True, "reply": False}
+    assert rt.meta == {"retweet": True, "reply": False, "self_retweet": False}
+
+
+def test_self_retweet_marked_in_meta() -> None:
+    # 自分の RT は Stage 1 の規則 3 が落とす(設計 03 §2)。他人の RT と区別できるよう meta に残す
+    body = page([
+        tweet("610", "RT @x: ...", author="me", retweeted="43"),
+        tweet("611", "RT @y: ...", author="a1", retweeted="44"),
+    ])
+    result = connector_from([(200, body, {})], me_id="me").fetch(make_source(), {})
+    metas = {i.external_id: i.meta for i in result.items}
+    assert metas["43"] == {"retweet": True, "reply": False, "self_retweet": True}
+    assert metas["44"] == {"retweet": True, "reply": False, "self_retweet": False}
 
 
 def test_reply_to_other_excluded_but_self_reply_kept() -> None:

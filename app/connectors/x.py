@@ -267,7 +267,13 @@ def _to_raw_item(tweet: dict, users: dict[str, str], me_id: str) -> RawItem | No
         author=users.get(tweet.get("author_id")),
         published_at=parse_created_at(tweet.get("created_at")),
         raw_content=tweet_full_text(tweet),
-        meta={"retweet": retweeted_id is not None, "reply": in_reply_to is not None},
+        # self_retweet = 自分の RT(本人が既に見たもの)。Stage 1 の規則 3 が reply と合わせて除外する
+        # (設計 03 §2)。他人の RT は元ツイに正規化して残す
+        meta={
+            "retweet": retweeted_id is not None,
+            "reply": in_reply_to is not None,
+            "self_retweet": retweeted_id is not None and tweet.get("author_id") == me_id,
+        },
     )
 
 
