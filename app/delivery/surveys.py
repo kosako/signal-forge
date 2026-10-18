@@ -22,7 +22,6 @@ from app.delivery.telegram import (
     TelegramApi,
     escape_and_truncate,
     escape_attr,
-    escape_text,
 )
 from app.digest.builder import JST, today_jst
 
@@ -35,6 +34,10 @@ READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4
 # 未消化 🔖 一覧(GH#88)。可視テキストを 4096 字制限に収める(URL は href 側で不算入)
 DIG_BACKLOG_MAX_ITEMS = 15
 DIG_BACKLOG_TITLE_MAX_CHARS = 80
+
+# watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると送信が毎周期失敗し、
+# 同じ周期の getUpdates まで止まる。GH#124 でソースの行が可変長になった)
+WATCHDOG_TEXT_MAX_CHARS = 4000
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -101,7 +104,9 @@ def run_due_timers(
             # 同一種別1日1通なので、見つけた問題は1通にまとめる
             api.send_message(
                 _require_chat_id(config),
-                escape_text("\n".join(f"⚠️ watchdog: {p}" for p in problems)),
+                escape_and_truncate(
+                    "\n".join(f"⚠️ watchdog: {p}" for p in problems), WATCHDOG_TEXT_MAX_CHARS
+                ),
             )
             set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
             logger.warning(f"watchdog 通知: {' / '.join(problems)}", extra={"stage": "poll"})

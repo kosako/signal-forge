@@ -422,6 +422,44 @@ def test_watchdog_escapes_and_truncates_source_error(conn, tmp_path) -> None:
     assert "x" * 200 not in text and "…" in text
 
 
+def test_watchdog_keeps_one_line_per_source(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    add_source(conn, "x", "x:\nsearch", 3, error="FatalError: first\nsecond")
+    api = FakeApi()
+    run_due_timers(conn, x_config(tmp_path), api, logger, jst_now("07:15"))
+
+    assert api.sent[0][1].count("\n") == 0  # 例外の文言が複数行でも 1 件 1 行
+    assert "「x: search」" in api.sent[0][1] and "first second" in api.sent[0][1]
+
+
+def test_watchdog_message_stays_within_telegram_limit(conn, tmp_path) -> None:
+    # 4096 字を超えると送信が毎周期失敗し、同じ周期の getUpdates まで止まる
+    silence_watchdog(conn)
+    for i in range(40):
+        add_source(conn, "x", f"x:{i}-" + "n" * 100, 3, error="e" * 300)
+    api = FakeApi()
+    run_due_timers(conn, x_config(tmp_path), api, logger, jst_now("07:15"))
+
+    assert len(api.sent[0][1]) <= 4000
+    assert api.sent[0][1].endswith("…")
+
+
+def test_watchdog_repeats_source_alert_next_morning(conn, tmp_path) -> None:
+    # 「直すか止めるまで毎朝通知」: 翌朝は再送し、同じ朝の再実行では増やさない
+    add_source(conn, "x", "x:search", 3)
+    api = FakeApi()
+    config = x_config(tmp_path)
+    today = jst_now("07:15")
+
+    run_due_timers(conn, config, api, logger, today - timedelta(days=1))
+    run_due_timers(conn, config, api, logger, today)
+    run_due_timers(conn, config, api, logger, today)
+
+    assert len(api.sent) == 2
+    assert all("「x:search」が 3 回" in text for _, text in api.sent)
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) == today.strftime("%Y-%m-%d")
+
+
 # --- callback: 夜アンケート回答(q1/q2) ---
 
 

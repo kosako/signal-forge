@@ -51,12 +51,12 @@ def source_failure_alerts(
     ).fetchall()
     alerts = []
     for row in rows:
-        error = row["last_error"] or "不明"
+        # 改行は空白に寄せて 1 件 1 行を保つ(例外の文言は複数行になりうる)
+        name = " ".join(row["name"].split())
+        error = " ".join((row["last_error"] or "不明").split())
         if len(error) > ALERT_ERROR_MAX_CHARS:
             error = error[: ALERT_ERROR_MAX_CHARS - 1] + "…"
-        alerts.append(
-            f"「{row['name']}」が {row['consecutive_failures']} 回連続で失敗(直近: {error})"
-        )
+        alerts.append(f"「{name}」が {row['consecutive_failures']} 回連続で失敗(直近: {error})")
     return alerts
 
 
