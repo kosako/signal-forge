@@ -125,7 +125,8 @@ class CodexCliEngine:
                 self._codex_bin,
                 "exec",
                 "--skip-git-repo-check",
-                "--ephemeral",  # ユーザーの config.toml を読まない(認証は CODEX_HOME)
+                # セッションを保存しない(ユーザー設定の遮断は使い捨て CODEX_HOME が担う)
+                "--ephemeral",
                 # read-only sandbox は読取を許すため `-s read-only` の代わりに permission
                 # profile を使う。profile なら read-only 相当(書込・network 遮断)を保ったまま
                 # CODEX_HOME/実 ~/.codex の読取を deny できる(Issue #54)。`-s` を明示すると
@@ -191,7 +192,8 @@ class CodexCliEngine:
 
         実ユーザーの HOME を渡すと、read-only sandbox はファイル読み取りを防がないため
         `~/.ssh` 等が要約経由で流出する経路が残る。HOME は空の workspace に差し替え、
-        codex の認証だけ CODEX_HOME で最小限見せる(auth 以外の設定は --ephemeral で遮断)。
+        codex の認証だけ CODEX_HOME で最小限見せる(CODEX_HOME には auth.json しか置かないので、
+        ユーザーの config.toml・MCP・hooks 等の設定は読まれない)。
         ANTHROPIC_API_KEY を含む他の環境変数は構造的に渡さない(設計 00 §4)。
         """
         return {
