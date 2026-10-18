@@ -49,12 +49,15 @@ def note_path(config: Config, conn: sqlite3.Connection, dig_id: int) -> Path:
     return Path(config.obsidian.vault_path) / "SignalForge" / "DeepDive" / f"{name}.md"
 
 
-def answered(conn, dig_id, text, message_id, kind, *, created="2026-10-18T13:00:55Z") -> int:
+def answered(
+    conn, dig_id, text, message_id, kind, *, created="2026-10-18T13:00:55Z", sent=True
+) -> int:
+    """返事を作った質問。sent=True なら返事も送れている(answer_message_id がある)。"""
     question_id = ask(conn, dig_id, text, message_id)
     conn.execute(
         "UPDATE dig_questions SET status = 'answered', kind = ?, answer = '返事', "
-        "created_at = ? WHERE id = ?",
-        (kind, created, question_id),
+        "created_at = ?, answer_message_id = ? WHERE id = ?",
+        (kind, created, message_id + 10_000 if sent else None, question_id),
     )
     return question_id
 
@@ -155,7 +158,7 @@ def test_missing_note_still_records_followup(conn, config, caplog) -> None:
 
     with caplog.at_level(logging.WARNING):
         assert record_takes(conn, config, logger) == 1
-    assert "解説ノートが見つからず" in caplog.text
+    assert "ノートが見つからない" in caplog.text
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
     assert not has_unrecorded_take(conn)
 
@@ -178,21 +181,21 @@ def test_write_failure_is_retried_next_run(conn, config, monkeypatch, caplog) ->
     other_id = add_dig(conn, config, note=NOTE, url="https://a.example/2")
     answered(conn, dig_id, "書けない take", 911, "take")
     answered(conn, other_id, "書ける take", 912, "take")
-    real_write = dig_take.atomic_write
+    real_replace = dig_take._replace_if_unchanged
 
-    def flaky(path, content):
+    def flaky(path, original, content):
         if "書けない take" in content:
             raise PermissionError("vault に書けない")
-        real_write(path, content)
+        real_replace(path, original, content)
 
-    monkeypatch.setattr(dig_take, "atomic_write", flaky)
+    monkeypatch.setattr(dig_take, "_replace_if_unchanged", flaky)
     with caplog.at_level(logging.ERROR):
         assert record_takes(conn, config, logger) == 1  # 1 件の失敗は他を止めない
     assert "次の実行で再試行" in caplog.text
     assert followups(conn, item_of(conn, dig_id)) == []
     assert has_unrecorded_take(conn)
 
-    monkeypatch.setattr(dig_take, "atomic_write", real_write)
+    monkeypatch.setattr(dig_take, "_replace_if_unchanged", real_replace)
     assert record_takes(conn, config, logger) == 1
     assert "書けない take" in note_path(config, conn, dig_id).read_text(encoding="utf-8")
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
@@ -225,3 +228,88 @@ def test_no_vault_records_followup_only(conn, config) -> None:
     config = replace(config, obsidian=replace(config.obsidian, vault_path=None))
     assert record_takes(conn, config, logger) == 1
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
+
+
+def test_unsent_reply_is_not_recorded_until_sent(conn, config) -> None:
+    # 返事が届く前に未消化一覧から消さない。送れたら記録する
+    dig_id = add_dig(conn, config, note=NOTE)
+    question_id = answered(conn, dig_id, "結論", 915, "take", sent=False)
+    assert not has_unrecorded_take(conn)
+    assert record_takes(conn, config, logger) == 0
+    assert followups(conn, item_of(conn, dig_id)) == []
+    assert "結論" not in note_path(config, conn, dig_id).read_text(encoding="utf-8")
+
+    conn.execute("UPDATE dig_questions SET answer_message_id = 9915 WHERE id = ?", (question_id,))
+    assert has_unrecorded_take(conn)
+    assert record_takes(conn, config, logger) == 1
+    assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
+
+
+def test_owner_save_between_read_and_replace_is_kept(conn, config, monkeypatch, caplog) -> None:
+    # 読んだ後に本人がノートを保存したら置き換えない(本人の編集を消さない)。次の実行で書く
+    dig_id = add_dig(conn, config, note=NOTE)
+    answered(conn, dig_id, "結論はこう", 916, "take")
+    path = note_path(config, conn, dig_id)
+    edited = NOTE + "\n本人がいま書いたメモ\n"
+    real_mkstemp = dig_take.tempfile.mkstemp
+
+    def save_while_writing(*args, **kwargs):
+        path.write_text(edited, encoding="utf-8")  # 読んだ後・置き換える前に本人が保存
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(dig_take.tempfile, "mkstemp", save_while_writing)
+    with caplog.at_level(logging.WARNING):
+        assert record_takes(conn, config, logger) == 0
+    assert "次の実行に回す" in caplog.text
+    assert path.read_text(encoding="utf-8") == edited
+    assert followups(conn, item_of(conn, dig_id)) == []
+    assert has_unrecorded_take(conn)
+    assert [p.name for p in path.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    monkeypatch.setattr(dig_take.tempfile, "mkstemp", real_mkstemp)
+    assert record_takes(conn, config, logger) == 1
+    text = path.read_text(encoding="utf-8")
+    assert "本人がいま書いたメモ" in text and "結論はこう" in text
+
+
+def test_empty_frontmatter_does_not_touch_body(conn, config) -> None:
+    note = "---\n---\n本文\n\n---\nstatus: take待ち\n---\n"
+    dig_id = add_dig(conn, config, note=note)
+    answered(conn, dig_id, "結論", 917, "take")
+    assert record_takes(conn, config, logger) == 1
+    text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
+    assert text.startswith(note)  # 本文の status 行は frontmatter ではない
+
+
+def test_undecodable_note_is_left_and_later_takes_are_recorded(conn, config, caplog) -> None:
+    broken_id = add_dig(conn, config, note=NOTE)
+    path = note_path(config, conn, broken_id)
+    path.write_bytes(b"---\nstatus: take\x8a\x82\n---\n")
+    other_id = add_dig(conn, config, note=NOTE, url="https://a.example/2")
+    answered(conn, broken_id, "読めないノートへの take", 918, "take")
+    answered(conn, other_id, "読めるノートへの take", 919, "take")
+
+    with caplog.at_level(logging.WARNING):
+        assert record_takes(conn, config, logger) == 2
+    assert "UTF-8 で読めない" in caplog.text
+    assert path.read_bytes() == b"---\nstatus: take\x8a\x82\n---\n"  # ファイルは変えない
+    assert "読めるノートへの take" in note_path(config, conn, other_id).read_text(encoding="utf-8")
+    assert not has_unrecorded_take(conn)
+
+
+def test_take_on_bookmarked_item_counts_in_kpi_06(conn, config) -> None:
+    # followup_dig=yes は「深掘りした」の記録。🔖 の付いたアイテムでは KPI 06 の分子に入る
+    dig_id = add_dig(conn, config, note=NOTE)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'dig', '2026-10-15')",
+        (item_of(conn, dig_id),),
+    )
+    answered(conn, dig_id, "結論", 920, "take")
+    kpi = Path(__file__).resolve().parent.parent / "scripts" / "kpi" / "06-phase2-boundary.sql"
+    before = conn.execute(kpi.read_text(encoding="utf-8")).fetchone()
+    assert (before["dig_total"], before["followup_yes"]) == (1, 0)
+
+    assert record_takes(conn, config, logger) == 1
+    after = conn.execute(kpi.read_text(encoding="utf-8")).fetchone()
+    assert (after["dig_total"], after["followup_yes"], after["dig_execution_pct"]) == (1, 1, 100.0)
