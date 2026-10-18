@@ -36,6 +36,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (8, "008_digests_bookmark_item_ids.sql"),
         (9, "009_dig_queue.sql"),
         (10, "010_dig_results.sql"),
+        (11, "011_dig_questions.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)

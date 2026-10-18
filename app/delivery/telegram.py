@@ -42,6 +42,9 @@ TITLE_MAX_CHARS = 300
 # 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
 BOOKMARK_TITLE_MAX_CHARS = 80
 
+# 深掘りカードへの質問への返事(GH#126)の 1 通の上限。Telegram の 4096 字に余裕を残す
+ANSWER_TEXT_MAX_CHARS = 4000
+
 _WEEKDAYS_JA = "月火水木金土日"
 
 # 反応ボタン(callback_data 形式の正本は設計 04 §3)
@@ -76,12 +79,22 @@ class TelegramApi:
         )
 
     def send_message(
-        self, chat_id: int, text: str, *, reply_markup: dict | None = None
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+        reply_to_message_id: int | None = None,
     ) -> int:
         """sendMessage を実行し message_id を返す。リトライ規約は設計 05 §8。"""
         payload: dict[str, object] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
+        if reply_to_message_id is not None:
+            # 返信先が消されていても送る(返事そのものを落とさない)
+            payload["reply_parameters"] = json.dumps(
+                {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
+            )
         result = self._post("sendMessage", payload)
         if not isinstance(result, dict):
             raise DeliveryError(f"sendMessage の応答形が不正: {type(result).__name__}")

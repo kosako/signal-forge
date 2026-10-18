@@ -49,7 +49,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ## 3. ログ設計
 
-- 出力先: `~/.local/state/intel/logs/`。`morning.log` / `poller.log`(launchd の stdout/stderr もここへ向ける)。
+- 出力先: `~/.local/state/intel/logs/`。`morning.log` / `poller.log`(launchd の stdout/stderr もここへ向ける)/ `answer.log`(深掘りカードへの質問に返事する `intel answer`。GH#126。poller とはプロセスが別なので、日次ローテーションが競合しないようファイルを分ける)。
 - 形式: **JSON Lines**(ts, level, run_id, stage, source_id, item_id, msg, extra)。理由: KPI 週次レビューや障害調査を `jq` の一発クエリで済ませるため。
 - `run_id` は朝バッチ1回ごとの ULID。digests・analyses にも記録し、ログ⇔DB を突合可能にする。
 - ローテーション: Python `logging.handlers.TimedRotatingFileHandler`(日次・14世代)。newsyslog 等の外部設定は持たない(依存最小)。

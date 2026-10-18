@@ -110,6 +110,9 @@ class DigConfig:
     body_max_chars: int = 40_000  # 解説生成に渡す本文の上限(超過は切り詰め注記)
     translation_max_chars: int = 24_000  # 対訳対象の本文上限(超過分は打ち切り注記)
     min_body_chars: int = 200  # これ未満は材料不足(自動選出は skip・指定は失敗)
+    # カードへの質問への返事(GH#126)。スマホで待つので effort は既定 low(応答の速さ優先)
+    answer_reasoning_effort: str = "low"
+    answer_source_max_chars: int = 30_000  # 返事の材料に渡す原文/対訳ノートの上限
 
 
 @dataclass(frozen=True)
@@ -325,17 +328,19 @@ def _validate(path: Path, config: Config) -> None:
         )
     if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
         raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
-    if config.dig.reasoning_effort not in DIG_EFFORTS:
-        raise ConfigError(
-            f"{path}: [dig].reasoning_effort は {'/'.join(DIG_EFFORTS)} のいずれか: "
-            f"{config.dig.reasoning_effort!r}"
-        )
+    for key in ("reasoning_effort", "answer_reasoning_effort"):
+        if getattr(config.dig, key) not in DIG_EFFORTS:
+            raise ConfigError(
+                f"{path}: [dig].{key} は {'/'.join(DIG_EFFORTS)} のいずれか: "
+                f"{getattr(config.dig, key)!r}"
+            )
     positives = [
         ("x", "daily_read_cap", config.x.daily_read_cap),
         ("dig", "timeout_s", config.dig.timeout_s),
         ("dig", "body_max_chars", config.dig.body_max_chars),
         ("dig", "translation_max_chars", config.dig.translation_max_chars),
         ("dig", "min_body_chars", config.dig.min_body_chars),
+        ("dig", "answer_source_max_chars", config.dig.answer_source_max_chars),
         ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),
         ("x_search", "daily_read_cap", config.x_search.daily_read_cap),
         ("digest", "max_items", config.digest.max_items),
