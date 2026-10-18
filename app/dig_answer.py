@@ -57,7 +57,7 @@ class DigAnswer(BaseModel):
 def enqueue_question(
     conn: sqlite3.Connection, dig_result_id: int, question: str, question_message_id: int
 ) -> int:
-    """質問を台帳に積む(返事は answer_pending が作る)。呼び出し側が commit する。"""
+    """質問を台帳に積む(返事は answer_pending が作る)。トランザクションは呼び出し側が張る。"""
     return conn.execute(
         "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
         "VALUES (?, ?, ?)",

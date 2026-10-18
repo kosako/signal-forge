@@ -695,26 +695,35 @@ def _handle_dig_card_reply(
         # 受け付け済みなら何もしない(感想も返事も二重にしない)
         logger.info("受け付け済みの質問の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
         return
-    conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, text))
     cap = config.dig.answer_daily_cap
     if cap <= 0 or type(message_id) is not int:
-        conn.commit()
-        logger.info("感想を記録", extra={"stage": "poll", "item_id": item_id})
-        reply("📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
-        return
-    if questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
-        conn.commit()
+        accept = False
+        notice = "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
+    elif questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
+        accept = False
+        notice = f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません"
         logger.warning(
             f"質問の上限({cap} 件/日)に達したため返事を作らない",
             extra={"stage": "poll", "item_id": item_id},
         )
-        reply(f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません")
-        return
-    enqueue_question(conn, dig_result_id, text, message_id)
-    conn.commit()
-    logger.info("質問を受け付けた", extra={"stage": "poll", "item_id": item_id})
-    reply("📝 記録しました。返事を作っています(数分かかることがあります)")
-    if answer_worker is not None:
+    else:
+        accept = True
+        notice = "📝 記録しました。返事を作っています(数分かかることがあります)"
+    # 感想と質問は一緒に記帳する(接続は autocommit。間で止まると、再配達で感想だけ二重になる)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, text))
+        if accept:
+            enqueue_question(conn, dig_result_id, text, message_id)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    logger.info(
+        "質問を受け付けた" if accept else "感想を記録", extra={"stage": "poll", "item_id": item_id}
+    )
+    reply(notice)
+    if accept and answer_worker is not None:
         answer_worker.kick(logger)
 
 

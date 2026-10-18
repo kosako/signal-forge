@@ -2,6 +2,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,7 @@ from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
 from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
 from app.delivery.telegram import LONG_POLL_S, reaction_keyboard
+from app.digest.builder import JST
 from tests.test_delivery import add_digest, add_item
 
 logger = logging.getLogger("test-poller")
@@ -707,6 +709,53 @@ def test_card_reply_over_daily_cap_is_recorded_only(conn, tmp_path) -> None:
         (CHAT_ID, "📝 記録しました。今日の返事の上限(1 件)に達したため、返事は作りません")
     ]
     assert worker.kicks == 0
+
+
+@pytest.mark.parametrize(
+    ("earlier_created_at", "accepted"),
+    [
+        ("2026-10-17T14:59:59Z", True),  # JST 10/17 23:59:59 = 前日分は数えない
+        ("2026-10-17T15:00:00Z", False),  # JST 10/18 00:00:00 = 当日分
+    ],
+)
+def test_daily_cap_counts_by_jst_day(conn, tmp_path, earlier_created_at, accepted) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, created_at) "
+        "VALUES (?, '先の質問', 80, ?)",
+        (dig_id, earlier_created_at),
+    )
+    api, worker = FakeApi([[card_reply("次の質問", 700)]]), FakeWorker()
+    now = datetime(2026, 10, 18, 0, 0, 30, tzinfo=JST)
+
+    poll_once(
+        conn, answer_config(tmp_path, cap=1), api, logger,
+        now_fn=lambda: now, answer_worker=worker,
+    )
+
+    count = conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0]
+    assert count == (2 if accepted else 1)
+    assert worker.kicks == (1 if accepted else 0)
+
+
+def test_note_and_question_are_recorded_together(conn, tmp_path) -> None:
+    # 台帳に積めなかったら感想も残さない(再配達で感想だけ二重にならない)
+    _item_id, _dig_id = add_dig_card(conn)
+    update = card_reply("質問", 700)
+    config = answer_config(tmp_path)
+    conn.execute(
+        "CREATE TRIGGER boom BEFORE INSERT ON dig_questions "
+        "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+
+    poll_once(conn, config, FakeApi([[update]]), logger, answer_worker=FakeWorker())
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+
+    conn.execute("DROP TRIGGER boom")
+    conn.execute("DELETE FROM telegram_state")  # offset を保存できなかった状態 → 再配達
+    poll_once(conn, config, FakeApi([[update]]), logger, answer_worker=FakeWorker())
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 1
 
 
 def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
