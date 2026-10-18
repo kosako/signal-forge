@@ -113,7 +113,7 @@ class LLMEngine(Protocol):
 
 | 障害 | 挙動 |
 |---|---|
-| 単一ソースの collect 失敗 | sources に失敗時刻を記録し他ソースは続行。連続失敗は doctor が警告 |
+| 単一ソースの collect 失敗 | sources に失敗時刻を記録し他ソースは続行。連続失敗は doctor #14 が警告し、X は watchdog も通知(設計 02 §2・§3) |
 | 本文抽出失敗 | extraction_status=failed のままタイトル+メタで degraded 分析に回す(黙って脱落させない) |
 | LLM 失敗(transient: 検証失敗・タイムアウト) | §5 のリトライ→degraded ダイジェスト |
 | LLM 環境障害(起動不能・認証不在)・分析全滅(analyzed=0) | degraded で握らず analyze 段の失敗として raise → 失敗通知(設計 05 §4)。全滅時は degraded 行が書き込み済みのため劣化配信は併走する(GH#74) |

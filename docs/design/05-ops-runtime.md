@@ -45,6 +45,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 11 | documents の TTL 超過残存件数+**全ソース**の `items.raw_payload` の TTL 超過残存件数(ソース別 TTL — X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days` — で判定。削除経路の故障検知。01 §6) | WARN |
 | 12 | 環境に `ANTHROPIC_API_KEY` が存在したら WARN(無自覚 API 課金防止) | WARN |
 | 13 | X OAuth2 token(S1 = GH#58): token 有効性を `/2/users/me`(読取課金なし)で確認。**token 未取得は SKIP**(S1 取込を使うまで認可不要。恒久 FAIL にしない)。token ファイル破損・client_id 未設定(refresh 不能)・users/me 失敗は FAIL。refresh はローテーションを伴うため検査では強制しない(失効時のみセッションが refresh) | FAIL(未認可時は SKIP) |
+| 14 | ソース死活: enabled なソースの `consecutive_failures` が X ≥ 3 / RSS ≥ 7(死亡疑い)なら WARN(設計 02 §2・§3。`x.enabled=false` の間の X は見ない)。自動 disable はしない | WARN |
 
 ## 3. ログ設計
 
@@ -58,7 +59,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 - 通知チャネルは配信と同じ Bot・同じ chat(owner のみ)。通知種別:
   1. **朝バッチ失敗**: `intel run` が非0終了 → 末尾の例外要約1行+「`intel run` で再走」の定型文。
-  2. **watchdog**: 7:15 に当日 digest 無し → 「今朝のダイジェスト未生成」(1 との重複は許容。取りこぼしゼロを優先)。
+  2. **watchdog**: 7:15 に当日 digest 無し → 「今朝のダイジェスト未生成」(1 との重複は許容。取りこぼしゼロを優先)。X ソースの連続失敗(consecutive_failures ≥ 3。設計 02 §2)も同じ 1 通に行を足して知らせる(GH#124)。
   3. **degraded 配信**: LLM 全滅でタイトルのみ配信した場合、ヘッダに明記(別通知は出さない)。
 - レート制限: 同一種別は1日1通まで(通知疲れで watchdog が無視される事態を防ぐ)。
 - 通知自体の失敗(Telegram 障害)はログ記録のみで諦める。フォールバック通知経路は作らない(拡張点)。

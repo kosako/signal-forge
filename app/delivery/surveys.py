@@ -14,6 +14,7 @@ import logging
 import sqlite3
 from datetime import datetime, time, timedelta
 
+from app.collect import X_FAILURE_ALERT, source_failure_alerts
 from app.config import Config
 from app.delivery.state import get_state, set_state
 from app.delivery.telegram import (
@@ -33,6 +34,10 @@ READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4
 # 未消化 🔖 一覧(GH#88)。可視テキストを 4096 字制限に収める(URL は href 側で不算入)
 DIG_BACKLOG_MAX_ITEMS = 15
 DIG_BACKLOG_TITLE_MAX_CHARS = 80
+
+# watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると送信が毎周期失敗し、
+# 同じ周期の getUpdates まで止まる。GH#124 でソースの行が可変長になった)
+WATCHDOG_TEXT_MAX_CHARS = 4000
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -92,15 +97,19 @@ def run_due_timers(
         _is_due(now, config.telegram.watchdog_time)
         and get_state(conn, STATE_WATCHDOG_NOTIFIED) != today
     ):
-        problem = _watchdog_problem(conn, today)
-        if problem is not None:
+        problems = _watchdog_problems(conn, config, today)
+        if problems:
             # 通知系は送信成功後に state を立てる(失敗した日に沈黙しない。夜アンケートの
-            # 送信前記録とは目的が逆: 通知は届くまで再試行してよい)
+            # 送信前記録とは目的が逆: 通知は届くまで再試行してよい)。
+            # 同一種別1日1通なので、見つけた問題は1通にまとめる
             api.send_message(
-                _require_chat_id(config), f"⚠️ watchdog: {problem}。`intel run` で再走できます"
+                _require_chat_id(config),
+                escape_and_truncate(
+                    "\n".join(f"⚠️ watchdog: {p}" for p in problems), WATCHDOG_TEXT_MAX_CHARS
+                ),
             )
             set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
-            logger.warning(f"watchdog 通知: {problem}", extra={"stage": "poll"})
+            logger.warning(f"watchdog 通知: {' / '.join(problems)}", extra={"stage": "poll"})
 
 
 def send_evening_survey(
@@ -276,15 +285,24 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _watchdog_problem(conn: sqlite3.Connection, today: str) -> str | None:
+def _watchdog_problems(conn: sqlite3.Connection, config: Config, today: str) -> list[str]:
+    """watchdog が知らせる問題(平文)。空 = 問題なし。"""
+    problems = []
     row = conn.execute(
         "SELECT delivery_status FROM digests WHERE digest_date = ?", (today,)
     ).fetchone()
     if row is None:
-        return "今朝のダイジェストが未生成です"
-    if row["delivery_status"] != "sent":
-        return "今朝のダイジェストが未配信です"
-    return None
+        problems.append("今朝のダイジェストが未生成です。`intel run` で再走できます")
+    elif row["delivery_status"] != "sent":
+        problems.append("今朝のダイジェストが未配信です。`intel run` で再走できます")
+    # X ソースの連続失敗(設計 02 §2)。collect はソースの失敗を run の失敗にしないので、
+    # ここで拾わないと誰も気づかない(GH#124)。X を止めている間は回数が進まないので見ない
+    if config.x.enabled:
+        problems.extend(
+            f"X ソース{alert}。直すか sources.enabled=0 で止めるまで毎朝通知します"
+            for alert in source_failure_alerts(conn, "x", X_FAILURE_ALERT)
+        )
+    return problems
 
 
 def _require_chat_id(config: Config) -> int:

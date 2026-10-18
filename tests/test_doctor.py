@@ -140,7 +140,7 @@ def make_fresh_backup(tmp_path: Path) -> Path:
 def test_baseline_has_no_failure(config_dir, tmp_path) -> None:
     make_fresh_backup(tmp_path)
     results = doctor(config_dir, tmp_path)
-    assert len(results) == 13
+    assert len(results) == 14
     assert not has_failure(results)
     statuses = {r.number: r.status for r in results}
     assert statuses[1] == "PASS"
@@ -149,6 +149,7 @@ def test_baseline_has_no_failure(config_dir, tmp_path) -> None:
     assert statuses[6] == "PASS"
     assert statuses[12] == "PASS"
     assert statuses[13] == "SKIP"  # OAuth2 未認可(S1 前は恒久 FAIL にしない)
+    assert statuses[14] == "PASS"
 
 
 def test_missing_config_is_fail_but_all_checks_run(tmp_path) -> None:
@@ -156,7 +157,7 @@ def test_missing_config_is_fail_but_all_checks_run(tmp_path) -> None:
     empty.mkdir()
     results = doctor(empty, tmp_path)
     assert by_number(results, 1).status == "FAIL"
-    assert len(results) == 13  # 1つの失敗で残りを止めない
+    assert len(results) == 14  # 1つの失敗で残りを止めない
     assert has_failure(results)
     # config 依存項目は既定 Config で別 DB を診断せず「検査不可」に倒す
     assert "検査不可" in by_number(results, 3).detail
@@ -184,7 +185,7 @@ def test_check_exception_is_isolated_to_its_item(config_dir, tmp_path) -> None:
     result = by_number(results, 8)
     assert result.status == "FAIL"
     assert "例外" in result.detail
-    assert len(results) == 13  # 他の検査は巻き添えにならない
+    assert len(results) == 14  # 他の検査は巻き添えにならない
     assert by_number(results, 4).status == "PASS"
 
 
@@ -663,6 +664,48 @@ def test_ttl_leftover_warn(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 11)
     assert result.status == "WARN"
     assert "documents 1 件" in result.detail
+
+
+def _add_failing_source(
+    tmp_path: Path, type_: str, name: str, failures: int, *, enabled: int = 1
+) -> None:
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO sources (type, name, enabled, consecutive_failures, last_error) "
+        "VALUES (?, ?, ?, ?, 'FatalError: HTTP 400')",
+        (type_, name, enabled, failures),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_source_health_warns_at_design_thresholds(config_dir, tmp_path) -> None:
+    # 設計 02: X は 3 回・RSS は 7 回(死亡疑い)で警告。しきい値未満と止めたソースは出さない
+    _add_failing_source(tmp_path, "x", "x:search", 3)
+    _add_failing_source(tmp_path, "x", "x:home", 2)
+    _add_failing_source(tmp_path, "rss", "dead-feed", 7)
+    _add_failing_source(tmp_path, "rss", "flaky-feed", 6)
+    _add_failing_source(tmp_path, "rss", "stopped-feed", 30, enabled=0)
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[x]\nenabled = true\n", encoding="utf-8"
+    )
+
+    result = by_number(doctor(config_dir, tmp_path), 14)
+
+    assert result.status == "WARN"  # 自動 disable はせず人に知らせるだけ(FAIL にしない)
+    assert "X「x:search」が 3 回連続で失敗(直近: FatalError: HTTP 400)" in result.detail
+    assert "RSS「dead-feed」が 7 回連続で失敗" in result.detail
+    assert "死亡疑い" in result.detail
+    for quiet in ("x:home", "flaky-feed", "stopped-feed"):
+        assert quiet not in result.detail
+
+
+def test_source_health_ignores_x_failures_while_x_disabled(config_dir, tmp_path) -> None:
+    # x.enabled=false の間は collect が X を回さず回数が進まない(止める前の回数で鳴らさない)
+    _add_failing_source(tmp_path, "x", "x:search", 9)
+    result = by_number(doctor(config_dir, tmp_path), 14)
+    assert result.status == "PASS"
 
 
 def test_anthropic_key_in_env_is_warn(config_dir, tmp_path) -> None:

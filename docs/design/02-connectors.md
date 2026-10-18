@@ -52,7 +52,7 @@ class Connector(Protocol):
 - **コスト記録**: 取得件数 × config `x.unit_price_usd`(Day 0 実測値を設定)を collect_runs.estimated_cost_usd に記録。doctor が月次見込みを集計し、超過ペースで警告。
 - **リツイート/リプライ**: RT は referenced tweet の URL に正規化して重複排除に乗せる。自分宛以外のリプライは既定で除外(meta に記録)。理由: ノイズ率対策の最安の一手。
 - **本文保持ポリシー(RSS と分離)**: tweet 本文は分析に必要なので documents に入れるが **TTL 付きキャッシュのみ・恒久保存しない**(恒久保存は自作要約+メタ+URL)。**確定済み(2026-07-06、Issue #2)**: `x_cache_ttl_days=7`、X 由来の抜粋は Obsidian に置かない(詳細は 01 §6 / 04 §7)。
-- **縮退**: consecutive_failures ≥ 3 で doctor・watchdog 通知(自動 disable はしない。理由: 勝手に情報源が消えるより通知して人が `sources.enabled=0` を切る方が安全)。X 停止中もパイプラインはソース非依存で RSS+手動URLで継続。
+- **縮退**: consecutive_failures ≥ 3 で doctor #14 が WARN、watchdog が Telegram に通知(自動 disable はしない。理由: 勝手に情報源が消えるより通知して人が `sources.enabled=0` を切る方が安全)。watchdog は直すか止めるまで毎朝 1 通(同一種別 1 日 1 通。設計 05 §4)。collect はソースの失敗を run の失敗にしないため、朝バッチ失敗通知には載らない(GH#124)。`x.enabled=false` の間は回数が進まないので知らせない。X 停止中もパイプラインはソース非依存で RSS+手動URLで継続。
 
 ### AI 検索(`connectors/x_search.py`・Issue #57)
 
@@ -114,7 +114,7 @@ class Connector(Protocol):
 - **条件付き GET**: `cursor = {"etag": str|None, "last_modified": str|None}` を保存し、`If-None-Match` / `If-Modified-Since` を送る。304 は正常 no-op(collect_runs に `status='ok'`・`items_fetched=0` で記録。error 列には書かない正常系。01 の status CHECK に値を増やさない)。
 - **重複排除キー**: entry の `id`(guid)を external_id に。無ければ正規化 URL の hash にフォールバック。
 - **raw_content**: `content` / `summary` があれば RawItem.raw_content に同梱。全文フィードなら本文抽出の HTTP を節約できる(使うかは extraction 層が判断)。
-- **フィード死活**: consecutive_failures ≥ 7(約1週間)で doctor が「死亡疑い」警告。410 Gone と恒久リダイレクトループは即 FatalError。自動削除・自動 disable はせず週次セルフレビューで棚卸し。理由: RSS は一時障害が多く、自動判定の誤爆コストの方が高い。
+- **フィード死活**: consecutive_failures ≥ 7(約1週間)で doctor #14 が「死亡疑い」警告(watchdog は通知しない)。410 Gone と恒久リダイレクトループは即 FatalError。自動削除・自動 disable はせず週次セルフレビューで棚卸し。理由: RSS は一時障害が多く、自動判定の誤爆コストの方が高い。
 - **恒久リダイレクト(301)**: 警告表示のみ。sources.config の URL 書き換えは人が行う(sources はユーザー管理データのため)。
 
 ## 4. 手動 URL コネクタ(Telegram 投入フロー)

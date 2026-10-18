@@ -28,7 +28,36 @@ from app.normalize import (
 
 RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
 
+# consecutive_failures がこの回数に達したら人に知らせる(設計 02 §2・§3)。
+# X = doctor #14 と watchdog / RSS = doctor #14 のみ(一時障害が多く約1週間で「死亡疑い」)
+X_FAILURE_ALERT = 3
+RSS_FAILURE_ALERT = 7
+ALERT_ERROR_MAX_CHARS = 200  # 知らせる文に載せる直近エラーの上限(URL 込みで1〜2行)
+
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+
+
+def source_failure_alerts(
+    conn: sqlite3.Connection, source_type: str, threshold: int
+) -> list[str]:
+    """enabled なソースのうち threshold 回以上連続で失敗しているものを 1 件 1 行で返す。
+
+    doctor #14・watchdog 用の平文(HTML エスケープは送る側)。
+    """
+    rows = conn.execute(
+        "SELECT name, consecutive_failures, last_error FROM sources "
+        "WHERE enabled = 1 AND type = ? AND consecutive_failures >= ? ORDER BY id",
+        (source_type, threshold),
+    ).fetchall()
+    alerts = []
+    for row in rows:
+        # 改行は空白に寄せて 1 件 1 行を保つ(例外の文言は複数行になりうる)
+        name = " ".join(row["name"].split())
+        error = " ".join((row["last_error"] or "不明").split())
+        if len(error) > ALERT_ERROR_MAX_CHARS:
+            error = error[: ALERT_ERROR_MAX_CHARS - 1] + "…"
+        alerts.append(f"「{name}」が {row['consecutive_failures']} 回連続で失敗(直近: {error})")
+    return alerts
 
 
 def collect_all(

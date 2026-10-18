@@ -179,7 +179,7 @@ class XConnector:
             raise_for_auth(response, "timeline")
             if response.status_code != 200:
                 # 1ページ目から失敗(429/5xx/4xx)は「取得0件の成功」で隠さず失敗として返す
-                # (consecutive_failures を上げ doctor #5 / watchdog に拾わせる)。
+                # (consecutive_failures を上げ doctor #14 / watchdog に拾わせる)。
                 # 既取得分があれば部分取得で打ち切り(古い側の欠落は許容。設計 02 §2)
                 if not tweets:
                     raise status_error(response, url)
