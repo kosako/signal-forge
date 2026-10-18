@@ -2,6 +2,8 @@
 
 作成日: 2026-07-05 / ステータス: ドラフト / 対象読者: 本人
 
+> 注記: 本案は採用していない(比較の結果、A-lite に直行。[00-comparison.md](00-comparison.md) と [../PROPOSAL.md](../PROPOSAL.md) の経緯を参照)。比較検討の記録として残す。確定版は [../PROPOSAL.md](../PROPOSAL.md)。
+
 ## 一行コンセプト
 
 > 収集と本文抽出は Miniflux に丸投げし、自作は「選別パイプライン + Telegram + Obsidian グルー」だけに絞って、数日〜1週間で朝のダイジェスト運用を開始する。

@@ -2,6 +2,7 @@
 name = "signal-forge"
 version = "0.1.0"
 description = "個人用インテリジェンスサービス(A-lite MVP)。X・RSS・手動URLを毎朝の日本語ダイジェストに圧縮する"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "feedparser>=6.0.12",
@@ -33,7 +34,7 @@ packages = ["app"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["scripts"]  # Day 0 の使い捨てスクリプト(vibe 品質。plan.md #1)
+extend-exclude = ["scripts"]  # scripts/ の Python は Day 0 の使い捨て(vibe 品質。plan.md #1)。kpi/ は SQL
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
