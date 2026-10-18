@@ -319,8 +319,9 @@ M3:  #17 → #24
 - **小 PR 分割**: 1 Issue = 1 PR。目安は 1 CLI サブコマンド or 1 コネクタ(設計 05 §9)。大きくなりそうなら Issue を割ってから着手。ローカルで一気に作り込まない。
 - **相互レビュー(author ≠ reviewer)**: Claude が実装 → Codex がレビュー。commit 末尾に `Co-Authored-By: Claude ...` トレーラを必ず付け、PR の commit trailers を routing の正本とする。レビューは PR 上に 🔴 must / 🟡 should / ⚪ nit の3段階で残し、**must ゼロを merge 条件**とする(should/nit は author 判断)。複数 AI の commit が混在した PR は分割するか人間が裁定(fail-closed)。
 - **CI 最小**: PR ごとに `uv run pytest` + `ruff check` をローカル実行。マイグレーションを含む PR は「バックアップ取得 → 適用 → doctor 通過」をレビューチェック項目に含める。
-- **ドキュメント正本は Notion**: 開発運用ルールに従い、PROPOSAL・設計 00〜05 の確定版は Notion へ同期する。運用ポイント:
-  - 仕様(PROPOSAL・設計)は**上書き更新**でリポジトリ → Notion に同期(節目 = 各マイルストーン完了時)。
+- **文書の正本の置き場**: 開発運用ルールに従い、種別ごとに正本を決める。運用ポイント:
+  - 企画(PROPOSAL)は Notion の企画書が正本。変更は Notion を直してから `docs/PROPOSAL.md` へ写す(**上書き更新**。向きは Notion → リポジトリ。写しの冒頭の注記を保つ)。
+  - 技術設計の正本はリポジトリの `docs/design/00〜06` と `docs/adr/`(上書き更新。Notion には写さない)。
   - ログ(Day 0 実測結果・週次レビュー・判定記録)は**時系列追記**。
   - ダッシュボード(Issue 消化状況・KPI 現在地)は**常に現在地を反映**(週次レビュー時に更新)。
   - レビューのやり取りは GitHub PR に置き、Notion に転記しない。
