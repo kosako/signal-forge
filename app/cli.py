@@ -212,6 +212,7 @@ def answer(
     from app.dig_answer import answer_pending
     from app.dig_take import record_takes
     from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.vault_guard import VaultGuard
 
     config = load_config(config_dir)
     env = load_env(config_dir)
@@ -232,6 +233,8 @@ def answer(
         apply_migrations(conn, config.db_path)
         logger = setup_logging(DEFAULT_LOG_DIR, "answer.log")  # poller.log とはプロセスを分ける
         api = create_api(env)
+        # vault へのアクセスは時間の上限つき。止まったら、この実行では vault に触れない(GH#145)
+        vault = VaultGuard()
         sent = answer_pending(
             conn,
             config,
@@ -241,9 +244,15 @@ def answer(
                 reply_to_message_id=reply_to,
             ),
             logger,
+            vault,
         )
         # 返事を送った後に記録する(本人を待たせない)。前回の実行で記録できなかった分も含む
-        recorded = record_takes(conn, config, logger)
+        recorded = record_takes(conn, config, logger, vault)
+        if vault.stalled:
+            logger.error(
+                "vault が応答しなかった(macOS のプライバシーの確認待ちの可能性。runbook §11)",
+                extra={"stage": "answer"},
+            )
     typer.echo(f"answer 完了(送信 {sent} 通・take の記録 {recorded} 件)")
 
 

@@ -3,10 +3,12 @@
 import logging
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
+from app import dig_answer
 from app.analysis.llm import LLMError
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
@@ -17,6 +19,7 @@ from app.dig_answer import (
     answer_pending,
     enqueue_request,
 )
+from app.vault_guard import VaultGuard
 
 logger = logging.getLogger("test-dig-answer")
 
@@ -264,6 +267,36 @@ def test_missing_notes_are_noted_and_still_answered(conn, config) -> None:
     assert "(解説ノートが見つからない)" in engine.prompts[0]
     assert "(原文/対訳ノートが見つからない)" in engine.prompts[0]
     assert rows(conn)[0]["status"] == "answered"
+
+
+def test_vault_stall_answers_without_notes(conn, config, monkeypatch) -> None:
+    # vault が応答しない(macOS の確認待ちなど)ときも、返事はノートなしで作って送る(GH#145)
+    first = add_dig(conn, config)
+    second = add_dig(conn, config, url="https://a.example/2")
+    ask(conn, first, "質問1", 71)
+    ask(conn, second, "質問2", 72)
+    release = threading.Event()
+    reads: list[str] = []
+
+    def stuck(deepdive_dir, note_name):
+        reads.append(note_name)
+        release.wait()
+
+    monkeypatch.setattr(dig_answer, "_read_note", stuck)
+    engine = Engine()
+    vault = VaultGuard(timeout_s=0.05)
+    try:
+        assert answer_pending(conn, config, engine.factory, Sender(), logger, vault) == 2
+    finally:
+        release.set()
+
+    assert vault.stalled
+    assert len(reads) == 1  # 止まった後は vault に触れない
+    for prompt in engine.prompts:
+        assert "カードの本文" in prompt
+        assert "(解説ノートを読めない: vault が応答しない)" in prompt
+        assert "(原文/対訳ノートを読めない: vault が応答しない)" in prompt
+    assert [r["status"] for r in rows(conn)] == ["answered", "answered"]
 
 
 def test_answers_without_vault_from_card_only(conn, config, tmp_path) -> None:
