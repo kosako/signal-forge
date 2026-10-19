@@ -10,7 +10,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ### 1.1 朝バッチ `com.intel.morning`
 
-- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→x_signals→extract→analyze→digest→export→deliver→dig→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。dig 段(GH#105)は 1 件あたり分オーダーの LLM 生成を含むため、`telegram.watchdog_time`(07:15)は「06:30 起動 + 既存段 + dig 上限件数 × 数分」を見込んだ余裕であることに注意(既定 daily_cap=2 で収まる想定。上限を増やすときは watchdog_time と合わせて見直す)。
+- `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→x_signals→extract→analyze→digest→export→deliver→dig→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。dig 段(GH#105)は 1 件あたり分オーダーの LLM 生成を含むが、deliver の後に走るので watchdog(当日のダイジェストの生成・配信と X ソースの連続失敗だけを見る)の判定には影響しない。dig の所要時間で後ろにずれるのは purge と backup の完了時刻と、朝バッチが poller と DB を共有する時間の長さ(上限 `[dig].daily_cap` を増やすときはこちらを見直す)。
 - `StartCalendarInterval`: 06:30 JST(配信 7:00 の30分前。LLM バッチと X ページングの余裕をみる)。
 - **再起動方針: 自動再実行しない**。`intel run` は冪等(sources のカーソル管理+items の content_hash 重複排除)なので失敗時は手動 `intel run` で安全に再走できる。自動リトライを launchd に持たせない理由: 二重課金・二重配信の検知より、watchdog 通知→手動再走の方が単純で事故が少ない。
 - スリープ対策: `sudo pmset repeat wakeorpoweron MTWRFSU 06:25:00`。StartCalendarInterval はスリープ中スキップされるため wake を先に確保する。
@@ -19,9 +19,9 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 ### 1.2 受信デーモン `com.intel.poller`
 
 - `ProgramArguments`: `[uv, run, intel, poll]`(Telegram long polling 常駐。ボタン反応・手動 URL・夜アンケートを受信し signals / items に記録)。
-- **再起動方針: `KeepAlive: true` + `ThrottleInterval: 30`**。クラッシュしても callback query の取りこぼしを最小化するため常時復帰。連続クラッシュ(30秒間に再起動が繰り返される状態)は launchd が抑制し、doctor と watchdog で検知する。
-- 夜アンケート送信(**21:30 JST 仮**、config で変更可。設計 04 §4 と同一方式・同一時刻)と watchdog(7:15 JST に digests の当日行を確認、無ければ失敗通知)はポーラー内のタイマーで実行する。`telegram.watchdog_time` は**配信時刻+15分程度に設定する前提**(それ以前だと朝バッチ未完の時点で確認が走り誤通知になる)。理由: plist を2枚に抑え、Telegram 送信経路を1プロセスに集約するため(別 launchd ジョブによる `--survey` 起動は採らない)。送信ロジック自体は `delivery/telegram.py` の関数(実装の置き場は 04 が正本)。
-- **深掘りカードへの質問への返事(GH#126)**: カード(とその返事)へのリプライを受けたポーラーは、質問を台帳 `dig_questions` に積み、`intel answer` を**別プロセス**(`python -m app.cli answer`)で起動する。LLM の待ち(数十秒〜数分)で受信と内蔵タイマーを止めないため。子は別セッションで動かし(ポーラーの再起動で作りかけの返事を道連れにしない)、子の側の flock で同時に 1 つに絞る。ポーラーは各周期の見回りで、答えていない質問が残っていれば起動し直し、送れていない返事だけなら 10 分おきに再送を起動する。子の詳細ログは `answer.log`。このため poller.plist の PATH にも codex の dir を入れる(#72 と同じ理由)。1 日の上限は `[dig].answer_daily_cap`(既定 20。0 = 返事をせず記録だけ)。
+- **再起動方針: `KeepAlive: true` + `ThrottleInterval: 30`**。クラッシュしても callback query の取りこぼしを最小化するため常時復帰。連続クラッシュ(30秒間に再起動が繰り返される状態)は launchd が抑制する。連続クラッシュを自動で知らせる仕組みは無い(doctor #8 はジョブがロードされているかだけを見る。watchdog はこのプロセスの内蔵タイマーなので、落ちている間は動かない)。`poller-launchd.log` と `poller.log` で確かめる。
+- 夜アンケート送信(**21:30 JST 仮**、config で変更可。設計 04 §4 と同一方式・同一時刻)と watchdog(7:15 JST に当日のダイジェストが未生成・未配信なら通知。X ソースの連続失敗も同じ 1 通で知らせる。§4)はポーラー内のタイマーで実行する。`telegram.watchdog_time` は**配信時刻+15分程度に設定する前提**(それ以前だと朝バッチ未完の時点で確認が走り誤通知になる)。理由: plist を2枚に抑え、Telegram 送信経路を1プロセスに集約するため(別 launchd ジョブによる `--survey` 起動は採らない)。送信ロジック自体は `delivery/telegram.py` の関数(実装の置き場は 04 が正本)。
+- **深掘りカードへの質問への返事(GH#126)**: カード(とその返事)へのリプライを受けたポーラーは、質問を台帳 `dig_questions` に積み、`intel answer` を**別プロセス**(`python -m app.cli answer`)で起動する。LLM の待ち(数十秒〜数分)で受信と内蔵タイマーを止めないため。子は別セッションで動かし(ポーラーの再起動で作りかけの返事を道連れにしない)、子の側の flock で同時に 1 つに絞る。ポーラーは各周期の見回りで、答えていない質問が残っていれば起動し直し、送れていない返事・記録できていない take(GH#106)だけなら 10 分おきに起動する。子の詳細ログは `answer.log`。このため poller.plist の PATH にも codex の dir を入れる(#72 と同じ理由)。1 日の上限は `[dig].answer_daily_cap`(既定 20。0 = 返事をせず記録だけ)。
 
 ### 1.3 事前セットアップ(doctor で検査)
 
@@ -41,7 +41,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 6 | LLM: 設定エンジン(MVP は1本。設計 00 §5)で固定プロンプト1件の `complete_structured` 成功+推論専用モードの**動的検査(隔離 canary 3プローブ)**。read-only sandbox はファイル読取・読取系コマンドの実行自体は許す(Issue #3 実測)ため「拒否確認」は構造的に不成立。代わりに**隔離が効いているか**を客観確認する: (1) HOME 隔離 = 実 HOME 直下の canary を `~` 相対で読ませ内容が漏れないこと (2) ネットワーク遮断 = ローカル canary サーバの URL を fetch させ到達が観測されないこと(自己申告に依存しない) (3) CODEX_HOME 隔離(codex-cli のみ)= auth.json と同居させた canary が漏れないこと(credential 流出経路の実測。auth 実内容は載せず canary で代替)。いずれか漏れ・到達で FAIL。**(3) は当初 read-only sandbox が読取を許すため真陽性 FAIL だった(Issue #54)→ engine 側を permission profile の deny-read に変更し塞いだ(設計 00 §5)。プローブ自体は不変** | FAIL |
 | 7 | Obsidian Vault パスへのテスト書き込み・削除(TCC/FDA 検査を兼ねる) | FAIL |
 | 8 | launchd 2ジョブのロード状態(`launchctl print`) | WARN |
-| 9 | 当月コスト見込み(analyses.estimated_cost 合算+X 読取件数×単価)と $30 比 | 超過ペースで WARN |
+| 9 | 当月コストの実績と着地見込み(`analyses.estimated_cost_usd` の合算 + X の読み取り費用 = `collect_runs` と `x_signal_runs` の `estimated_cost_usd` の合算)と `[budget].monthly_cap_usd` の比 | 超過ペースで WARN |
 | 10 | バックアップ最新世代の日付(48h 超で WARN)+アーカイブのパーミッション(600 以外は WARN) | WARN |
 | 11 | documents の TTL 超過残存件数+**全ソース**の `items.raw_payload` の TTL 超過残存件数(ソース別 TTL — X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days` — で判定。削除経路の故障検知。01 §6) | WARN |
 | 12 | 環境に `ANTHROPIC_API_KEY` が存在したら WARN(無自覚 API 課金防止) | WARN |
@@ -54,22 +54,22 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 形式: **JSON Lines**(ts, level, run_id, stage, source_id, item_id, msg, extra)。理由: KPI 週次レビューや障害調査を `jq` の一発クエリで済ませるため。
 - `run_id` は朝バッチ1回ごとの ULID。digests・analyses にも記録し、ログ⇔DB を突合可能にする。
 - ローテーション: Python `logging.handlers.TimedRotatingFileHandler`(日次・14世代)。newsyslog 等の外部設定は持たない(依存最小)。
-- レベル方針: 正常系は stage 境界の INFO 1行(件数・所要・推定コスト)。外部本文・プロンプト全文は**ログに書かない**(untrusted data の拡散と肥大化を防ぐ)。デバッグ時のみ `--verbose`。
+- レベル方針: 正常系は stage 境界の INFO 1行(件数・所要・推定コスト)。外部本文・プロンプト全文は**ログに書かない**(untrusted data の拡散と肥大化を防ぐ)。詳細ログの切り替え(`setup_logging` の `verbose` 引数)は CLI からはまだ渡せない(`--verbose` オプションは未実装)。
 
 ## 4. 失敗時の Telegram 通知
 
 - 通知チャネルは配信と同じ Bot・同じ chat(owner のみ)。通知種別:
-  1. **朝バッチ失敗**: `intel run` が非0終了 → 末尾の例外要約1行+「`intel run` で再走」の定型文。
-  2. **watchdog**: 7:15 に当日 digest 無し → 「今朝のダイジェスト未生成」(1 との重複は許容。取りこぼしゼロを優先)。X ソースの連続失敗(consecutive_failures ≥ 3。設計 02 §2)も同じ 1 通に行を足して知らせる(GH#124)。
+  1. **朝バッチ失敗**: `intel run` で失敗した段がある → 失敗した段の一覧と run_id +「`intel run` で再走」の定型文(例外の詳細は `morning.log` を run_id で引く)。
+  2. **watchdog**: 7:15 に当日 digest 無し → 「今朝のダイジェストが未生成」、digest はあるが配信されていない(`delivery_status` ≠ `sent`)→「未配信」(1 との重複は許容。取りこぼしゼロを優先)。X ソースの連続失敗(consecutive_failures ≥ 3。設計 02 §2)も同じ 1 通に行を足して知らせる(GH#124)。
   3. **degraded 配信**: LLM 全滅でタイトルのみ配信した場合、ヘッダに明記(別通知は出さない)。
 - レート制限: 同一種別は1日1通まで(通知疲れで watchdog が無視される事態を防ぐ)。
 - 通知自体の失敗(Telegram 障害)はログ記録のみで諦める。フォールバック通知経路は作らない(拡張点)。
 
 ## 5. バックアップ
 
-- 対象: SQLite 本体、`~/.config/intel/`(config.toml・.env・関心プロファイル)、`prompts/`(git 管理だが世代の一貫性のため同梱)。
+- 対象: SQLite 本体、`~/.config/intel/` の全体(config.toml・.env・関心プロファイル、X の OAuth 2.0 を使うなら `x-oauth2-token.json`)、`prompts/`(git 管理だが世代の一貫性のため同梱)。
 - 方式: 朝バッチ末尾で `sqlite3 ... ".backup"`(オンラインバックアップ API。ファイルコピーは WAL 破損リスクがあるため不可)→ 設定類と併せ tar.gz、`~/Backups/intel/` に **日次14世代**。
-- **secrets 拡散防止**: tar.gz は作成時に **umask/chmod 600 を強制**する(.env の X API キー・bot token・Anthropic キーが同梱されるため、.env 本体の 600 と同水準を複製側にも要求)。`~/Backups/intel/` は **クラウド同期(iCloud 等)の対象外に置く**(Time Machine 込みの扱いはユーザー判断だが、同期経由の secrets 拡散を既定で作らない)。パーミッションは doctor #10 が検査。
+- **secrets 拡散防止**: tar.gz は作成時に **umask/chmod 600 を強制**する(.env の X API キー・bot token・Anthropic キーと X の OAuth 2.0 token が同梱されるため、.env 本体の 600 と同水準を複製側にも要求)。`~/Backups/intel/` は **クラウド同期(iCloud 等)の対象外に置く**(Time Machine 込みの扱いはユーザー判断だが、同期経由の secrets 拡散を既定で作らない)。パーミッションは doctor #10 が検査。
 - 復旧手順: tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外(SQLite が正本で、export/obsidian.py で再生成可能)。
 - リモート退避(Time Machine 外のクラウド等)は拡張点に留める。
 
@@ -82,8 +82,10 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ## 7. 月次コストレポート
 
-- 毎月1日の朝バッチ末尾で前月分を集計し、ダイジェストとは別メッセージで Telegram 配信: X 読取件数×実測単価 / LLM 推定コスト(analyses.estimated_cost 合算)とサブスク・クォータ消費率メモ / 合計と $30 比・超過時の推奨日次上限(逆算値)。
-- 集計クエリは `intel doctor --cost` でいつでも単発実行可(判定材料の随時確認用)。X の課金メーター実測値との突合は月次の手動作業とする(API で取れる保証がないため自動化しない)。
+> **現状(未実装。plan #25)**: 月次レポートの Telegram 配信はまだ無い。今あるのは**当月**の実績と着地見込みの集計だけで、doctor #9 と `intel doctor --cost` が出す(`app/doctor.py` の `month_cost_summary`)。以下は実装するときの設計。
+
+- 毎月1日の朝バッチ末尾で前月分を集計し、ダイジェストとは別メッセージで Telegram 配信: X 読取件数×実測単価 / LLM 推定コスト(`analyses.estimated_cost_usd` の合算)とサブスク・クォータ消費率メモ / 合計と $30 比・超過時の推奨日次上限(逆算値)。
+- 当月の集計は `intel doctor --cost` でいつでも単発実行できる(判定材料の随時確認用。前月分の集計は月次レポートとともに実装する)。X の課金メーター実測値との突合は月次の手動作業とする(API で取れる保証がないため自動化しない)。
 
 ## 8. リトライ / タイムアウト規約(全コンポーネント共通)
 
@@ -92,7 +94,8 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 経路 | timeout | リトライ | 備考 |
 |---|---|---|---|
 | HTTP 取得(RSS・本文・X) | connect 10s / read 30s | 2回、指数バックオフ(1s→4s)+ jitter | 429 は Retry-After 尊重。恒久 4xx はリトライしない |
-| LLM `complete_structured` | 120s/呼 | 同一エンジン1回(失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。なお失敗は degraded 直行(エンジンフォールバックは拡張点。設計 00 §5) |
+| LLM `complete_structured`(analyze・トレンド) | 120s/呼 | 同一エンジン1回(失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。なお失敗は degraded 直行(エンジンフォールバックは拡張点。設計 00 §5) |
+| LLM `complete_structured`(深掘りの調査段・対訳・質問への返事) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回 | 調査段はアイテム単位で隔離し、失敗は段の失敗として朝バッチ失敗通知に載せる。返事は作れなければ失敗の知らせをリプライで送る(GH#126) |
 | Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |
 

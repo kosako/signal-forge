@@ -9,7 +9,7 @@
                     │ Mac mini(launchd 管理・ローカルファースト)      │
                     │                                             │
  [X API]──────────▶ │ ■ 朝バッチ  intel run(StartCalendarInterval) │
- [RSS 5〜10本]─────▶ │   collect → extract → analyze → digest      │
+ [RSS 5〜10本]─────▶ │   collect → extract → analyze → digest …(§2)│
                     │      │        │         │         │         │
                     │   sources   documents  analyses  digests    │
                     │   items ────────┴─────────┴─────────┘        │
@@ -19,13 +19,13 @@
                     │                                             │
  [Telegram 更新]───▶ │ ■ 受信デーモン  intel poll                    │
   (ボタン/URL/       │   (KeepAlive 常駐・long polling)             │
-   夜アンケート)      │   → signals / items(manual) に記録            │
+   夜アンケート)      │   → signals / items(manual) / 感想 / 深掘り  │
                     │   内蔵タイマー: 夜アンケート送信・watchdog      │
                     └─────────────────────────────────────────────┘
 ```
 
 - SQLite が唯一の正本。Obsidian は export 先であり DB にしない(理由: 正本の分裂が plan-c 不採用の主因であり、同じ轍を踏まない)。
-- 外部との接続は「X API・RSS の読み取り」「Telegram の送受信(long polling)」「Vault へのファイル書き込み」の3種のみ。受信ポートは一切開けない(理由: 自宅常設機に外部公開面を作らない)。
+- 外部との接続は「X API の読み取り(OAuth 2.0 の認可を含む)」「RSS と記事本文の取得(extract)」「LLM CLI(`codex exec` が自分の API に接続する)」「Telegram の送受信(long polling)」「Vault へのファイル書き込み」に限る。外部に公開する受信ポートは開けない(理由: 自宅常設機に外部公開面を作らない)。例外は `intel x-auth` の認可の間だけ 127.0.0.1 に開く一時的なコールバック受信で、外部には公開しない(設計 02 §2)。
 
 ## 2. プロセスモデル
 
@@ -43,34 +43,51 @@
 ### 2プロセスの責務分離
 
 - **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ dig(深掘り調査。`[dig].daily_cap > 0` のときのみ。GH#105 / 設計 06)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。dig を deliver の後に置く理由: ダイジェスト配信を深掘り生成(分オーダー)で遅らせない。purge より前に置く理由: X 由来 documents の TTL 失効前に本文を材料に使う。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
-- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録 (4) 深掘りカード・その返事へのリプライ → 感想として記録し、質問として台帳に積んで `intel answer` を別プロセスで起動(返事の送信は子が行う。LLM の待ちで受信を止めないため。GH#126 / 設計 05 §1.2)。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
+- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録 (4) 深掘りカード・その返事へのリプライ → 感想として記録し、質問として台帳に積んで `intel answer` を別プロセスで起動(返事の送信は子が行う。LLM の待ちで受信を止めないため。GH#126 / 設計 05 §1.2) (5) ダイジェストの記事メッセージ・ヘッダへのリプライ → 感想として item_notes / digest_notes に記録(GH#92 / GH#96) (6) 未消化一覧へのリプライ → 深掘りの指定として dig_queue を更新(GH#104 / 設計 06 §2)。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
 
 ## 3. モジュール構成と依存方向
 
 ```text
 app/
-  cli.py          # Typer。intel collect/extract/analyze/digest/deliver/dig/poll/run/doctor
+  cli.py          # Typer。intel collect/extract/analyze/digest/deliver/dig/answer/poll/run/doctor
+                  #   と x-auth(X OAuth 2.0 の認可)/ x-signals(興味シグナルの取込)/ x-insights(週次インサイト)
                   #   poll = 受信デーモン(long polling 常駐+内蔵タイマー)
+                  #   answer = 深掘りカードへの質問に答える(通常は poller が起動。GH#126)
                   #   doctor は --purge(期限切れ削除の単独実行)/ --cost(コスト集計の単発表示)を持つ
+  run.py          # 朝バッチの段を直列に実行する(§2。段の失敗の局所化・失敗通知)
+  collect.py      # collect 段(全ソースから items を取り込む。カーソル・冪等。設計 02 §1)
+  purge.py        # purge 段(期限切れ本文の削除。設計 01 §6)
+  backup.py       # backup 段(日次バックアップ。設計 05 §5)
+  doctor.py       # intel doctor の検査(設計 05 §2)
   config.py       # config.toml + .env の読込・検証(Pydantic Settings 相当の薄い自前)
   db.py           # sqlite3 接続・migrations/ 適用ランナー・薄いリポジトリ層
   models.py       # sources/items/documents/analyses/signals/digests の dataclass/Pydantic
-  connectors/     # x.py(ホームTL + XRouter), x_search.py(AI 検索), x_oauth2.py(OAuth2 PKCE・S1), x_signals.py(興味シグナル取込・S1b), rss.py
-  insights.py     # X 興味シグナルの週次インサイト(読取専用・S1c)
+  http.py         # 共通 HTTP(SSRF ガード・接続先のピン留め。設計 05 §8)
+  normalize.py    # canonical_url の正規化(u1)と content_hash(h1)。設計 01 §4〜5
+  logs.py         # JSON Lines のログ(設計 05 §3)
+  connectors/     # base.py(Connector の型)、x.py(ホームTL + XRouter)、x_search.py(AI 検索)、
+                  #   x_oauth2.py(OAuth2 PKCE・S1)、x_signals.py(興味シグナル取込・S1b)、rss.py
                   #   — items を produce(カーソル・冪等)
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
+  insights.py     # X 興味シグナルの週次インサイト(読取専用・S1c)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
-  analysis/       # llm.py(LLMEngine 抽象層)+ analyzer.py — analyses を produce
+  analysis/       # llm.py(LLMEngine 抽象層)、stage1.py(事前選別)、analyzer.py(本分析)、
+                  #   trend.py(今日の全体トレンド)、profile.py(関心プロファイルの読込)— analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
   digest/         # digests(日本語 Markdown)を produce
   delivery/       # telegram.py(Bot API 直叩き・配信)、poller.py(受信デーモン)、
-                  #   surveys.py(夜アンケート・watchdog・失敗通知)、state.py(telegram_state KV)
+                  #   surveys.py(夜アンケート・watchdog・失敗通知)、state.py(telegram_state KV)、
+                  #   answer_worker.py(poller から intel answer を起動する。GH#126)
   dig.py          # 深掘りキュー(夜の入口。GH#104。poller から import — 軽量に保つ)
   deepdive.py     # 朝の調査段(GH#105。DeepDive ノート生成 + 概要カード。設計 06 §4〜5)
-  export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し
+  dig_answer.py   # カードへの質問への返事(GH#126。操作面に依存しない。ADR 0005)
+  dig_take.py     # カードへのリプライのうち take を解説ノートと followup_dig に記録する(GH#106)
+  export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し(DeepDive/ への書き出しも
+                  #   同じ atomic_write を使う。DeepDive ノートの中身は deepdive.py が作る)
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
-prompts/          # バージョン付き .md(analyses.prompt_ver で追跡)
+prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer。
+                  #   analyses は prompt_version 列で追跡し、ほかは各モジュールの PROMPT_VERSION 定数)
 tests/
 ```
 
@@ -85,7 +102,7 @@ tests/
 - **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 読取上限(ホームTL `x.daily_read_cap`・検索 `x_search.daily_read_cap`・合算の単一ノブ `x.combined_daily_read_cap`。ADR 0001)、検索スロット `x_search.slots`(最大3・入れ替え式)、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、深掘り調査段 `[dig]`(日次上限 `daily_cap` 既定2・0=無効、解説生成の `reasoning_effort`、LLM 1呼び出しの `timeout_s`、本文入力上限 `body_max_chars` / 対訳上限 `translation_max_chars`、材料不足しきい値 `min_body_chars`。GH#105 / 設計 06 §3〜4。カードへの質問への返事の effort `answer_reasoning_effort` 既定 low・材料に渡す原文/対訳ノートの上限 `answer_source_max_chars`・1 日に受け付ける質問の上限 `answer_daily_cap` 既定 20(0 = 返事をしない)。GH#126)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
 - **secrets**: `~/.config/intel/.env`(chmod 600)に X API キー・Telegram bot token。launchd の plist には secrets を書かない(plist は誰でも読めるため)。
 - **ANTHROPIC_API_KEY は launchd 実行環境に載せない**(理由: claude -p が API 課金へ無自覚フォールバックするのを設定で遮断)。API エンジンを明示使用する場合のみ .env に別名キーで持ち、AnthropicApiEngine 内でだけ環境へ渡す。
-- `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コスト見込みとクォータ消費率。
+- `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コストの実績と着地見込み(全項目は設計 05 §2)。
 
 ## 5. LLM 抽象層
 
@@ -102,7 +119,7 @@ class LLMEngine(Protocol):
   1. `claude -p` は**専用の設定分離**で起動する: `--setting-sources ""` で user/project/local 設定(CLAUDE.md・settings.json)を読み込ませず、`--disallowedTools "*"` + `--strict-mcp-config`(MCP 空指定)でツールを全遮断する。**専用 CONFIG DIR/HOME 分離は使わない**(実測 2026-07-06、Issue #3: CONFIG DIR を分けると認証も分離され Not logged in で不成立)。出力は ```json フェンス付きで返るため、スキーマ検証前にフェンス除去を行う。
   2. `codex exec` は**作業ディレクトリを空の専用ディレクトリに固定**し、ネットワーク遮断サンドボックスで起動する(read-only でもファイル読み取りは可能なため、`.env`・SSH 鍵等が summary 経由で出力に流出する経路を作業ディレクトリ隔離で塞ぐ)。**認証は使い捨て CODEX_HOME(auth.json symlink のみ)で最小限見せる**が、read-only sandbox は同居する auth.json を summary 経由で流出させうる(Issue #54 で実測。symlink 経由の実体読取・絶対パス直読みを含む)。これを **permission profile の deny-read** で塞ぐ: `-s read-only` の代わりに `default_permissions` で名前付き profile を選び(`-s` を明示すると profile の filesystem deny が無視される・実測)、`[permissions.<name>].filesystem` に write を一切与えず network を空にして read-only 相当の隔離を保ったまま、**CODEX_HOME と実 `~/.codex` の読取を deny** する。codex 自身の auth 読取は sandbox 外で行われるため認証は維持される。
   2b. `codex exec` の既定で有効な、外へ届く・実行するツールの機能(アカウント側の接続サービス・Web・ブラウザ・画像生成・shell・コード実行・サブエージェント等)を `--disable` で機能ごと外し、Web 検索も `web_search="disabled"` にする(GH#129)。接続サービスや Web のツールは sandbox の外で動くため、2 の書込・network 遮断では止まらない(2026-10-18 に実測。無効化前は多数のツールが見えていた)。`--strict-config` の下で未知の feature 名は起動エラーになる(黙って無視されない)。codex が起動引数を拒否したとき(版の不一致)は環境障害(`LLMUnavailableError`)として扱い、記事を degraded で進めない(GH#74 と同じ扱い)。
-  3. doctor の推論専用モード検査は設定値の確認でなく**動的検査**とする: 実際にツール呼び出し・ファイル読み取りを試みるプロンプトを流し、拒否されることを確認する(設計 05 §2 #6)。
+  3. doctor の推論専用モード検査は設定値の確認でなく**動的検査**とする: 隔離が効いているかを canary で確かめる 3 つの検査(HOME の隔離・ネットワーク遮断・CODEX_HOME の隔離)。read-only の sandbox は読み取りを許すので、「読み取りを試みて拒否されることを確認する」方式は成り立たない(実測。Issue #3)。詳細は設計 05 §2 #6。
   4. プロンプトは **argv でなく stdin 渡し**(ps でのプロンプト露出防止と、シェル解釈の事故防止を兼ねる)。
 - **呼び出し規約**: 1呼び出し10〜20件のバッチ判定。subprocess 実行、timeout 120s。出力は Pydantic でスキーマ検証(フィールド allowlist・スコア値域・理由の長さ上限)。
 - **失敗時**: 検証失敗またはタイムアウト → 同一エンジンで1リトライ(失敗はチャンク単位に局所化し、該当チャンクのみ再実行)→ なお失敗ならタイトルのみの degraded ダイジェストへ直行(理由: 無配信より劣化配信。黙って止まらない)。エンジンフォールバックは複数エンジン導入時の拡張点。**例外(GH#74)**: 環境障害(エンジン起動不能・認証不在 = `LLMUnavailableError`)はリトライ・degraded で回復しないため、per-chunk で握らず analyze 段の失敗として raise する(silent full-degradation 防止。#72 の実障害)。
