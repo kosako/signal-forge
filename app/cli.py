@@ -123,7 +123,7 @@ def digest(
     from app.config import load_config
     from app.db import apply_migrations, connect
     from app.digest import generate_digest
-    from app.digest.builder import today_jst
+    from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
@@ -150,7 +150,7 @@ def deliver(
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.delivery import create_api, deliver_digest
-    from app.digest.builder import today_jst
+    from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)

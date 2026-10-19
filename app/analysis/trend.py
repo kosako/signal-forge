@@ -13,18 +13,16 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import secrets
 import sqlite3
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from app.analysis.analyzer import sanitize
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
-
-JST = timezone(timedelta(hours=9))
+from app.jst import JST
+from app.prompting import fill_template, sanitize
 
 PROMPT_VERSION = "trend-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
@@ -143,8 +141,7 @@ def _build_prompt(rows: list[sqlite3.Row], nonce: str) -> str:
         "schema": json.dumps(TrendSummary.model_json_schema(), ensure_ascii=False),
         "nonce": nonce,
     }
-    # 単一パス置換(入力由来の {{...}} を展開しない。analyzer と同方針)
-    return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)
+    return fill_template(template, mapping)
 
 
 def _render(result: TrendSummary, valid_ids: set[int]) -> str:

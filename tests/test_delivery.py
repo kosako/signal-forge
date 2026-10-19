@@ -10,7 +10,7 @@ from app.config import Config, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, create_api, deliver_digest
 from app.delivery.telegram import ITEM_TEXT_MAX_CHARS, escape_attr, escape_text
-from app.digest.builder import today_jst
+from app.jst import today_jst
 
 logger = logging.getLogger("test-delivery")
 

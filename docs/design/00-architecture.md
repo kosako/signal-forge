@@ -66,6 +66,9 @@ app/
   http.py         # 共通 HTTP(SSRF ガード・接続先のピン留め。設計 05 §8)
   normalize.py    # canonical_url の正規化(u1)と content_hash(h1)。設計 01 §4〜5
   logs.py         # JSON Lines のログ(設計 05 §3)
+  jst.py          # 日本時間(JST)と今日の暦日(複数の段が使う。GH#113)
+  prompting.py    # プロンプトの sanitize と単一パスのテンプレート置換(分析・トレンド・深掘り・
+                  #   返事が共通に使う。設計 03 §3.2・GH#113)
   connectors/     # base.py(Connector の型)、x.py(ホームTL + XRouter)、x_search.py(AI 検索)、
                   #   x_oauth2.py(OAuth2 PKCE・S1)、x_signals.py(興味シグナル取込・S1b)、rss.py
                   #   — items を produce(カーソル・冪等)
@@ -93,7 +96,15 @@ tests/
 
 依存方向の規則(理由: 差し替え点を外周に置き、正本ロジックを守る):
 
-- `cli.py` → 各処理モジュール → `db.py`/`models.py`/`config.py` の一方向のみ。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。
+- `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`prompting.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
+- 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
+  - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う
+  - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)
+  - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
+  - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
+  - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)
+  - ソースの失敗の知らせ(`collect.py` の `source_failure_alerts`)を、doctor と watchdog(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む
+  - `doctor.py` は検査のために各段を読む
 - 外部 I/O(httpx・feedparser・trafilatura・LLM CLI)は connectors/extraction/analysis/delivery の内側に閉じ込め、models の語彙(items, documents, …)に変換してから外へ出す。
 - パイプラインはソース非依存: connectors が items さえ作れば、X を止めても RSS+手動 URL だけで全段が動く(撤退・縮退シナリオの前提)。
 

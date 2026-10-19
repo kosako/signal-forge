@@ -34,13 +34,12 @@ import secrets
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
-from app.analysis.analyzer import sanitize, sanitize_body
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
@@ -51,8 +50,8 @@ from app.delivery.telegram import (
     escape_text,
 )
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
-
-JST = timezone(timedelta(hours=9))
+from app.jst import JST
+from app.prompting import fill_template, sanitize, sanitize_body
 
 PROMPT_VERSION = "dig-v001"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
@@ -492,7 +491,7 @@ def build_dig_prompt(
     else:
         quote_policy = "引用は必要な範囲で可(出典を明示)。"
 
-    return _fill_template(
+    return fill_template(
         template,
         {
             "brief": brief,
@@ -505,11 +504,6 @@ def build_dig_prompt(
             "nonce": nonce,
         },
     )
-
-
-def _fill_template(template: str, mapping: dict[str, str]) -> str:
-    """単一パス置換(analyzer と同じ規約。入力由来の {{nonce}} 等を再展開しない)。"""
-    return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)
 
 
 def _translate_body(
@@ -526,7 +520,7 @@ def _translate_body(
     parts: list[str] = []
     for index, chunk in enumerate(chunks, start=1):
         nonce = secrets.token_hex(4)
-        prompt = _fill_template(
+        prompt = fill_template(
             template,
             {
                 "part": f"{index}/{len(chunks)}",

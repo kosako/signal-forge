@@ -38,13 +38,13 @@ import sqlite3
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from app.collect import RAW_CONTENT_MAX_CHARS
 from app.config import X_SIGNALS_MIN_PAGE, Config
 from app.connectors.base import FatalError
 from app.connectors.x import raise_for_auth, rate_limit_exhausted, tweet_full_text
 from app.connectors.x_oauth2 import USERS_ME_URL, XOAuth2Error, XOAuth2Session
 from app.db import insert_item_with_dedup
 from app.dig import enqueue_bookmark
+from app.models import RAW_CONTENT_MAX_CHARS
 from app.normalize import (
     UrlError,
     content_hash,

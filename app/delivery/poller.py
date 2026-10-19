@@ -42,7 +42,7 @@ from app.delivery.surveys import (
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
-from app.digest.builder import JST
+from app.jst import JST
 from app.normalize import (
     content_hash,
     is_dedup_eligible,

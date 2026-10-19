@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import secrets
 import sqlite3
 from collections.abc import Callable
@@ -24,10 +23,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.analysis.analyzer import sanitize_body
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
+from app.prompting import fill_template, sanitize_body
 
 PROMPT_VERSION = "dig-answer-v001"
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -244,7 +243,7 @@ def build_answer_prompt(conn: sqlite3.Connection, config: Config, row: sqlite3.R
     template = (_PROMPTS_DIR / f"{PROMPT_VERSION}.md").read_text(encoding="utf-8")
     profile = load_interest_profile(config.profile_path).body
     question = sanitize_body(row["question"], nonce)[:QUESTION_MAX_CHARS]
-    return _fill_template(
+    return fill_template(
         template,
         {
             "interest_profile": profile,
@@ -360,8 +359,3 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n(…以降は長さ上限で切り詰め)"
-
-
-def _fill_template(template: str, mapping: dict[str, str]) -> str:
-    """単一パス置換(調査段と同じ規約。入力由来の {{nonce}} 等を再展開しない)。"""
-    return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)

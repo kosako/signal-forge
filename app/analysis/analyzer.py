@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import secrets
 import sqlite3
 from pathlib import Path
@@ -25,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from app.analysis.llm import LLMEngine, LLMError, LLMUnavailableError, complete_with_retry
 from app.config import Config
+from app.prompting import fill_template, sanitize, sanitize_body
 
 PROMPT_VERSION = "analyze-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
@@ -35,8 +35,6 @@ RECENT_DAYS = 14
 MAX_TITLE = 300
 MAX_AUTHOR = 100
 MAX_SOURCE = 100
-
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class ItemAnalysis(BaseModel):
@@ -223,17 +221,7 @@ def build_prompt(
         "schema": json.dumps(AnalysisBatch.model_json_schema(), ensure_ascii=False),
         "nonce": nonce,
     }
-    # 単一パス置換: テンプレート上のプレースホルダだけを置き換え、置換後の値は再走査
-    # しない(逐次 .replace() だと入力由来の {{nonce}} 等が展開され nonce が漏れる)
-    return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)
-
-
-def sanitize(value: str | None, max_length: int, nonce: str) -> str:
-    """改行・制御文字の除去(1行強制)→ nonce 除去 → 長さ上限(設計 03 §3.2)。"""
-    if not value:
-        return ""
-    flattened = _CONTROL_CHARS.sub(" ", value.replace("\n", " ").replace("\r", " "))
-    return flattened.replace(nonce, "")[:max_length]
+    return fill_template(template, mapping)
 
 
 def _item_block(row: sqlite3.Row, nonce: str, body_max_chars: int) -> str:
@@ -256,14 +244,6 @@ def _item_block(row: sqlite3.Row, nonce: str, body_max_chars: int) -> str:
         f"DATA-{nonce}>>>\n"
         "</item>"
     )
-
-
-def sanitize_body(value: str, nonce: str) -> str:
-    """body は改行を保持し、制御文字(改行以外)・nonce・フェンス境界を除去する。"""
-    cleaned = re.sub(r"[\x00-\x09\x0b-\x1f\x7f]", " ", value)
-    cleaned = cleaned.replace(nonce, "")
-    # フェンス境界の偽装文字列も除去(nonce 除去で実質無効化されるが、生の境界形も落とす)
-    return cleaned.replace("<<<DATA-", "").replace("DATA-", "")
 
 
 def _recent_titles(conn: sqlite3.Connection) -> list[str]:

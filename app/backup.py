@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from app.config import Config
-from app.digest.builder import today_jst
+from app.jst import today_jst
 
 GENERATIONS = 14
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"

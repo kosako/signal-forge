@@ -17,7 +17,7 @@ from collections.abc import Callable
 
 from app.connectors.base import Connector, FatalError, RawItem, RetryableError
 from app.db import insert_item_with_dedup
-from app.models import Source
+from app.models import RAW_CONTENT_MAX_CHARS, Source
 from app.normalize import (
     UrlError,
     content_hash,
@@ -25,8 +25,6 @@ from app.normalize import (
     normalize_text_for_hash,
     normalize_url,
 )
-
-RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
 
 # consecutive_failures がこの回数に達したら人に知らせる(設計 02 §2・§3)。
 # X = doctor #14 と watchdog / RSS = doctor #14 のみ(一時障害が多く約1週間で「死亡疑い」)

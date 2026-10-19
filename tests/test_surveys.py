@@ -17,7 +17,7 @@ from app.delivery.surveys import (
     STATE_WATCHDOG_NOTIFIED,
 )
 from app.delivery.telegram import DeliveryError
-from app.digest.builder import JST, today_jst
+from app.jst import JST, today_jst
 from tests.test_delivery import add_digest, add_item
 from tests.test_poller import CHAT_ID, FakeApi, make_callback_update, make_config
 

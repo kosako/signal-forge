@@ -227,7 +227,7 @@ repo 固有の決まり:
 
 | パス | 役割 |
 |---|---|
-| `app/` | 本体。朝バッチの段の実体(`collect.py`・`purge.py`・`backup.py`)と直列実行(`run.py`)、検査(`doctor.py`)、CLI(`cli.py`)、設定(`config.py`)、DB と migration のランナー(`db.py`)、共通部品(`http.py`・`logs.py`・`models.py`・`normalize.py`)、X シグナルのインサイト(`insights.py`) |
+| `app/` | 本体。朝バッチの段の実体(`collect.py`・`purge.py`・`backup.py`)と直列実行(`run.py`)、検査(`doctor.py`)、CLI(`cli.py`)、設定(`config.py`)、DB と migration のランナー(`db.py`)、共通部品(`http.py`・`jst.py`・`logs.py`・`models.py`・`normalize.py`・`prompting.py`)、X シグナルのインサイト(`insights.py`) |
 | `app/connectors/` | ソースのコネクタ。RSS と X(ホーム TL・検索・OAuth 2.0・興味シグナル) |
 | `app/extraction/` | 記事の本文抽出 |
 | `app/analysis/` | LLM の抽象層、事前選別(Stage 1)、本分析(Stage 2)、トレンドまとめ、関心プロファイルの読み込み |
