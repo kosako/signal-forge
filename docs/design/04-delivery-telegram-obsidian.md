@@ -25,7 +25,7 @@
 ```
 
 - **見出しの言語**: `{タイトル}` は **analyses.title_ja(日本語見出し。analyze-v002)優先・NULL(v001 世代 / degraded)は items.title に fallback**。追い掛け(🔖 深掘りした?)の引用タイトルも同じ規則(設計 01 §3 / 03 §3.3)。
-- **長さ制限**: Telegram は1通4096字だが、安全側で **1通1000字(概算)を上限**にし、超過分は要約末尾を `…` で切り詰める(タイトル・URL・示唆は削らない)— 制限は要約で吸収するのが読みやすさを壊さない。
+- **長さ制限**: Telegram は1通4096字だが、安全側で **1通1000字(概算)を上限**にし、超過分は要約末尾を `…` で切り詰める(URL・示唆は削らない。タイトルは 300 字で切る = 実質ほぼ削らない)— 制限は要約で吸収するのが読みやすさを壊さない。
 - 各アイテムに InlineKeyboard 1行4ボタン: `👍 価値あり / 🔖 深掘り / ✅ 既知 / 👎 不要`。
 - 文体例(1件分、日本語ダイジェストのトーンの正):
 
@@ -60,7 +60,7 @@
 
 - デーモンは owner からの**平文メッセージ中の http/https URL をすべて抽出**し、`sources`(type=manual)経由で `items` に投入。既存 URL(**canonical_url 一致のみ。**content_hash は使わない — manual は本文が無く空ハッシュになるため。01 §5〜6 / 02 §4)は再投入せず「投入済み」と返信。
 - 応答例: `✅ 1件受け付けました。明朝のダイジェストで分析します`。URL を含まないメッセージには `URL を送ると翌朝のダイジェスト候補になります` と定型応答(コマンド体系は作らない — MVP の操作は URL 投入だけで足りる)。
-- **感想キャプチャ(GH#92 / GH#96)**: メッセージが digest の**記事メッセージへのリプライ**(`reply_to_message.message_id` が `digest_messages` の item 行に一致)なら `item_notes`、**ヘッダメッセージへのリプライ**(item_id IS NULL 行に一致)なら `digest_notes` に記録して ack。この経路では URL 抽出をしない(感想内の URL は感想の一部)。未消化一覧へのリプライは深掘り指定(GH#104。`dig_backlog_messages` 台帳で認識)。追い掛け等**台帳に無いメッセージへのリプライ・非リプライは従来の URL 投入フロー**。KPI(reaction)には記帳しない。Obsidian への投影は朝バッチ export(§7。記事感想 = Items ノート / 日次感想 = Daily ノート)。
+- **感想キャプチャ(GH#92 / GH#96)**: メッセージが digest の**記事メッセージへのリプライ**(`reply_to_message.message_id` が `digest_messages` の item 行に一致)なら `item_notes`、**ヘッダメッセージへのリプライ**(item_id IS NULL 行に一致)なら `digest_notes` に記録して ack。この経路では URL 抽出をしない(感想内の URL は感想の一部)。未消化一覧へのリプライは深掘り指定(GH#104。`dig_backlog_messages` 台帳で認識)。深掘りカード・その返事へのリプライは、感想(item_notes)として記録したうえで質問として `dig_questions` に積む(設計 06 §6・05 §1.2)。これらのリプライの振り分けは owner の DM(`owner_chat_id`)のメッセージだけ。追い掛け等**台帳に無いメッセージへのリプライ・非リプライは従来の URL 投入フロー**。KPI(reaction)には記帳しない。Obsidian への投影は朝バッチ export(§7。記事感想 = Items ノート / 日次感想 = Daily ノート)。Items ノートへ投影されるのは、digest に記事メッセージとして載った item の感想だけ(export が `digest_messages` の記事の行を手がかりにするため)。🔖 保存節にだけ載った X ブックマークや、digest に載っていない item への感想(深掘りカードへのリプライなど)は `item_notes` に残るが、ノートには出ない(take は解説ノートに追記される。設計 06 §6)。
 
 ## 6. 認可
 
@@ -73,7 +73,7 @@
 - **ディレクトリ**: `{vault}/{folder}/Daily/` と `{vault}/{folder}/Items/`。
 - **ファイル名規則**:
   - Daily: `YYYY-MM-DD.md`(digest 生成日)
-  - Items: `YYYYMMDD-{item_id}-{slug}.md`。slug は**原文タイトル(items.title)**から Obsidian 禁止文字(`/\:*?"<>|#^[]`)を除去し40字で切る(title_ja 導入後もファイル名規則は不変。frontmatter の `title` のみ title_ja 優先)。item_id を含めるので slug 衝突は無害(一意性は id が担保)。
+  - Items: `YYYYMMDD-{item_id}-{slug}.md`。slug は**原文タイトル(items.title)**の Obsidian 禁止文字(`/\:*?"<>|#^[]`)と空白の連続を `-` に置き換え、両端の `-` を落として 40 字で切る(title_ja 導入後もファイル名規則は不変。frontmatter の `title` のみ title_ja 優先)。item_id を含めるので slug 衝突は無害(一意性は id が担保)。
 - **Daily ノート**: frontmatter(`date`, `item_count`, `degraded`)+ digest Markdown 全文。各アイテムから `[[YYYYMMDD-{id}-{slug}]]` で Items へ wikilink。🔖 保存節の item(GH#99 = `digests.bookmark_item_ids`)も配信 item と同様に Items ノート化し wikilink に載せる(=「保存」の実体。順序は配信順 → 保存順)。
 - **Items ノート**の構造:
 
@@ -115,5 +115,5 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 ## 8. 他コンポーネントとの境界
 
 - 入力: `digest` コンポーネントが `digests` 行(Markdown + item_ids)を確定してから本層を呼ぶ。本層は選別・要約に関与しない。
-- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `item_notes`・`digest_notes`(感想。GH#92/#96)/ `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
-- 失敗時: 配信失敗・Vault 書込失敗は watchdog(設計 05 想定)への通知対象。本層は例外を握りつぶさず終了コードで返す。
+- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `item_notes`・`digest_notes`(感想。GH#92/#96)/ `dig_backlog_messages`・`dig_queue`(深掘りの指定。GH#104)/ `dig_questions`(カードへの質問。GH#126)/ `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
+- 失敗時: 配信失敗・Vault 書込失敗は設計 05 §4 の失敗通知で知らせる(朝バッチの段の失敗 = 朝バッチ失敗通知。watchdog が見るのはダイジェストの未生成・未配信と X ソースの連続失敗だけで、Vault 書込失敗は見ない)。本層は例外を握りつぶさず終了コードで返す。
