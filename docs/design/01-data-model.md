@@ -20,8 +20,13 @@ sources 1 ──< items ──1 documents              (本文キャッシュ、
                 │ ├──< analyses                (LLM分析。再分析で複数行)
                 │ ├──< signals                 (kind='reaction'/'followup_dig' は item_id 必須)
                 │ ├──< item_notes              (感想 = Telegram リプライ。恒久保存。GH#92)
+                │ ├──1 dig_queue               (深掘りキュー。GH#104)
+                │ ├──< dig_results ──< dig_questions (深掘りの実行結果 / カードへの質問と返事。GH#105・#126)
                 │ └── dup_of_item_id ──> items (自己参照: 24h dedup の親)
 signals(kind='survey_*') … item_id NULL(日単位の回答)
+x_signals ──> items(item_id NULL 可)          (X の興味シグナル。🔖 だけ items に紐付く。GH#58・#99)
+x_signal_cursors / x_signal_runs               (シグナル取込のカーソル / 読取の実行ログ)
+dig_backlog_messages                           (未消化一覧の message_id 台帳。GH#104)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
@@ -31,7 +36,9 @@ schema_migrations                              (マイグレーション台帳�
 
 digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定専用の台帳(設計 04 §2)。
 
-## 3. DDL(migrations/001_init.sql)
+## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006 の追加)
+
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表)は §7・§8 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -103,11 +110,11 @@ CREATE TABLE analyses (
   degraded              INTEGER NOT NULL DEFAULT 0 CHECK (degraded IN (0,1)),  -- タイトルのみ分析
   engine                TEXT    NOT NULL CHECK (engine IN ('codex-cli','claude-cli','anthropic-api')),
   model                 TEXT    NOT NULL,
-  prompt_version        TEXT    NOT NULL,   -- prompts/ のファイル名に対応(例 'rank-v3')
+  prompt_version        TEXT    NOT NULL,   -- prompts/ のファイル名に対応(例 'analyze-v002')
   input_hash            TEXT    NOT NULL,   -- 実際にLLMへ渡した入力の sha256
   input_tokens          INTEGER,
   output_tokens         INTEGER,
-  estimated_cost_usd    REAL    NOT NULL DEFAULT 0,  -- サブスク枠実行時は 0(クォータは doctor で別掲)
+  estimated_cost_usd    REAL    NOT NULL DEFAULT 0,  -- サブスク枠実行時は 0
   analyzed_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   title_ja              TEXT                          -- 日本語見出し(002 で追加のため末尾列。
                                                       -- NULL = v001 世代 / degraded。表示側は
@@ -215,7 +222,7 @@ CREATE INDEX ix_digest_notes_pending ON digest_notes(digest_id) WHERE exported_a
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)の9つ。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。§7)の 12。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -280,7 +287,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 
 - `documents.expires_at` は**挿入時に確定**する: RSS/manual は `extracted_at + cache_ttl_days`(config、既定 30 日)、X 由来は `x_cache_ttl_days`(**7 日で確定。Day 0 の Developer Agreement 確認(2026-07-06、Issue #2)より: 規約に一律の保存期間上限は存在せず、義務は「X 側の削除・変更との同期」。TTL 7日は削除・非公開化が最長7日で自動的にキャッシュから消える同期実装として妥当**)。理由: purge 側が `expires_at <= now` の比較だけで済み、ソース種別の分岐を持たない。
 - **削除リクエストの即時対応(Developer Agreement IV.B)**: X または投稿者から特定コンテンツの削除要求を受けたら **24時間以内**に消す義務がある(TTL では代替できない)。MVP は手動対応で、手順は本節に完結させる: 該当 item の `documents` 行 DELETE + `raw_payload` NULL 化 + Obsidian ノートの削除(X 由来は本文を置かないためメタのみ)。個人用途で発生確率は低く、専用コマンドは作らない。
-- 削除ジョブは `intel run` の backup の直前の段(段の順序の正本は設計 00 §2。単独実行は `intel doctor --purge` 相当のサブコマンドでも可):
+- 削除ジョブは `intel run` の backup の直前の段(段の順序の正本は設計 00 §2。単独実行は `intel doctor --purge`):
   1. `DELETE FROM documents WHERE expires_at <= now`
   2. `raw_payload` の NULL 化は **documents から独立して**行う: `items.fetched_at + TTL <= now` の**全行**(documents の有無・status を問わない。duplicate・skipped・抽出未実行の行も対象)の `raw_payload` を NULL 化。TTL はソース別(X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days`)。理由: documents.expires_at 起点にすると documents 行を持たない items が purge から漏れる。特に X は full_text の無期限残存が本文非保持ポリシー違反になる(恒久保存は `analyses.summary` + メタ + URL のみ)。TTL 超過残存は doctor #11 が検査する(設計 05 §2)
   3. 削除行と `raw_payload` NULL 化行の合算が 1,000 行を超えた回は `VACUUM`(NULL 化も大きな空きを生むため合算で判定)。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
@@ -366,12 +373,13 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 - 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
+- `trend_markdown`(migration 003。GH#75)= その日の「今日のトレンド」節のプレーンテキスト。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。
 - `delivery_status` で watchdog(digest 未生成・未送検知)が判定する。`status='degraded'` は LLM 全滅時のタイトルのみ配信。
 
 ## 9. コスト記録
 
-- LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率は doctor が別途表示)。
+- LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率の表示は未実装 = 拡張点)。
 - X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。
 - `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿。
 
@@ -379,7 +387,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 - `migrations/NNN_name.sql`(3桁ゼロ埋め連番・欠番禁止)。自前ランナー(`app/db.py`)が `schema_migrations(version INTEGER PRIMARY KEY, filename TEXT, applied_at TEXT)` を台帳に、未適用分を番号順に **1 ファイル = 1 トランザクション**(`BEGIN IMMEDIATE`)で適用する。
 - CLI 起動時(collect/run 等)に自動適用、`intel doctor` は未適用の有無を表示。理由: 単一ユーザー・単一ホストでは適用忘れによる稼働停止の方が怖い。
-- **forward-only(down なし)**。適用前に DB ファイルを `intel.db.bak` にコピーしてから適用。理由: 個人運用ではロールバック SQL の保守より単一ファイルコピー復元が確実。
+- **forward-only(down なし)**。未適用があるときだけ、適用前に backup API で `<DB>.bak`(既定 `intel.db.bak`)へ一貫したスナップショットを取ってから適用する(単純なファイルコピーは WAL に未反映の分を取りこぼしうるため)。理由: 個人運用ではロールバック SQL の保守より単一ファイルコピー復元が確実。
 - 適用済みファイルは編集禁止。修正・変更は必ず新番号のファイルで行う。
 
 ## 11. 拡張点(実装しない。必要時にマイグレーション追加)
