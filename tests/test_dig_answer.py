@@ -99,10 +99,11 @@ class Engine:
 
     name = "fake"
 
-    def __init__(self, fail_on: set[int] | None = None):
+    def __init__(self, fail_on: set[int] | None = None, redig_on: set[int] | None = None):
         self.prompts: list[str] = []
         self.efforts: list[str] = []
         self._fail_on = fail_on or set()
+        self._redig_on = redig_on or set()
 
     def factory(self, effort: str) -> "Engine":
         self.efforts.append(effort)
@@ -113,7 +114,11 @@ class Engine:
         self.prompts.append(prompt)
         if len(self.prompts) in self._fail_on:
             raise LLMError("壊れた出力")
-        return DigAnswer(kind="question", answer=f"返事{len(self.prompts)}")
+        return DigAnswer(
+            kind="question",
+            answer=f"返事{len(self.prompts)}",
+            redig=len(self.prompts) in self._redig_on,
+        )
 
 
 class Sender:
@@ -473,3 +478,96 @@ def test_card_button_falls_back_to_source_note_then_to_card_only(conn, config) -
     assert "元記事の本文が手元に無い" in engine.prompts[1]
     assert REQUESTS["more"] in engine.prompts[1]
 
+
+
+# --- 調べ直しの依頼(GH#137) ---
+
+
+def queue_of(conn: sqlite3.Connection, dig_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT q.* FROM dig_queue q JOIN dig_results r ON r.item_id = q.item_id WHERE r.id = ?",
+        (dig_id,),
+    ).fetchone()
+
+
+def test_redig_request_is_queued_with_reply_as_angle(conn, config) -> None:
+    dig_id = add_dig(conn, config)
+    reply = "  承認フローを運用している会社の事例を中心に、もう一度調べてほしい  "
+    question_id = ask(conn, dig_id, reply, 71)
+    engine = Engine(redig_on={1})
+    sender = Sender()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    queue = queue_of(conn, dig_id)
+    assert queue["status"] == "queued"
+    assert queue["source"] == "request"
+    assert queue["angle"] == reply.strip()  # 観点は本人のリプライの原文(LLM の出力ではない)
+    assert queue["requested_at"] is not None  # リプライ指定と同じく優先される
+    assert sender.sent[0][1] == "返事1" + dig_answer.REDIG_NOTICE
+    row = conn.execute("SELECT redig FROM dig_questions WHERE id = ?", (question_id,)).fetchone()
+    assert row["redig"] == 1
+    assert '"redig"' in engine.prompts[0]  # スキーマで LLM に分けさせる(別の呼び出しを増やさない)
+
+
+def test_redig_returns_done_item_to_queue_keeping_source(conn, config) -> None:
+    # 深掘り済み(done)の 🔖 のアイテムも queued へ戻る。source は初回投入の経路のまま
+    dig_id = add_dig(conn, config)
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle) "
+        "VALUES (?, 'done', 'bookmark', '前')",
+        (item_id,),
+    )
+    ask(conn, dig_id, "コスト面でもう一度", 71)
+
+    answer_pending(conn, config, Engine(redig_on={1}).factory, Sender(), logger)
+
+    queue = queue_of(conn, dig_id)
+    assert (queue["status"], queue["source"], queue["angle"]) == (
+        "queued", "bookmark", "コスト面でもう一度"
+    )
+
+
+@pytest.mark.parametrize("case", ["not_requested", "dig_disabled", "button"])
+def test_redig_is_not_queued(conn, config, tmp_path, case) -> None:
+    # 依頼でない / 深掘りの段が止まっている(daily_cap = 0)/ ボタンからの依頼 は積まず、知らせない
+    dig_id = add_dig(conn, config)
+    run_config = config
+    if case == "button":
+        enqueue_request(conn, dig_id, "summary")
+    else:
+        ask(conn, dig_id, "もう一度調べて", 71)
+    if case == "dig_disabled":
+        run_config = Config(
+            config_dir=tmp_path, obsidian=config.obsidian, telegram=config.telegram,
+            dig=DigConfig(daily_cap=0),
+        )
+    engine = Engine(redig_on=set() if case == "not_requested" else {1})
+    sender = Sender()
+
+    answer_pending(conn, run_config, engine.factory, sender, logger)
+
+    assert queue_of(conn, dig_id) is None
+    assert sender.sent[0][1] == "返事1"
+    assert conn.execute("SELECT redig FROM dig_questions").fetchone()["redig"] == 0
+
+
+def test_redig_queue_failure_still_answers_without_notice(conn, config, monkeypatch) -> None:
+    # キューに積めなかったら「調べ直します」とは送らず、返事だけは送る(質問を残し続けない)
+    dig_id = add_dig(conn, config)
+    ask(conn, dig_id, "もう一度調べて", 71)
+
+    def broken(conn, instructions):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(dig_answer, "apply_instructions", broken)
+    sender = Sender()
+
+    answer_pending(conn, config, Engine(redig_on={1}).factory, sender, logger)
+
+    assert sender.sent[0][1] == "返事1"
+    row = conn.execute("SELECT status, redig FROM dig_questions").fetchone()
+    assert (row["status"], row["redig"]) == ("answered", 0)
+    assert queue_of(conn, dig_id) is None
+    assert not conn.in_transaction

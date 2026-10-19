@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
@@ -253,6 +254,44 @@ def test_dig_happy_path_en_article(conn, config) -> None:
     assert "medium" in engines and "low" in engines
     assert engines["medium"].prompts[0][0] == "DigDraft"
     assert all(name == "TranslationChunk" for name, _ in engines["low"].prompts)
+
+
+def test_redig_writes_new_note_linked_to_previous(conn, config) -> None:
+    # 調べ直し(done からの再指定)は新しいノートにし、前回のノートへつなぐ。
+    # 前回のノートは書き換えない(GH#137)
+    item = add_item(conn, "https://blog.example/post", language="en")
+    enqueue(conn, item, angle="コスト面で", requested_at="2026-07-22T10:00:00Z")
+    previous = deepdive_dir(config) / "20260721-old-深掘り.md"
+    previous.parent.mkdir(parents=True, exist_ok=True)
+    previous.write_text("前回のノート(take 付き)\n", encoding="utf-8")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at, published_at,"
+        " message_id) VALUES (?, '20260721-old-深掘り', 'カード', '2026-07-21T00:00:00Z',"
+        " '2026-07-21T00:00:01Z', 800)",
+        (item,),
+    )
+    conn.execute(  # 公開されていない行はつなぐ先にしない
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at)"
+        " VALUES (?, '20260720-unpublished', 'カード', '2026-07-20T00:00:00Z')",
+        (item,),
+    )
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+    new_note = next(deepdive_dir(config).glob("20260723-*深掘り*.md"))
+    content = new_note.read_text(encoding="utf-8")
+    front = yaml.safe_load(content.split("---\n", 2)[1])
+    assert front["previous"] == "[[20260721-old-深掘り]]"
+    assert "requested: コスト面で" in content
+    assert previous.read_text(encoding="utf-8") == "前回のノート(take 付き)\n"
+
+
+def test_first_dig_has_no_previous_link(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", language="en")
+    enqueue(conn, item)
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+    note = next(deepdive_dir(config).glob("20260722-*深掘り*.md"))
+    assert "previous:" not in note.read_text(encoding="utf-8")
 
 
 def test_dig_ja_source_copies_without_translation(conn, config) -> None:

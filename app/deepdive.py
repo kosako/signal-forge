@@ -115,6 +115,8 @@ class DigCandidate:
     language: str | None
     title_ja: str | None  # 既存分析(あれば)
     summary: str | None
+    # 同じ item の前回の解説ノート(調べ直し = done からの再指定。GH#137)。新しいノートからリンクする
+    previous_note_name: str | None = None
 
 
 def run_dig_stage(
@@ -205,7 +207,10 @@ def _select_candidates(
         SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
                i.title, i.author, i.published_at, i.canonical_url,
                d.extracted_text, d.language,
-               a.title_ja, a.summary
+               a.title_ja, a.summary,
+               (SELECT r.note_name FROM dig_results r
+                WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
+                ORDER BY r.id DESC LIMIT 1) AS previous_note_name
         FROM dig_queue q
         JOIN items i ON i.id = q.item_id
         LEFT JOIN documents d ON d.item_id = q.item_id
@@ -241,6 +246,7 @@ def _select_candidates(
             language=row["language"],
             title_ja=row["title_ja"],
             summary=row["summary"],
+            previous_note_name=row["previous_note_name"],
         )
         if candidate.body and len(candidate.body) >= config.dig.min_body_chars:
             selected.append(candidate)
@@ -607,6 +613,10 @@ def _explainer_note(
         frontmatter["auto_brief"] = AUTO_BRIEF
     if source_note_name is not None:
         frontmatter["related"] = f"[[{source_note_name}]]"
+    if candidate.previous_note_name is not None:
+        # 調べ直しの結果は前回のノートを書き換えず、新しいノートにして前回へつなぐ(GH#137。
+        # 公開済みのノートは本人のもの。AI のドラフトを take の付いたノートに混ぜない = ADR 0003)
+        frontmatter["previous"] = f"[[{candidate.previous_note_name}]]"
     body = draft.note_markdown.strip()
     return (
         render_frontmatter(frontmatter)
