@@ -171,6 +171,26 @@ def test_degraded_judgement_ignores_bookmark_items(conn, tmp_path) -> None:
     assert json.loads(row["item_ids"]) == [a]  # ブックマークは載らない
 
 
+def test_degraded_judgement_uses_latest_analysis(conn, tmp_path) -> None:
+    # 全滅の判定はランキングと同じく最新の分析で行う(候補の条件は 1 か所。GH#112)
+    item = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+    conn.execute("UPDATE analyses SET analyzed_at = '2026-01-01T00:00:00Z' WHERE item_id = ?",
+                 (item,))
+    conn.execute(
+        "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
+        "negative_labels, recommendation_reason, implication, degraded, engine, model, "
+        "prompt_version, input_hash, analyzed_at) "
+        "VALUES (?, '要約', '課題直結', 90, 'new', '[]', '理由', '示唆', 0, 'codex-cli', 'm', "
+        "'analyze-v001', 'sha256:re', '2026-01-02T00:00:00Z')",
+        (item,),
+    )
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "ok"  # 古い degraded の分析で全滅と判定しない
+    assert json.loads(row["item_ids"]) == [item]
+
+
 def link_bookmark(conn, item_id: int, tweet_id: str, observed_at: str) -> None:
     conn.execute(
         "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
