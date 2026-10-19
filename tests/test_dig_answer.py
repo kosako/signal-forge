@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from app import dig_answer
-from app.analysis.llm import LLMError
+from app.analysis.llm import LLMError, parse_structured
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.dig_answer import (
@@ -429,7 +429,7 @@ class TakeEngine(Engine):
 
     def complete_structured(self, prompt, schema, timeout_s=120):
         super().complete_structured(prompt, schema, timeout_s)
-        return DigAnswer(kind="take", answer="要約の本文")
+        return DigAnswer(kind="take", answer="要約の本文", redig=False)
 
 
 def add_document(conn, dig_id: int, text: str) -> None:
@@ -553,12 +553,23 @@ def test_redig_is_not_queued(conn, config, tmp_path, case) -> None:
     assert conn.execute("SELECT redig FROM dig_questions").fetchone()["redig"] == 0
 
 
-def test_redig_queue_failure_still_answers_without_notice(conn, config, monkeypatch) -> None:
-    # キューに積めなかったら「調べ直します」とは送らず、返事だけは送る(質問を残し続けない)
+def test_redig_queue_failure_rolls_back_and_answers_without_notice(
+    conn, config, monkeypatch
+) -> None:
+    # キューを書き換えた後に失敗しても、キューは元のまま(ロールバック)。「調べ直します」とは
+    # 送らず、返事だけは送る(質問を残し続けない)
     dig_id = add_dig(conn, config)
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle) "
+        "VALUES (?, 'done', 'bookmark', '前の観点')",
+        (item_id,),
+    )
     ask(conn, dig_id, "もう一度調べて", 71)
+    real_apply = dig_answer.apply_instructions
 
     def broken(conn, instructions):
+        real_apply(conn, instructions)  # キューを queued・新しい観点に書き換えてから
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(dig_answer, "apply_instructions", broken)
@@ -567,7 +578,17 @@ def test_redig_queue_failure_still_answers_without_notice(conn, config, monkeypa
     answer_pending(conn, config, Engine(redig_on={1}).factory, sender, logger)
 
     assert sender.sent[0][1] == "返事1"
-    row = conn.execute("SELECT status, redig FROM dig_questions").fetchone()
-    assert (row["status"], row["redig"]) == ("answered", 0)
-    assert queue_of(conn, dig_id) is None
+    row = conn.execute("SELECT status, redig, answer FROM dig_questions").fetchone()
+    assert (row["status"], row["redig"], row["answer"]) == ("answered", 0, "返事1")
+    queue = queue_of(conn, dig_id)
+    assert (queue["status"], queue["angle"], queue["requested_at"]) == ("done", "前の観点", None)
     assert not conn.in_transaction
+
+
+def test_answer_without_redig_field_is_a_validation_failure() -> None:
+    # redig の書き漏らしを「依頼でない」と黙って受け付けない(依頼を失わない)
+    with pytest.raises(LLMError):
+        parse_structured('{"kind": "question", "answer": "返事"}', DigAnswer)
+    parsed = parse_structured('{"kind": "both", "answer": "返事", "redig": true}', DigAnswer)
+    assert parsed.redig is True
+    assert "redig" in DigAnswer.model_json_schema()["required"]

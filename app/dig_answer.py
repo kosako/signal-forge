@@ -74,11 +74,13 @@ class DigAnswer(BaseModel):
     """返事の構造化出力(prompts/dig-answer-v002.md)。kind は take の記録(#106)が使う。
 
     redig = 本人が観点を足して調べ直してほしいと求めている(GH#137。翌朝の深掘りのキューに積む)。
+    既定値を持たせない(書き漏らしを「依頼でない」と黙って受け付けて依頼を失わない。欠ければ
+    検証の失敗として扱う)。
     """
 
     kind: Literal["question", "take", "both"]
     answer: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
-    redig: bool = False
+    redig: bool
 
 
 def enqueue_question(
