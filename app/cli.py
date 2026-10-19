@@ -230,6 +230,10 @@ def answer(
         except BlockingIOError:
             typer.echo("別の answer が実行中")
             return
+        # ロックはプロセスの終了まで握る(fd を複製し、with の close では外れないようにする)。
+        # vault が止まると、中断できないスレッドが残って後から追記を終えうる。正常の終わりでも
+        # 中断(例外)でも、その間に次の answer が同じ take を書かないため(GH#145)
+        os.dup(lock.fileno())
         conn = connect(config.db_path)
         apply_migrations(conn, config.db_path)
         logger = setup_logging(DEFAULT_LOG_DIR, "answer.log")  # poller.log とはプロセスを分ける
@@ -250,10 +254,6 @@ def answer(
         # 返事を送った後に記録する(本人を待たせない)。前回の実行で記録できなかった分も含む
         recorded = record_takes(conn, config, logger, vault)
         if vault.stalled:
-            # 止まった vault のスレッドはプロセスの終了まで残り、後から追記を終えうる。その間に
-            # 次の answer が同じ take を書かないよう、ロックはプロセスの終了まで握る(fd を複製し、
-            # with の close では外れないようにする。終了時にスレッドと一緒に外れる)
-            os.dup(lock.fileno())
             logger.error(
                 "vault が応答しなかった(macOS のプライバシーの確認待ちの可能性。runbook §11)",
                 extra={"stage": "answer"},

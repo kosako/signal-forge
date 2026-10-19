@@ -152,3 +152,36 @@ def test_answer_keeps_lock_while_stalled_vault_thread_may_write(tmp_path, monkey
             fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         release.set()
+
+
+def test_answer_keeps_lock_when_interrupted_while_vault_thread_lives(tmp_path, monkeypatch) -> None:
+    # 待っている途中で中断(KeyboardInterrupt など)されても、ロックは外さない(GH#145 round 2)
+    import fcntl
+    import threading
+
+    import app.delivery as delivery
+    from app import dig_take, vault_guard
+
+    _unsent_take(tmp_path, monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(dig_take, "_append_to_note", lambda config, row: release.wait())
+
+    class InterruptedGuard(vault_guard.VaultGuard):
+        def call(self, fn):
+            threading.Thread(target=fn, daemon=True).start()  # 書き込み直前で待つスレッド
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(vault_guard, "VaultGuard", InterruptedGuard)
+
+    class Api:
+        def send_message(self, chat_id, text, *, reply_to_message_id=None):
+            return 82
+
+    monkeypatch.setattr(delivery, "create_api", lambda env: Api())
+    try:
+        result = runner.invoke(app, ["answer", "--config-dir", str(tmp_path)])
+        assert result.exit_code == 130  # 中断で終わる(typer は SIGINT と同じ 130 で抜ける)
+        with (tmp_path / "answer.lock").open("w") as other, pytest.raises(BlockingIOError):
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        release.set()
