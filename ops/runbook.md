@@ -145,7 +145,7 @@ mv "${RESTORE_DIR}/intel.db" "${DB_PATH}"
 uv run intel doctor
 ```
 
-Obsidian Vault はバックアップ対象外(SQLite が正本。`intel run` の export 段で再生成される)。
+Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は `intel run` の export 段で書き直されるが、DeepDive ノートと、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する(設計 05 §5)。
 
 ## 8. secrets ローテーション(設計 05 §6)
 

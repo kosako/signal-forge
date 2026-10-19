@@ -70,7 +70,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 対象: SQLite 本体、`~/.config/intel/` の全体(config.toml・.env・関心プロファイル、X の OAuth 2.0 を使うなら `x-oauth2-token.json`)、`prompts/`(git 管理だが世代の一貫性のため同梱)。
 - 方式: 朝バッチ末尾で `sqlite3 ... ".backup"`(オンラインバックアップ API。ファイルコピーは WAL 破損リスクがあるため不可)→ 設定類と併せ tar.gz、`~/Backups/intel/` に **日次14世代**。
 - **secrets 拡散防止**: tar.gz は作成時に **umask/chmod 600 を強制**する(.env の X API キー・bot token・Anthropic キーと X の OAuth 2.0 token が同梱されるため、.env 本体の 600 と同水準を複製側にも要求)。`~/Backups/intel/` は **クラウド同期(iCloud 等)の対象外に置く**(Time Machine 込みの扱いはユーザー判断だが、同期経由の secrets 拡散を既定で作らない)。パーミッションは doctor #10 が検査。
-- 復旧手順: tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外(SQLite が正本で、export/obsidian.py で再生成可能)。
+- 復旧手順: tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は SQLite のデータから export で書き直せるが、DeepDive ノート(公開した後は本文を DB に残さない。設計 01 §7)と、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する。
 - リモート退避(Time Machine 外のクラウド等)は拡張点に留める。
 
 ## 6. secrets 保管
@@ -94,7 +94,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | 経路 | timeout | リトライ | 備考 |
 |---|---|---|---|
 | HTTP 取得(RSS・本文・X) | connect 10s / read 30s | 2回、指数バックオフ(1s→4s)+ jitter | 429 は Retry-After 尊重。恒久 4xx はリトライしない |
-| LLM `complete_structured`(analyze・トレンド) | 120s/呼 | 同一エンジン1回(失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。なお失敗は degraded 直行(エンジンフォールバックは拡張点。設計 00 §5) |
+| LLM `complete_structured`(analyze・トレンド) | 120s/呼 | 同一エンジン1回(analyze は失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。analyze はなお失敗なら degraded 直行(エンジンフォールバックは拡張点。設計 00 §5)。トレンドは失敗したら節を省くだけで digest を止めない(設計 03 §3.5) |
 | LLM `complete_structured`(深掘りの調査段・対訳・質問への返事) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回 | 調査段はアイテム単位で隔離し、失敗は段の失敗として朝バッチ失敗通知に載せる。返事は作れなければ失敗の知らせをリプライで送る(GH#126) |
 | Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |
