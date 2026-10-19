@@ -203,6 +203,7 @@ def answer(
 ) -> None:
     """深掘りカードへの質問に答え、Telegram で返事を送る(GH#126)。take は記録する(GH#106)。"""
     import fcntl
+    import os
 
     from app.analysis.llm import create_engine
     from app.config import load_config, load_env
@@ -249,6 +250,10 @@ def answer(
         # 返事を送った後に記録する(本人を待たせない)。前回の実行で記録できなかった分も含む
         recorded = record_takes(conn, config, logger, vault)
         if vault.stalled:
+            # 止まった vault のスレッドはプロセスの終了まで残り、後から追記を終えうる。その間に
+            # 次の answer が同じ take を書かないよう、ロックはプロセスの終了まで握る(fd を複製し、
+            # with の close では外れないようにする。終了時にスレッドと一緒に外れる)
+            os.dup(lock.fileno())
             logger.error(
                 "vault が応答しなかった(macOS のプライバシーの確認待ちの可能性。runbook §11)",
                 extra={"stage": "answer"},
