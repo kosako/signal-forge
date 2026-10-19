@@ -347,7 +347,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる)
 
-### 深掘りカードへの質問と返事(dig_questions・migration 011 + 012。GH#126 / ADR 0005 / 設計 06 §6)
+### 深掘りカードへの質問と返事(dig_questions・migration 011〜014。GH#126 / GH#141 / ADR 0005 / 設計 06 §6)
 
 概要カードへのリプライ(質問・感想)と、それへの返事の台帳(1 リプライ = 1 行)。返事は
 **write-ahead** で作る: 答え(または失敗)を先に記帳し(`status` を `answered` / `failed` へ)、
@@ -355,11 +355,12 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 行の送信から再開し、同じ質問の答えを作り直さない。
 
 - `dig_result_id` = どのカードへの質問か(スレッド)。カードへのリプライも返事へのリプライも同じカードに帰属させ、同じカードのそれまでのやり取りを返事の材料に含める
-- `question_message_id` = 本人のリプライの message_id。返事はこれへのリプライとして送る(owner DM 限定)。UNIQUE(migration 012): poller が台帳に積んだ後、offset を保存する前に止まると同じ update が再配達されるため、同じリプライを 2 回受け付けない
+- `question_message_id` = 本人のリプライの message_id。返事はこれへのリプライとして送る(owner DM 限定)。UNIQUE(migration 012): poller が台帳に積んだ後、offset を保存する前に止まると同じ update が再配達されるため、同じリプライを 2 回受け付けない。カードのボタンからの依頼では NULL(返事はカード = `dig_results.message_id` へのリプライ。migration 014)
+- `request`(migration 014)= カードのボタンの種類(`summary` = 📝 要約 / `more` = 📖 詳しく。NULL = 本人のリプライ)。`question` には決まった依頼文が入る。`request` が NULL ⇔ `question_message_id` がある(CHECK)。同じカードの同じボタンは 1 行だけ(部分 UNIQUE。再配達・二重押しで 2 回作らない)。NOT NULL を外すため、migration 014 で表を作り直した
 - `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しで一緒に返させる(別の呼び出しを増やさない)。take の記録(GH#106)がこれを使う
 - `take_recorded_at`(migration 013)= take(`take` / `both`)を解説ノートと `followup_dig` に記録した時刻。NULL = 未記録で、次の `intel answer` が記録し直す(設計 06 §6)
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
-- 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)
+- 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
 
 ## 8. digests
 

@@ -44,7 +44,12 @@ from app.analysis.analyzer import sanitize, sanitize_body
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
-from app.delivery.telegram import TelegramApi, escape_and_truncate, escape_text
+from app.delivery.telegram import (
+    TelegramApi,
+    dig_card_keyboard,
+    escape_and_truncate,
+    escape_text,
+)
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 
 JST = timezone(timedelta(hours=9))
@@ -404,12 +409,19 @@ def _send_pending_cards(
     """
     failures: list[str] = []
     rows = conn.execute(
-        "SELECT id, item_id, card_text FROM dig_results "
-        "WHERE message_id IS NULL AND published_at IS NOT NULL ORDER BY id"
+        "SELECT r.id, r.item_id, r.card_text, i.canonical_url FROM dig_results r "
+        "JOIN items i ON i.id = r.item_id "
+        "WHERE r.message_id IS NULL AND r.published_at IS NOT NULL ORDER BY r.id"
     ).fetchall()
     for row in rows:
+        # 🔗 元記事 / 📝 要約 / 📖 詳しく(GH#141。スマホの Telegram で完結させる)
+        keyboard = dig_card_keyboard(
+            row["id"], row["canonical_url"], with_requests=config.dig.answer_daily_cap > 0
+        )
         try:
-            message_id = api.send_message(config.telegram.owner_chat_id, row["card_text"])
+            message_id = api.send_message(
+                config.telegram.owner_chat_id, row["card_text"], reply_markup=keyboard
+            )
         except Exception as e:
             logger.error(
                 f"概要カード送信失敗 item={row['item_id']}: {type(e).__name__}",

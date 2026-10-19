@@ -15,10 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import sqlite3
 import time
 from collections.abc import Callable
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -407,6 +409,46 @@ def reaction_keyboard(item_id: int, *, selected: str | None = None) -> dict:
             ]
         ]
     }
+
+
+# 深掘りカードのボタン(GH#141。callback_data 形式の正本は設計 04 §3)
+_DIG_REQUEST_BUTTONS = (("📝 要約", "s"), ("📖 詳しく", "m"))
+_URL_BUTTON_MAX = 2048  # 送信が恒久失敗しないよう、変な長さの URL にはボタンを付けない
+_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
+
+
+def dig_card_keyboard(
+    dig_result_id: int, url: str | None, *, with_requests: bool
+) -> dict | None:
+    """深掘りカードのボタン: 🔗 元記事(URL ボタン)/ 📝 要約 / 📖 詳しく(GH#141)。
+
+    URL ボタンは http(s) の URL のときだけ付ける(不正な URL があると sendMessage 自体が
+    400 になり、カードが届かなくなるため)。要約・詳しくは返事をする設定のときだけ付ける。
+    """
+    row: list[dict] = []
+    if _is_button_url(url):
+        row.append({"text": "🔗 元記事", "url": url})
+    if with_requests:
+        row.extend(
+            {"text": label, "callback_data": f"d:{dig_result_id}:{code}"}
+            for label, code in _DIG_REQUEST_BUTTONS
+        )
+    return {"inline_keyboard": [row]} if row else None
+
+
+def _is_button_url(url: str | None) -> bool:
+    """URL ボタンに載せてよい URL か。
+
+    http(s)・ASCII・空白や制御文字なし・ホスト名の文字が正しいものだけ(Telegram が拒否すると
+    sendMessage が 400 になり、再送でも同じボタンを付けるのでカードが届かなくなる)。
+    """
+    if url is None or len(url) > _URL_BUTTON_MAX or not url.isascii():
+        return False
+    if any(ch <= " " or ch == "\x7f" for ch in url):
+        return False
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    return parts.scheme in ("http", "https") and _HOST_RE.fullmatch(host) is not None
 
 
 # --- DB アクセス ---

@@ -124,12 +124,14 @@ class ScriptedEngine:
 class FakeApi:
     def __init__(self, fail: bool = False):
         self.sent: list[tuple[int, str]] = []
+        self.markups: list[dict | None] = []
         self._fail = fail
 
     def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
         if self._fail:
             raise RuntimeError("送信失敗")
         self.sent.append((chat_id, text))
+        self.markups.append(reply_markup)
         return 900 + len(self.sent)
 
 
@@ -593,3 +595,30 @@ def test_split_paragraphs_groups_by_blank_line() -> None:
     chunks = _split_paragraphs(text, 100)
     assert len(chunks) > 1
     assert "".join(c.replace("\n\n", "") for c in chunks) == text.replace("\n\n", "")
+
+
+@pytest.mark.parametrize("answer_daily_cap", [20, 0])
+def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily_cap) -> None:
+    # GH#141: スマホの Telegram で完結させる。🔗 元記事 / 📝 要約 / 📖 詳しく
+    item = add_item(conn, "https://a.example/1")
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
+        " VALUES (?, 'n', 'カード本文', '2026-07-22T21:40:00Z')",
+        (item,),
+    ).lastrowid
+    conn.commit()
+    config = replace(config, dig=replace(config.dig, answer_daily_cap=answer_daily_cap))
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+
+    buttons = api.markups[0]["inline_keyboard"][0]
+    assert buttons[0] == {"text": "🔗 元記事", "url": "https://a.example/1"}
+    if answer_daily_cap > 0:
+        assert buttons[1:] == [
+            {"text": "📝 要約", "callback_data": f"d:{dig_id}:s"},
+            {"text": "📖 詳しく", "callback_data": f"d:{dig_id}:m"},
+        ]
+    else:
+        assert buttons[1:] == []  # 返事をしない設定では要約・詳しくを出さない
+
