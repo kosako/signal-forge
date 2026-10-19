@@ -23,7 +23,7 @@ from app.delivery.telegram import (
     escape_and_truncate,
     escape_attr,
 )
-from app.digest.builder import JST, today_jst
+from app.jst import JST, today_jst
 
 STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"

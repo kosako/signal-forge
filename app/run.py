@@ -22,10 +22,11 @@ from app.collect import collect_all
 from app.config import Config
 from app.connectors.base import Connector
 from app.delivery import create_api, deliver_digest, is_telegram_configured
-from app.digest.builder import generate_digest, today_jst
+from app.digest.builder import generate_digest
 from app.export import export_digest, export_pending_notes
 from app.extraction import extract_pending
 from app.http import HttpClient
+from app.jst import today_jst
 from app.purge import purge_expired
 
 

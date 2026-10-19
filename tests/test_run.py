@@ -11,8 +11,8 @@ from app.analysis.analyzer import AnalysisBatch, ItemAnalysis
 from app.config import AnalysisConfig, Config, ObsidianConfig, StorageConfig
 from app.connectors.base import FetchResult, FetchStats, RawItem
 from app.db import apply_migrations, connect
-from app.digest.builder import today_jst
 from app.http import HttpClient
+from app.jst import today_jst
 from app.run import run_pipeline
 
 logger = logging.getLogger("test-run")

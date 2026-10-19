@@ -11,19 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import UTC, datetime, timedelta, timezone
 
 from app.config import Config
+from app.jst import today_jst
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
-
-JST = timezone(timedelta(hours=9))
 
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
 BOOKMARK_SECTION_MAX = 10
-
-
-def today_jst() -> str:
-    return datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d")
 
 
 def generate_digest(

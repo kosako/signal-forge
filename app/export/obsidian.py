@@ -16,12 +16,13 @@ import os
 import re
 import sqlite3
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
 
 from app.config import Config
+from app.jst import JST
 
 GENERATED_BEGIN = "<!-- GENERATED:BEGIN -->"
 GENERATED_END = "<!-- GENERATED:END -->"
@@ -277,7 +278,7 @@ def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
 def _jst_date(created_at: str) -> str:
     """UTC の created_at('...Z')を JST 日付に(表示は他の日付系と同じ JST 基準)。"""
     dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-    return (dt + timedelta(hours=9)).strftime("%Y-%m-%d")
+    return dt.astimezone(JST).strftime("%Y-%m-%d")
 
 
 def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.Row]:

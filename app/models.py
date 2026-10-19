@@ -12,6 +12,8 @@ import sqlite3
 from dataclasses import dataclass, fields
 from typing import Self
 
+RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
+
 
 @dataclass(frozen=True)
 class _Row:

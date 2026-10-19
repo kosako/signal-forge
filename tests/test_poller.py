@@ -13,7 +13,7 @@ from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
 from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
-from app.digest.builder import JST
+from app.jst import JST
 from tests.test_delivery import add_digest, add_item
 
 logger = logging.getLogger("test-poller")
@@ -451,7 +451,7 @@ def test_insert_failure_answers_warning(conn, tmp_path) -> None:
 def test_survey_insert_failure_answers_warning(conn, tmp_path) -> None:
     from datetime import datetime
 
-    from app.digest.builder import JST
+    from app.jst import JST
 
     conn.execute("DROP TABLE signals")
     date_compact = datetime.now(JST).strftime("%Y%m%d")
