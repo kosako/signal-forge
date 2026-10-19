@@ -14,7 +14,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 
 from app.config import Config
-from app.ranking import RankedItem, rank_for_digest
+from app.ranking import RankedItem, digest_candidates, rank_for_digest
 
 JST = timezone(timedelta(hours=9))
 
@@ -209,28 +209,11 @@ def _pending_bookmark_items(
 
 
 def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[RankedItem]:
-    """LLM 全滅判定: 候補全件の最新分析が degraded なら、その候補をタイトルのみで返す。"""
-    rows = conn.execute(
-        """
-        SELECT items.id AS item_id, items.source_id, items.title, items.canonical_url,
-               sources.type || ':' || sources.name AS source_label,
-               analyses.id AS analysis_id, analyses.degraded
-        FROM items
-        JOIN sources ON sources.id = items.source_id
-        JOIN analyses ON analyses.id = (
-            SELECT id FROM analyses WHERE item_id = items.id
-            ORDER BY analyzed_at DESC, id DESC LIMIT 1
-        )
-        WHERE items.status = 'analyzed'
-          -- ブックマーク紐付けのある item は digest 候補でない(ランキングと同じ除外。
-          -- 合流ケースでも属性が残るよう x_signals の紐付けで判定。GH#99)
-          AND NOT EXISTS (
-            SELECT 1 FROM x_signals
-            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
-          )
-        ORDER BY items.id
-        """
-    ).fetchall()
+    """LLM 全滅判定: 候補全件の最新分析が degraded なら、その候補をタイトルのみで返す。
+
+    候補はランキングと同じ集合(digest_candidates。ブックマーク紐付けの item を含まない。GH#99)。
+    """
+    rows = digest_candidates(conn)
     if not rows or any(row["degraded"] == 0 for row in rows):
         return []
     return [

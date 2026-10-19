@@ -40,7 +40,29 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
 
     total_score の書き戻しは候補全件に対して行う(選抜外too。週次レビューの分析材料)。
     """
-    rows = conn.execute(
+    rows = digest_candidates(conn)
+
+    # 生スコアで合成し、clamp は全ペナルティ適用後に1回だけ(設計 03 §6 の式どおり。
+    # 途中 clamp すると novelty 係数 >1.0 等の許容設定で結果がズレる)
+    scored = [(row, _base_score(row, config)) for row in rows]
+    scored = _apply_topic_dup_penalty(scored, config)
+    scored = [(row, _clamp(score)) for row, score in scored]
+
+    for row, score in scored:
+        conn.execute(
+            "UPDATE analyses SET total_score = ? WHERE id = ?", (score, row["analysis_id"])
+        )
+
+    return _select(scored, config)
+
+
+def digest_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """digest の候補(status='analyzed' の items)を最新の分析と一緒に item_id 順で返す。
+
+    通常のランキングと LLM 全滅(degraded)の判定は同じ集合を見る必要があるので、候補の条件は
+    ここにだけ置く(GH#112)。
+    """
+    return conn.execute(
         """
         SELECT items.id AS item_id, items.source_id, items.title, items.canonical_url,
                items.published_at,
@@ -56,9 +78,9 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
         WHERE items.status = 'analyzed'
-          -- ブックマーク紐付けのある item はランキング不参加(must-include の別枠。
-          -- 判定は x_signals の紐付け = 既存 item への合流(RSS 等と canonical 重複)
-          -- でも属性が失われない。GH#99)
+          -- ブックマーク紐付けのある item は候補に入れない(ランキングにも全滅の判定にも。
+          -- must-include の別枠。判定は x_signals の紐付け = 既存 item への合流(RSS 等と
+          -- canonical 重複)でも属性が失われない。GH#99)
           AND NOT EXISTS (
             SELECT 1 FROM x_signals
             WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = items.id
@@ -66,19 +88,6 @@ def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem
         ORDER BY items.id
         """
     ).fetchall()
-
-    # 生スコアで合成し、clamp は全ペナルティ適用後に1回だけ(設計 03 §6 の式どおり。
-    # 途中 clamp すると novelty 係数 >1.0 等の許容設定で結果がズレる)
-    scored = [(row, _base_score(row, config)) for row in rows]
-    scored = _apply_topic_dup_penalty(scored, config)
-    scored = [(row, _clamp(score)) for row, score in scored]
-
-    for row, score in scored:
-        conn.execute(
-            "UPDATE analyses SET total_score = ? WHERE id = ?", (score, row["analysis_id"])
-        )
-
-    return _select(scored, config)
 
 
 def _base_score(row: sqlite3.Row, config: Config) -> float:
