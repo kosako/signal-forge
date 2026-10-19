@@ -1092,6 +1092,11 @@ def test_card_button_not_bound_to_the_card_is_rejected(
         ("https://例え.jp/記事", False),  # 送信が 400 で恒久失敗しないよう、ASCII の URL だけ
         (None, False),
         ("https://a.example/" + "x" * 3000, False),
+        ("https://bad host.example/article", False),  # ホストに空白
+        ("https://a.example/a b", False),  # 空白
+        ("https://a.example/\x01", False),  # 制御文字
+        ("https://localhost/x", False),  # ドットの無いホスト
+        ("https://A.Example:8443/path?q=1#f", True),
     ],
 )
 def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
