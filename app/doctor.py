@@ -619,7 +619,7 @@ def _launchctl_loaded(job: str) -> bool:
 
 
 def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, float]:
-    """当月のコスト実績と着地見込み(doctor #9 / --cost / 月次レポートで共用)。"""
+    """当月のコスト実績と着地見込み(doctor #9 / --cost で共用。月次レポート plan #25 は未実装)。"""
     month_prefix = datetime.now(UTC).strftime("%Y-%m")
     llm_cost = conn.execute(
         "SELECT coalesce(sum(estimated_cost_usd), 0) FROM analyses "

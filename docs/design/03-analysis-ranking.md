@@ -123,6 +123,17 @@ analyses への写像(01 §3 の列に対応): `relevance` → relevance_score /
 - 実例は interest-profile.md の「実例」節が正本で、プロンプトには関心プロファイルの一部として丸ごと注入される(独立の few-shot 機構は作らない)。理由: 還流経路を 1 本にし、プロンプト差分をファイル差分で追えるようにする。
 - 還流は**週次・手動**: 週次セルフレビューで `signals` を SQL で引き(👍🔖/👎/✅ 別)、代表例を各カテゴリ 5 件・計 20 件を上限に実例節へ追記・入替する。遅延スポットチェックの乖離実例を優先採用。自動還流はフェーズ2。
 
+### 3.5 今日の全体トレンドまとめ(GH#75。`app/analysis/trend.py`・`prompts/trend-v002.md`)
+
+ダイジェストの冒頭に「今日のトレンド」節を付ける(全体感を掴む → 個別アイテム → 深掘り、の入口)。付加機能なので、失敗しても digest は止めない。
+
+- **対象**: その日(JST 暦日)に分析された非 degraded のアイテム(最新の分析)。🔖 保存アイテム(X のブックマーク)は過去の任意時点の内容なので入れない(§6 末尾)。relevance の高い順に最大 120 件。5 件未満の日は節を省く。
+- **入力**: 各アイテムの日本語タイトル・topic・category・ソース名だけ(本文は渡さない)。§3.2 と同じく nonce のフェンスとサニタイズで data として扱う。
+- **出力スキーマ**: `{"themes": [{"label": 40 字以内, "summary": str, "item_ids": [int]}]}`。prompt で 3〜5 テーマ・要約 160 字以内を指示する。
+- **接地の確認**: 入力に無い id しか持たないテーマは捨てる(幻のテーマを排除)。要約は 200 字で切る安全網を持ち(prompt を守れば発動しない)、テーマは最大 5 件。
+- **失敗時**: 対象が少ない・LLM の失敗・接地のあるテーマが 0 件のときは節を省く。digest を当日生成済みで作り直さない(`--force` でない)ときは呼ばない。
+- **載せる先**: `digests.trend_markdown`(migration 003)に保存し、Telegram のヘッダメッセージと Obsidian の Daily ノートに出す。degraded 配信では付けない。
+
 ## 4. interest-profile.md の形式
 
 配置: `~/.config/intel/interest-profile.md`(config.toml `analysis.profile_path`)。自作ファイルなので trusted としてプロンプトに verbatim 注入する。パースは front matter のみ(本文は構造解釈しない。理由: 自由文チューニングを毎日コード変更なしで行うため)。
@@ -154,7 +165,7 @@ updated: 2026-07-05
 ### ✅ 既知
 ```
 
-`intel doctor` は「存在・front matter・updated が 14 日超で警告」のみ検査する。
+プロファイルの欠落と front matter の不正(`updated: YYYY-MM-DD` が無い)は、プロファイルを使う処理(analyze・深掘りの調査段・質問への返事)の実行時に `ProfileError` で止まる(fail fast)。`intel doctor` はプロファイルを検査しない。`updated` が古い(14 日超)ときの警告は未実装。
 
 ### 興味シグナルの重みとインサイト(S1c = GH#58 / ADR 0001)
 
@@ -193,8 +204,10 @@ negativeペナルティ: negative ラベル 1 個につき −15
 
 ## 7. $30 キャップの執行
 
-- **概算集計**: 月初からの累計 = Σ analyses.estimated_cost(サブスク枠時は現金 0 だがトークン概算も併記記録)+ X 読み取り件数 × 実測単価(Day 0 確定値を config に保存)。月末着地見込みは線形外挿。`intel doctor` と朝バッチログに表示。
-- **執行点は朝バッチの 2 箇所**(いずれも db.py の同一集計関数を呼ぶ budget check。判定箇所をこれ以上増やさない):
+> **現状(未実装。plan #20)**: 自動の縮退・予算判定はまだ無い。今あるのは集計と警告だけで、`app/doctor.py` の `month_cost_summary` が当月の実績と着地見込みを出し、doctor #9 が着地見込みが `[budget].monthly_cap_usd` を超えるペースなら WARN を出す(`intel doctor --cost` で単発表示)。朝バッチには予算判定の段も呼び出しも無い。以下は実装するときの設計。
+
+- **概算集計**(実装済み): 月初からの累計 = Σ `analyses.estimated_cost_usd`(サブスク枠時は 0)+ X の読み取り費用(`collect_runs.estimated_cost_usd` と `x_signal_runs.estimated_cost_usd` の合計。読み取り件数 × config の実測単価)。月末着地見込みは線形外挿。`intel doctor`(#9)と `--cost` に表示する(朝バッチのログには出さない)。
+- **執行点は朝バッチの 2 箇所**(未実装。いずれも同じ集計関数を呼ぶ budget check。判定箇所をこれ以上増やさない):
   1. **collect 直前**: 月次着地見込みで X 従量コストの 3 段縮退(下表)。
   2. **analyze 直前(API 課金エンジン使用時のみ)**: `daily_llm_limit` は**件数上限でありドル上限ではない**ため、実行前にドルで判定する。Week 1 実測の平均トークン量 × 当日対象件数から「1日最大 LLM 費」を見積もり、当月実績+見積が $30 を超える見込みなら `daily_llm_limit` を残予算から逆算して縮小、残予算ゼロならタイトルのみの degraded に落とす。サブスク CLI エンジン(現金 $0)時は no-op。
 - **閾値と縮退(3 段、月替わりで自動復帰)**:

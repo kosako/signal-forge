@@ -20,7 +20,7 @@ sqlite3 -header -column ~/.local/share/intel/intel.db < scripts/kpi/01-daily-kpi
 | 03 | `03-read-minutes.sql` | 読了時間の分布(質問2) | §6-4 |
 | 04 | `04-source-category-rates.sql` | ソース別・カテゴリ別 👍∨🔖 率 | §6-5 |
 | 05 | `05-spot-check.sql` | 👍校正スポットチェック(7日前の👍から無作為3件) | §6-7 |
-| 06 | `06-phase2-boundary.sql` | 🔖累計・深掘り実施率・フェーズ2境界判定 | 最終判定 |
+| 06 | `06-phase2-boundary.sql` | 🔖累計・深掘り実施率・フェーズ2境界判定(2026-07-19 の PROPOSAL §フェーズ2境界の改訂で進出済み。現在は参考値) | 最終判定 |
 | 07 | `07-invalid-streak.sql` | 無効日3日連続の検知 | R1 発動判定 |
 | 08 | `08-weekly-summary.sql` | 直近7日の配信日数・KPI 達成日数・無効日数・fail-closed 週判定 | §6-1〜2 |
 | 09 | (SQL でなく)`uv run intel x-insights` | X 興味シグナルのインサイト(常連著者・頻出テーマ・直近シグナル)。重み係数は config `[x_signals]`(GH#58 S1c) | §6-8 |
