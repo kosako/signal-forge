@@ -39,6 +39,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (11, "011_dig_questions.sql"),
         (12, "012_dig_questions_unique_message.sql"),
         (13, "013_dig_questions_take_recorded.sql"),
+        (14, "014_dig_questions_card_requests.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -180,3 +181,54 @@ def _copy_real_migrations(other: Path) -> int:
     for f in files:
         (other / f.name).write_text(f.read_text())
     return len(files)
+
+
+def test_card_requests_migration_keeps_questions_and_enforces_rules(tmp_path: Path) -> None:
+    # GH#141(migration 014): 表を作り直しても既存の質問は残り、ボタンの依頼の決まりが効く
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 13:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    conn.execute(
+        "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 2, 'https://a/1', 'https://a/1', 'sha256:x')"
+    )
+    conn.execute(
+        "INSERT INTO dig_results (id, item_id, note_name, card_text, message_id) "
+        "VALUES (1, 1, 'n', 'カード', 700)"
+    )
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, kind, "
+        "answer, answer_message_id, take_recorded_at) "
+        "VALUES (1, '質問', 81, 'answered', 'take', '返事', 82, '2026-10-19T00:00:00Z')"
+    )
+
+    apply_migrations(conn, db)
+
+    row = conn.execute("SELECT * FROM dig_questions").fetchone()
+    assert (row["question"], row["question_message_id"], row["request"], row["kind"]) == (
+        "質問", 81, None, "take"
+    )
+    assert row["take_recorded_at"] == "2026-10-19T00:00:00Z"
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, request) VALUES (1, '要約', 'summary')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):  # 同じカードの同じボタンは 1 行だけ
+        conn.execute(
+            "INSERT INTO dig_questions (dig_result_id, question, request) "
+            "VALUES (1, '要約', 'summary')"
+        )
+    with pytest.raises(sqlite3.IntegrityError):  # 本人のリプライでもボタンでもない行は作れない
+        conn.execute("INSERT INTO dig_questions (dig_result_id, question) VALUES (1, '?')")
+    with pytest.raises(sqlite3.IntegrityError):  # 再配達の二重受付は従来どおり防ぐ
+        conn.execute(
+            "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+            "VALUES (1, '質問', 81)"
+        )
+    conn.close()
+

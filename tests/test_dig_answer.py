@@ -10,7 +10,13 @@ import pytest
 from app.analysis.llm import LLMError
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
-from app.dig_answer import FAILURE_TEXT, DigAnswer, answer_pending
+from app.dig_answer import (
+    FAILURE_TEXT,
+    REQUESTS,
+    DigAnswer,
+    answer_pending,
+    enqueue_request,
+)
 
 logger = logging.getLogger("test-dig-answer")
 
@@ -378,3 +384,59 @@ def test_nothing_pending_does_nothing(conn, config) -> None:
     engine, sender = Engine(), Sender()
     assert answer_pending(conn, config, engine.factory, sender, logger) == 0
     assert engine.prompts == [] and sender.attempts == 0
+
+
+class TakeEngine(Engine):
+    """LLM がボタンの依頼を take と分けてしまう場合(ボタンの依頼は本人の take ではない)。"""
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        super().complete_structured(prompt, schema, timeout_s)
+        return DigAnswer(kind="take", answer="要約の本文")
+
+
+def add_document(conn, dig_id: int, text: str) -> None:
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, language, extraction_status, expires_at)"
+        " VALUES (?, ?, 'en', 'ok', '2099-01-01T00:00:00Z')",
+        (item_id, text),
+    )
+
+
+def test_card_button_uses_source_text_from_db_and_replies_to_the_card(conn, config) -> None:
+    # GH#141: 材料は DB の元記事の本文(vault の解説ノートには頼らない)。返事はカードへのリプライ
+    dig_id = add_dig(conn, config)
+    add_document(conn, dig_id, "The original article body extracted from the web.")
+    assert enqueue_request(conn, dig_id, "summary")
+    assert not enqueue_request(conn, dig_id, "summary")  # 同じカードの同じボタンは 1 回だけ
+    engine, sender = TakeEngine(), Sender()
+
+    assert answer_pending(conn, config, engine.factory, sender, logger) == 1
+
+    card_message_id = conn.execute(
+        "SELECT message_id FROM dig_results WHERE id = ?", (dig_id,)
+    ).fetchone()[0]
+    assert sender.sent == [(card_message_id, "要約の本文")]
+    prompt = engine.prompts[0]
+    assert REQUESTS["summary"] in prompt
+    assert "The original article body extracted from the web." in prompt
+    assert "カードの本文" in prompt
+    assert "解説ノートの本文" not in prompt
+    row = rows(conn)[0]
+    assert (row["request"], row["kind"]) == ("summary", "question")  # take としては記録しない
+    assert row["question_message_id"] is None
+
+
+def test_card_button_falls_back_to_source_note_then_to_card_only(conn, config) -> None:
+    with_note = add_dig(conn, config, url="https://a.example/1")  # 本文は DB に無い(期限切れ)
+    without = add_dig(conn, config, url="https://a.example/2", source=None)
+    enqueue_request(conn, with_note, "more")
+    enqueue_request(conn, without, "more")
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, Sender(), logger)
+
+    assert "訳文の段落" in engine.prompts[0]  # 原文/対訳ノートを使う
+    assert "元記事の本文が手元に無い" in engine.prompts[1]
+    assert REQUESTS["more"] in engine.prompts[1]
+

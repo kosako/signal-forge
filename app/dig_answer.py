@@ -41,6 +41,20 @@ HISTORY_TURNS = 5  # 材料に含めるそれまでのやり取り(直近から)
 
 FAILURE_TEXT = "⚠️ 答えを作れませんでした。時間をおいて、もう一度リプライしてください"
 
+# カードのボタンからの依頼(GH#141)。台帳の question にこの文を入れ、質問と同じ流れで答える
+# (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)
+REQUESTS = {
+    "summary": (
+        "(📝 要約のボタン)元記事の要約を日本語で書いてほしい。元記事が日本語以外なら、和訳した"
+        "要約にする。記事が何を主張し、何を根拠にしているかが分かるように、要点を 3〜5 個の"
+        "短い箇条書きで。"
+    ),
+    "more": (
+        "(📖 詳しくのボタン)元記事の中身を、概要カードより詳しく日本語で説明してほしい。記事の"
+        "流れに沿って、主張・根拠・具体例を省きすぎずに。元記事が日本語以外なら日本語で。"
+    ),
+}
+
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 
 # (返信先 = 質問の message_id, プレーンテキスト) -> 送った message_id
@@ -63,6 +77,16 @@ def enqueue_question(
         "VALUES (?, ?, ?)",
         (dig_result_id, question, question_message_id),
     ).lastrowid
+
+
+def enqueue_request(conn: sqlite3.Connection, dig_result_id: int, request: str) -> bool:
+    """カードのボタンからの依頼を台帳に積む(GH#141)。同じカードの同じボタンが既にあれば
+    積まずに False を返す(再配達・二重押し。migration 014 の部分 UNIQUE)。"""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO dig_questions (dig_result_id, question, request) VALUES (?, ?, ?)",
+        (dig_result_id, REQUESTS[request], request),
+    )
+    return cursor.rowcount == 1
 
 
 def question_received(conn: sqlite3.Connection, question_message_id: int) -> bool:
@@ -123,8 +147,8 @@ def answer_pending(
 def _next_pending(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT q.id, q.dig_result_id, q.question,
-               r.note_name, r.source_note_name, r.card_text
+        SELECT q.id, q.dig_result_id, q.question, q.request,
+               r.item_id, r.note_name, r.source_note_name, r.card_text
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'pending'
         ORDER BY q.id LIMIT 1
@@ -155,13 +179,15 @@ def _answer_one(
         conn.commit()
         logger.error(f"返事を作れなかった: {type(e).__name__}: {e}", extra=log_extra)
         return
+    # ボタンからの依頼は本人の take ではない(LLM の分類によらず question。GH#106 が記録しない)
+    kind = "question" if row["request"] is not None else result.kind
     conn.execute(
         f"UPDATE dig_questions SET status = 'answered', kind = ?, answer = ?, "
         f"answered_at = {_NOW_UTC} WHERE id = ?",
-        (result.kind, result.answer, row["id"]),
+        (kind, result.answer, row["id"]),
     )
     conn.commit()
-    logger.info(f"返事を作った(kind={result.kind})", extra=log_extra)
+    logger.info(f"返事を作った(kind={kind})", extra=log_extra)
 
 
 class _Sender:
@@ -183,17 +209,20 @@ class _Sender:
     def flush(self) -> None:
         if self._broken:
             return
+        # 返信先: 質問は本人のリプライ、ボタンからの依頼はカード(GH#141)
         rows = self._conn.execute(
             """
-            SELECT id, status, answer, question_message_id FROM dig_questions
-            WHERE status <> 'pending' AND answer_message_id IS NULL
-            ORDER BY id
+            SELECT q.id, q.status, q.answer,
+                   coalesce(q.question_message_id, r.message_id) AS reply_to
+            FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
+            WHERE q.status <> 'pending' AND q.answer_message_id IS NULL
+            ORDER BY q.id
             """
         ).fetchall()
         for row in rows:
             text = row["answer"] if row["status"] == "answered" else FAILURE_TEXT
             try:
-                message_id = self._send_reply(row["question_message_id"], text)
+                message_id = self._send_reply(row["reply_to"], text)
             except Exception as e:
                 self._broken = True
                 self._logger.error(
@@ -219,7 +248,11 @@ def build_answer_prompt(conn: sqlite3.Connection, config: Config, row: sqlite3.R
         template,
         {
             "interest_profile": profile,
-            "materials": _materials(config, row, nonce),
+            "materials": (
+                _request_materials(conn, config, row, nonce)
+                if row["request"] is not None
+                else _materials(config, row, nonce)
+            ),
             "history": _history(conn, row["dig_result_id"], row["id"], nonce),
             "question": question,
             "schema": json.dumps(DigAnswer.model_json_schema(), ensure_ascii=False),
@@ -253,6 +286,29 @@ def _materials(config: Config, row: sqlite3.Row, nonce: str) -> str:
             parts.append(
                 _truncate(sanitize_body(source, nonce), config.dig.answer_source_max_chars)
             )
+    return "\n\n".join(parts)
+
+
+def _request_materials(
+    conn: sqlite3.Connection, config: Config, row: sqlite3.Row, nonce: str
+) -> str:
+    """カードのボタンからの依頼の材料(GH#141): カード + 元記事の本文。
+
+    スマホの Telegram で完結させるため、元記事の本文は DB(抽出済みの documents)を第一にし、
+    vault のノートには頼らない。保持期限を過ぎて DB に無いときだけ、原文/対訳ノート(vault)を使う。
+    """
+    parts = ["## 概要カード", sanitize_body(row["card_text"], nonce), "## 元記事の本文"]
+    doc = conn.execute(
+        "SELECT extracted_text FROM documents WHERE item_id = ? AND extracted_text IS NOT NULL",
+        (row["item_id"],),
+    ).fetchone()
+    body = doc["extracted_text"] if doc is not None else None
+    if body is None and row["source_note_name"] is not None:
+        body = _read_note(_deepdive_dir(config), row["source_note_name"])
+    if body is None:
+        parts.append("(元記事の本文が手元に無い。概要カードの範囲で答える)")
+    else:
+        parts.append(_truncate(sanitize_body(body, nonce), config.dig.answer_source_max_chars))
     return "\n\n".join(parts)
 
 

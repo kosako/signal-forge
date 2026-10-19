@@ -41,7 +41,7 @@ from app.delivery.surveys import (
 )
 from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
-from app.dig_answer import enqueue_question, question_received, questions_on
+from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.digest.builder import JST
 from app.normalize import (
     content_hash,
@@ -154,7 +154,9 @@ def handle_update(
 ) -> None:
     callback = update.get("callback_query")
     if isinstance(callback, dict):
-        _handle_callback(conn, config, api, callback, logger, now_fn=now_fn)
+        _handle_callback(
+            conn, config, api, callback, logger, now_fn=now_fn, answer_worker=answer_worker
+        )
         return
     message = update.get("message")
     if isinstance(message, dict):
@@ -176,6 +178,7 @@ def _handle_callback(
     logger: logging.Logger,
     *,
     now_fn: Callable[[], datetime],
+    answer_worker: AnswerWorker | None = None,
 ) -> None:
     # 外部 API 由来のネスト値は形を仮定しない(型不正は未認可と同じ扱いで破棄)
     sender = callback.get("from")
@@ -218,6 +221,12 @@ def _handle_callback(
             return
         if prefix == "f" and arg.isdigit() and code in ("y", "n"):
             _record_followup(conn, api, callback, callback_id, int(arg), code, logger)
+            return
+        if prefix == "d" and arg.isdigit() and code in _DIG_REQUESTS:
+            _record_dig_request(
+                conn, config, api, callback, callback_id, int(arg), code, logger,
+                now_fn(), answer_worker,
+            )
             return
     # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
     # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
@@ -314,6 +323,84 @@ def _record_survey(
         else q2_keyboard(date_compact, selected=code)
     )
     _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+# 深掘りカードのボタン(GH#141)の code → 台帳の request と、受け付けたときの知らせ
+_DIG_REQUESTS = {
+    "s": ("summary", "📝 要約を作っています(数分かかることがあります)"),
+    "m": ("more", "📖 詳しい説明を作っています(数分かかることがあります)"),
+}
+
+
+def _record_dig_request(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    dig_result_id: int,
+    code: str,
+    logger: logging.Logger,
+    now: datetime,
+    answer_worker: AnswerWorker | None,
+) -> None:
+    """深掘りカードの 📝 要約・📖 詳しく(GH#141)。依頼を台帳に積み、返事は `intel answer` が
+    カードへのリプライで送る(質問と同じ流れ・同じ 1 日の上限)。
+
+    押されたメッセージが、そのカードとして送ったメッセージであることを確かめる(callback_data
+    だけを信じない)。同じカードの同じボタンは 1 回だけ受け付ける(再配達・二重押し)。
+    """
+    request, accepted_text = _DIG_REQUESTS[code]
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    card = conn.execute(
+        "SELECT item_id FROM dig_results WHERE id = ? AND message_id = ?",
+        (dig_result_id, message_id if type(message_id) is int else None),
+    ).fetchone()
+    if card is None or chat_id != config.telegram.owner_chat_id:
+        logger.warning("カードと結び付かない深掘りのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ このカードには対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": card["item_id"], "extra": {"request": request}}
+    cap = config.dig.answer_daily_cap
+    if cap <= 0:
+        api.answer_callback_query(callback_id, text="返事をしない設定です")
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            requested = conn.execute(
+                "SELECT 1 FROM dig_questions WHERE dig_result_id = ? AND request = ?",
+                (dig_result_id, request),
+            ).fetchone()
+            today = now.astimezone(JST).date().isoformat()
+            if requested is None and questions_on(conn, today) >= cap:
+                conn.execute("ROLLBACK")
+                logger.warning(f"質問の上限({cap} 件/日)に達したため受け付けない", extra=log_extra)
+                api.answer_callback_query(
+                    callback_id, text=f"今日の返事の上限({cap} 件)に達しました"
+                )
+                return
+            accepted = requested is None and enqueue_request(conn, dig_result_id, request)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(f"深掘りのボタンを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ 受け付けに失敗、もう一度")
+        return
+    if not accepted:
+        logger.info("受け付け済みの深掘りのボタン(再配達・二重押し)", extra=log_extra)
+        api.answer_callback_query(callback_id, text="受け付け済みです(返事は届いているか作成中)")
+        return
+    logger.info("深掘りのボタンを受け付けた", extra=log_extra)
+    api.answer_callback_query(callback_id, text=accepted_text)
+    if answer_worker is not None:
+        answer_worker.kick(logger)
 
 
 def _record_followup(

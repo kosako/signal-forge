@@ -41,6 +41,7 @@
 - **callback_data 形式**(64バイト制限内・ASCII のみ):
   - 反応ボタン: `s:{item_id}:{up|dig|knw|no}`(👍🔖✅👎に対応)
   - 夜アンケート: `q1:{YYYYMMDD}:{y|n}` / `q2:{YYYYMMDD}:{分}` / 深掘り追い掛け: `f:{item_id}:{y|n}`
+  - 深掘りカードのボタン(GH#141): `d:{dig_result_id}:{s|m}`(📝 要約 / 📖 詳しく)。押されたメッセージがそのカード(`dig_results.message_id`・owner の chat)であることを確かめてから台帳 `dig_questions` に積む(signals には書かない。設計 06 §6)。🔗 元記事は URL ボタンで callback を持たない
 - 処理順は **①検証+signals に INSERT → ②結果に応じて answerCallbackQuery(記帳成功 = `記録しました` / 検証失敗・期限切れ・DB 書込失敗など**記帳できなかった場合** = 警告 answer)→ ③ editMessageReplyMarkup で選択状態を反映**(選ばれたボタンに `✓` を付けた盤面に差し替え)。answerCallbackQuery は 1 callback につき 1 回しか返せないため、記帳の成否で answer 文言を分けるには記帳を answer より先に行う必要がある(ローカル SQLite はミリ秒オーダーで、10秒失効に十分間に合う)。
 - **INSERT 前の検証**: パースした item_id が items に実在し、かつ**いずれかの `digests.item_ids` に含まれる**ことを確認してから signals に書く(signal_date の帰属=その digest_date もこの照合で同時に解決)。不一致・不正形式の callback_data は記帳せずログのみ(古いメッセージや偽造データで KPI 分母外に記帳されるのを防ぐ)。
 - **押し直し許容**: signals は追記型(append-only)で記録し、KPI 集計時は item ごとの最新レコードを採用 — 誤タップを訂正可能にしつつ履歴を失わない。

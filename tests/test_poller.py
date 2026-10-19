@@ -12,7 +12,7 @@ from app.config import Config, DigConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
 from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
-from app.delivery.telegram import LONG_POLL_S, reaction_keyboard
+from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
 from app.digest.builder import JST
 from tests.test_delivery import add_digest, add_item
 
@@ -991,3 +991,113 @@ def test_dig_reply_accepts_queued_id_not_in_pending(conn, tmp_path) -> None:
 
     row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
     assert (row["status"], row["angle"]) == ("queued", "再検討の観点で")
+
+
+def dig_button(dig_id: int, code: str, *, card_message_id: int = 700, update_id: int = 1,
+               chat_id: int = CHAT_ID) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "from": {"id": OWNER_ID},
+            "data": f"d:{dig_id}:{code}",
+            "message": {"message_id": card_message_id, "chat": {"id": chat_id}},
+        },
+    }
+
+
+def dig_requests(conn) -> list[tuple]:
+    rows = conn.execute(
+        "SELECT dig_result_id, request, question_message_id, status FROM dig_questions ORDER BY id"
+    )
+    return [tuple(r) for r in rows]
+
+
+def test_card_buttons_queue_requests_and_kick_answer(conn, tmp_path) -> None:
+    # GH#141: 📝 要約・📖 詳しく は質問と同じ台帳に積み、返事はカードへのリプライ
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "s"), dig_button(dig_id, "m", update_id=2)]])
+    worker = FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+
+    assert dig_requests(conn) == [
+        (dig_id, "summary", None, "pending"),
+        (dig_id, "more", None, "pending"),
+    ]
+    assert api.answered == [
+        ("cb1", "📝 要約を作っています(数分かかることがあります)"),
+        ("cb2", "📖 詳しい説明を作っています(数分かかることがあります)"),
+    ]
+    assert worker.kicks == 2
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0  # 感想ではない
+
+
+def test_same_button_twice_is_accepted_once(conn, tmp_path) -> None:
+    # 再配達・二重押しで 2 回作らない。上限に達していても「受け付け済み」と分かるように返す
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "s"), dig_button(dig_id, "s", update_id=2)]])
+    worker = FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path, cap=1), api, logger, answer_worker=worker)
+
+    assert dig_requests(conn) == [(dig_id, "summary", None, "pending")]
+    assert api.answered[1] == ("cb2", "受け付け済みです(返事は届いているか作成中)")
+    assert worker.kicks == 1
+
+
+def test_card_button_over_daily_cap_or_disabled_is_not_queued(conn, tmp_path) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (?, '今日の 1 件目', 80)",
+        (dig_id,),
+    )
+    conn.commit()
+    api, worker = FakeApi([[dig_button(dig_id, "s")]]), FakeWorker()
+    poll_once(conn, answer_config(tmp_path, cap=1), api, logger, answer_worker=worker)
+    assert api.answered == [("cb1", "今日の返事の上限(1 件)に達しました")]
+
+    api = FakeApi([[dig_button(dig_id, "m", update_id=2)]])
+    poll_once(conn, answer_config(tmp_path, cap=0), api, logger, answer_worker=worker)
+    assert api.answered == [("cb2", "返事をしない設定です")]
+    assert len(dig_requests(conn)) == 1  # 今日の 1 件目だけ
+    assert worker.kicks == 0
+
+
+@pytest.mark.parametrize(
+    ("card_message_id", "chat_id"),
+    [(701, CHAT_ID), (700, 999)],  # 別のメッセージ / owner の chat 以外
+)
+def test_card_button_not_bound_to_the_card_is_rejected(
+    conn, tmp_path, card_message_id, chat_id
+) -> None:
+    # callback_data だけを信じない: 押されたのが、そのカードとして送ったメッセージか確かめる
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "s", card_message_id=card_message_id, chat_id=chat_id)]])
+    worker = FakeWorker()
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+
+    assert dig_requests(conn) == []
+    assert api.answered == [("cb1", "⚠️ このカードには対応できません")]
+    assert worker.kicks == 0
+
+
+@pytest.mark.parametrize(
+    ("url", "has_url_button"),
+    [
+        ("https://a.example/1", True),
+        ("ftp://a.example/1", False),
+        ("https://例え.jp/記事", False),  # 送信が 400 で恒久失敗しないよう、ASCII の URL だけ
+        (None, False),
+        ("https://a.example/" + "x" * 3000, False),
+    ],
+)
+def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
+    keyboard = dig_card_keyboard(5, url, with_requests=True)
+    buttons = keyboard["inline_keyboard"][0]
+    assert ("url" in buttons[0]) is has_url_button
+    assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:s", "d:5:m"]
+    assert dig_card_keyboard(5, None, with_requests=False) is None
+
