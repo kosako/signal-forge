@@ -19,7 +19,11 @@
   辿らずに開く
 - 本人がノートを動かした・消したときは、ノートへの追記だけを諦める(原文は台帳と item_notes に
   残る)。vault に書けない一時的な失敗(DeepDive の置き場ごと見えないときを含む)は記録しない
-  まま残し、次の実行で再試行する。どの失敗もその 1 件に閉じ、後の take は記録する
+  まま残し、次の実行で再試行する。時間の上限を超えたとき(下)を除き、どの失敗もその 1 件に
+  閉じ、後の take は記録する
+- vault への追記には時間の上限を付ける(macOS の確認待ちなどで止まったまま返事の処理を
+  止めない。GH#145)。上限を超えたら、この実行では残りの take を記録せず次の実行に回す
+  (止まった追記が後から終わっても、節の記録番号で 2 回は書かない)
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import stat
 from pathlib import Path
 
 from app.config import Config
+from app.vault_guard import VaultGuard, VaultStalled
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 
@@ -51,8 +56,14 @@ def has_unrecorded_take(conn: sqlite3.Connection) -> bool:
     )
 
 
-def record_takes(conn: sqlite3.Connection, config: Config, logger: logging.Logger) -> int:
+def record_takes(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    vault: VaultGuard | None = None,
+) -> int:
     """未記録の take を古い順に記録し、記録した件数を返す(1 件の失敗は他を止めない)。"""
+    vault = vault or VaultGuard()
     rows = conn.execute(
         """
         SELECT q.id, q.question, date(q.created_at, '+9 hours') AS take_date,
@@ -69,7 +80,13 @@ def record_takes(conn: sqlite3.Connection, config: Config, logger: logging.Logge
         log_extra = {"stage": "answer", "item_id": row["item_id"],
                      "extra": {"question_id": row["id"]}}
         try:
-            _append_to_note(config, row)
+            vault.call(lambda row=row: _append_to_note(config, row))
+        except VaultStalled as e:
+            logger.error(
+                f"vault が応答しないので take の記録をこの実行では止める(次の実行で再試行): {e}",
+                extra=log_extra,
+            )
+            break
         except _NoteMissing as e:
             logger.warning(
                 f"解説ノートに take を書けなかった({e}。台帳と感想には残る)", extra=log_extra

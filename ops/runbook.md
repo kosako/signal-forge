@@ -225,3 +225,14 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
   解説ノートの末尾へ原文を足す(ノートは書き直さず追記だけ。frontmatter の status は変えない)。vault に書けないときは
   `answer.log` に ERROR が出て、poller が 10 分おきに `intel answer` を起動して再試行する
   (poller を入れ直すまでは、次にリプライしたときにだけ再試行する)。
+- vault が応答しないとき(GH#145): `intel answer` は vault への 1 回のアクセスを 10 秒で打ち切り、
+  その実行では vault に触れずに返事を作る(材料にノートが入らない)。take は記録せず次の実行に回す。
+  `answer.log` に「vault が応答しなかった」の ERROR が出たら、macOS のプライバシーの確認
+  (書類フォルダへのアクセス。対象は uv)が出ていないかを Mac の画面で見る。出ていれば許可する。
+  見分け方:
+  ```sh
+  log show --last 30m --predicate 'process == "tccd" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"'
+  ```
+  確認を出さないようにするには、§4 の FDA を uv の実体に付け直す(uv を更新したときは付け直しが要る)。
+  vault のファイルを自分のシェルで開いて確かめるときも、時間の上限を付ける
+  (`perl -e 'alarm 5; exec @ARGV' head -c 1 <file>`。上限なしだとシェルも止まる)。

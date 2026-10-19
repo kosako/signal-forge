@@ -69,6 +69,7 @@ app/
   jst.py          # 日本時間(JST)と今日の暦日(複数の段が使う。GH#113)
   prompting.py    # プロンプトの sanitize と単一パスのテンプレート置換(分析・トレンド・深掘り・
                   #   返事が共通に使う。設計 03 §3.2・GH#113)
+  vault_guard.py  # vault へのアクセスに時間の上限を付ける(返事と take の記録が使う。GH#145)
   connectors/     # base.py(Connector の型)、x.py(ホームTL + XRouter)、x_search.py(AI 検索)、
                   #   x_oauth2.py(OAuth2 PKCE・S1)、x_signals.py(興味シグナル取込・S1b)、rss.py
                   #   — items を produce(カーソル・冪等)
@@ -96,7 +97,7 @@ tests/
 
 依存方向の規則(理由: 差し替え点を外周に置き、正本ロジックを守る):
 
-- `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`prompting.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
+- `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`prompting.py`・`vault_guard.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
 - 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
   - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)

@@ -3,6 +3,7 @@
 import logging
 import os
 import sqlite3
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from app import dig_take
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.dig_take import has_unrecorded_take, record_takes
+from app.vault_guard import VaultGuard
 from tests.test_dig_answer import add_dig, ask
 
 logger = logging.getLogger("test-dig-take")
@@ -196,6 +198,65 @@ def test_write_failure_is_retried_next_run(conn, config, monkeypatch, caplog) ->
     assert record_takes(conn, config, logger) == 1
     assert "書けない take" in note_path(config, conn, dig_id).read_text(encoding="utf-8")
     assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
+
+
+def test_vault_stall_stops_recording_and_is_retried(conn, config, monkeypatch, caplog) -> None:
+    # 追記が止まったら(macOS の確認待ちなど)この実行では残りを試さず、次の実行で記録する(GH#145)
+    first = add_dig(conn, config, note=NOTE)
+    second = add_dig(conn, config, note=NOTE, url="https://a.example/2")
+    answered(conn, first, "take 1", 921, "take")
+    answered(conn, second, "take 2", 922, "take")
+    release = threading.Event()
+    attempts: list[int] = []
+    real_append = dig_take._append_to_note
+
+    def stuck(config, row):
+        attempts.append(row["id"])
+        release.wait()
+
+    monkeypatch.setattr(dig_take, "_append_to_note", stuck)
+    try:
+        with caplog.at_level(logging.ERROR):
+            assert record_takes(conn, config, logger, VaultGuard(timeout_s=0.05)) == 0
+    finally:
+        release.set()
+    assert len(attempts) == 1
+    assert "vault が応答しない" in caplog.text
+    assert followups(conn, item_of(conn, first)) == []
+    assert has_unrecorded_take(conn)
+
+    monkeypatch.setattr(dig_take, "_append_to_note", real_append)
+    assert record_takes(conn, config, logger) == 2
+    assert "take 1" in note_path(config, conn, first).read_text(encoding="utf-8")
+    assert "take 2" in note_path(config, conn, second).read_text(encoding="utf-8")
+
+
+def test_stalled_append_finishing_late_is_not_written_twice(conn, config, monkeypatch) -> None:
+    # 止まったと判断した後に追記が終わっても、台帳は未記録のまま。次の実行は節を足さずに記録する
+    dig_id = add_dig(conn, config, note=NOTE)
+    question_id = answered(conn, dig_id, "遅れて書かれる take", 931, "take")
+    release, finished = threading.Event(), threading.Event()
+    real_append = dig_take._append_to_note
+
+    def late(config, row):
+        release.wait()
+        real_append(config, row)
+        finished.set()
+
+    monkeypatch.setattr(dig_take, "_append_to_note", late)
+    try:
+        assert record_takes(conn, config, logger, VaultGuard(timeout_s=0.05)) == 0
+    finally:
+        release.set()
+    assert finished.wait(5)
+    assert has_unrecorded_take(conn)
+
+    monkeypatch.setattr(dig_take, "_append_to_note", real_append)
+    assert record_takes(conn, config, logger) == 1
+    text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
+    assert text.count(f"記録番号 {question_id})") == 1
+    assert text.count("遅れて書かれる take") == 1
+    assert not has_unrecorded_take(conn)
 
 
 def test_ledger_failure_rolls_back_and_is_retried(conn, config, monkeypatch, caplog) -> None:

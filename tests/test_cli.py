@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import pytest
 from typer.testing import CliRunner
 
 from app.cli import app
@@ -59,9 +62,8 @@ def test_answer_exits_quietly_while_another_runs(tmp_path) -> None:
     assert not (tmp_path / "intel.db").exists()
 
 
-def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
-    # 返事を送った後に take を記録する(GH#106)。送る時点では未記録で、同じ実行の終わりに記録済み
-    import app.delivery as delivery
+def _unsent_take(tmp_path, monkeypatch) -> Path:
+    """返事が未送信の take が 1 件ある DB と vault を用意し、vault の置き場を返す。"""
     from app import logs
     from app.db import apply_migrations, connect
 
@@ -90,6 +92,15 @@ def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
         "answer) VALUES (1, '結論はこう', 81, 'answered', 'take', '返事')"  # 返事は未送信
     )
     conn.close()
+    return vault
+
+
+def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
+    # 返事を送った後に take を記録する(GH#106)。送る時点では未記録で、同じ実行の終わりに記録済み
+    import app.delivery as delivery
+    from app.db import connect
+
+    vault = _unsent_take(tmp_path, monkeypatch)
     recorded_at_send: list = []
 
     class Api:
@@ -110,3 +121,67 @@ def test_answer_records_takes_after_replies(tmp_path, monkeypatch) -> None:
     assert "送信 1 通・take の記録 1 件" in result.output
     text = (vault / "SignalForge" / "DeepDive" / "note.md").read_text(encoding="utf-8")
     assert "結論はこう" in text
+
+
+def test_answer_keeps_lock_while_stalled_vault_thread_may_write(tmp_path, monkeypatch) -> None:
+    # vault が止まったら、止まったスレッドが後から追記を終えうる間(プロセスの終了まで)
+    # ロックを握り、次の answer に同じ take を書かせない(GH#145)
+    import fcntl
+    import threading
+
+    import app.delivery as delivery
+    from app import dig_take, vault_guard
+
+    _unsent_take(tmp_path, monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(dig_take, "_append_to_note", lambda config, row: release.wait())
+    real_guard = vault_guard.VaultGuard
+    monkeypatch.setattr(vault_guard, "VaultGuard", lambda: real_guard(timeout_s=0.05))
+
+    class Api:
+        def send_message(self, chat_id, text, *, reply_to_message_id=None):
+            return 82
+
+    monkeypatch.setattr(delivery, "create_api", lambda env: Api())
+    try:
+        result = runner.invoke(app, ["answer", "--config-dir", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        assert "送信 1 通・take の記録 0 件" in result.output
+        # このテストのプロセスが終わるまでロックは外れない(複製した fd は閉じない)
+        with (tmp_path / "answer.lock").open("w") as other, pytest.raises(BlockingIOError):
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        release.set()
+
+
+def test_answer_keeps_lock_when_interrupted_while_vault_thread_lives(tmp_path, monkeypatch) -> None:
+    # 待っている途中で中断(KeyboardInterrupt など)されても、ロックは外さない(GH#145 round 2)
+    import fcntl
+    import threading
+
+    import app.delivery as delivery
+    from app import dig_take, vault_guard
+
+    _unsent_take(tmp_path, monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(dig_take, "_append_to_note", lambda config, row: release.wait())
+
+    class InterruptedGuard(vault_guard.VaultGuard):
+        def call(self, fn):
+            threading.Thread(target=fn, daemon=True).start()  # 書き込み直前で待つスレッド
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(vault_guard, "VaultGuard", InterruptedGuard)
+
+    class Api:
+        def send_message(self, chat_id, text, *, reply_to_message_id=None):
+            return 82
+
+    monkeypatch.setattr(delivery, "create_api", lambda env: Api())
+    try:
+        result = runner.invoke(app, ["answer", "--config-dir", str(tmp_path)])
+        assert result.exit_code == 130  # 中断で終わる(typer は SIGINT と同じ 130 で抜ける)
+        with (tmp_path / "answer.lock").open("w") as other, pytest.raises(BlockingIOError):
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        release.set()

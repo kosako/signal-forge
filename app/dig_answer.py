@@ -27,6 +27,7 @@ from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.prompting import fill_template, sanitize_body
+from app.vault_guard import VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-answer-v001"
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -130,15 +131,18 @@ def answer_pending(
     engine_factory: Callable[[str], LLMEngine],
     send_reply: SendReply,
     logger: logging.Logger,
+    vault: VaultGuard | None = None,
 ) -> int:
     """未処理の質問に古い順で答えて送り、送った通数(失敗の知らせを含む)を返す。
 
-    1 件ずつ「答えを作る → 送る」を繰り返す(先の質問の返事を待たせない)。
+    1 件ずつ「答えを作る → 送る」を繰り返す(先の質問の返事を待たせない)。vault のノートは
+    時間の上限つきで読み、vault が応答しないときはノートなしで答える(GH#145)。
     """
+    vault = vault or VaultGuard()
     sender = _Sender(conn, send_reply, logger)
     sender.flush()  # 前回の実行で送れなかった返事から
     while (row := _next_pending(conn)) is not None:
-        _answer_one(conn, config, engine_factory, row, logger)
+        _answer_one(conn, config, engine_factory, row, logger, vault)
         sender.flush()
     return sender.sent
 
@@ -161,12 +165,13 @@ def _answer_one(
     engine_factory: Callable[[str], LLMEngine],
     row: sqlite3.Row,
     logger: logging.Logger,
+    vault: VaultGuard,
 ) -> None:
     """1 件を pending から answered / failed へ必ず進める(残すと answer_pending が回り続ける)。"""
     log_extra = {"stage": "answer", "extra": {"question_id": row["id"]}}
     try:
         engine = engine_factory(config.dig.answer_reasoning_effort)
-        prompt = build_answer_prompt(conn, config, row)
+        prompt = build_answer_prompt(conn, config, row, vault)
         result = complete_with_retry(engine, prompt, DigAnswer, timeout_s=config.dig.timeout_s)
     except Exception as e:
         # 想定外の例外も 1 件に閉じ、失敗として本人に知らせる(返事を待たせたままにしない)
@@ -238,7 +243,10 @@ class _Sender:
             self.sent += 1
 
 
-def build_answer_prompt(conn: sqlite3.Connection, config: Config, row: sqlite3.Row) -> str:
+def build_answer_prompt(
+    conn: sqlite3.Connection, config: Config, row: sqlite3.Row, vault: VaultGuard | None = None
+) -> str:
+    vault = vault or VaultGuard()
     nonce = secrets.token_hex(4)
     template = (_PROMPTS_DIR / f"{PROMPT_VERSION}.md").read_text(encoding="utf-8")
     profile = load_interest_profile(config.profile_path).body
@@ -248,9 +256,9 @@ def build_answer_prompt(conn: sqlite3.Connection, config: Config, row: sqlite3.R
         {
             "interest_profile": profile,
             "materials": (
-                _request_materials(conn, config, row, nonce)
+                _request_materials(conn, config, row, nonce, vault)
                 if row["request"] is not None
-                else _materials(config, row, nonce)
+                else _materials(config, row, nonce, vault)
             ),
             "history": _history(conn, row["dig_result_id"], row["id"], nonce),
             "question": question,
@@ -260,27 +268,28 @@ def build_answer_prompt(conn: sqlite3.Connection, config: Config, row: sqlite3.R
     )
 
 
-def _materials(config: Config, row: sqlite3.Row, nonce: str) -> str:
+def _materials(config: Config, row: sqlite3.Row, nonce: str, vault: VaultGuard) -> str:
     """カード(台帳)+ 解説ノート + 原文/対訳ノート(vault)。
 
     ノート本文は公開時に台帳から消える(migration 010)ので vault から読む。本人が
-    ノートを動かした・消した場合も、手元の材料で答えられるよう欠落は注記で済ませる。
+    ノートを動かした・消した場合や vault が応答しない場合も、手元の材料で答えられるよう
+    欠落は注記で済ませる。
     """
     deepdive_dir = _deepdive_dir(config)
     parts = ["## 概要カード", sanitize_body(row["card_text"], nonce)]
 
-    explainer = _read_note(deepdive_dir, row["note_name"])
+    explainer = _read_note_guarded(vault, deepdive_dir, row["note_name"])
     parts.append("## 解説ノート")
     if explainer is None:
-        parts.append("(解説ノートが見つからない)")
+        parts.append(_missing_note("解説ノート", vault))
     else:
         parts.append(_truncate(sanitize_body(explainer, nonce), EXPLAINER_MAX_CHARS))
 
     if row["source_note_name"] is not None:
-        source = _read_note(deepdive_dir, row["source_note_name"])
+        source = _read_note_guarded(vault, deepdive_dir, row["source_note_name"])
         parts.append("## 原文/対訳ノート")
         if source is None:
-            parts.append("(原文/対訳ノートが見つからない)")
+            parts.append(_missing_note("原文/対訳ノート", vault))
         else:
             parts.append(
                 _truncate(sanitize_body(source, nonce), config.dig.answer_source_max_chars)
@@ -289,7 +298,7 @@ def _materials(config: Config, row: sqlite3.Row, nonce: str) -> str:
 
 
 def _request_materials(
-    conn: sqlite3.Connection, config: Config, row: sqlite3.Row, nonce: str
+    conn: sqlite3.Connection, config: Config, row: sqlite3.Row, nonce: str, vault: VaultGuard
 ) -> str:
     """カードのボタンからの依頼の材料(GH#141): カード + 元記事の本文。
 
@@ -303,7 +312,7 @@ def _request_materials(
     ).fetchone()
     body = doc["extracted_text"] if doc is not None else None
     if body is None and row["source_note_name"] is not None:
-        body = _read_note(_deepdive_dir(config), row["source_note_name"])
+        body = _read_note_guarded(vault, _deepdive_dir(config), row["source_note_name"])
     if body is None:
         parts.append("(元記事の本文が手元に無い。概要カードの範囲で答える)")
     else:
@@ -338,6 +347,24 @@ def _deepdive_dir(config: Config) -> Path | None:
     if config.obsidian.vault_path is None:
         return None
     return Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder / DEEPDIVE_FOLDER
+
+
+def _read_note_guarded(
+    vault: VaultGuard, deepdive_dir: Path | None, note_name: str
+) -> str | None:
+    """_read_note を時間の上限つきで(vault が応答しないときは None。理由は vault.stalled)。"""
+    if deepdive_dir is None:
+        return None
+    try:
+        return vault.call(lambda: _read_note(deepdive_dir, note_name))
+    except VaultStalled:
+        return None
+
+
+def _missing_note(label: str, vault: VaultGuard) -> str:
+    if vault.stalled:
+        return f"({label}を読めない: vault が応答しない)"
+    return f"({label}が見つからない)"
 
 
 def _read_note(deepdive_dir: Path | None, note_name: str) -> str | None:
