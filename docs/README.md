@@ -104,7 +104,7 @@ ADR(Architecture Decision Record)は、覆しにくい判断とその理由・�
 |---|---|---|---|---|---|
 | [0001](adr/0001-interest-feedback-loop.md) | 興味フィードバック・ループと X ソース戦略 | Accepted | 2026-07-10 | 手動のアカウントリストをやめ、ホーム TL・検索・ブックマーク/いいね/自分の RT などの行動を燃料に、予算内で段階的に回す | 入力側の判断。0002 が参照する |
 | [0002](adr/0002-retrieval-agent-via-mcp.md) | retrieval の主経路は「エージェント経由(MCP)」とする | Accepted | 2026-07-12 | 貯めた知見は、人の検索窓ではなく作業中の AI エージェントが MCP 経由で引く | MCP の口は未実装 |
-| [0003](adr/0003-knowledge-item-as-deepdive-byproduct.md) | 知見の単位は「深掘りの副産物」 | Accepted | 2026-07-12 | 知見 = ソース + 出典群 + ユーザーの結論(take)。AI がドラフトし、take が付いたものだけを確定とする | 0002 を前提とする。take の記録は未実装 |
+| [0003](adr/0003-knowledge-item-as-deepdive-byproduct.md) | 知見の単位は「深掘りの副産物」 | Accepted | 2026-07-12 | 知見 = ソース + 出典群 + ユーザーの結論(take)。AI がドラフトし、take が付いたものだけを確定とする | 0002 を前提とする。take の記録は GH#106 で実装(解説ノートへの追記と followup_dig) |
 | [0004](adr/0004-deepdive-in-agent-obsidian-substrate.md) | 深掘りは既存エージェント内 / 知見の substrate は Obsidian | Accepted | 2026-07-12 | 深掘りは既存のエージェントの中で行い、知見はダイジェストと同じ Obsidian vault の別フォルダに貯める | 0002・0003 を前提とする。「専用 UI は延期」の部分は 0005 で置き換え |
 | [0005](adr/0005-operation-surface-separate-app.md) | 機能は signal-forge が口として持ち、操作するアプリは別プロジェクトで作る | Accepted | 2026-10-18 | 操作面を差し替えられる形に寄せる。当面の操作面は Telegram で、カードへの質問への返事を先に作る | 0004 の一部を置き換える。中央アプリへ出す口(0002 の MCP の方向)は口を出すときに改めて決める |
 

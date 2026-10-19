@@ -4,7 +4,8 @@
   受信デーモン(設計 05 §1.2)。__PLACEHOLDER__ は ops/runbook.md の手順で置換してから
   ~/Library/LaunchAgents/ へ「コピー」して bootstrap する(symlink 不可)。
   - KeepAlive: クラッシュしても callback の取りこぼしを最小化するため常時復帰
-  - 連続クラッシュは ThrottleInterval 30 で launchd が抑制(検知は doctor #8 / watchdog)
+  - 連続クラッシュは ThrottleInterval 30 で launchd が抑制(自動の検知は無い。doctor #8 はロード
+    済みかだけを見る。poller-launchd.log / poller.log で確かめる)
   - 夜アンケート・watchdog はこのプロセスの内蔵タイマー(時刻は config.toml)
   - PATH には uv に加え codex の dir(__CODEX_DIR__)を入れる。深掘りカードへの質問に返事する
     `intel answer`(このプロセスが起動する子。GH#126)が codex を subprocess 起動するため(#72)
