@@ -40,6 +40,7 @@ BREAKER_THRESHOLD = 2
 PRIMARY_SKIPPED = "skipped"  # 台帳の primary_error: 主を飛ばした回
 # codex の effort → Claude API の effort(ほかは同じ名前。DIG_EFFORTS と ANTHROPIC_EFFORTS)
 _CLAUDE_EFFORTS = {"minimal": "low"}
+_STAGE_LABELS = {"analyze": "記事の判定", "trend": "トレンド", "dig": "深掘り", "answer": "返事"}
 
 
 def fallback_cost_this_month(conn: sqlite3.Connection) -> float:
@@ -118,7 +119,7 @@ class FallbackEngine:
 
     `name` と `model` は最後に答えたエンジンのもの。呼び出しの直後に読めば、その呼び出しに
     答えたエンジンになる(analyzer は結果ごとに控えて analyses の engine / model に記録する。
-    1 つのチャンクの中で主と予備が混ざりうるため。GH#156 その 2)。
+    1 つのチャンクの中で主と予備が混ざりうるため)。
     """
 
     def __init__(
@@ -225,16 +226,23 @@ def fallback_engine_factory(
     *,
     stage: str,
     run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
 ) -> Callable[[str], LLMEngine]:
     """effort → エンジン。予備が無効(既定)なら主のエンジンをそのまま返す。
 
     1 つの factory が作るエンジンは、主が続けて失敗したかの記録を共有する(1 つの段・1 回の
     実行ぶん)。予備のエンジンは主が失敗したときに初めて作る(キーが無いなどの失敗も、その
-    ときの呼び出しの失敗として扱う)。
+    ときの呼び出しの失敗として扱う)。primary は主のエンジンの作り方(既定は config の
+    `[llm].engine`。朝バッチは run_pipeline に渡された factory を使う)。
     """
     settings = config.llm_fallback
+    if primary is None:
+
+        def primary(effort: str) -> LLMEngine:
+            return create_engine(config.llm.engine, model_reasoning_effort=effort)
+
     if settings.engine == "":
-        return lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort)
+        return primary
     ledger = FallbackLedger(conn, settings.monthly_cap_usd, stage=stage, run_id=run_id)
     breaker = _Breaker()
     extra = {"run_id": run_id, "stage": stage}
@@ -248,7 +256,7 @@ def fallback_engine_factory(
             output_usd_per_mtok=settings.output_usd_per_mtok,
         )
         return FallbackEngine(
-            create_engine(config.llm.engine, model_reasoning_effort=effort),
+            primary(effort),
             lambda: create_anthropic_engine(claude, env),
             ledger,
             breaker,
@@ -258,3 +266,30 @@ def fallback_engine_factory(
         )
 
     return make
+
+
+def run_fallback_notice(conn: sqlite3.Connection, run_id: str, cap_usd: float) -> str | None:
+    """朝バッチ 1 回ぶんの予備の利用の知らせ(使っていなければ None)。
+
+    予備で答えられても、Codex が止まっていることには変わらないので知らせる(黙って Claude API に
+    頼り続けない)。文言は固定の語と数だけ(外部の文字列を含まない)。
+    """
+    rows = conn.execute(
+        "SELECT stage, count(*) AS calls, sum(ok) AS answered, sum(cost_usd) AS cost"
+        " FROM llm_fallback_calls WHERE run_id = ? GROUP BY stage ORDER BY min(id)",
+        (run_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    lines = ["⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました"]
+    for row in rows:
+        failed = row["calls"] - row["answered"]
+        detail = f"(うち予備も失敗 {failed} 回)" if failed else ""
+        lines.append(f"・{_STAGE_LABELS[row['stage']]}: {row['calls']} 回{detail}")
+    spent = sum(row["cost"] for row in rows)
+    lines.append(
+        f"今回 ${spent:.2f} / 今月の予備 ${fallback_cost_this_month(conn):.2f}"
+        f"(上限 ${cap_usd:.2f})"
+    )
+    lines.append("Codex の上限・ログインの状態を確かめてください(runbook §14)")
+    return "\n".join(lines)

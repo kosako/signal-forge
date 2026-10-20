@@ -316,3 +316,53 @@ def test_fallback_failure_logs_and_raises_without_reply_body(conn, caplog) -> No
     assert marker not in caplog.text
     (row,) = ledger_rows(conn)
     assert row["ok"] == 0 and row["cost_usd"] > 0
+
+
+def test_run_fallback_notice_summarizes_one_run(conn) -> None:
+    from app.analysis.fallback import run_fallback_notice
+
+    rows = [
+        ("01RUN", "analyze", 1, 0.02),
+        ("01RUN", "analyze", 1, 0.03),
+        ("01RUN", "analyze", 0, 0.01),
+        ("01RUN", "dig", 1, 0.10),
+        ("01OTHER", "answer", 1, 5.00),  # ほかの実行は数えない(今月の合計には入る)
+    ]
+    for run_id, stage, ok, cost in rows:
+        conn.execute(
+            "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok, cost_usd)"
+            " VALUES (?, ?, 'claude-sonnet-5-5', 'LLMError', ?, ?)",
+            (run_id, stage, ok, cost),
+        )
+    text = run_fallback_notice(conn, "01RUN", 10.0)
+    assert text.splitlines() == [
+        "⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました",
+        "・記事の判定: 3 回(うち予備も失敗 1 回)",
+        "・深掘り: 1 回",
+        "今回 $0.16 / 今月の予備 $5.16(上限 $10.00)",
+        "Codex の上限・ログインの状態を確かめてください(runbook §14)",
+    ]
+    assert run_fallback_notice(conn, "01NONE", 10.0) is None
+
+
+def test_factory_uses_injected_primary(conn, tmp_path) -> None:
+    primary = Scripted("codex-cli", [Verdict(score=1)])
+    made: list[str] = []
+
+    def make_primary(effort: str):
+        made.append(effort)
+        return primary
+
+    off = fallback_engine_factory(
+        conn, Config(config_dir=tmp_path), {}, logger, stage="analyze", primary=make_primary
+    )
+    assert off is make_primary  # 予備が無効なら主の作り方そのもの
+    on_config = Config(
+        config_dir=tmp_path, llm_fallback=LLMFallbackConfig(engine="anthropic-api")
+    )
+    on = fallback_engine_factory(
+        conn, on_config, {}, logger, stage="analyze", primary=make_primary
+    )
+    engine = on("low")
+    assert engine.complete_structured("p", Verdict) == Verdict(score=1)
+    assert made == ["low"]

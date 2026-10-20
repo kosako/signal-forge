@@ -94,19 +94,21 @@ def analyze(
 ) -> None:
     """事前選別+LLM 本分析で analyses を生成する。"""
     from app.analysis.analyzer import analyze_selected
-    from app.analysis.llm import create_engine
+    from app.analysis.fallback import fallback_engine_factory
     from app.analysis.profile import load_interest_profile
     from app.analysis.stage1 import preselect
-    from app.config import load_config
+    from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
+    env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
     profile = load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
-    engine = create_engine(config.llm.engine)
+    # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
+    engine = fallback_engine_factory(conn, config, env, logger, stage="analyze")("low")
     result = preselect(conn, config, logger)
     counts = analyze_selected(conn, config, engine, profile.body, result.selected_ids, logger)
     typer.echo(f"analyzed={counts['analyzed']} degraded={counts['degraded']}")
@@ -118,15 +120,16 @@ def digest(
     force: bool = typer.Option(False, "--force", help="生成済みでも当日分を置換する"),
 ) -> None:
     """ランキングして日本語ダイジェスト(digests)を生成する。"""
-    from app.analysis.llm import create_engine
+    from app.analysis.fallback import fallback_engine_factory
     from app.analysis.trend import synthesize_trend
-    from app.config import load_config
+    from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.digest import generate_digest
     from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     config = load_config(config_dir)
+    env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
@@ -135,7 +138,8 @@ def digest(
     # 生成済み & not force なら generate_digest は skip する。無駄な synthesis を避ける
     if force or exists is None:
         try:  # トレンドは付加機能。失敗しても digest 本体を止めない
-            trend = synthesize_trend(conn, create_engine(config.llm.engine), logger)
+            engine = fallback_engine_factory(conn, config, env, logger, stage="trend")("low")
+            trend = synthesize_trend(conn, engine, logger)
         except Exception as e:
             logger.warning(f"トレンド synthesis が例外(節を省略): {type(e).__name__}")
     digest_id = generate_digest(conn, config, logger, force=force, trend_markdown=trend)
@@ -171,7 +175,8 @@ def dig(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """深掘りキューから本日分を調査し、DeepDive ノート生成+概要カード送信(GH#105)。"""
-    from app.analysis.llm import create_anthropic_engine, create_engine
+    from app.analysis.fallback import fallback_engine_factory
+    from app.analysis.llm import create_anthropic_engine
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.deepdive import run_dig_stage
@@ -190,7 +195,7 @@ def dig(
     run_dig_stage(
         conn,
         config,
-        lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+        fallback_engine_factory(conn, config, env, logger, stage="dig"),  # GH#156
         api,
         logger,
         review_engine_factory=(  # GH#153
@@ -210,7 +215,7 @@ def answer(
     import fcntl
     import os
 
-    from app.analysis.llm import create_engine
+    from app.analysis.fallback import fallback_engine_factory
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.delivery import create_api, is_telegram_configured
@@ -248,7 +253,7 @@ def answer(
         sent = answer_pending(
             conn,
             config,
-            lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+            fallback_engine_factory(conn, config, env, logger, stage="answer"),  # GH#156
             lambda reply_to, text: api.send_message(
                 chat_id, escape_and_truncate(text, ANSWER_TEXT_MAX_CHARS),
                 reply_to_message_id=reply_to,
@@ -448,7 +453,7 @@ def run(
     from app.db import apply_migrations, connect
     from app.http import HttpClient
     from app.logs import DEFAULT_LOG_DIR, setup_logging
-    from app.run import run_pipeline
+    from app.run import notify_llm_fallback, run_pipeline
 
     config = load_config(config_dir)
     env = load_env(config_dir)
@@ -468,6 +473,8 @@ def run(
         run_id,
         force_digest=force_digest,
     )
+    # 予備(GH#156)を使ったら知らせる。段が成功していても Codex は止まっているため
+    notify_llm_fallback(conn, config, env, run_id, logger)
     if failures:
         # 朝バッチ失敗通知(設計 05 §4)。通知の失敗は notify 側でログのみに握る
         from app.delivery import create_api, is_telegram_configured, notify_run_failure

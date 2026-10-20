@@ -141,7 +141,9 @@ class LLMEngine(Protocol):
 - **予備への切り替え(GH#156。config `[llm_fallback]`、既定 off)**: 主のエンジン(Codex)が失敗した呼び出しだけを、予備(`anthropic-api`。既定 Sonnet 5.5)でやり直す(`analysis/fallback.py` の FallbackEngine)。使い分けは「残量を見て切り替える」ではなく「落ちたら次へ」で、主の失敗そのものを合図にする(サブスクの残量は外から読めない。GH#153 の相談)。
   - 主が続けて 2 回失敗したら(起動できない = `LLMUnavailableError` は 1 回で)、同じ factory から作るエンジンは主を飛ばして予備へ行く(Codex が止まった朝に、チャンクごとに主の失敗を待たない)。主に戻るのは次のプロセスから(朝バッチは毎朝、返事は質問ごとに起動し直す)。
   - 予備も失敗したら、**主の失敗と同じ種類のエラー**にする(LLMError なら劣化、LLMUnavailableError なら段の失敗、という各段の扱いを変えない)。予備を作れない(キーが無い)・月の上限に達したときも同じ。LLM の失敗以外の例外(実装の誤り)は予備に回さない。
-  - effort は主の effort に合わせる(codex の minimal は Claude の low)。`name` / `model` は最後に答えたエンジンのものにする(呼び出しの直後に読めば、その呼び出しに答えたエンジン)。analyzer は結果ごとにそれを控えて analyses の engine / model に記録する(1 つのチャンクの中で、バッチは主・欠けた item の単発の再分析は予備、と混ざりうるため。配線と合わせて GH#156 その 2)。
+  - effort は主の effort に合わせる(codex の minimal は Claude の low)。`name` / `model` は最後に答えたエンジンのものにする(呼び出しの直後に読めば、その呼び出しに答えたエンジン)。analyzer は結果ごとにそれを控えて analyses の engine / model に記録する(1 つのチャンクの中で、バッチは主・欠けた item の単発の再分析は予備、と混ざりうるため)。
+  - 対象は、主のエンジンを使う全経路: analyze・トレンド・深掘り(解説・対訳・指摘を受けた直し)・カードへの返事(朝バッチの `run.py` と、`cli.py` の analyze / digest / dig / answer)。深掘りのレビュー役(GH#153。もともと Claude API)は対象外。段ごとに factory を分けるので、主を飛ばす判定と台帳の段は段ごと。朝バッチの analyze・トレンドは、`run_pipeline` に渡された主の作り方をそのまま包む(テストで主を差し替えられる)。
+  - 予備で答えられても Codex が止まっていることには変わらないので、朝バッチの後に 1 通知らせる(設計 05 §4。段ごとの回数・予備も失敗した回数・今回と今月の額)。朝バッチの外(カードへの返事)の利用は `answer.log` の WARNING と台帳・doctor #9 で見る。
   - 予備の呼び出しは台帳 `llm_fallback_calls`(migration 018。予備も失敗した呼び出しも課金されうるので残す)に記録し、月(UTC の暦月。doctor #9 の当月と同じ)の合計が `[llm_fallback].monthly_cap_usd`(既定 $10)に達したら予備を使わない。費用は doctor #9 に入る。
 - 外部本文はプロンプト内で明示フェンス(ランダム nonce 区切り。設計 03 §3.2)で囲み、data として扱う旨を毎回指示。title・author 等のメタデータも未検証データとしてサニタイズする(同 §3.2)。配信・ノートに載せる URL は LLM 出力でなく DB 上の正規 URL のみ。
 

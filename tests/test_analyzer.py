@@ -127,6 +127,34 @@ def test_out_of_allowlist_item_id_dropped_and_missing_reanalyzed(conn, tmp_path)
     assert row["input_hash"] == single_hash
 
 
+def test_engine_recorded_per_result_when_answers_mix(conn, tmp_path) -> None:
+    # バッチを主が答え、欠けた item の単発の再分析を予備が答えると(GH#156)、analyses の
+    # engine / model はそれぞれ答えたエンジンになる(最後のエンジンで全件を上書きしない)
+    a = add_item(conn, "https://a.example/1")
+    b = add_item(conn, "https://a.example/2")
+
+    class Switching(FakeEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            result = super().complete_structured(prompt, schema, timeout_s)
+            if len(self.prompts) == 2:  # 単発の再分析は予備が答えた
+                self.name, self.model = "anthropic-api", "claude-sonnet-5-5"
+            return result
+
+    engine = Switching(
+        [
+            AnalysisBatch(results=[analysis_for(a)]),  # b が欠落
+            AnalysisBatch(results=[analysis_for(b)]),
+        ]
+    )
+    counts = analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
+    assert counts == {"analyzed": 2, "degraded": 0}
+    rows = conn.execute("SELECT item_id, engine, model FROM analyses ORDER BY item_id").fetchall()
+    assert [tuple(row) for row in rows] == [
+        (a, "codex-cli", "fake-model"),
+        (b, "anthropic-api", "claude-sonnet-5-5"),
+    ]
+
+
 def test_still_missing_after_retry_becomes_degraded(conn, tmp_path) -> None:
     a = add_item(conn, "https://a.example/1", title="タイトルX")
     engine = FakeEngine(
