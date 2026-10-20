@@ -356,3 +356,36 @@ def test_dig_review_defaults_and_validation(tmp_path: Path) -> None:
         write_config(tmp_path, f"[dig]\nreview_monthly_cap_usd = {bad}\n")
         with pytest.raises(ConfigError, match="review_monthly_cap_usd"):
             load_config(tmp_path)
+
+
+def test_llm_fallback_defaults_and_overrides(tmp_path: Path) -> None:
+    default = load_config(tmp_path).llm_fallback
+    assert (default.engine, default.model, default.max_tokens) == ("", "claude-sonnet-5-5", 16_000)
+    assert (default.input_usd_per_mtok, default.output_usd_per_mtok) == (2.0, 10.0)
+    assert default.monthly_cap_usd == 10.0
+    write_config(
+        tmp_path,
+        '[llm_fallback]\nengine = "anthropic-api"\nmodel = "claude-haiku-5-5"\n'
+        "input_usd_per_mtok = 0.1\noutput_usd_per_mtok = 0.5\nmonthly_cap_usd = 3\n",
+    )
+    config = load_config(tmp_path).llm_fallback
+    assert (config.engine, config.model, config.monthly_cap_usd) == (
+        "anthropic-api", "claude-haiku-5-5", 3
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ('engine = "codex-cli"', "engine"),  # 主と同じエンジンは予備にならない
+        ('model = ""', "model"),
+        ("max_tokens = 0", "正の整数"),
+        ("output_usd_per_mtok = -0.5", "output_usd_per_mtok"),
+        ("monthly_cap_usd = 0", "monthly_cap_usd"),
+        ("monthly_cap_usd = nan", "monthly_cap_usd"),
+    ],
+)
+def test_llm_fallback_rejects_bad_values(tmp_path: Path, body: str, match: str) -> None:
+    write_config(tmp_path, f"[llm_fallback]\n{body}\n")
+    with pytest.raises(ConfigError, match=match):
+        load_config(tmp_path)

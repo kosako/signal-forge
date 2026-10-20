@@ -549,3 +549,20 @@ def test_create_anthropic_engine_ignores_os_environ(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "from-environ")
     with pytest.raises(LLMUnavailableError, match=ANTHROPIC_API_KEY_ENV):
         create_anthropic_engine(AnthropicApiConfig(), {})
+
+
+def test_anthropic_parse_failure_does_not_echo_reply_body() -> None:
+    # 応答の本文(外部の記事の文を含みうる)を例外・traceback に載せない(GH#156 のレビュー)
+    marker = "記事の本文そのものXYZ"
+    cases = [
+        (f"{marker} は JSON ではない", "JSON でない"),
+        (json.dumps({"score": marker, "reason": marker}, ensure_ascii=False), "score: int_parsing"),
+        (json.dumps({"reason": marker}, ensure_ascii=False), "score: missing"),
+    ]
+    for text, expected in cases:
+        reply = anthropic_reply(text=text)
+        engine = anthropic_engine(lambda request, reply=reply: httpx.Response(200, json=reply))
+        with pytest.raises(LLMError, match=expected) as excinfo:
+            engine.complete_structured("p", Verdict)
+        assert excinfo.value.__cause__ is None
+        assert marker not in "".join(traceback.format_exception(excinfo.value))

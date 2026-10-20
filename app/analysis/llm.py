@@ -458,7 +458,13 @@ class AnthropicApiEngine:
             and block.get("type") == "text"
             and isinstance(block.get("text"), str)
         )
-        return parse_structured(text, schema)
+        try:
+            return parse_structured(text, schema)
+        except LLMError as e:
+            # 応答の本文(外部の記事の文を含みうる)を例外 = ログに載せない。合わない場所だけ
+            # (parse_structured は応答の先頭・入力値を載せ、原因の例外にも本文が残るため
+            # つながない。GH#156 のレビュー)
+            raise LLMError(_content_free_parse_error(e)) from None
 
     def _usage(self, usage: object) -> LLMUsage | None:
         if not isinstance(usage, dict):
@@ -474,6 +480,23 @@ class AnthropicApiEngine:
             return None
         cost = (input_tokens * self._input_price + output_tokens * self._output_price) / 1_000_000
         return LLMUsage(input_tokens, output_tokens, round(cost, 6))
+
+
+def _content_free_parse_error(error: LLMError) -> str:
+    """parse_structured の失敗を、応答の本文を含まない説明にする(場所と種類だけ)。"""
+    cause = error.__cause__
+    if isinstance(cause, json.JSONDecodeError):
+        return f"Anthropic API の応答が JSON でない({cause.msg}・位置 {cause.pos})"
+    if isinstance(cause, ValidationError):
+        places = [
+            f"{'.'.join(str(part) for part in item['loc'])}: {item['type']}"
+            for item in cause.errors(
+                include_url=False, include_context=False, include_input=False
+            )[:5]
+        ]
+        detail = re.sub(r"[^\w.:/ -]", "", " / ".join(places))[:200]
+        return f"Anthropic API の応答がスキーマに合わない({detail})"
+    return "Anthropic API の応答を検証できない"
 
 
 def _anthropic_error_type(response: httpx.Response) -> str:
