@@ -46,6 +46,8 @@ class FetchResult:
     items: list[RawItem]
     next_cursor: dict  # sources.cursor に JSON 保存する不透明な辞書
     stats: FetchStats
+    # 恒久移転(301/308)を経由したときの移転先(RSS。sources.moved_url へ。設計 02 §3・GH#150)
+    moved_url: str | None = None
 
 
 class Connector(Protocol):

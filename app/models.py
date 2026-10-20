@@ -35,6 +35,7 @@ class Source(_Row):
     last_error: str | None
     consecutive_failures: int
     created_at: str
+    moved_url: str | None = None  # migration 016(GH#150)
 
 
 @dataclass(frozen=True)

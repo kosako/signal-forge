@@ -117,7 +117,7 @@ class Connector(Protocol):
 - **重複排除キー**: entry の `id`(guid)を external_id に。無ければ正規化 URL の hash にフォールバック。
 - **raw_content**: `content` / `summary` があれば RawItem.raw_content に同梱。全文フィードなら本文抽出の HTTP を節約できる(使うかは extraction 層が判断)。
 - **フィード死活**: consecutive_failures ≥ 7(約1週間)で doctor #14 が「死亡疑い」警告(watchdog は通知しない)。410 Gone と恒久リダイレクトループは即 FatalError。自動削除・自動 disable はせず週次セルフレビューで棚卸し。理由: RSS は一時障害が多く、自動判定の誤爆コストの方が高い。
-- **恒久リダイレクト(301)**: 警告表示のみ。sources.config の URL 書き換えは人が行う(sources はユーザー管理データのため)。
+- **恒久リダイレクト(301 / 308)**: 取得は転送先から続け、ログに WARNING を出し、移転先(リダイレクトを辿った最終の URL)を `sources.moved_url`(migration 016)に残す。移転なしで取れた回に消え、取れなかった回は変えない。週次のソースの健康診断(GH#150)で知らせる。sources.config の URL 書き換えは人が行う(sources はユーザー管理データのため。自動では書き換えない)。
 
 ## 4. 手動 URL コネクタ(Telegram 投入フロー)
 

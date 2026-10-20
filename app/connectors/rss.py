@@ -44,6 +44,8 @@ class RssConnector:
         fetched = self._http.get(feed_url, headers=headers)
         response = fetched.response
         duration_ms = int((time.monotonic() - started) * 1000)
+        # 移転先は記録して週次の健康診断で知らせる。config の URL の書き換えは人が行う(設計 02 §3)
+        moved_url = fetched.final_url if fetched.permanently_moved else None
 
         if response.status_code == 304:
             stats = FetchStats(
@@ -53,7 +55,7 @@ class RssConnector:
                 http_status=304,
                 duration_ms=duration_ms,
             )
-            return FetchResult(items=[], next_cursor=cursor, stats=stats)
+            return FetchResult(items=[], next_cursor=cursor, stats=stats, moved_url=moved_url)
         if response.status_code == 410:
             raise FatalError(f"410 Gone(フィード恒久消滅): {feed_url}")
         if 400 <= response.status_code < 500:
@@ -66,8 +68,7 @@ class RssConnector:
         if feed.bozo and not feed.entries:
             raise RetryableError(f"フィードのパース失敗: {feed_url}({feed.bozo_exception})")
 
-        if fetched.permanently_moved:
-            # 警告表示のみ。sources.config の URL 書き換えは人が行う(設計 02 §3)
+        if moved_url is not None:
             logging.getLogger("intel").warning(
                 "フィードが恒久移転(301)。sources.config の URL 更新を検討",
                 extra={"source_id": source_row.id, "extra": {"final_url": fetched.final_url}},
@@ -88,6 +89,7 @@ class RssConnector:
                 http_status=response.status_code,
                 duration_ms=duration_ms,
             ),
+            moved_url=moved_url,
         )
 
 
