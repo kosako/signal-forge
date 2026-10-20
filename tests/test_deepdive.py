@@ -1,5 +1,6 @@
 """朝の調査段(GH#105 / 設計 06 §3〜5)。"""
 
+import json
 import logging
 import sqlite3
 from dataclasses import replace
@@ -8,16 +9,21 @@ from pathlib import Path
 import pytest
 import yaml
 
+from app.analysis.llm import LLMError, LLMUnavailableError, LLMUsage
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.deepdive import (
     AUTO_BRIEF,
+    REVIEW_MAX_FINDINGS,
     DigDraft,
     DigError,
+    DigReview,
+    ReviewFinding,
     TranslationChunk,
     _select_candidates,
     _split_paragraphs,
     build_dig_prompt,
+    build_review_prompt,
     run_dig_stage,
 )
 
@@ -111,6 +117,16 @@ class ScriptedEngine:
         self.prompts.append((schema.__name__, prompt))
         if schema.__name__ in self._fail_for:
             raise RuntimeError("engine 故障")
+        if schema is DigDraft and "前回のドラフトへの査読" in prompt:  # 指摘を受けた直し
+            if "DigDraft-revise" in self._fail_for:
+                raise LLMError("直しの失敗")
+            return DigDraft(
+                title_ja="直した見出し",
+                writer_stance="現場リーダー向けの週刊ニュースレター著者",
+                for_you="直したあなたにとって",
+                for_world="直した世の中にとって",
+                note_markdown="## 概要\n\n直した本文",
+            )
         if schema is DigDraft:
             return DigDraft(
                 title_ja="日本語見出し",
@@ -661,3 +677,240 @@ def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily
     else:
         assert buttons[1:] == []  # 返事をしない設定では要約・詳しくを出さない
 
+
+
+# --- 別系統の AI のレビュー(GH#153) ---
+
+
+def finding(
+    kind: str = "unsupported", severity: str = "must", problem: str = "数字が無い"
+) -> ReviewFinding:
+    return ReviewFinding(
+        kind=kind, severity=severity, location="## 骨子 の 2", problem=problem, fix="削る"
+    )
+
+
+class ReviewEngine:
+    """レビュー役の偽物。呼び出しごとに usage を残す(失敗した応答でも課金はある)。"""
+
+    name = "anthropic-api"
+    model = "claude-opus-5-5"
+
+    def __init__(self, findings=(), *, fail: Exception | None = None, cost: float = 0.1):
+        self.prompts: list[str] = []
+        self._findings = list(findings)
+        self._fail = fail
+        self._cost = cost
+        self.last_usage: LLMUsage | None = None
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        assert schema is DigReview
+        self.prompts.append(prompt)
+        self.last_usage = LLMUsage(1000, 100, self._cost)
+        if self._fail is not None:
+            raise self._fail
+        return DigReview(findings=self._findings)
+
+
+def run_with_review(conn, config, review_engine, *, engines=None, fail_for=None, api=None):
+    engines = {} if engines is None else engines
+    api = FakeApi() if api is None else api
+    item = add_item(conn, "https://blog.example/post", language="ja")  # 対訳の呼び出しを省く
+    enqueue(conn, item)
+    run_dig_stage(
+        conn,
+        config,
+        make_factory(engines, fail_for),
+        api,
+        logger,
+        today="2026-07-22",
+        review_engine_factory=(lambda: review_engine) if review_engine is not None else None,
+    )
+    row = conn.execute("SELECT * FROM dig_results WHERE item_id = ?", (item,)).fetchone()
+    note = next(deepdive_dir(config).glob("*深掘り.md")).read_text()
+    return row, note, api.sent[-1][1], engines
+
+
+def test_review_findings_revised_once_and_recorded(conn, config) -> None:
+    findings = [finding(), finding("omission", "should", "前提が抜けている")]
+    review = ReviewEngine(findings, cost=0.12)
+    row, note, card, engines = run_with_review(conn, config, review)
+
+    # 書き手(解説と同じ effort)が 1 回だけ直し、直した版を届ける。再レビューはしない
+    drafts = [prompt for name, prompt in engines["medium"].prompts if name == "DigDraft"]
+    assert len(drafts) == 2
+    assert "前回のドラフトへの査読" in drafts[1]
+    assert "数字が無い" in drafts[1] and "前提が抜けている" in drafts[1]
+    assert len(review.prompts) == 1
+    assert "直した本文" in note and "直した見出し" in card
+
+    # 台帳: 状態・指摘(公開後も残す)・費用
+    assert row["review_status"] == "revised"
+    recorded = json.loads(row["review_findings"])
+    assert [f["kind"] for f in recorded] == ["unsupported", "omission"]
+    assert row["review_cost_usd"] == pytest.approx(0.12)
+    assert row["note_markdown"] is None  # 本文列は公開後に消すが、review_* は残る
+
+    # ノート: frontmatter と take 領域の上の記録 / カード: 1 行
+    frontmatter = yaml.safe_load(note.split("---")[1])
+    assert frontmatter["review"] == "revised"
+    callout = note.index("> [!note]- 別 AI のレビュー(claude-opus-5-5): 指摘 2 件")
+    assert callout < note.index("take 領域")
+    assert "> 1. 🔴 元記事に無い — ## 骨子 の 2: 数字が無い(直し方: 削る)" in note
+    assert "> 2. 🟡 抜け" in note
+    assert "🧪 別 AI のレビュー: 指摘 2 件 → 直した版です" in card
+
+
+def test_review_without_findings_keeps_draft(conn, config) -> None:
+    row, note, card, engines = run_with_review(conn, config, ReviewEngine([]))
+    assert [name for name, _ in engines["medium"].prompts] == ["DigDraft"]  # 直さない
+    assert row["review_status"] == "clean"
+    assert row["review_findings"] == "[]"
+    assert "> [!note] 別 AI のレビュー(claude-opus-5-5): 指摘なし" in note
+    assert "🧪 別 AI のレビュー: 指摘なし" in card
+    assert "日本語見出し" in card
+
+
+@pytest.mark.parametrize(
+    "error", [LLMError("Anthropic API 529(overloaded_error)"), LLMUnavailableError("キーが無い")]
+)
+def test_review_failure_still_delivers_unreviewed(conn, config, error) -> None:
+    review = ReviewEngine(fail=error, cost=0.05)
+    row, note, card, _ = run_with_review(conn, config, review)  # 段は失敗にしない
+    retried = isinstance(error, LLMError) and not isinstance(error, LLMUnavailableError)
+    assert len(review.prompts) == (2 if retried else 1)
+    assert row["review_status"] == "failed"
+    assert row["review_findings"] is None
+    # 失敗した応答の分も費用に入れる(やり直しの分を含む)
+    assert row["review_cost_usd"] == pytest.approx(0.05 * len(review.prompts))
+    assert "> [!warning] 別 AI のレビュー(claude-opus-5-5)は失敗(未レビューのまま)" in note
+    assert "⚠️ 別 AI のレビューに失敗(未レビュー)" in card
+    assert "日本語見出し" in card
+
+
+def test_review_engine_unavailable_at_creation(conn, config) -> None:
+    def no_key() -> ReviewEngine:
+        raise LLMUnavailableError(".env に INTEL_ANTHROPIC_API_KEY が無い")
+
+    engines: dict[str, ScriptedEngine] = {}
+    api = FakeApi()
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    run_dig_stage(
+        conn, config, make_factory(engines), api, logger, today="2026-07-22",
+        review_engine_factory=no_key,
+    )
+    row = conn.execute("SELECT * FROM dig_results").fetchone()
+    assert (row["review_status"], row["review_cost_usd"]) == ("failed", 0)
+    assert "⚠️ 別 AI のレビューに失敗(未レビュー)" in api.sent[0][1]
+
+
+def test_revise_failure_keeps_original_and_shows_findings(conn, config) -> None:
+    row, note, card, _ = run_with_review(
+        conn, config, ReviewEngine([finding()]), fail_for={"DigDraft-revise"}
+    )
+    assert row["review_status"] == "revise_failed"
+    assert json.loads(row["review_findings"])[0]["problem"] == "数字が無い"
+    assert "日本語見出し" in card and "直した" not in note
+    assert "> [!warning]- 別 AI のレビュー(claude-opus-5-5): 指摘 1 件(直すのに失敗" in note
+    assert "> 1. 🔴 元記事に無い" in note
+    assert "⚠️ 別 AI のレビュー: 指摘 1 件(直せていません。ノート末尾を参照)" in card
+
+
+def test_review_programming_error_fails_the_item(conn, config) -> None:
+    # LLM の失敗でない例外(実装の誤り)は握らず、item の失敗として段に伝える
+    review = ReviewEngine(fail=RuntimeError("バグ"))
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    with pytest.raises(DigError):
+        run_dig_stage(
+            conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22",
+            review_engine_factory=lambda: review,
+        )
+    assert conn.execute("SELECT count(*) FROM dig_results").fetchone()[0] == 0
+
+
+def test_review_skipped_after_monthly_cap(conn, config) -> None:
+    other = add_item(conn, "https://blog.example/old", language="ja")
+    # 同じ JST 暦月(7 月 1 日 00:30 JST = 6 月 30 日 15:30 UTC)の費用が上限に達している。
+    # 前の月の分(6 月 30 日 14:00 UTC = 23:00 JST)は数えない
+    for created_at, cost in (("2026-06-30T15:30:00Z", 9.5), ("2026-06-30T14:00:00Z", 50.0)):
+        conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, published_at, message_id,"
+            " review_status, review_cost_usd, created_at) VALUES (?, 'n', 'c', 'x', 1,"
+            " 'clean', ?, ?)",
+            (other, cost, created_at),
+        )
+    config = replace(config, dig=replace(config.dig, review_monthly_cap_usd=9.5))
+    review = ReviewEngine([finding()])
+    row, note, card, _ = run_with_review(conn, config, review)
+    assert review.prompts == []  # 呼ばない
+    assert (row["review_status"], row["review_cost_usd"]) == ("skipped", 0)
+    assert "> [!info] 今月のレビュー費用が上限に達したため、レビューなし" in note
+    assert "🧪 今月のレビュー費用が上限に達したため未レビュー" in card
+
+
+def test_review_under_cap_runs(conn, config) -> None:
+    other = add_item(conn, "https://blog.example/old", language="ja")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at, message_id,"
+        " review_cost_usd, created_at) VALUES (?, 'n', 'c', 'x', 1, 9.4,"
+        " '2026-07-10T00:00:00Z')",
+        (other,),
+    )
+    config = replace(config, dig=replace(config.dig, review_monthly_cap_usd=9.5))
+    review = ReviewEngine([])
+    row, _, _, _ = run_with_review(conn, config, review)
+    assert len(review.prompts) == 1
+    assert row["review_status"] == "clean"
+
+
+def test_review_off_leaves_no_trace(conn, config) -> None:
+    row, note, card, _ = run_with_review(conn, config, None)
+    assert row["review_status"] is None and row["review_findings"] is None
+    assert row["review_cost_usd"] == 0
+    assert "review" not in yaml.safe_load(note.split("---")[1])
+    assert "レビュー" not in note and "レビュー" not in card
+    assert note.endswith("## 骨子\n\n1. …\n\n---\n\n(この下は手書きメモ・take 領域)\n")
+
+
+def test_review_findings_capped_and_one_line(conn, config) -> None:
+    many = [finding(problem=f"指摘{i}\n改行" + "長" * 400) for i in range(REVIEW_MAX_FINDINGS + 3)]
+    row, note, _, engines = run_with_review(conn, config, ReviewEngine(many))
+    assert len(json.loads(row["review_findings"])) == REVIEW_MAX_FINDINGS
+    lines = [line for line in note.splitlines() if line.startswith("> ") and "🔴" in line]
+    assert len(lines) == REVIEW_MAX_FINDINGS
+    assert all("改行" in line and len(line) < 600 for line in lines)
+    assert "…" in lines[0]
+    revise = [p for name, p in engines["medium"].prompts if name == "DigDraft"][1]
+    assert f"指摘{REVIEW_MAX_FINDINGS - 1}" in revise and f"指摘{REVIEW_MAX_FINDINGS}" not in revise
+
+
+def test_review_finding_enum_case_is_normalized() -> None:
+    parsed = DigReview.model_validate(
+        {"findings": [{"kind": "Misread", "severity": " MUST", "location": "l",
+                       "problem": "p", "fix": "f"}]}
+    )
+    assert (parsed.findings[0].kind, parsed.findings[0].severity) == ("misread", "must")
+
+
+def test_review_prompt_fences_source_and_draft_without_profile(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", body="本文" * 30_000)
+    enqueue(conn, item, angle="観点")
+    (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
+    draft = DigDraft(
+        title_ja="見出し",
+        writer_stance="書き手",
+        for_you="あなた",
+        for_world="世の中",
+        note_markdown="## 概要\n\nノート本文",
+    )
+    prompt = build_review_prompt(config, candidate, draft)
+    nonce = prompt.split("<<<DATA-")[1].split("\n")[0]
+    assert f"<<<DRAFT-{nonce}\n" in prompt and f"DRAFT-{nonce}>>>" in prompt
+    assert "## 概要\n\nノート本文" in prompt and "- 見出し: 見出し" in prompt
+    # 書き手と同じ範囲の本文を読む(同じ切り詰め)
+    assert "(…以降は長さ上限で切り詰め)" in prompt
+    # 関心プロファイルは渡さない(元記事との照合だけ)
+    assert "AI エージェント運用" not in prompt
+    assert '"findings"' in prompt  # スキーマ

@@ -87,6 +87,8 @@ def run_doctor(
             results.append(CheckResult(2, ".env", "FAIL", f"{config_dir / '.env'} が存在しない"))
         elif "TELEGRAM_BOT_TOKEN" not in env:
             results.append(CheckResult(2, ".env", "FAIL", "TELEGRAM_BOT_TOKEN がない"))
+        elif (missing := _missing_review_key(config, env)) is not None:
+            results.append(CheckResult(2, ".env", "FAIL", missing))
         else:
             results.append(CheckResult(2, ".env", "PASS", "パーミッション・必須キー OK"))
     except ConfigError as e:
@@ -142,6 +144,20 @@ def run_doctor(
         if conn is not None:
             conn.close()
     return sorted(results, key=lambda r: r.number)
+
+
+def _missing_review_key(config: Config | None, env: dict[str, str]) -> str | None:
+    """深掘りのレビュー(GH#153)を使う設定なのに Claude API のキーが無ければ、その説明。
+
+    キーが無くても深掘りは届く(レビューだけが毎朝失敗する)ので、ここで FAIL にして気づかせる。
+    """
+    from app.analysis.llm import ANTHROPIC_API_KEY_ENV
+
+    if config is None or not config.dig.review or config.dig.daily_cap <= 0:
+        return None
+    if env.get(ANTHROPIC_API_KEY_ENV, "").strip():
+        return None
+    return f"{ANTHROPIC_API_KEY_ENV} がない([dig].review = true。深掘りのレビューが毎回失敗する)"
 
 
 def has_failure(results: list[CheckResult]) -> bool:
@@ -631,6 +647,12 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
         "WHERE started_at LIKE ? || '%'",
         (month_prefix,),
     ).fetchone()[0]
+    if _column_exists(conn, "dig_results", "review_cost_usd"):  # migration 017(GH#153)
+        llm_cost += conn.execute(
+            "SELECT coalesce(sum(review_cost_usd), 0) FROM dig_results "
+            "WHERE created_at LIKE ? || '%'",
+            (month_prefix,),
+        ).fetchone()[0]
     if _table_exists(conn, "x_signal_runs"):  # migration 004 未適用の DB を落とさない
         x_cost += conn.execute(
             "SELECT coalesce(sum(estimated_cost_usd), 0) FROM x_signal_runs "
@@ -760,3 +782,8 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    # doctor は migration を当てないので、後から足した列は有無を確かめてから読む
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))

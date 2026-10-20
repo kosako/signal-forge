@@ -199,6 +199,26 @@ def test_env_permission_and_missing_token_fail(config_dir, tmp_path) -> None:
     assert "TELEGRAM_BOT_TOKEN" in result.detail
 
 
+def test_review_on_requires_anthropic_key(config_dir, tmp_path) -> None:
+    # 深掘りのレビュー(GH#153)を使う設定ならキーが要る。無いとレビューだけが毎朝失敗する
+    config_path = config_dir / "config.toml"
+    base = config_path.read_text(encoding="utf-8")
+    config_path.write_text(base + "\n[dig]\nreview = true\n", encoding="utf-8")
+    result = by_number(doctor(config_dir, tmp_path), 2)
+    assert result.status == "FAIL"
+    assert "INTEL_ANTHROPIC_API_KEY" in result.detail
+    (config_dir / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=tok\nINTEL_ANTHROPIC_API_KEY=k\n", encoding="utf-8"
+    )
+    assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
+    # 深掘り自体が無効ならキーは要らない
+    (config_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=tok\n", encoding="utf-8")
+    config_path.write_text(
+        base + "\n[dig]\nreview = true\ndaily_cap = 0\n", encoding="utf-8"
+    )
+    assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
+
+
 def test_pending_migration_fails(config_dir, tmp_path) -> None:
     # 台帳を1件消して「未適用」状態を作る
     conn = sqlite3.connect(tmp_path / "intel.db")
@@ -744,6 +764,40 @@ def test_month_cost_summary_breakdown(config_dir, tmp_path) -> None:
     assert summary["spent_usd"] == 1.5
     assert summary["projected_usd"] >= 1.5
     assert summary["cap_usd"] == 30.0
+
+
+def test_month_cost_summary_includes_review_cost(config_dir, tmp_path) -> None:
+    # 深掘りのレビューの API 費用(GH#153)は LLM に入れる。前の月の分は入れない
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (2, 'https://e.example/a', 'https://e.example/a', 'sha256:x')"
+    ).lastrowid
+    for created_at, cost in ((None, 0.25), ("2000-01-15T00:00:00Z", 9.0)):
+        conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, review_cost_usd,"
+            " created_at) VALUES (?, 'n', 'c', ?,"
+            " coalesce(?, strftime('%Y-%m-%dT%H:%M:%SZ','now')))",
+            (item, cost, created_at),
+        )
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["llm_usd"] == 0.25
+    assert summary["spent_usd"] == 0.25
+
+
+def test_month_cost_summary_without_review_column(config_dir, tmp_path) -> None:
+    # doctor は migration を当てない。017 より前の DB でも当月コストを出せる
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("ALTER TABLE dig_results DROP COLUMN review_cost_usd")
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["llm_usd"] == 0
 
 
 # --- #13 X OAuth2 token(S1 = GH#58) ---

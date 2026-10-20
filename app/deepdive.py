@@ -16,6 +16,11 @@
 - 材料不足(本文抽出なし・短すぎ)は、自動選出なら skip(未消化一覧には残る)、
   リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)
 
+別系統の AI のレビュー(GH#153。config `[dig].review`): ドラフトを Claude API が元記事と
+照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
+レビューは品質の上乗せなので、失敗しても深掘りは止めない(未レビューのまま届け、ノートと
+カードに明示する)。費用は台帳に残し、月の上限額に達したらその月はレビューを省く。
+
 障害の局所化: item 単位で隔離し、1 件の失敗で他の件・他の段を止めない。失敗が
 あれば段としては失敗にする(#74 と同じ「進めるものは進め、止まったことは通知」)。
 中断耐性は dig_results(migration 010)への write-ahead で作る: LLM 生成物
@@ -36,11 +41,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from app.analysis.llm import LLMEngine, complete_with_retry
+from app.analysis.llm import DEFAULT_TIMEOUT_S, LLMEngine, LLMError, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.delivery.telegram import (
@@ -55,6 +61,8 @@ from app.prompting import fill_template, sanitize, sanitize_body
 
 PROMPT_VERSION = "dig-v001"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
+REVIEW_PROMPT_VERSION = "dig-review-v001"  # 別系統の AI のレビュー(GH#153)
+REVISE_PROMPT_VERSION = "dig-revise-v001"  # 指摘を受けて書き手が 1 回直す
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限定。ADR 0004)
@@ -73,6 +81,18 @@ _CARD_TITLE_MAX = 200
 _CARD_STANCE_MAX = 300
 _CARD_FOR_YOU_MAX = 1500
 _CARD_FOR_WORLD_MAX = 1200
+
+# レビューの指摘の上限件数と、ノート・カードに出す各欄の上限(LLM 出力を有界に保つ)
+REVIEW_MAX_FINDINGS = 8
+_FINDING_LOCATION_MAX = 120
+_FINDING_TEXT_MAX = 300
+_REVIEW_KIND_LABELS = {
+    "unsupported": "元記事に無い",
+    "misread": "読み違い",
+    "overstated": "言い過ぎ",
+    "omission": "抜け",
+}
+_REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
 
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
 _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
@@ -96,6 +116,38 @@ class TranslationChunk(BaseModel):
     """対訳チャンクの構造化出力(prompts/dig-translate-v001.md)。"""
 
     markdown: str = Field(min_length=1)
+
+
+class ReviewFinding(BaseModel):
+    """レビューの指摘 1 件(prompts/dig-review-v001.md)。長さはノート・カードに出すときに切る。"""
+
+    kind: Literal["unsupported", "misread", "overstated", "omission"]
+    severity: Literal["must", "should"]
+    location: str = Field(min_length=1)
+    problem: str = Field(min_length=1)
+    fix: str = Field(min_length=1)
+
+    @field_validator("kind", "severity", mode="before")
+    @classmethod
+    def _normalize_case(cls, value: object) -> object:
+        # 列挙値の大文字・小文字の揺れで、課金済みのレビュー全体を捨てない
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class DigReview(BaseModel):
+    """レビューの構造化出力。誤りが無ければ findings は空。"""
+
+    findings: list[ReviewFinding]
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """1 件のレビューの結果(dig_results の review_* 列に記帳する)。"""
+
+    status: str  # clean / revised / revise_failed / failed / skipped(migration 017)
+    model: str = ""
+    findings: tuple[ReviewFinding, ...] = ()
+    cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -130,6 +182,8 @@ def run_dig_stage(
     # JST の YYYY-MM-DD(テスト注入用)。差し替わるのは暦日だけで dig_results.created_at は
     # 実時刻で入るため、上限・同日判定を試す test は created_at を注入した日に揃える(GH#119)
     today: str | None = None,
+    # 別系統の AI のレビュー役(GH#153)。None = レビューしない(config `[dig].review` が off)
+    review_engine_factory: Callable[[], LLMEngine] | None = None,
 ) -> None:
     """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
 
@@ -148,7 +202,16 @@ def run_dig_stage(
         )
         for candidate in selected:
             try:
-                _dig_one(conn, config, engine_factory, candidate, day, logger, run_id)
+                _dig_one(
+                    conn,
+                    config,
+                    engine_factory,
+                    review_engine_factory,
+                    candidate,
+                    day,
+                    logger,
+                    run_id,
+                )
             except Exception as e:
                 # item 単位の隔離。ただし黙らせない(段の失敗に集約 → 失敗通知)
                 logger.error(
@@ -260,6 +323,7 @@ def _dig_one(
     conn: sqlite3.Connection,
     config: Config,
     engine_factory: Callable[[str], LLMEngine],
+    review_engine_factory: Callable[[], LLMEngine] | None,
     candidate: DigCandidate,
     day: str,
     logger: logging.Logger,
@@ -292,8 +356,27 @@ def _dig_one(
             )
 
     draft = _generate_draft(config, engine_factory, candidate, source_note_name)
-    note_body = _explainer_note(candidate, draft, source_note_name)
-    card_text = _card_text(config, candidate, draft, note_name, source_note_name)
+    review: ReviewOutcome | None = None
+    if review_engine_factory is not None:
+        draft, review = _review_and_revise(
+            conn,
+            config,
+            engine_factory,
+            review_engine_factory,
+            candidate,
+            source_note_name,
+            draft,
+            day,
+            logger,
+            run_id,
+        )
+    note_body = _explainer_note(candidate, draft, source_note_name, review)
+    card_text = _card_text(config, candidate, draft, note_name, source_note_name, review)
+    review_findings = None
+    if review is not None and review.status in ("clean", "revised", "revise_failed"):
+        review_findings = json.dumps(
+            [finding.model_dump() for finding in review.findings], ensure_ascii=False
+        )
 
     # 生成は分オーダーだが、記帳は短く(poller と DB を共有するため)。
     # 接続は autocommit のため、台帳とキューの原子性は明示トランザクションで作る
@@ -303,8 +386,9 @@ def _dig_one(
             """
             INSERT INTO dig_results
               (item_id, run_id, note_name, source_note_name, angle, card_text,
-               note_markdown, source_note_markdown)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               note_markdown, source_note_markdown,
+               review_status, review_findings, review_cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate.item_id,
@@ -315,6 +399,9 @@ def _dig_one(
                 card_text,
                 note_body,
                 source_note_body,
+                review.status if review is not None else None,
+                review_findings,
+                review.cost_usd if review is not None else 0.0,
             ),
         )
         # compare-and-set: 生成中(分オーダー)に poller がこの行を更新していたら
@@ -472,18 +559,10 @@ def build_dig_prompt(
     else:
         brief = f"観点指定なし(自動選出)。{AUTO_BRIEF}。"
 
-    meta_lines = [
-        f"- title: {sanitize(candidate.title, 300, nonce) or '(なし)'}",
-        f"- author: {sanitize(candidate.author, 100, nonce) or '(不明)'}",
-        f"- published_at: {sanitize(candidate.published_at, 30, nonce) or '(不明)'}",
-        f"- url: {sanitize(candidate.canonical_url, 500, nonce)}",
-    ]
+    meta_lines = _item_meta_lines(candidate, nonce)
     if candidate.summary:
         meta_lines.append(f"- 既存分析の要約: {sanitize(candidate.summary, 300, nonce)}")
-
-    body = sanitize_body(candidate.body or "", nonce)
-    if len(body) > config.dig.body_max_chars:
-        body = body[: config.dig.body_max_chars] + "\n(…以降は長さ上限で切り詰め)"
+    body = _prompt_body(config, candidate, nonce)
 
     if source_note_name is not None:
         source_note_link = f"原文/対訳ノート `[[{source_note_name}]]` への wikilink"
@@ -510,6 +589,229 @@ def build_dig_prompt(
             "nonce": nonce,
         },
     )
+
+
+def _item_meta_lines(candidate: DigCandidate, nonce: str) -> list[str]:
+    return [
+        f"- title: {sanitize(candidate.title, 300, nonce) or '(なし)'}",
+        f"- author: {sanitize(candidate.author, 100, nonce) or '(不明)'}",
+        f"- published_at: {sanitize(candidate.published_at, 30, nonce) or '(不明)'}",
+        f"- url: {sanitize(candidate.canonical_url, 500, nonce)}",
+    ]
+
+
+def _prompt_body(config: Config, candidate: DigCandidate, nonce: str) -> str:
+    """解説の生成とレビューに渡す本文(同じ切り詰め。書き手と査読者が同じ範囲を読む)。"""
+    body = sanitize_body(candidate.body or "", nonce)
+    if len(body) > config.dig.body_max_chars:
+        body = body[: config.dig.body_max_chars] + "\n(…以降は長さ上限で切り詰め)"
+    return body
+
+
+# --- 別系統の AI のレビュー(GH#153 / 設計 06 §4) ---
+
+
+class _CostMeter:
+    """呼び出しごとの usage(LLMUsage)を合算する。やり直しの分も課金されるため。"""
+
+    def __init__(self, engine: LLMEngine) -> None:
+        self._engine = engine
+        self.name = engine.name
+        self.model = str(getattr(engine, "model", engine.name))
+        self.cost_usd = 0.0
+
+    def complete_structured[M: BaseModel](
+        self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
+    ) -> M:
+        try:
+            return self._engine.complete_structured(prompt, schema, timeout_s)
+        finally:
+            usage = getattr(self._engine, "last_usage", None)
+            if usage is not None:
+                self.cost_usd += usage.cost_usd
+
+
+def _review_and_revise(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    review_engine_factory: Callable[[], LLMEngine],
+    candidate: DigCandidate,
+    source_note_name: str | None,
+    draft: DigDraft,
+    day: str,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> tuple[DigDraft, ReviewOutcome]:
+    """レビュー → 指摘があれば書き手が 1 回だけ直す。戻り値 = (届けるドラフト, 結果)。
+
+    LLM の失敗(LLMError)はここで握り、直す前のドラフトで先へ進む(レビューは上乗せ)。
+    それ以外の例外(実装の誤り)は握らず、item の失敗として段に伝える。
+    """
+    extra = {"run_id": run_id, "stage": "dig", "item_id": candidate.item_id}
+    cap = config.dig.review_monthly_cap_usd
+    spent = _review_cost_in_month(conn, day)
+    if spent >= cap:
+        logger.warning(
+            f"レビューを省略: 今月のレビュー費用 ${spent:.2f} が上限 ${cap:.2f} に達している",
+            extra=extra,
+        )
+        return draft, ReviewOutcome("skipped")
+
+    meter: _CostMeter | None = None
+    try:
+        meter = _CostMeter(review_engine_factory())
+        prompt = build_review_prompt(config, candidate, draft)
+        review = complete_with_retry(meter, prompt, DigReview, timeout_s=config.dig.timeout_s)
+    except LLMError as e:
+        logger.warning(
+            f"レビュー失敗(未レビューのまま届ける) item={candidate.item_id}: "
+            f"{type(e).__name__}: {e}",
+            extra=extra,
+        )
+        if meter is None:
+            return draft, ReviewOutcome("failed")
+        return draft, ReviewOutcome("failed", meter.model, (), meter.cost_usd)
+
+    findings = tuple(review.findings[:REVIEW_MAX_FINDINGS])
+    if len(review.findings) > REVIEW_MAX_FINDINGS:
+        logger.warning(
+            f"レビューの指摘 {len(review.findings)} 件のうち先頭 {REVIEW_MAX_FINDINGS} 件だけ使う",
+            extra=extra,
+        )
+    if not findings:
+        return draft, ReviewOutcome("clean", meter.model, (), meter.cost_usd)
+    try:
+        revised = _revise_draft(
+            config, engine_factory, candidate, source_note_name, draft, findings
+        )
+    except LLMError as e:
+        logger.warning(
+            f"指摘を受けた直しに失敗(直す前のまま届ける) item={candidate.item_id}: "
+            f"{type(e).__name__}: {e}",
+            extra=extra,
+        )
+        return draft, ReviewOutcome("revise_failed", meter.model, findings, meter.cost_usd)
+    logger.info(
+        f"レビューの指摘 {len(findings)} 件を受けて 1 回直した item={candidate.item_id}",
+        extra=extra,
+    )
+    return revised, ReviewOutcome("revised", meter.model, findings, meter.cost_usd)
+
+
+def _review_cost_in_month(conn: sqlite3.Connection, day: str) -> float:
+    """その JST 暦月(day = YYYY-MM-DD)のレビュー費用の合計(created_at は UTC 保存)。"""
+    return conn.execute(
+        "SELECT coalesce(sum(review_cost_usd), 0) AS cost FROM dig_results "
+        "WHERE substr(datetime(created_at, '+9 hours'), 1, 7) = ?",
+        (day[:7],),
+    ).fetchone()["cost"]
+
+
+def build_review_prompt(config: Config, candidate: DigCandidate, draft: DigDraft) -> str:
+    """査読のプロンプト。関心プロファイルと既存分析の要約は渡さない(元記事との照合だけ)。"""
+    nonce = secrets.token_hex(4)
+    template = (_PROMPTS_DIR / f"{REVIEW_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    draft_text = (
+        "## 概要カード\n"
+        f"- 見出し: {draft.title_ja}\n"
+        f"- 書き手: {draft.writer_stance}\n"
+        f"- あなたにとって: {draft.for_you}\n"
+        f"- 世の中にとって: {draft.for_world}\n\n"
+        "## 解説ノート\n"
+        f"{draft.note_markdown}"
+    )
+    return fill_template(
+        template,
+        {
+            "meta": "\n".join(_item_meta_lines(candidate, nonce)),
+            "body": _prompt_body(config, candidate, nonce),
+            "draft": sanitize_body(draft_text, nonce),
+            "schema": json.dumps(DigReview.model_json_schema(), ensure_ascii=False),
+            "max_findings": str(REVIEW_MAX_FINDINGS),
+            "nonce": nonce,
+        },
+    )
+
+
+def _revise_draft(
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    candidate: DigCandidate,
+    source_note_name: str | None,
+    draft: DigDraft,
+    findings: tuple[ReviewFinding, ...],
+) -> DigDraft:
+    """書き手(解説と同じエンジン・effort)が、元の指示 + 前回のドラフト + 指摘で直す。"""
+    engine = engine_factory(config.dig.reasoning_effort)
+    nonce = secrets.token_hex(4)
+    template = (_PROMPTS_DIR / f"{REVISE_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    finding_lines = [
+        f"{index}. [{finding.severity} / {finding.kind}] "
+        f"場所: {sanitize(finding.location, _FINDING_LOCATION_MAX, nonce)} / "
+        f"問題: {sanitize(finding.problem, _FINDING_TEXT_MAX, nonce)} / "
+        f"直し方: {sanitize(finding.fix, _FINDING_TEXT_MAX, nonce)}"
+        for index, finding in enumerate(findings, start=1)
+    ]
+    prompt = fill_template(
+        template,
+        {
+            "dig_prompt": build_dig_prompt(config, candidate, source_note_name),
+            "draft": sanitize_body(
+                json.dumps(draft.model_dump(), ensure_ascii=False, indent=2), nonce
+            ),
+            "findings": "\n".join(finding_lines),
+            "nonce": nonce,
+        },
+    )
+    return complete_with_retry(engine, prompt, DigDraft, timeout_s=config.dig.timeout_s)
+
+
+def _one_line(value: str, max_length: int) -> str:
+    """ノート・カードに出す LLM の文を 1 行にして切り詰める。"""
+    flattened = " ".join(value.split())
+    if len(flattened) > max_length:
+        return flattened[: max_length - 1] + "…"
+    return flattened
+
+
+def _review_callout(review: ReviewOutcome) -> str:
+    """解説ノートの末尾(take 領域の上)に置くレビューの記録(Obsidian の callout)。"""
+    who = f"別 AI のレビュー({review.model})" if review.model else "別 AI のレビュー"
+    count = len(review.findings)
+    if review.status == "clean":
+        return f"> [!note] {who}: 指摘なし\n"
+    if review.status == "failed":
+        return f"> [!warning] {who}は失敗(未レビューのまま)\n"
+    if review.status == "skipped":
+        return "> [!info] 今月のレビュー費用が上限に達したため、レビューなし\n"
+    if review.status == "revised":
+        head = f"> [!note]- {who}: 指摘 {count} 件 → 書き手が確かめて 1 回直した"
+    else:  # revise_failed
+        head = f"> [!warning]- {who}: 指摘 {count} 件(直すのに失敗。本文は直す前のまま)"
+    lines = [head]
+    for index, finding in enumerate(review.findings, start=1):
+        lines.append(
+            f"> {index}. {_REVIEW_SEVERITY_MARKS[finding.severity]} "
+            f"{_REVIEW_KIND_LABELS[finding.kind]} — "
+            f"{_one_line(finding.location, _FINDING_LOCATION_MAX)}: "
+            f"{_one_line(finding.problem, _FINDING_TEXT_MAX)}"
+            f"(直し方: {_one_line(finding.fix, _FINDING_TEXT_MAX)})"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _review_card_line(review: ReviewOutcome) -> str:
+    count = len(review.findings)
+    if review.status == "clean":
+        return "🧪 別 AI のレビュー: 指摘なし"
+    if review.status == "revised":
+        return f"🧪 別 AI のレビュー: 指摘 {count} 件 → 直した版です"
+    if review.status == "revise_failed":
+        return f"⚠️ 別 AI のレビュー: 指摘 {count} 件(直せていません。ノート末尾を参照)"
+    if review.status == "failed":
+        return "⚠️ 別 AI のレビューに失敗(未レビュー)"
+    return "🧪 今月のレビュー費用が上限に達したため未レビュー"  # skipped
 
 
 def _translate_body(
@@ -596,7 +898,10 @@ def _deepdive_dir(config: Config) -> Path:
 
 
 def _explainer_note(
-    candidate: DigCandidate, draft: DigDraft, source_note_name: str | None
+    candidate: DigCandidate,
+    draft: DigDraft,
+    source_note_name: str | None,
+    review: ReviewOutcome | None = None,
 ) -> str:
     """解説ノート(kind: deepdive)。フォーマットの正はデモ実物(設計 06 §0・§5.1)。"""
     frontmatter: dict = {
@@ -617,12 +922,16 @@ def _explainer_note(
         # 調べ直しの結果は前回のノートを書き換えず、新しいノートにして前回へつなぐ(GH#137。
         # 公開済みのノートは本人のもの。AI のドラフトを take の付いたノートに混ぜない = ADR 0003)
         frontmatter["previous"] = f"[[{candidate.previous_note_name}]]"
+    if review is not None:
+        frontmatter["review"] = review.status  # 別 AI のレビューの結果(GH#153)
     body = draft.note_markdown.strip()
+    review_block = f"\n\n{_review_callout(review)}" if review is not None else "\n"
     return (
         render_frontmatter(frontmatter)
         + "\n"
         + body
-        + "\n\n---\n\n(この下は手書きメモ・take 領域)\n"
+        + review_block
+        + "\n---\n\n(この下は手書きメモ・take 領域)\n"
     )
 
 
@@ -679,6 +988,7 @@ def _card_text(
     draft: DigDraft,
     note_name: str,
     source_note_name: str | None,
+    review: ReviewOutcome | None = None,
 ) -> str:
     """概要カード v3(設計 06 §5.3)。1 通・分割しない。parse_mode=HTML 前提で escape。"""
     title = escape_and_truncate(draft.title_ja, _CARD_TITLE_MAX)
@@ -698,6 +1008,8 @@ def _card_text(
     # parse_mode=HTML で送るため未エスケープだと送信自体が 400 で恒久失敗する(Codex P1)
     note_path = escape_text(f"{config.obsidian.folder}/{DEEPDIVE_FOLDER}/{note_name}.md")
     note_line = f"📄 ノート: {note_path}{suffix}"
+    if review is not None:  # 別 AI のレビューの結果(GH#153。固定の文言だけ)
+        note_line = f"{_review_card_line(review)}\n{note_line}"
     if config.dig.answer_daily_cap > 0:  # 質問への返事(GH#126)
         guide = "💬 リプライで質問すると答えます。感想・結論は take として記録します"
     else:

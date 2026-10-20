@@ -273,3 +273,44 @@ sqlite3 -readonly -header -column "$db" \
   INSERT INTO sources (type, name, config) VALUES ('rss', '<名前>', json_object('url', '<URL>'));
   SQL
   ```
+
+## 13. 深掘りノートのレビュー(GH#153・設計 06 §4)
+
+朝の深掘りの解説ノートを、書き手(Codex)とは別系統の AI(Claude API)が元記事と照らして
+レビューし、指摘があれば書き手が 1 回だけ直す。既定は off。
+
+**有効にする**:
+
+1. Anthropic のコンソールで API キーを発行し、月の利用上限(spend limit)も設定しておく。
+2. `~/.config/intel/.env` に `INTEL_ANTHROPIC_API_KEY=<キー>` を足す。名前を `ANTHROPIC_API_KEY`
+   にしない(環境に載ると claude -p が無自覚に API 課金へ回る。doctor #12 が WARN にする)。
+3. `config.toml` に足す:
+   ```toml
+   [dig]
+   review = true
+   # review_monthly_cap_usd = 10.0   # JST の暦月の上限。達したらその月はレビューを省く
+
+   # [anthropic_api]                  # 既定は Opus 5.5・effort medium(モデルを替えたら単価も)
+   # model = "claude-opus-5-5"
+   ```
+4. `uv run intel doctor` で #2 が PASS になること(キーが無いと FAIL)。
+5. 次の朝のカードに「🧪 別 AI のレビュー: …」の行が付く。ノートの末尾(take 領域の上)に指摘が残る。
+
+朝バッチは毎回 `.env` と config を読むので、入れ直しは要らない(poller も入れ直し不要)。
+
+**結果を見る**(1〜2 週間回して、続けるかを決める材料):
+
+```sh
+sqlite3 ~/.local/share/intel/intel.db <<'SQL'
+SELECT date(created_at, '+9 hours') AS day, item_id, review_status,
+       json_array_length(review_findings) AS findings, round(review_cost_usd, 3) AS usd
+FROM dig_results WHERE review_status IS NOT NULL ORDER BY id DESC LIMIT 20;
+SQL
+```
+
+- 指摘の中身は `review_findings`(JSON)か、ノート末尾の記録で読む。
+- `failed` が続くときは `morning.log` の「レビュー失敗」の WARNING を見る。401/403 はキー、404 はモデル名、
+  400 はクレジット残高の不足や利用上限のことがある。
+- 当月の費用は `uv run intel doctor --cost` の LLM に入る。
+
+**止める**: `[dig].review = false`(キーは残してよい)。

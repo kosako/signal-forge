@@ -94,6 +94,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 
    - `TELEGRAM_BOT_TOKEN`(必須)
    - X を使うときだけ: `X_API_KEY` / `X_API_SECRET` / `X_ACCESS_TOKEN` / `X_ACCESS_TOKEN_SECRET`。ブックマーク等の取り込み(OAuth 2.0)を Web App 型で使うなら `X_OAUTH2_CLIENT_SECRET`。
+   - 深掘りノートを Claude にレビューさせるとき(`[dig].review = true`)だけ: `INTEL_ANTHROPIC_API_KEY`。名前を `ANTHROPIC_API_KEY` にしない(手順は [ops/runbook.md](ops/runbook.md) の §13)。
 
 4. 関心プロファイルを置く。分析・深掘り・質問への返事はこれを基準にし、無いと analyze・dig・answer が失敗する。
 

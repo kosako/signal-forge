@@ -115,6 +115,11 @@ class DigConfig:
     answer_source_max_chars: int = 30_000  # 返事の材料に渡す原文/対訳ノートの上限
     # 1 日に受け付ける質問の上限(JST 暦日。暴走と費用の歯止め)。0 = 返事をしない(記録だけ)
     answer_daily_cap: int = 20
+    # 解説ノートを別系統の AI(Claude API = [anthropic_api])にレビューさせ、指摘があれば
+    # 書き手が 1 回だけ直す(GH#153)。キーは .env の INTEL_ANTHROPIC_API_KEY
+    review: bool = False
+    # レビューの API 費用の月の上限(JST の暦月)。達したらその月はレビューを省く
+    review_monthly_cap_usd: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -351,6 +356,9 @@ def _validate(path: Path, config: Config) -> None:
         )
     if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
         raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
+    cap = config.dig.review_monthly_cap_usd
+    if not (math.isfinite(cap) and cap > 0):
+        raise ConfigError(f"{path}: [dig].review_monthly_cap_usd は正の有限値: {cap}")
     if config.anthropic_api.effort not in ANTHROPIC_EFFORTS:
         raise ConfigError(
             f"{path}: [anthropic_api].effort は {'/'.join(ANTHROPIC_EFFORTS)} のいずれか: "
