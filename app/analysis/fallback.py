@@ -239,10 +239,16 @@ class FallbackEngine:
         return result
 
     def _error_like_primary(self, primary_error: LLMError | None, note: str) -> LLMError:
-        """主の失敗と同じ種類のエラー(各段の劣化・失敗の扱いを変えない)。"""
+        """主の失敗と同じ種類のエラー(各段の劣化・失敗の扱いを変えない)。
+
+        メッセージは主の失敗の種類だけにする(主の例外の全文は codex の stderr の末尾・応答の
+        先頭を含みうり、各段がこのメッセージをログに書くため)。note は予備の側の説明で、
+        Claude API のエンジンのメッセージは本文を含まない(GH#156 その 1)。
+        """
         if primary_error is None:  # 主を飛ばした回: 最後に見た主の失敗と同じ種類
             return self._breaker.last_error_class(f"主のエンジンは続けて失敗していた。{note}")
-        return type(primary_error)(f"{primary_error}。{note}")
+        kind = _primary_failure_kind(primary_error)
+        return type(primary_error)(f"主のエンジンが失敗({kind})。{note}")
 
 
 def fallback_engine_factory(

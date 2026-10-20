@@ -154,7 +154,7 @@ def test_fallback_failure_raises_like_primary(conn, error_class) -> None:
     with pytest.raises(error_class) as excinfo:
         engine.complete_structured("p", Verdict)
     assert type(excinfo.value) is error_class
-    assert "主の失敗" in str(excinfo.value) and "予備も失敗" in str(excinfo.value)
+    assert "主のエンジンが失敗" in str(excinfo.value) and "予備も失敗" in str(excinfo.value)
     (row,) = ledger_rows(conn)
     assert (row["ok"], row["cost_usd"]) == (0, 0.02)  # 失敗した応答の課金も残す
 
@@ -386,3 +386,36 @@ def test_fallback_log_names_primary_failure_kind_without_body(conn, caplog, erro
         build(conn, primary, fallback).complete_structured("p", Verdict)
     assert f"{type(error).__name__}・{kind}" in caplog.text
     assert "記事の本文そのもの" not in caplog.text
+
+
+@pytest.mark.parametrize("path", ["fallback_fails", "over_cap", "cannot_build"])
+def test_reraised_error_carries_only_failure_kind(conn, caplog, path) -> None:
+    # 予備で答えられずに投げ直す例外は、主の例外の全文(本文を含みうる)を持たない。
+    # 各段がこのメッセージをログに書くため(analyzer のチャンクの失敗・深掘りの item の失敗)
+    import traceback
+
+    marker = "記事の本文そのものXYZ"
+    primary = Scripted("codex-cli", [LLMError(f"JSON パース失敗: x(先頭: '{marker}')")])
+    fallback = Scripted("anthropic-api", [LLMError("Anthropic API 529(overloaded_error)")])
+    if path == "cannot_build":
+
+        def no_key():
+            raise LLMUnavailableError(".env に INTEL_ANTHROPIC_API_KEY が無い")
+
+        engine = FallbackEngine(
+            primary, no_key, FallbackLedger(conn, 10.0, stage="analyze", run_id=None),
+            _Breaker(), logger, fallback_model="claude-sonnet-5-5",
+        )
+    else:
+        engine = build(conn, primary, fallback, cap=0.0 if path == "over_cap" else 10.0)
+        if path == "over_cap":
+            conn.execute(
+                "INSERT INTO llm_fallback_calls (stage, model, primary_error, ok, cost_usd)"
+                " VALUES ('analyze', 'm', 'LLMError', 1, 0.01)"
+            )
+    with caplog.at_level(logging.WARNING), pytest.raises(LLMError) as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert type(excinfo.value) is LLMError
+    assert "JSON パース失敗" in str(excinfo.value)  # 種類は残す
+    assert marker not in "".join(traceback.format_exception(excinfo.value))
+    assert marker not in caplog.text

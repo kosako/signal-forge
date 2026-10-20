@@ -205,16 +205,17 @@ def test_commands_build_engines_through_fallback(tmp_path, monkeypatch, command,
     (tmp_path / "interest-profile.md").write_text(
         "---\nupdated: 2026-10-20\n---\n# 関心\n", encoding="utf-8"
     )
-    stages: list[str] = []
+    # spy の中の assert は digest の except に吸われるので、記録して後で確かめる
+    seen: list[tuple[str, dict]] = []
 
     def spy(conn, config, env, logger, *, stage, run_id=None, primary=None):
-        stages.append(stage)
-        assert env.get("TELEGRAM_BOT_TOKEN") == "test-token"  # .env の dict を渡す
+        seen.append((stage, dict(env)))
         raise _StopAtFactory
 
     monkeypatch.setattr(fallback, "fallback_engine_factory", spy)
     result = runner.invoke(app, [command, "--config-dir", str(tmp_path)])
-    assert stages == [stage]
+    assert [name for name, _ in seen] == [stage]
+    assert seen[0][1].get("TELEGRAM_BOT_TOKEN") == "test-token"  # .env の dict を渡す
     if command != "digest":  # digest はトレンドの失敗を握って本体を続ける(付加機能)
         assert isinstance(result.exception, _StopAtFactory)
 
