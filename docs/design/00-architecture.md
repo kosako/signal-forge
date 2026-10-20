@@ -43,7 +43,7 @@
 ### 2プロセスの責務分離
 
 - **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ dig(深掘り調査。`[dig].daily_cap > 0` のときのみ。GH#105 / 設計 06)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。dig を deliver の後に置く理由: ダイジェスト配信を深掘り生成(分オーダー)で遅らせない。purge より前に置く理由: X 由来 documents の TTL 失効前に本文を材料に使う。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
-- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録 (4) 深掘りカード・その返事へのリプライ → 感想として記録し、質問として台帳に積んで `intel answer` を別プロセスで起動(返事の送信は子が行う。LLM の待ちで受信を止めないため。GH#126 / 設計 05 §1.2) (5) ダイジェストの記事メッセージ・ヘッダへのリプライ → 感想として item_notes / digest_notes に記録(GH#92 / GH#96) (6) 未消化一覧へのリプライ → 深掘りの指定として dig_queue を更新(GH#104 / 設計 06 §2)。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
+- **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録 (4) 深掘りカード・その返事へのリプライ → 感想として記録し、質問として台帳に積んで `intel answer` を別プロセスで起動(返事の送信は子が行う。LLM の待ちで受信を止めないため。GH#126 / 設計 05 §1.2) (5) ダイジェストの記事メッセージ・ヘッダへのリプライ → 感想として item_notes / digest_notes に記録(GH#92 / GH#96) (6) 未消化一覧へのリプライ → 深掘りの指定として dig_queue を更新(GH#104 / 設計 06 §2)。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)、週 1 回のソースの健康診断(日曜の夜アンケートの時刻。GH#150)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。
 
 ## 3. モジュール構成と依存方向
@@ -70,6 +70,7 @@ app/
   prompting.py    # プロンプトの sanitize と単一パスのテンプレート置換(分析・トレンド・深掘り・
                   #   返事が共通に使う。設計 03 §3.2・GH#113)
   vault_guard.py  # vault へのアクセスに時間の上限を付ける(返事と take の記録が使う。GH#145)
+  source_health.py # 情報ソースの健康(連続の失敗の知らせ・週 1 回の健康診断。読み取りだけ。GH#150)
   connectors/     # base.py(Connector の型)、x.py(ホームTL + XRouter)、x_search.py(AI 検索)、
                   #   x_oauth2.py(OAuth2 PKCE・S1)、x_signals.py(興味シグナル取込・S1b)、rss.py
                   #   — items を produce(カーソル・冪等)
@@ -104,7 +105,7 @@ tests/
   - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
   - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
   - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)。カードへの返事(`dig_answer.py`)も、調べ直しの依頼を同じ規則でキューに積む(`dig.py`。GH#137)
-  - ソースの失敗の知らせ(`collect.py` の `source_failure_alerts`)を、doctor と watchdog(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む
+  - ソースの健康(`source_health.py` の連続の失敗の知らせと週 1 回の健康診断)を、doctor と poller の内蔵タイマー(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む
   - `doctor.py` は検査のために各段を読む
 - 外部 I/O(httpx・feedparser・trafilatura・LLM CLI)は connectors/extraction/analysis/delivery の内側に閉じ込め、models の語彙(items, documents, …)に変換してから外へ出す。
 - パイプラインはソース非依存: connectors が items さえ作れば、X を止めても RSS+手動 URL だけで全段が動く(撤退・縮退シナリオの前提)。

@@ -31,7 +31,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
         ▼
  受信デーモン  intel poll(launchd KeepAlive で常駐。Telegram の long polling)
    受ける: ボタン / URL / ダイジェストへの感想 / 夜の回答と深掘りの指定 / 深掘りカードへの質問
-   内蔵タイマー: 夜アンケート(既定 21:30)/ watchdog(既定 07:15)
+   内蔵タイマー: 夜アンケート(既定 21:30)/ watchdog(既定 07:15)/ ソースの健康診断(日曜の夜)
    質問 → intel answer(別プロセス)→ Telegram のリプライで返事
 ```
 
@@ -46,7 +46,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   - ダイジェストの記事・ヘッダへのリプライ(感想)。翌朝の export で Obsidian の Items / Daily ノートに反映する。
   - 夜アンケートの回答と、未消化一覧へのリプライ(深掘りの指定)。
   - 深掘りカードとその返事へのリプライ。感想として記録し、1 日の上限(`[dig].answer_daily_cap`)の内なら質問として返事を作る。
-  - 内蔵タイマーで夜アンケートと watchdog を送る。時刻は config の `[telegram].survey_time` / `watchdog_time` で変えられる(上の時刻は既定値)。watchdog は、当日のダイジェストが未生成・未配信のときと、X ソースが続けて失敗しているとき(X を有効にしている場合。[設計 02 §2](docs/design/02-connectors.md))に知らせる。
+  - 内蔵タイマーで夜アンケートと watchdog を送る。時刻は config の `[telegram].survey_time` / `watchdog_time` で変えられる(上の時刻は既定値)。watchdog は、当日のダイジェストが未生成・未配信のときと、X ソースが続けて失敗しているとき(X を有効にしている場合。[設計 02 §2](docs/design/02-connectors.md))に知らせる。毎週日曜の夜アンケートの時刻に、ソースの健康診断(失敗・移転・新着なし・👍・🔖 の率の低いソース)を 1 通送る([設計 02 §3](docs/design/02-connectors.md))。
   - `[telegram].owner_user_id` 以外からの update は、ログに WARN を 1 行残すだけで破棄する(本文は保存せず、応答も返さない)。
 - **深掘りの流れ**([設計 06](docs/design/06-deepdive-experience.md))
   1. 夜: 未消化一覧(Telegram の 🔖 と X のブックマーク)に自由文でリプライし、「番号 + 観点」か「パス」を指定する。X で新しくブックマークした投稿(x_signals 段が取り込んだもの)は、指定しなくてもキューに入る。Telegram の 🔖 ボタンは未消化一覧に載るだけで、キューには入らない。
@@ -227,7 +227,7 @@ repo 固有の決まり:
 
 | パス | 役割 |
 |---|---|
-| `app/` | 本体。朝バッチの段の実体(`collect.py`・`purge.py`・`backup.py`)と直列実行(`run.py`)、検査(`doctor.py`)、CLI(`cli.py`)、設定(`config.py`)、DB と migration のランナー(`db.py`)、共通部品(`http.py`・`jst.py`・`logs.py`・`models.py`・`normalize.py`・`prompting.py`・`vault_guard.py`)、X シグナルのインサイト(`insights.py`) |
+| `app/` | 本体。朝バッチの段の実体(`collect.py`・`purge.py`・`backup.py`)と直列実行(`run.py`)、検査(`doctor.py`)、ソースの健康(`source_health.py`)、CLI(`cli.py`)、設定(`config.py`)、DB と migration のランナー(`db.py`)、共通部品(`http.py`・`jst.py`・`logs.py`・`models.py`・`normalize.py`・`prompting.py`・`vault_guard.py`)、X シグナルのインサイト(`insights.py`) |
 | `app/connectors/` | ソースのコネクタ。RSS と X(ホーム TL・検索・OAuth 2.0・興味シグナル) |
 | `app/extraction/` | 記事の本文抽出 |
 | `app/analysis/` | LLM の抽象層、事前選別(Stage 1)、本分析(Stage 2)、トレンドまとめ、関心プロファイルの読み込み |

@@ -11,6 +11,7 @@
 - §8: secrets のローテーション
 - §9〜§10: X OAuth 2.0 のセットアップと興味シグナルの取り込み
 - §11: 深掘りカードへの質問への返事(既存のインストールの更新を含む)
+- §12: ソースの見直し(週 1 回の健康診断を受けて止める・URL を直す)
 
 ## 前提
 
@@ -237,3 +238,27 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
   確認を出さないようにするには、§4 の FDA を uv の実体に付け直す(uv を更新したときは付け直しが要る)。
   vault のファイルを自分のシェルで開いて確かめるときも、時間の上限を付ける
   (`perl -e 'alarm 5; exec @ARGV' head -c 1 <file>`。上限なしだとシェルも止まる)。
+
+## 12. ソースの見直し(GH#150・設計 02 §3)
+
+毎週日曜の夜(夜アンケートの時刻)に poller が「🩺 ソースの健康診断」を送る。止める・URL を直すかは
+人が決める(自動では変えない)。ソースの定義の正本は DB の `sources`(設計 01 §3)。
+
+```sh
+db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+sqlite3 -readonly -header -column "$db" \
+  "SELECT id, type, name, enabled, consecutive_failures, moved_url, config FROM sources ORDER BY id;"
+```
+
+- **移転(↪️)**: 移転先がフィードを返すことを確かめてから、config の URL を書き換える。
+  記事は記事の URL で重複を見分けるので、フィードの URL を変えても同じ記事は二重に入らない。
+  次に移転なしで取れた朝に、健康診断から消える(`moved_url` が空に戻る)。
+  ```sh
+  sqlite3 "$db" "UPDATE sources SET config = json_set(config, '\$.url', '<移転先の URL>') WHERE id = <id>;"
+  ```
+- **失敗が続く(⚠️)・新しい記事が入らない(💤)・👍・🔖 の率が低い(📊)**: 原因を見て、直せないなら止める。
+  止めても行と記事は残る(戻すときは `enabled = 1`)。X のソースは止める前に設計 02 §2 の予算と検索スロットも見る。
+  ```sh
+  sqlite3 "$db" "UPDATE sources SET enabled = 0 WHERE id = <id>;"
+  ```
+- 新しい RSS を足すときも同じ表に行を入れる(`INSERT INTO sources (type, name, config) VALUES ('rss', '<名前>', json_object('url', '<URL>'));`)。

@@ -10,9 +10,10 @@ import pytest
 from app.config import Config, TelegramConfig, XConfig
 from app.db import apply_migrations, connect
 from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poller
-from app.delivery.state import get_state
+from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     STATE_RUN_FAILURE_NOTIFIED,
+    STATE_SOURCE_REPORT_SENT,
     STATE_SURVEY_SENT,
     STATE_WATCHDOG_NOTIFIED,
 )
@@ -22,6 +23,16 @@ from tests.test_delivery import add_digest, add_item
 from tests.test_poller import CHAT_ID, FakeApi, make_callback_update, make_config
 
 logger = logging.getLogger("test-surveys")
+
+
+@pytest.fixture(autouse=True)
+def _source_report_not_today(monkeypatch):
+    """週 1 回のソースの健康診断(GH#150)を今日以外の曜日にする。ほかのタイマーのテストは
+    実際の今日の日時で動くので、日曜に流すと通数が 1 通増えて落ちるため(+3 日 = 日付を
+    跨いでも今日・明日にならない)。健康診断のテストは日付を固定して曜日を戻す。"""
+    from app import source_health
+
+    monkeypatch.setattr(source_health, "REPORT_WEEKDAY", (datetime.now(JST).weekday() + 3) % 7)
 
 
 @pytest.fixture
@@ -461,6 +472,72 @@ def test_watchdog_repeats_source_alert_next_morning(conn, tmp_path) -> None:
 
 
 # --- callback: 夜アンケート回答(q1/q2) ---
+
+
+# --- 週 1 回のソースの健康診断(GH#150) ---
+
+SUNDAY = datetime(2026, 10, 25, 21, 30, tzinfo=JST)
+
+
+def only_source_report_due(conn, monkeypatch, now: datetime) -> None:
+    """曜日を日曜に戻し、同じ時刻に動く夜アンケート・watchdog は送信済みにする。"""
+    from app import source_health
+
+    monkeypatch.setattr(source_health, "REPORT_WEEKDAY", 6)
+    day = now.strftime("%Y-%m-%d")
+    set_state(conn, STATE_SURVEY_SENT, day)
+    set_state(conn, STATE_WATCHDOG_NOTIFIED, day)
+
+
+def test_source_report_sent_once_on_sunday_evening(conn, tmp_path, monkeypatch) -> None:
+    only_source_report_due(conn, monkeypatch, SUNDAY)
+    api = FakeApi()
+    config = make_config(tmp_path)
+
+    run_due_timers(conn, config, api, logger, SUNDAY)
+    run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=1))  # 同じ日は 1 通
+
+    assert len(api.sent) == 1
+    assert "🩺 ソースの健康診断" in api.sent[0][1]
+    assert get_state(conn, STATE_SOURCE_REPORT_SENT) == "2026-10-25"
+
+
+@pytest.mark.parametrize(
+    "now",
+    [SUNDAY - timedelta(minutes=1), SUNDAY - timedelta(days=1), SUNDAY + timedelta(days=1)],
+    ids=["before-time", "saturday", "monday"],
+)
+def test_source_report_not_sent_other_times(conn, tmp_path, monkeypatch, now) -> None:
+    only_source_report_due(conn, monkeypatch, now)
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+    assert api.sent == []
+    assert get_state(conn, STATE_SOURCE_REPORT_SENT) is None
+
+
+def test_source_report_retried_after_send_failure(conn, tmp_path, monkeypatch) -> None:
+    only_source_report_due(conn, monkeypatch, SUNDAY)
+
+    class FailOnceApi(FakeApi):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def send_message(self, chat_id, text, *, reply_markup=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise DeliveryError("送信失敗")
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    api = FailOnceApi()
+    config = make_config(tmp_path)
+    with pytest.raises(DeliveryError):
+        run_due_timers(conn, config, api, logger, SUNDAY)
+    assert get_state(conn, STATE_SOURCE_REPORT_SENT) is None  # 届くまで再試行する
+
+    run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=1))
+    assert len(api.sent) == 1
+    assert get_state(conn, STATE_SOURCE_REPORT_SENT) == "2026-10-25"
 
 
 def test_q1_answer_recorded_with_date_attribution(conn, tmp_path) -> None:
