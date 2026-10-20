@@ -264,3 +264,55 @@ def test_factory_maps_effort_and_builds_fallback_lazily(conn, tmp_path, monkeypa
     engine._make_fallback()
     assert (built[0].model, built[0]._effort) == ("claude-sonnet-5-5", "low")  # minimal → low
     assert built[0]._input_price == 2.0 and built[0]._output_price == 10.0
+
+
+def test_breaker_is_shared_within_a_factory_and_not_across(conn, tmp_path, monkeypatch) -> None:
+    # 公開の入口(factory)経由: 同じ factory のエンジンは主を飛ばし、別の factory では主を呼ぶ
+    primary = Scripted("codex-cli", [LLMUnavailableError("codex 起動失敗")] * 2)
+    fallback = Scripted("anthropic-api", [Verdict(score=i) for i in range(3)])
+    monkeypatch.setattr(
+        "app.analysis.fallback.create_engine", lambda name, model_reasoning_effort: primary
+    )
+    monkeypatch.setattr(
+        "app.analysis.fallback.create_anthropic_engine", lambda settings, env: fallback
+    )
+    config = Config(config_dir=tmp_path, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
+    first = fallback_engine_factory(conn, config, {}, logger, stage="dig")
+    first("medium").complete_structured("p", Verdict)
+    first("low").complete_structured("p", Verdict)  # 同じ factory: 主を飛ばす
+    assert primary.calls == 1
+    second = fallback_engine_factory(conn, config, {}, logger, stage="dig")
+    second("medium").complete_structured("p", Verdict)  # 別の factory: 主を呼び直す
+    assert primary.calls == 2
+
+
+def test_fallback_failure_logs_and_raises_without_reply_body(conn, caplog) -> None:
+    # 予備(実物の AnthropicApiEngine)の応答が検証に失敗しても、本文はログにも例外にも出ない
+    import json
+    import traceback
+
+    import httpx
+
+    marker = "記事の本文そのものXYZ"
+    reply = {
+        "content": [{"type": "text", "text": json.dumps({"score": marker}, ensure_ascii=False)}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    claude = AnthropicApiEngine(
+        api_key="k",
+        model="claude-sonnet-5-5",
+        effort="low",
+        max_tokens=1000,
+        input_usd_per_mtok=2.0,
+        output_usd_per_mtok=10.0,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply)),
+    )
+    engine = build(conn, Scripted("codex-cli", [LLMError("codex 非0終了")]), claude)
+    with caplog.at_level(logging.WARNING), pytest.raises(LLMError) as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert "スキーマに合わない" in str(excinfo.value)
+    assert marker not in "".join(traceback.format_exception(excinfo.value))
+    assert marker not in caplog.text
+    (row,) = ledger_rows(conn)
+    assert row["ok"] == 0 and row["cost_usd"] > 0

@@ -116,8 +116,9 @@ class _Breaker:
 class FallbackEngine:
     """主が失敗した呼び出しを予備でやり直す LLMEngine。
 
-    `name` と `model` は最後に答えたエンジンのもの(analyzer が analyses の engine / model に
-    記録する。呼び出しの後に読むので、その呼び出しに答えたエンジンになる)。
+    `name` と `model` は最後に答えたエンジンのもの。呼び出しの直後に読めば、その呼び出しに
+    答えたエンジンになる(analyzer は結果ごとに控えて analyses の engine / model に記録する。
+    1 つのチャンクの中で主と予備が混ざりうるため。GH#156 その 2)。
     """
 
     def __init__(
