@@ -288,7 +288,7 @@ sqlite3 -readonly -header -column "$db" \
    ```toml
    [dig]
    review = true
-   # review_monthly_cap_usd = 10.0   # JST の暦月の上限。達したらその月はレビューを省く
+   # review_monthly_cap_usd = 10.0   # 月(UTC の暦月)の上限。達したらその月はレビューを省く
 
    # [anthropic_api]                  # 既定は Opus 5.5・effort medium(モデルを替えたら単価も)
    # model = "claude-opus-5-5"
@@ -301,7 +301,8 @@ sqlite3 -readonly -header -column "$db" \
 **結果を見る**(1〜2 週間回して、続けるかを決める材料):
 
 ```sh
-sqlite3 ~/.local/share/intel/intel.db <<'SQL'
+db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+sqlite3 -readonly -header -column "$db" <<'SQL'
 SELECT date(created_at, '+9 hours') AS day, item_id, review_status,
        json_array_length(review_findings) AS findings, round(review_cost_usd, 3) AS usd
 FROM dig_results WHERE review_status IS NOT NULL ORDER BY id DESC LIMIT 20;

@@ -5,7 +5,8 @@
 --                   'failed' = レビュー自体が失敗(未レビュー)/ 'skipped' = 月の上限額に達して省いた
 --   review_findings 指摘の JSON 配列(clean は空配列。failed・skipped は NULL)。
 --                   公開後も残す(1〜2 週間回して続けるかを決める材料)
---   review_cost_usd レビューの API 費用の見積もり(やり直しの分を含む。doctor #9 の当月コストに入る)
+--   review_cost_usd レビューの API 費用の見積もり(やり直しの分を含む。月の上限の判定と
+--                   doctor #9 の当月コストに使う。どちらも UTC の暦月)
 ALTER TABLE dig_results ADD COLUMN review_status TEXT
   CHECK (review_status IN ('clean', 'revised', 'revise_failed', 'failed', 'skipped'));
 ALTER TABLE dig_results ADD COLUMN review_findings TEXT;

@@ -118,7 +118,7 @@ class DigConfig:
     # 解説ノートを別系統の AI(Claude API = [anthropic_api])にレビューさせ、指摘があれば
     # 書き手が 1 回だけ直す(GH#153)。キーは .env の INTEL_ANTHROPIC_API_KEY
     review: bool = False
-    # レビューの API 費用の月の上限(JST の暦月)。達したらその月はレビューを省く
+    # レビューの API 費用の月の上限(UTC の暦月 = doctor #9 の当月)。達したらその月はレビューを省く
     review_monthly_cap_usd: float = 10.0
 
 

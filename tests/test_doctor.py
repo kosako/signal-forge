@@ -789,6 +789,30 @@ def test_month_cost_summary_includes_review_cost(config_dir, tmp_path) -> None:
     assert summary["spent_usd"] == 0.25
 
 
+def test_month_cost_summary_review_cost_month_boundary(config_dir, tmp_path) -> None:
+    # 月は深掘りの上限の判定と同じ UTC の暦月。月初ちょうどは数え、前の月の最後の 1 秒は数えない
+    from datetime import UTC, datetime, timedelta
+
+    start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (2, 'https://e.example/a', 'https://e.example/a', 'sha256:x')"
+    ).lastrowid
+    for moment, cost in ((start, 0.5), (start - timedelta(seconds=1), 7.0)):
+        conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, review_cost_usd,"
+            " created_at) VALUES (?, 'n', 'c', ?, ?)",
+            (item, cost, moment.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["llm_usd"] == 0.5
+
+
 def test_month_cost_summary_without_review_column(config_dir, tmp_path) -> None:
     # doctor は migration を当てない。017 より前の DB でも当月コストを出せる
     conn = connect(tmp_path / "intel.db")

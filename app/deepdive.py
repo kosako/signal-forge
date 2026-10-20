@@ -19,7 +19,8 @@
 別系統の AI のレビュー(GH#153。config `[dig].review`): ドラフトを Claude API が元記事と
 照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
 レビューは品質の上乗せなので、失敗しても深掘りは止めない(未レビューのまま届け、ノートと
-カードに明示する)。費用は台帳に残し、月の上限額に達したらその月はレビューを省く。
+カードに明示する)。費用は台帳に残し、月(UTC の暦月。doctor #9 の当月と同じ)の上限額に達したら
+その月はレビューを省く。
 
 障害の局所化: item 単位で隔離し、1 件の失敗で他の件・他の段を止めない。失敗が
 あれば段としては失敗にする(#74 と同じ「進めるものは進め、止まったことは通知」)。
@@ -366,7 +367,6 @@ def _dig_one(
             candidate,
             source_note_name,
             draft,
-            day,
             logger,
             run_id,
         )
@@ -639,7 +639,6 @@ def _review_and_revise(
     candidate: DigCandidate,
     source_note_name: str | None,
     draft: DigDraft,
-    day: str,
     logger: logging.Logger,
     run_id: str | None,
 ) -> tuple[DigDraft, ReviewOutcome]:
@@ -650,7 +649,7 @@ def _review_and_revise(
     """
     extra = {"run_id": run_id, "stage": "dig", "item_id": candidate.item_id}
     cap = config.dig.review_monthly_cap_usd
-    spent = _review_cost_in_month(conn, day)
+    spent = _review_cost_this_month(conn)
     if spent >= cap:
         logger.warning(
             f"レビューを省略: 今月のレビュー費用 ${spent:.2f} が上限 ${cap:.2f} に達している",
@@ -699,12 +698,17 @@ def _review_and_revise(
     return revised, ReviewOutcome("revised", meter.model, findings, meter.cost_usd)
 
 
-def _review_cost_in_month(conn: sqlite3.Connection, day: str) -> float:
-    """その JST 暦月(day = YYYY-MM-DD)のレビュー費用の合計(created_at は UTC 保存)。"""
+def _review_cost_this_month(conn: sqlite3.Connection) -> float:
+    """今の UTC の暦月のレビュー費用の合計。
+
+    月は doctor #9(month_cost_summary)の当月と同じ UTC の暦月にそろえる(上限の判定と
+    doctor の表示で同じ額を見る)。JST の朝 9 時前の月初は、まだ前の月として数える。
+    """
+    month_prefix = datetime.now(UTC).strftime("%Y-%m")
     return conn.execute(
         "SELECT coalesce(sum(review_cost_usd), 0) AS cost FROM dig_results "
-        "WHERE substr(datetime(created_at, '+9 hours'), 1, 7) = ?",
-        (day[:7],),
+        "WHERE created_at LIKE ? || '%'",
+        (month_prefix,),
     ).fetchone()["cost"]
 
 
