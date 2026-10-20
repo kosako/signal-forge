@@ -131,3 +131,33 @@ def test_rates_list_lowest_sources_with_enough_deliveries(conn, tmp_path) -> Non
     assert report.index(low_line) < report.index(high_line)  # 低い順
     assert "「few」" not in report  # 配信が少ないと率がぶれるので出さない
     assert "「old」" not in report
+
+
+def test_rates_skip_manual_and_stopped_x(conn, tmp_path) -> None:
+    # 手動の投入と、止めている X は見直しの対象でないので、率の枠を使わない
+    x_home = add_source(conn, "x:home", type_="x")
+    feed = add_source(conn, "feed")
+    manual = conn.execute("SELECT id FROM sources WHERE type = 'manual'").fetchone()[0]
+    ids = []
+    for source_id, name in ((x_home, "x"), (feed, "feed"), (manual, "manual")):
+        ids += [
+            add_item(conn, source_id, f"https://{name}/{n}", "2026-10-20T00:00:00Z")
+            for n in range(10)
+        ]
+    deliver(conn, "2026-10-20", ids)
+
+    stopped = source_health_report(conn, config(tmp_path, x_enabled=False), TODAY)
+    assert "「feed」0%" in stopped
+    assert "「x:home」" not in stopped and "「manual」" not in stopped
+    running = source_health_report(conn, config(tmp_path), TODAY)
+    assert "「x:home」0%" in running and "「manual」" not in running
+
+
+def test_new_source_failing_or_moved_is_reported(conn, tmp_path) -> None:
+    # 登録して間もないソースも、失敗・移転はすぐ知らせる(除くのは「新着なし」だけ)
+    add_source(conn, "fresh-fail", failures=1, error="HTTP 404", created="2026-10-24T00:00:00Z")
+    add_source(conn, "fresh-moved", moved="https://n/feed", created="2026-10-24T00:00:00Z")
+    report = source_health_report(conn, config(tmp_path), TODAY)
+    assert "「fresh-fail」が 1 回連続で失敗" in report
+    assert "「fresh-moved」のフィードが移転している" in report
+    assert "💤" not in report

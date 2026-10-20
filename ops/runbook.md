@@ -250,15 +250,26 @@ sqlite3 -readonly -header -column "$db" \
   "SELECT id, type, name, enabled, consecutive_failures, moved_url, config FROM sources ORDER BY id;"
 ```
 
-- **移転(↪️)**: 移転先がフィードを返すことを確かめてから、config の URL を書き換える。
+- **移転(↪️)**: 移転先がフィードを返すことを確かめてから、config の URL を記録済みの移転先に
+  書き換える(URL を手で貼らない。`'` や `$` を含む URL で SQL やシェルが壊れないように、DB の
+  `moved_url` をそのまま使い、SQL は引用符付きのヒアドキュメントで渡す)。
   記事は記事の URL で重複を見分けるので、フィードの URL を変えても同じ記事は二重に入らない。
   次に移転なしで取れた朝に、健康診断から消える(`moved_url` が空に戻る)。
   ```sh
-  sqlite3 "$db" "UPDATE sources SET config = json_set(config, '\$.url', '<移転先の URL>') WHERE id = <id>;"
+  sqlite3 "$db" <<'SQL'
+  UPDATE sources SET config = json_set(config, '$.url', moved_url)
+  WHERE id = <id> AND moved_url IS NOT NULL;
+  SQL
   ```
 - **失敗が続く(⚠️)・新しい記事が入らない(💤)・👍・🔖 の率が低い(📊)**: 原因を見て、直せないなら止める。
   止めても行と記事は残る(戻すときは `enabled = 1`)。X のソースは止める前に設計 02 §2 の予算と検索スロットも見る。
   ```sh
   sqlite3 "$db" "UPDATE sources SET enabled = 0 WHERE id = <id>;"
   ```
-- 新しい RSS を足すときも同じ表に行を入れる(`INSERT INTO sources (type, name, config) VALUES ('rss', '<名前>', json_object('url', '<URL>'));`)。
+- 新しい RSS を足すときも同じ表に行を入れる。SQL は引用符付きのヒアドキュメントで渡す(シェルに
+  展開させない)。名前や URL に `'` が含まれるときは `''` と重ねる。
+  ```sh
+  sqlite3 "$db" <<'SQL'
+  INSERT INTO sources (type, name, config) VALUES ('rss', '<名前>', json_object('url', '<URL>'));
+  SQL
+  ```

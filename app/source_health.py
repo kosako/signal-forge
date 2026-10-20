@@ -74,7 +74,7 @@ def source_health_report(conn: sqlite3.Connection, config: Config, today: str) -
     rates = [
         f"・「{_one_line(row['name'])}」{100 * row['positive'] / row['delivered']:.0f}%"
         f"(👍・🔖 {row['positive']} / 配信 {row['delivered']})"
-        for row in _lowest_rates(conn, today)
+        for row in _lowest_rates(conn, types, today)
     ]
     lines = ["🩺 ソースの健康診断(週 1 回)", ""]
     lines += findings or ["✅ 失敗・移転・新着なしのソースはありません"]
@@ -116,14 +116,18 @@ def _quiet(conn: sqlite3.Connection, types: list[str], today: str) -> list[sqlit
     ).fetchall()
 
 
-def _lowest_rates(conn: sqlite3.Connection, today: str) -> list[sqlite3.Row]:
+def _lowest_rates(
+    conn: sqlite3.Connection, types: list[str], today: str
+) -> list[sqlite3.Row]:
     """直近 RATE_DAYS の配信での 👍・🔖 の率が低いソース(KPI 04 をソース単位にしたもの)。
 
     母集団は配信済みの digest の item(無反応の配信も分母に入る)。反応は item ごとの最新。
+    ほかの欄と同じ種類のソースだけを見る(手動の投入と、止めている X は見直しの対象でない)。
     """
     since = (datetime.fromisoformat(today) - timedelta(days=RATE_DAYS)).strftime("%Y-%m-%d")
+    marks = ",".join("?" * len(types))
     return conn.execute(
-        """
+        f"""
         WITH delivered AS (
           SELECT DISTINCT CAST(je.value AS INTEGER) AS item_id
           FROM digests, json_each(digests.item_ids) AS je
@@ -140,13 +144,13 @@ def _lowest_rates(conn: sqlite3.Connection, today: str) -> list[sqlite3.Row]:
         JOIN items i ON i.id = delivered.item_id
         JOIN sources s ON s.id = i.source_id
         LEFT JOIN latest ON latest.item_id = delivered.item_id AND latest.rn = 1
-        WHERE s.enabled = 1
+        WHERE s.enabled = 1 AND s.type IN ({marks})
         GROUP BY s.id
         HAVING count(*) >= ?
         ORDER BY 1.0 * positive / count(*), count(*) DESC, s.id
         LIMIT ?
         """,
-        (since, RATE_MIN_DELIVERED, RATE_SHOW),
+        (since, *types, RATE_MIN_DELIVERED, RATE_SHOW),
     ).fetchall()
 
 
