@@ -110,13 +110,18 @@ def _analyze_chunk(
 
     results: dict[int, ItemAnalysis] = {}
     hashes: dict[int, str] = {}  # 実際に LLM へ渡した入力の hash(item ごと。設計 01 §3)
+    # 結果ごとに答えたエンジン(engine, model)。主が失敗した呼び出しは予備が答えるので
+    # (GH#156)、1 つのチャンクの中で混ざりうる。呼び出しの直後に控える
+    answered_by: dict[int, tuple[str, str]] = {}
     chunk_failed = False
     try:
         batch = complete_with_retry(engine, prompt, AnalysisBatch)
+        batch_engine = _engine_identity(engine)
         for result in batch.results:
             if result.item_id in chunk_ids:  # allowlist 外の item_id は破棄
                 results[result.item_id] = result
                 hashes[result.item_id] = chunk_hash
+                answered_by[result.item_id] = batch_engine
     except LLMUnavailableError:
         # 環境障害(codex 不在・認証不在)は degraded で握ると全件が黙って劣化する
         # (#72)。段の失敗として伝播させ失敗通知に載せる(GH#74)
@@ -142,6 +147,7 @@ def _analyze_chunk(
             hashes[row["id"]] = single_hash
             if analysis is not None:
                 results[row["id"]] = analysis
+                answered_by[row["id"]] = _engine_identity(engine)
 
     # 分析結果の挿入と items の状態遷移を同一トランザクションで確定する
     # (別々だと途中クラッシュで status='new' のまま analyses だけ残り、再実行時に
@@ -153,7 +159,8 @@ def _analyze_chunk(
             analysis = results.get(row["id"])
             if analysis is not None:
                 _insert_analysis(
-                    conn, row, analysis, engine, hashes[row["id"]], run_id, degraded=False
+                    conn, row, analysis, answered_by[row["id"]], hashes[row["id"]], run_id,
+                    degraded=False,
                 )
                 counts["analyzed"] += 1
             else:
@@ -165,6 +172,11 @@ def _analyze_chunk(
         conn.execute("ROLLBACK")
         raise
     return counts
+
+
+def _engine_identity(engine: LLMEngine) -> tuple[str, str]:
+    """今答えたエンジンの (engine, model)。予備への切り替え(GH#156)では呼び出しごとに変わる。"""
+    return engine.name, str(getattr(engine, "model", "engine-default"))
 
 
 def _prompt_hash(prompt: str) -> str:
@@ -283,7 +295,7 @@ def _insert_analysis(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     analysis: ItemAnalysis,
-    engine: LLMEngine,
+    answered_by: tuple[str, str],  # (engine, model)。_engine_identity で呼び出しの直後に控えた値
     input_hash: str,
     run_id: str | None,
     *,
@@ -310,8 +322,7 @@ def _insert_analysis(
             analysis.reason,
             analysis.implication,
             int(degraded),
-            engine.name,
-            getattr(engine, "model", "engine-default"),
+            *answered_by,
             PROMPT_VERSION,
             input_hash,
         ),

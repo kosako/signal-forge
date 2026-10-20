@@ -315,3 +315,52 @@ SQL
 - 当月の費用は `uv run intel doctor --cost` の LLM に入る。
 
 **止める**: `[dig].review = false`(キーは残してよい)。
+
+## 14. Codex が失敗したときの予備(GH#156・設計 00 §5)
+
+Codex(主のエンジン)が上限・障害・ログイン切れで失敗した LLM の呼び出しだけを、Claude API
+(既定 Sonnet 5.5)でやり直す。対象は記事の判定・トレンド・深掘り(解説・対訳・指摘を受けた直し)・
+カードへの返事。残量は見ず、失敗そのものを合図にする。既定は off。
+
+**有効にする**: §13 と同じキー(`.env` の `INTEL_ANTHROPIC_API_KEY`)を使う。`config.toml` に足す:
+
+```toml
+[llm_fallback]
+engine = "anthropic-api"
+# monthly_cap_usd = 10.0   # 予備の月(UTC の暦月)の上限。達したらその月は予備を使わない
+# model = "claude-sonnet-5-5"   # 替えたら input_usd_per_mtok / output_usd_per_mtok も
+```
+
+`uv run intel doctor` の #2 が PASS になること(キーが無いと FAIL)。朝バッチ・`intel answer` は毎回
+config を読むので、poller の入れ直しは要らない。
+
+**「⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました」が届いたら**:
+
+1. 失敗の種類を見る。`morning.log` の「主のエンジンが失敗したため予備(…)で代行(主: …)」の WARNING に、
+   Codex の失敗の種類(`codex 非0終了(1)`・`タイムアウト`・`codex 起動失敗` など)が出る(本文は書かない)。
+2. Codex の状態を確かめる。`codex login status`(ログイン切れなら `codex login`)。`uv run intel doctor` の
+   #6 で、Codex が答えられるかを確かめる。上限なら `codex` を対話で起動して残りを見る。回復を待つ間も予備が動く。
+   - 「うち予備も失敗した呼び出し」は呼び出しの回数で、段の中のやり直し(1 回)で答えられたものも含む。最終的に
+     劣化・失敗したかは、朝バッチの失敗通知・ダイジェストの劣化の表示・深掘りのカードの有無と、`morning.log` の
+     「主のエンジンも予備も失敗」の WARNING で見る。
+3. 費用は知らせの「今月の予備」と `uv run intel doctor --cost` の LLM で見る。上限は呼び出しの前に
+   判定し、費用は呼び出しの後に記録するので、始めた呼び出しの分だけ上限を超えることがある(1 つだけ
+   走っていれば 1 回分。朝バッチとカードへの返事は同時に走りうるので、そのときは同時に始めた分)。上限に達した月は予備を使わず、
+   Codex が失敗した呼び出しは劣化・失敗に戻る(ログに「予備は今月の上限 … に達しているので使わない」)。
+
+予備の呼び出しの記録:
+
+```sh
+db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+sqlite3 -readonly -header -column "$db" <<'SQL'
+SELECT created_at, run_id, stage, primary_error, ok, round(cost_usd, 3) AS usd
+FROM llm_fallback_calls ORDER BY id DESC LIMIT 20;
+SQL
+```
+
+- `primary_error` が `skipped` の行は、同じ実行で Codex が続けて失敗した後に、Codex を呼ばずに予備へ
+  行った呼び出し(Codex に戻るのは次の実行から)。
+- カードへの返事(朝バッチの外)で予備を使ったときは知らせない。`answer.log` の WARNING と、上の表の
+  `run_id` が空の行で見る。
+
+**止める**: `[llm_fallback].engine = ""`(または行ごと消す)。

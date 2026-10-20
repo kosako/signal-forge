@@ -16,6 +16,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 
+from app.analysis.fallback import fallback_engine_factory, run_fallback_notice
 from app.analysis.llm import LLMEngine
 from app.backup import backup_daily
 from app.collect import collect_all
@@ -62,8 +63,11 @@ def run_pipeline(
     if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
-    stage("analyze", lambda: _analyze(conn, config, engine_factory, logger, run_id))
-    stage("digest", lambda: _digest(conn, config, engine_factory, logger, run_id, force_digest))
+    stage("analyze", lambda: _analyze(conn, config, env, engine_factory, logger, run_id))
+    stage(
+        "digest",
+        lambda: _digest(conn, config, env, engine_factory, logger, run_id, force_digest),
+    )
     stage("export", lambda: _export_today(conn, config, logger, run_id))
     if is_telegram_configured(config, env):
         stage("deliver", lambda: _deliver_today(conn, config, env, logger, run_id))
@@ -88,6 +92,7 @@ def run_pipeline(
 def _digest(
     conn: sqlite3.Connection,
     config: Config,
+    env: dict[str, str],
     engine_factory: Callable[[], LLMEngine],
     logger: logging.Logger,
     run_id: str,
@@ -100,7 +105,12 @@ def _digest(
     # digest が skip される場合(当日生成済み & not force)は synthesis しない(無駄な LLM 呼び)
     if force_digest or not _digest_exists_today(conn):
         try:
-            trend = synthesize_trend(conn, engine_factory(), logger, run_id=run_id)
+            # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
+            engine = fallback_engine_factory(
+                conn, config, env, logger, stage="trend", run_id=run_id,
+                primary=lambda _effort: engine_factory(),
+            )("low")
+            trend = synthesize_trend(conn, engine, logger, run_id=run_id)
         except Exception as e:  # トレンドは付加機能。失敗しても digest 本体を止めない
             logger.warning(
                 f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
@@ -149,6 +159,7 @@ def _collect_x_signals(
 def _analyze(
     conn: sqlite3.Connection,
     config: Config,
+    env: dict[str, str],
     engine_factory: Callable[[], LLMEngine],
     logger: logging.Logger,
     run_id: str,
@@ -160,7 +171,11 @@ def _analyze(
     from app.analysis.stage1 import preselect
 
     profile = load_interest_profile(config.profile_path)
-    engine = engine_factory()
+    # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
+    engine = fallback_engine_factory(
+        conn, config, env, logger, stage="analyze", run_id=run_id,
+        primary=lambda _effort: engine_factory(),
+    )("low")
     result = preselect(conn, config, logger, run_id=run_id)
     analyze_selected(
         conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
@@ -179,14 +194,15 @@ def _dig(
     Telegram 未設定でもノート生成は行い、カードは台帳(dig_results)に未送信で残す
     (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。
     """
-    from app.analysis.llm import create_anthropic_engine, create_engine
+    from app.analysis.llm import create_anthropic_engine
     from app.deepdive import run_dig_stage
 
     api = create_api(env) if is_telegram_configured(config, env) else None
     run_dig_stage(
         conn,
         config,
-        lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
+        # 解説・対訳・指摘を受けた直し。主が失敗したら予備でやり直す(GH#156)
+        fallback_engine_factory(conn, config, env, logger, stage="dig", run_id=run_id),
         api,
         logger,
         run_id=run_id,
@@ -226,3 +242,31 @@ def _today_digest_id(conn: sqlite3.Connection) -> int:
     if row is None:
         raise RuntimeError("当日の digest が存在しない(digest 段の失敗を参照)")
     return row["id"]
+
+
+def notify_llm_fallback(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    run_id: str,
+    logger: logging.Logger,
+) -> None:
+    """朝バッチで予備(GH#156)を使ったら 1 通知らせる。
+
+    知らせの失敗はログだけにする(朝バッチの終了コードを汚さない)。
+    """
+    if config.llm_fallback.engine == "":
+        return
+    notice = run_fallback_notice(conn, run_id, config.llm_fallback.monthly_cap_usd)
+    if notice is None:
+        return
+    logger.warning(notice.replace("\n", " / "), extra={"run_id": run_id, "stage": "run"})
+    if not is_telegram_configured(config, env) or config.telegram.owner_chat_id is None:
+        return
+    try:
+        create_api(env).send_message(config.telegram.owner_chat_id, notice)
+    except Exception as e:
+        logger.error(
+            f"予備の利用の知らせを送れない: {type(e).__name__}: {e}",
+            extra={"run_id": run_id, "stage": "run"},
+        )

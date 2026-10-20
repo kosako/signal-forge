@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -40,6 +41,31 @@ BREAKER_THRESHOLD = 2
 PRIMARY_SKIPPED = "skipped"  # 台帳の primary_error: 主を飛ばした回
 # codex の effort → Claude API の effort(ほかは同じ名前。DIG_EFFORTS と ANTHROPIC_EFFORTS)
 _CLAUDE_EFFORTS = {"minimal": "low"}
+_STAGE_LABELS = {"analyze": "記事の判定", "trend": "トレンド", "dig": "深掘り", "answer": "返事"}
+# 主の失敗の種類(app/analysis/llm.py が上げるメッセージの書き出し)。ログにはこの種類だけを書き、
+# 続く本文(codex の stderr の末尾・応答の先頭など、外部の文を含みうる)は書かない
+_PRIMARY_FAILURE_KINDS = (
+    "タイムアウト",
+    "codex 非0終了",
+    "codex 起動失敗",
+    "codex の起動設定エラー",
+    "codex が最終応答ファイルを書かなかった",
+    "~/.codex/auth.json がない",
+    "JSON パース失敗",
+    "スキーマ検証失敗",
+)
+
+
+def _primary_failure_kind(error: LLMError | None) -> str:
+    """主の失敗の種類(本文を含まない)。非0終了は終了コードも付ける。"""
+    if error is None:
+        return "続けて失敗したので主を呼ばなかった"
+    message = str(error)
+    for kind in _PRIMARY_FAILURE_KINDS:
+        if message.startswith(kind):
+            code = re.match(r"codex 非0終了\((-?\d{1,4})\)", message)
+            return f"{kind}({code.group(1)})" if code else kind
+    return "その他の失敗"
 
 
 def fallback_cost_this_month(conn: sqlite3.Connection) -> float:
@@ -118,7 +144,7 @@ class FallbackEngine:
 
     `name` と `model` は最後に答えたエンジンのもの。呼び出しの直後に読めば、その呼び出しに
     答えたエンジンになる(analyzer は結果ごとに控えて analyses の engine / model に記録する。
-    1 つのチャンクの中で主と予備が混ざりうるため。GH#156 その 2)。
+    1 つのチャンクの中で主と予備が混ざりうるため)。
     """
 
     def __init__(
@@ -164,11 +190,13 @@ class FallbackEngine:
                 self._last = self._primary
                 return result
         reason = type(primary_error).__name__ if primary_error else PRIMARY_SKIPPED
+        # ログに書く主の失敗: 例外の型と種類だけ(本文は書かない)
+        primary = f"{reason}・{_primary_failure_kind(primary_error)}"
 
         if not self._ledger.allows():
             self._logger.warning(
                 f"主のエンジンが失敗したが、予備は今月の上限 ${self._ledger.cap_usd:.2f} に"
-                f"達しているので使わない(主: {reason})",
+                f"達しているので使わない(主: {primary})",
                 extra=self._extra,
             )
             raise self._error_like_primary(primary_error, "予備は今月の上限に達したため使わない")
@@ -176,7 +204,7 @@ class FallbackEngine:
             fallback = self._make_fallback()
         except LLMError as e:  # キーが無いなど。予備を作れない
             self._logger.warning(
-                f"主のエンジンが失敗したが、予備を作れない(主: {reason} / 予備: "
+                f"主のエンジンが失敗したが、予備を作れない(主: {primary} / 予備: "
                 f"{type(e).__name__}: {e})",
                 extra=self._extra,
             )
@@ -191,7 +219,7 @@ class FallbackEngine:
                 usage=getattr(fallback, "last_usage", None),
             )
             self._logger.warning(
-                f"主のエンジンも予備も失敗(主: {reason} / 予備: {type(e).__name__}: {e})",
+                f"主のエンジンも予備も失敗(主: {primary} / 予備: {type(e).__name__}: {e})",
                 extra=self._extra,
             )
             raise self._error_like_primary(
@@ -204,17 +232,23 @@ class FallbackEngine:
             usage=getattr(fallback, "last_usage", None),
         )
         self._logger.warning(
-            f"主のエンジンが失敗したため予備({self._fallback_model})で代行(主: {reason})",
+            f"主のエンジンが失敗したため予備({self._fallback_model})で代行(主: {primary})",
             extra=self._extra,
         )
         self._last = fallback
         return result
 
     def _error_like_primary(self, primary_error: LLMError | None, note: str) -> LLMError:
-        """主の失敗と同じ種類のエラー(各段の劣化・失敗の扱いを変えない)。"""
+        """主の失敗と同じ種類のエラー(各段の劣化・失敗の扱いを変えない)。
+
+        メッセージは主の失敗の種類だけにする(主の例外の全文は codex の stderr の末尾・応答の
+        先頭を含みうり、各段がこのメッセージをログに書くため)。note は予備の側の説明で、
+        Claude API のエンジンのメッセージは本文を含まない(GH#156 その 1)。
+        """
         if primary_error is None:  # 主を飛ばした回: 最後に見た主の失敗と同じ種類
             return self._breaker.last_error_class(f"主のエンジンは続けて失敗していた。{note}")
-        return type(primary_error)(f"{primary_error}。{note}")
+        kind = _primary_failure_kind(primary_error)
+        return type(primary_error)(f"主のエンジンが失敗({kind})。{note}")
 
 
 def fallback_engine_factory(
@@ -225,16 +259,23 @@ def fallback_engine_factory(
     *,
     stage: str,
     run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
 ) -> Callable[[str], LLMEngine]:
     """effort → エンジン。予備が無効(既定)なら主のエンジンをそのまま返す。
 
     1 つの factory が作るエンジンは、主が続けて失敗したかの記録を共有する(1 つの段・1 回の
     実行ぶん)。予備のエンジンは主が失敗したときに初めて作る(キーが無いなどの失敗も、その
-    ときの呼び出しの失敗として扱う)。
+    ときの呼び出しの失敗として扱う)。primary は主のエンジンの作り方(既定は config の
+    `[llm].engine`。朝バッチは run_pipeline に渡された factory を使う)。
     """
     settings = config.llm_fallback
+    if primary is None:
+
+        def primary(effort: str) -> LLMEngine:
+            return create_engine(config.llm.engine, model_reasoning_effort=effort)
+
     if settings.engine == "":
-        return lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort)
+        return primary
     ledger = FallbackLedger(conn, settings.monthly_cap_usd, stage=stage, run_id=run_id)
     breaker = _Breaker()
     extra = {"run_id": run_id, "stage": stage}
@@ -248,7 +289,7 @@ def fallback_engine_factory(
             output_usd_per_mtok=settings.output_usd_per_mtok,
         )
         return FallbackEngine(
-            create_engine(config.llm.engine, model_reasoning_effort=effort),
+            primary(effort),
             lambda: create_anthropic_engine(claude, env),
             ledger,
             breaker,
@@ -258,3 +299,30 @@ def fallback_engine_factory(
         )
 
     return make
+
+
+def run_fallback_notice(conn: sqlite3.Connection, run_id: str, cap_usd: float) -> str | None:
+    """朝バッチ 1 回ぶんの予備の利用の知らせ(使っていなければ None)。
+
+    予備で答えられても、Codex が止まっていることには変わらないので知らせる(黙って Claude API に
+    頼り続けない)。文言は固定の語と数だけ(外部の文字列を含まない)。
+    """
+    rows = conn.execute(
+        "SELECT stage, count(*) AS calls, sum(ok) AS answered, sum(cost_usd) AS cost"
+        " FROM llm_fallback_calls WHERE run_id = ? GROUP BY stage ORDER BY min(id)",
+        (run_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    lines = ["⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました"]
+    for row in rows:
+        failed = row["calls"] - row["answered"]
+        detail = f"(うち予備も失敗した呼び出し {failed} 回)" if failed else ""
+        lines.append(f"・{_STAGE_LABELS[row['stage']]}: {row['calls']} 回{detail}")
+    spent = sum(row["cost"] for row in rows)
+    lines.append(
+        f"今回 ${spent:.2f} / 今月の予備 ${fallback_cost_this_month(conn):.2f}"
+        f"(上限 ${cap_usd:.2f})"
+    )
+    lines.append("Codex の上限・ログインの状態を確かめてください(runbook §14)")
+    return "\n".join(lines)

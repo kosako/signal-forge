@@ -154,7 +154,7 @@ def test_fallback_failure_raises_like_primary(conn, error_class) -> None:
     with pytest.raises(error_class) as excinfo:
         engine.complete_structured("p", Verdict)
     assert type(excinfo.value) is error_class
-    assert "主の失敗" in str(excinfo.value) and "予備も失敗" in str(excinfo.value)
+    assert "主のエンジンが失敗" in str(excinfo.value) and "予備も失敗" in str(excinfo.value)
     (row,) = ledger_rows(conn)
     assert (row["ok"], row["cost_usd"]) == (0, 0.02)  # 失敗した応答の課金も残す
 
@@ -316,3 +316,106 @@ def test_fallback_failure_logs_and_raises_without_reply_body(conn, caplog) -> No
     assert marker not in caplog.text
     (row,) = ledger_rows(conn)
     assert row["ok"] == 0 and row["cost_usd"] > 0
+
+
+def test_run_fallback_notice_summarizes_one_run(conn) -> None:
+    from app.analysis.fallback import run_fallback_notice
+
+    rows = [
+        ("01RUN", "analyze", 1, 0.02),
+        ("01RUN", "analyze", 1, 0.03),
+        ("01RUN", "analyze", 0, 0.01),
+        ("01RUN", "dig", 1, 0.10),
+        ("01OTHER", "answer", 1, 5.00),  # ほかの実行は数えない(今月の合計には入る)
+    ]
+    for run_id, stage, ok, cost in rows:
+        conn.execute(
+            "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok, cost_usd)"
+            " VALUES (?, ?, 'claude-sonnet-5-5', 'LLMError', ?, ?)",
+            (run_id, stage, ok, cost),
+        )
+    text = run_fallback_notice(conn, "01RUN", 10.0)
+    assert text.splitlines() == [
+        "⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました",
+        "・記事の判定: 3 回(うち予備も失敗した呼び出し 1 回)",
+        "・深掘り: 1 回",
+        "今回 $0.16 / 今月の予備 $5.16(上限 $10.00)",
+        "Codex の上限・ログインの状態を確かめてください(runbook §14)",
+    ]
+    assert run_fallback_notice(conn, "01NONE", 10.0) is None
+
+
+def test_factory_uses_injected_primary(conn, tmp_path) -> None:
+    primary = Scripted("codex-cli", [Verdict(score=1)])
+    made: list[str] = []
+
+    def make_primary(effort: str):
+        made.append(effort)
+        return primary
+
+    off = fallback_engine_factory(
+        conn, Config(config_dir=tmp_path), {}, logger, stage="analyze", primary=make_primary
+    )
+    assert off is make_primary  # 予備が無効なら主の作り方そのもの
+    on_config = Config(
+        config_dir=tmp_path, llm_fallback=LLMFallbackConfig(engine="anthropic-api")
+    )
+    on = fallback_engine_factory(
+        conn, on_config, {}, logger, stage="analyze", primary=make_primary
+    )
+    engine = on("low")
+    assert engine.complete_structured("p", Verdict) == Verdict(score=1)
+    assert made == ["low"]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (LLMError("codex 非0終了(1): 記事の本文そのものXYZ"), "codex 非0終了(1)"),
+        (LLMError("タイムアウト(120s)"), "タイムアウト"),
+        (LLMError("JSON パース失敗: x(先頭: '記事の本文そのものXYZ')"), "JSON パース失敗"),
+        (LLMUnavailableError("codex 起動失敗: [Errno 2]"), "codex 起動失敗"),
+        (LLMError("記事の本文そのものXYZ"), "その他の失敗"),
+    ],
+)
+def test_fallback_log_names_primary_failure_kind_without_body(conn, caplog, error, kind) -> None:
+    # ログには主の失敗の種類だけを書く(codex の stderr・応答の先頭は外部の文を含みうる)
+    primary = Scripted("codex-cli", [error])
+    fallback = Scripted("anthropic-api", [Verdict(score=1)])
+    with caplog.at_level(logging.WARNING):
+        build(conn, primary, fallback).complete_structured("p", Verdict)
+    assert f"{type(error).__name__}・{kind}" in caplog.text
+    assert "記事の本文そのもの" not in caplog.text
+
+
+@pytest.mark.parametrize("path", ["fallback_fails", "over_cap", "cannot_build"])
+def test_reraised_error_carries_only_failure_kind(conn, caplog, path) -> None:
+    # 予備で答えられずに投げ直す例外は、主の例外の全文(本文を含みうる)を持たない。
+    # 各段がこのメッセージをログに書くため(analyzer のチャンクの失敗・深掘りの item の失敗)
+    import traceback
+
+    marker = "記事の本文そのものXYZ"
+    primary = Scripted("codex-cli", [LLMError(f"JSON パース失敗: x(先頭: '{marker}')")])
+    fallback = Scripted("anthropic-api", [LLMError("Anthropic API 529(overloaded_error)")])
+    if path == "cannot_build":
+
+        def no_key():
+            raise LLMUnavailableError(".env に INTEL_ANTHROPIC_API_KEY が無い")
+
+        engine = FallbackEngine(
+            primary, no_key, FallbackLedger(conn, 10.0, stage="analyze", run_id=None),
+            _Breaker(), logger, fallback_model="claude-sonnet-5-5",
+        )
+    else:
+        engine = build(conn, primary, fallback, cap=0.0 if path == "over_cap" else 10.0)
+        if path == "over_cap":
+            conn.execute(
+                "INSERT INTO llm_fallback_calls (stage, model, primary_error, ok, cost_usd)"
+                " VALUES ('analyze', 'm', 'LLMError', 1, 0.01)"
+            )
+    with caplog.at_level(logging.WARNING), pytest.raises(LLMError) as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert type(excinfo.value) is LLMError
+    assert "JSON パース失敗" in str(excinfo.value)  # 種類は残す
+    assert marker not in "".join(traceback.format_exception(excinfo.value))
+    assert marker not in caplog.text

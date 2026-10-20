@@ -185,3 +185,52 @@ def test_answer_keeps_lock_when_interrupted_while_vault_thread_lives(tmp_path, m
             fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         release.set()
+
+
+class _StopAtFactory(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("command", "stage"),
+    [("analyze", "analyze"), ("digest", "trend"), ("dig", "dig"), ("answer", "answer")],
+)
+def test_commands_build_engines_through_fallback(tmp_path, monkeypatch, command, stage) -> None:
+    # 主のエンジンを使う各コマンドは、段の名前で予備への切り替え(GH#156)を通して作る
+    from app import logs
+    from app.analysis import fallback
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    (tmp_path / "interest-profile.md").write_text(
+        "---\nupdated: 2026-10-20\n---\n# 関心\n", encoding="utf-8"
+    )
+    # spy の中の assert は digest の except に吸われるので、記録して後で確かめる
+    seen: list[tuple[str, dict]] = []
+
+    def spy(conn, config, env, logger, *, stage, run_id=None, primary=None):
+        seen.append((stage, dict(env)))
+        raise _StopAtFactory
+
+    monkeypatch.setattr(fallback, "fallback_engine_factory", spy)
+    result = runner.invoke(app, [command, "--config-dir", str(tmp_path)])
+    assert [name for name, _ in seen] == [stage]
+    assert seen[0][1].get("TELEGRAM_BOT_TOKEN") == "test-token"  # .env の dict を渡す
+    if command != "digest":  # digest はトレンドの失敗を握って本体を続ける(付加機能)
+        assert isinstance(result.exception, _StopAtFactory)
+
+
+def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
+    # 朝バッチは、段が成功していても予備の利用(GH#156)を知らせる経路を通る
+    from app import logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    calls: list[str] = []
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        run, "notify_llm_fallback", lambda conn, config, env, run_id, logger: calls.append(run_id)
+    )
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1 and calls[0]

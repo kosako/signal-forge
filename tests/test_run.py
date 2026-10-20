@@ -364,3 +364,157 @@ def test_dig_stage_wires_review_engine_from_config(conn, tmp_path, monkeypatch, 
     _dig(conn, config, {}, logger, "run-2")
     with pytest.raises(LLMUnavailableError):
         captured["review_engine_factory"]()
+
+
+def test_fallback_answers_when_codex_fails_and_is_noticed(conn, tmp_path, monkeypatch) -> None:
+    # 主(Codex)が起動できなくても、予備(GH#156)が判定する。記録は答えたエンジンで、
+    # 朝バッチの後に 1 通知らせる
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.analysis.llm import LLMUnavailableError, LLMUsage
+    from app.config import LLMFallbackConfig, TelegramConfig
+
+    class Down:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 起動失敗")
+
+    class Claude(ScriptedEngine):
+        name = "anthropic-api"
+        model = "claude-sonnet-5-5"
+        last_usage = LLMUsage(1000, 100, 0.01)
+
+    monkeypatch.setattr(
+        "app.analysis.fallback.create_anthropic_engine", lambda settings, env: Claude(conn)
+    )
+    config = replace(make_config(tmp_path), llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: Down(), logger, "01RUNFB",
+    )
+    assert "analyze" not in failures
+    analysis = conn.execute("SELECT engine, model, degraded FROM analyses").fetchone()
+    assert tuple(analysis) == ("anthropic-api", "claude-sonnet-5-5", 0)
+    # 記事が 1 件なのでトレンドは LLM を呼ばない(配線は下の _digest のテスト)
+    ledger = conn.execute("SELECT stage, run_id FROM llm_fallback_calls").fetchall()
+    assert [(row["stage"], row["run_id"]) for row in ledger] == [("analyze", "01RUNFB")]
+
+    sent: list[tuple[int, str]] = []
+
+    class Api:
+        def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text))
+            return 1
+
+    monkeypatch.setattr(run_module, "create_api", lambda env: Api())
+    with_telegram = replace(config, telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10))
+    run_module.notify_llm_fallback(
+        conn, with_telegram, {"TELEGRAM_BOT_TOKEN": "t"}, "01RUNFB", logger
+    )
+    ((chat_id, text),) = sent
+    assert chat_id == 10
+    assert "Claude API で代行" in text and "記事の判定: 1 回" in text
+
+
+def test_fallback_notice_is_quiet_when_unused_or_off(conn, tmp_path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import LLMFallbackConfig, TelegramConfig
+
+    sent: list[str] = []  # 送信の失敗は握られるので、例外でなく記録で確かめる
+
+    class Api:
+        def send_message(self, chat_id, text, **kwargs):
+            sent.append(text)
+            return 1
+
+    monkeypatch.setattr(run_module, "create_api", lambda env: Api())
+    conn.execute(
+        "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok)"
+        " VALUES ('01USED', 'analyze', 'm', 'LLMError', 1)"
+    )
+    config = replace(
+        make_config(tmp_path), telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10)
+    )
+    env = {"TELEGRAM_BOT_TOKEN": "t"}
+    run_module.notify_llm_fallback(conn, config, env, "01USED", logger)  # 予備は無効
+    enabled = replace(config, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
+    run_module.notify_llm_fallback(conn, enabled, env, "01OTHER", logger)  # この回は使っていない
+    assert sent == []
+    run_module.notify_llm_fallback(conn, enabled, env, "01USED", logger)  # 対照: 送る
+    assert len(sent) == 1
+
+
+def test_fallback_notice_send_failure_is_only_logged(conn, tmp_path, monkeypatch, caplog) -> None:
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import LLMFallbackConfig, TelegramConfig
+
+    conn.execute(
+        "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok)"
+        " VALUES ('01RUN', 'dig', 'm', 'LLMError', 1)"
+    )
+
+    class Api:
+        def send_message(self, chat_id, text, **kwargs):
+            raise RuntimeError("送れない")
+
+    monkeypatch.setattr(run_module, "create_api", lambda env: Api())
+    config = replace(
+        make_config(tmp_path),
+        telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10),
+        llm_fallback=LLMFallbackConfig(engine="anthropic-api"),
+    )
+    run_module.notify_llm_fallback(conn, config, {"TELEGRAM_BOT_TOKEN": "t"}, "01RUN", logger)
+    assert "予備の利用の知らせを送れない" in caplog.text
+
+
+def test_dig_stage_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -> None:
+    from app import deepdive
+    from app.analysis.fallback import FallbackEngine
+    from app.analysis.llm import CodexCliEngine
+    from app.config import LLMFallbackConfig
+    from app.run import _dig
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        deepdive, "run_dig_stage", lambda *args, **kwargs: captured.update(args=args)
+    )
+    off = Config(config_dir=tmp_path)
+    _dig(conn, off, {}, logger, "run-1")
+    assert isinstance(captured["args"][2]("medium"), CodexCliEngine)
+    on = Config(config_dir=tmp_path, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
+    _dig(conn, on, {}, logger, "run-2")
+    assert isinstance(captured["args"][2]("medium"), FallbackEngine)
+
+
+def test_trend_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -> None:
+    from app.analysis import trend
+    from app.analysis.fallback import FallbackEngine
+    from app.config import LLMFallbackConfig
+    from app.run import _digest
+
+    engines: list = []
+
+    def capture(conn, engine, logger, run_id=None):
+        engines.append(engine)
+        return None
+
+    monkeypatch.setattr(trend, "synthesize_trend", capture)
+    primary = ScriptedEngine(conn)
+    for config in (
+        make_config(tmp_path),
+        Config(
+            config_dir=tmp_path,
+            obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault")),
+            llm_fallback=LLMFallbackConfig(engine="anthropic-api"),
+        ),
+    ):
+        _digest(conn, config, {}, lambda: primary, logger, "run-1", True)
+    assert engines[0] is primary  # 予備が無効なら主のまま
+    assert isinstance(engines[1], FallbackEngine) and engines[1]._primary is primary
