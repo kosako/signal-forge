@@ -76,9 +76,9 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ## 6. secrets 保管
 
-- 置き場: `~/.config/intel/.env`(chmod 600、リポジトリ外)。キー: X API・Telegram bot token・(fallback 用)Anthropic API キー・(confidential client のみ・任意)`X_OAUTH2_CLIENT_SECRET`。Keychain 対応は拡張点(security CLI 呼び出しの抽象は config.py に閉じる)。
+- 置き場: `~/.config/intel/.env`(chmod 600、リポジトリ外)。キー: X API・Telegram bot token・Anthropic API キー(`INTEL_ANTHROPIC_API_KEY`。深掘りノートのレビュー用。GH#153)・(confidential client のみ・任意)`X_OAUTH2_CLIENT_SECRET`。Keychain 対応は拡張点(security CLI 呼び出しの抽象は config.py に閉じる)。
 - X OAuth2 token(S1): `~/.config/intel/x-oauth2-token.json`(chmod 600)。`intel x-auth` が生成し、refresh のローテーションで自動更新される(手編集しない)。無効化は X 側のアプリ連携解除 + ファイル削除。
-- **Anthropic キーは .env にのみ置き、シェル環境・launchd 環境に export しない**。AnthropicApiEngine だけが .env から直接読む。
+- **Anthropic キーは .env にのみ置き、シェル環境・launchd 環境に export しない**。AnthropicApiEngine だけが .env から直接読む。キー名を `ANTHROPIC_API_KEY` にしないのは、環境に載ったときに claude -p が無自覚に API 課金へ回るのを防ぐため(doctor #12 が環境の `ANTHROPIC_API_KEY` を WARN にする)。
 - ローテーション手順(runbook): X = ポータルで再発行→.env 差し替え→doctor。Telegram = BotFather revoke→再発行→.env 差し替え→doctor(allowlist は chat_id 不変なので変更不要)。
 
 ## 7. 月次コストレポート

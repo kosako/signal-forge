@@ -313,3 +313,34 @@ def test_dig_rejects_bad_values(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[dig]\ndaily_cap = -1\n"))
     with pytest.raises(ConfigError, match=r"\[dig\].timeout_s"):
         load_config(write_config(tmp_path, "[dig]\ntimeout_s = 0\n"))
+
+
+def test_anthropic_api_defaults_and_overrides(tmp_path: Path) -> None:
+    default = load_config(tmp_path).anthropic_api
+    assert (default.model, default.effort) == ("claude-opus-5-5", "medium")
+    assert default.max_tokens == 16_000
+    assert (default.input_usd_per_mtok, default.output_usd_per_mtok) == (4.0, 20.0)
+    write_config(
+        tmp_path,
+        '[anthropic_api]\nmodel = "claude-sonnet-5-5"\neffort = "high"\nmax_tokens = 8000\n'
+        "input_usd_per_mtok = 2\noutput_usd_per_mtok = 10.0\n",
+    )
+    config = load_config(tmp_path).anthropic_api
+    assert (config.model, config.effort, config.max_tokens) == ("claude-sonnet-5-5", "high", 8000)
+    assert (config.input_usd_per_mtok, config.output_usd_per_mtok) == (2, 10.0)
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ('effort = "minimal"', "effort"),  # codex の語彙は Claude API に無い
+        ('model = " "', "model"),
+        ("max_tokens = 0", "正の整数"),
+        ("input_usd_per_mtok = -1", "input_usd_per_mtok"),
+        ("output_usd_per_mtok = nan", "output_usd_per_mtok"),
+    ],
+)
+def test_anthropic_api_rejects_bad_values(tmp_path: Path, body: str, match: str) -> None:
+    write_config(tmp_path, f"[anthropic_api]\n{body}\n")
+    with pytest.raises(ConfigError, match=match):
+        load_config(tmp_path)

@@ -122,6 +122,25 @@ class LLMConfig:
     engine: str = "codex-cli"  # 仮決定(Issue #3)。値は _LLM_ENGINES のいずれか
 
 
+# Claude の Messages API の effort の語彙(output_config.effort。モデルにより使えない
+# 段がある。使えない値は API が 400 で返す)
+ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True)
+class AnthropicApiConfig:
+    """Claude API(`anthropic-api` エンジン。GH#153)。キーは .env の INTEL_ANTHROPIC_API_KEY。
+
+    単価は費用の見積もりに使う(請求の正本は Anthropic 側)。モデルを替えたら単価も合わせる。
+    """
+
+    model: str = "claude-opus-5-5"
+    effort: str = "medium"  # Opus 5.5 の既定と同じ(思考の量 = 費用と時間の主なつまみ)
+    max_tokens: int = 16_000  # 出力の上限(思考 + 本文の合計。超えると打ち切り = 失敗)
+    input_usd_per_mtok: float = 4.0  # Opus 5.5 の単価(2026-10 時点)
+    output_usd_per_mtok: float = 20.0
+
+
 @dataclass(frozen=True)
 class RetentionConfig:
     cache_ttl_days: int = 30  # RSS/manual(設計 01 §6)
@@ -191,6 +210,7 @@ class Config:
     digest: DigestConfig = field(default_factory=DigestConfig)
     dig: DigConfig = field(default_factory=DigConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    anthropic_api: AnthropicApiConfig = field(default_factory=AnthropicApiConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -226,6 +246,7 @@ _SECTIONS = {
     "digest": DigestConfig,
     "dig": DigConfig,
     "llm": LLMConfig,
+    "anthropic_api": AnthropicApiConfig,
     "retention": RetentionConfig,
     "budget": BudgetConfig,
     "telegram": TelegramConfig,
@@ -330,6 +351,17 @@ def _validate(path: Path, config: Config) -> None:
         )
     if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
         raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
+    if config.anthropic_api.effort not in ANTHROPIC_EFFORTS:
+        raise ConfigError(
+            f"{path}: [anthropic_api].effort は {'/'.join(ANTHROPIC_EFFORTS)} のいずれか: "
+            f"{config.anthropic_api.effort!r}"
+        )
+    if not config.anthropic_api.model.strip():
+        raise ConfigError(f"{path}: [anthropic_api].model が空文字")
+    for key in ("input_usd_per_mtok", "output_usd_per_mtok"):
+        price = getattr(config.anthropic_api, key)
+        if not (math.isfinite(price) and price >= 0):
+            raise ConfigError(f"{path}: [anthropic_api].{key} は 0 以上の有限値: {price}")
     for key in ("reasoning_effort", "answer_reasoning_effort"):
         if getattr(config.dig, key) not in DIG_EFFORTS:
             raise ConfigError(
@@ -353,6 +385,7 @@ def _validate(path: Path, config: Config) -> None:
         ("analysis", "batch_size", config.analysis.batch_size),
         ("analysis", "body_max_chars", config.analysis.body_max_chars),
         ("ranking", "max_per_source", config.ranking.max_per_source),
+        ("anthropic_api", "max_tokens", config.anthropic_api.max_tokens),
     ]
     nonnegatives = [
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),

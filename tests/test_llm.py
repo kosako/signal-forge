@@ -1,19 +1,26 @@
 import json
 import os
 import stat
+import traceback
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
 from app.analysis.llm import (
+    ANTHROPIC_API_KEY_ENV,
+    AnthropicApiEngine,
     CodexCliEngine,
     LLMError,
     LLMUnavailableError,
+    LLMUsage,
     complete_with_retry,
+    create_anthropic_engine,
     create_engine,
     parse_structured,
 )
+from app.config import AnthropicApiConfig
 
 
 class Verdict(BaseModel):
@@ -335,3 +342,210 @@ def test_create_engine_only_codex_cli() -> None:
     assert create_engine("codex-cli").name == "codex-cli"
     with pytest.raises(LLMError, match="未実装"):
         create_engine("claude-cli")
+
+
+# --- anthropic-api(GH#153) ---
+
+FAKE_KEY = "test-key"
+
+
+def anthropic_reply(text: str = VALID, **overrides) -> dict:
+    reply = {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            {"type": "text", "text": text},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 12_000, "output_tokens": 3_000},
+    }
+    reply.update(overrides)
+    return reply
+
+
+def anthropic_engine(handler, **kwargs) -> AnthropicApiEngine:
+    params = {
+        "api_key": FAKE_KEY,
+        "model": "claude-opus-5-5",
+        "effort": "medium",
+        "max_tokens": 16_000,
+        "input_usd_per_mtok": 4.0,
+        "output_usd_per_mtok": 20.0,
+        "transport": httpx.MockTransport(handler),
+    }
+    params.update(kwargs)
+    return AnthropicApiEngine(**params)
+
+
+def test_anthropic_request_has_no_tools_and_fixed_destination() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=anthropic_reply())
+
+    result = anthropic_engine(handler).complete_structured("プロンプト本文", Verdict)
+
+    assert result == Verdict(score=80, reason="ok")
+    (request,) = seen
+    assert str(request.url) == "https://api.anthropic.com/v1/messages"
+    assert request.headers["x-api-key"] == FAKE_KEY
+    assert request.headers["anthropic-version"] == "2023-06-01"
+    body = json.loads(request.content)
+    # 推論専用は構造で作る: ツール・MCP・コンテナの類は一切付けない(この 4 キーだけ)
+    assert body == {
+        "model": "claude-opus-5-5",
+        "max_tokens": 16_000,
+        "messages": [{"role": "user", "content": "プロンプト本文"}],
+        "output_config": {"effort": "medium"},
+    }
+
+
+def test_anthropic_records_usage_and_cost() -> None:
+    engine = anthropic_engine(lambda request: httpx.Response(200, json=anthropic_reply()))
+    engine.complete_structured("p", Verdict)
+    # 12k × $4/M + 3k × $20/M = 0.048 + 0.06
+    assert engine.last_usage == LLMUsage(12_000, 3_000, 0.108)
+
+
+def test_anthropic_joins_text_blocks_and_skips_thinking() -> None:
+    reply = anthropic_reply(
+        content=[
+            # 種別で選ぶ(text の欄を持っていても、本文のブロックでなければ読まない)
+            {"type": "thinking", "thinking": "…", "text": '{"score": 1, "reason": "思考"}'},
+            {"type": "text", "text": '```json\n{"score": 80,'},
+            {"type": "text", "text": ' "reason": "ok"}\n```'},
+        ]
+    )
+    engine = anthropic_engine(lambda request: httpx.Response(200, json=reply))
+    assert engine.complete_structured("p", Verdict) == Verdict(score=80, reason="ok")
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "refusal", "pause_turn", None])
+def test_anthropic_incomplete_stop_is_error_but_usage_kept(stop_reason) -> None:
+    reply = anthropic_reply(stop_reason=stop_reason)
+    engine = anthropic_engine(lambda request: httpx.Response(200, json=reply))
+    with pytest.raises(LLMError, match="途中で終わった") as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert not isinstance(excinfo.value, LLMUnavailableError)
+    assert engine.last_usage == LLMUsage(12_000, 3_000, 0.108)  # 課金は発生している
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_anthropic_auth_and_model_errors_are_unavailable(status: int) -> None:
+    error = {"type": "error", "error": {"type": "authentication_error", "message": "秘密 key"}}
+    engine = anthropic_engine(lambda request: httpx.Response(status, json=error))
+    with pytest.raises(LLMUnavailableError) as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert f"{status}(authentication_error)" in str(excinfo.value)
+    assert "秘密" not in str(excinfo.value)  # 応答のメッセージ本文は載せない
+    assert engine.last_usage is None
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, 529])
+def test_anthropic_other_errors_are_transient(status: int) -> None:
+    engine = anthropic_engine(lambda request: httpx.Response(status, text="<html>"))
+    with pytest.raises(LLMError, match=rf"{status}\(unknown\)") as excinfo:
+        engine.complete_structured("p", Verdict)
+    assert not isinstance(excinfo.value, LLMUnavailableError)
+
+
+def test_anthropic_timeout_and_transport_errors() -> None:
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    with pytest.raises(LLMError, match="タイムアウト"):
+        anthropic_engine(timeout).complete_structured("p", Verdict, timeout_s=5)
+    with pytest.raises(LLMError, match="ConnectError"):
+        anthropic_engine(refused).complete_structured("p", Verdict)
+
+
+def test_anthropic_malformed_reply_is_error() -> None:
+    cases = [
+        httpx.Response(200, text="not json"),
+        httpx.Response(200, json=["list"]),
+        httpx.Response(200, json=anthropic_reply(content="text")),
+        httpx.Response(200, json=anthropic_reply(text='{"score": "高い"}')),
+    ]
+    for response in cases:
+        engine = anthropic_engine(lambda request, response=response: response)
+        with pytest.raises(LLMError):
+            engine.complete_structured("p", Verdict)
+
+
+def test_anthropic_usage_reset_per_call() -> None:
+    replies = iter([anthropic_reply(), anthropic_reply(usage=None)])
+    engine = anthropic_engine(lambda request: httpx.Response(200, json=next(replies)))
+    engine.complete_structured("p", Verdict)
+    engine.complete_structured("p", Verdict)
+    assert engine.last_usage is None  # 前回の usage を持ち越さない
+
+
+def test_create_anthropic_engine_reads_alias_key_only() -> None:
+    settings = AnthropicApiConfig(model="claude-sonnet-5-5", effort="high")
+    engine = create_anthropic_engine(settings, {ANTHROPIC_API_KEY_ENV: " k "})
+    assert (engine.name, engine.model) == ("anthropic-api", "claude-sonnet-5-5")
+    for env in ({}, {ANTHROPIC_API_KEY_ENV: "  "}, {"ANTHROPIC_API_KEY": "k"}):
+        with pytest.raises(LLMUnavailableError, match=ANTHROPIC_API_KEY_ENV):
+            create_anthropic_engine(settings, env)
+
+
+def test_create_engine_keeps_anthropic_off_main_path() -> None:
+    with pytest.raises(LLMError, match="主経路に未実装"):
+        create_engine("anthropic-api")
+
+
+def test_anthropic_transport_error_does_not_chain_key_into_traceback() -> None:
+    # 通信の例外のメッセージにキーが入っても、ログ(traceback)に出さない
+    def leaky(request: httpx.Request) -> httpx.Response:
+        raise httpx.LocalProtocolError(f"Illegal header value {request.headers['x-api-key']!r}")
+
+    def leaky_timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.WriteTimeout(f"stalled {request.headers['x-api-key']}", request=request)
+
+    for handler in (leaky, leaky_timeout):
+        with pytest.raises(LLMError) as excinfo:
+            anthropic_engine(handler).complete_structured("p", Verdict)
+        assert excinfo.value.__cause__ is None
+        rendered = "".join(traceback.format_exception(excinfo.value))
+        assert FAKE_KEY not in rendered
+
+
+@pytest.mark.parametrize("key", ["", "abc\x00def", "abc def", "鍵abc", "abc\n"])
+def test_anthropic_rejects_malformed_key_without_echo(key: str) -> None:
+    with pytest.raises(LLMUnavailableError, match="形が不正") as excinfo:
+        anthropic_engine(lambda request: httpx.Response(200), api_key=key)
+    if key:
+        assert key not in str(excinfo.value)
+
+
+def test_anthropic_ignores_proxy_environment(monkeypatch) -> None:
+    # transport を注入しない本番の構築経路で、プロキシの環境変数を読まない(trust_env=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    proxies: list[object] = []
+    original_init = httpx.HTTPTransport.__init__
+
+    def recording_init(self, *args, **kwargs):
+        proxies.append(kwargs.get("proxy"))
+        original_init(self, *args, **kwargs)
+
+    def fake_send(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=anthropic_reply())
+
+    monkeypatch.setattr(httpx.HTTPTransport, "__init__", recording_init)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", fake_send)  # 実通信を遮断
+    engine = anthropic_engine(None, transport=None)
+    assert engine.complete_structured("p", Verdict) == Verdict(score=80, reason="ok")
+    assert proxies and all(proxy is None for proxy in proxies)
+
+
+def test_create_anthropic_engine_ignores_os_environ(monkeypatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_API_KEY_ENV, "from-environ")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-environ")
+    with pytest.raises(LLMUnavailableError, match=ANTHROPIC_API_KEY_ENV):
+        create_anthropic_engine(AnthropicApiConfig(), {})
