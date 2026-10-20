@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -538,6 +539,39 @@ def test_source_report_retried_after_send_failure(conn, tmp_path, monkeypatch) -
     run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=1))
     assert len(api.sent) == 1
     assert get_state(conn, STATE_SOURCE_REPORT_SENT) == "2026-10-25"
+
+
+def test_source_report_escapes_external_strings(conn, tmp_path, monkeypatch) -> None:
+    # 外部由来の文字列(ソース名・エラー・移転先)で parse_mode=HTML の送信を壊さない
+    only_source_report_due(conn, monkeypatch, SUNDAY)
+    conn.execute(
+        "INSERT INTO sources (type, name, moved_url) VALUES ('rss', 'feed<&>', ?)",
+        ("https://n.example/feed?a=1&b=<2>",),
+    )
+    add_source(conn, "rss", "r<x>", 1, error="E: <b>&")
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    text = api.sent[0][1]
+    assert "<b>" not in text and "&lt;b&gt;&amp;" in text
+    assert "「r&lt;x&gt;」" in text
+    assert "「feed&lt;&amp;&gt;」" in text and "a=1&amp;b=&lt;2&gt;" in text
+
+
+def test_source_report_stays_within_telegram_limit(conn, tmp_path, monkeypatch) -> None:
+    # 4096 字を超えると送信が毎周期失敗するので 1 通に切り詰める(entity は分断しない)
+    only_source_report_due(conn, monkeypatch, SUNDAY)
+    for i in range(40):
+        add_source(conn, "rss", f"r{i}<" + "n" * 100, 1, error="E: <b>&" + "e" * 300)
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    assert len(api.sent) == 1
+    text = api.sent[0][1]
+    assert len(text) <= 4000 and text.endswith("…")
+    assert not re.search(r"&[#a-z0-9]*…$", text)
 
 
 def test_q1_answer_recorded_with_date_attribution(conn, tmp_path) -> None:

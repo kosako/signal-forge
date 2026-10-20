@@ -161,3 +161,28 @@ def test_new_source_failing_or_moved_is_reported(conn, tmp_path) -> None:
     assert "「fresh-fail」が 1 回連続で失敗" in report
     assert "「fresh-moved」のフィードが移転している" in report
     assert "💤" not in report
+
+
+@pytest.mark.parametrize(
+    ("last_fetched", "quiet"),
+    [("2026-10-10T15:00:00Z", False), ("2026-10-10T14:59:59Z", True)],
+    ids=["at-boundary", "just-before"],
+)
+def test_quiet_boundary_is_jst_midnight_14_days_ago(conn, tmp_path, last_fetched, quiet) -> None:
+    # 2026-10-25(JST)の 14 日前の 0 時 = 2026-10-11 00:00 JST = 2026-10-10T15:00:00Z(以後は新着)
+    source_id = add_source(conn, "feed")
+    add_item(conn, source_id, "https://f/1", last_fetched)
+    report = source_health_report(conn, config(tmp_path), TODAY)
+    assert ("💤 「feed」" in report) is quiet
+
+
+@pytest.mark.parametrize(
+    ("digest_date", "counted"), [("2026-09-28", True), ("2026-09-27", False)]
+)
+def test_rate_window_is_last_28_days(conn, tmp_path, digest_date, counted) -> None:
+    # 2026-10-25 の 28 日前(2026-09-27)の配信は数えず、翌日からは数える
+    source_id = add_source(conn, "feed")
+    ids = [add_item(conn, source_id, f"https://f/{n}", "2026-09-27T00:00:00Z") for n in range(10)]
+    deliver(conn, digest_date, ids)
+    report = source_health_report(conn, config(tmp_path), TODAY)
+    assert ("「feed」0%" in report) is counted
