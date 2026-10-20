@@ -425,18 +425,28 @@ def test_fallback_notice_is_quiet_when_unused_or_off(conn, tmp_path, monkeypatch
     from app import run as run_module
     from app.config import LLMFallbackConfig, TelegramConfig
 
+    sent: list[str] = []  # 送信の失敗は握られるので、例外でなく記録で確かめる
+
     class Api:
         def send_message(self, chat_id, text, **kwargs):
-            raise AssertionError("知らせない")
+            sent.append(text)
+            return 1
 
     monkeypatch.setattr(run_module, "create_api", lambda env: Api())
+    conn.execute(
+        "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok)"
+        " VALUES ('01USED', 'analyze', 'm', 'LLMError', 1)"
+    )
     config = replace(
         make_config(tmp_path), telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10)
     )
     env = {"TELEGRAM_BOT_TOKEN": "t"}
-    run_module.notify_llm_fallback(conn, config, env, "01RUN", logger)  # 予備は無効
+    run_module.notify_llm_fallback(conn, config, env, "01USED", logger)  # 予備は無効
     enabled = replace(config, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
-    run_module.notify_llm_fallback(conn, enabled, env, "01RUN", logger)  # この回は使っていない
+    run_module.notify_llm_fallback(conn, enabled, env, "01OTHER", logger)  # この回は使っていない
+    assert sent == []
+    run_module.notify_llm_fallback(conn, enabled, env, "01USED", logger)  # 対照: 送る
+    assert len(sent) == 1
 
 
 def test_fallback_notice_send_failure_is_only_logged(conn, tmp_path, monkeypatch, caplog) -> None:

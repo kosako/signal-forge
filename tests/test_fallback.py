@@ -337,7 +337,7 @@ def test_run_fallback_notice_summarizes_one_run(conn) -> None:
     text = run_fallback_notice(conn, "01RUN", 10.0)
     assert text.splitlines() == [
         "⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました",
-        "・記事の判定: 3 回(うち予備も失敗 1 回)",
+        "・記事の判定: 3 回(うち予備も失敗した呼び出し 1 回)",
         "・深掘り: 1 回",
         "今回 $0.16 / 今月の予備 $5.16(上限 $10.00)",
         "Codex の上限・ログインの状態を確かめてください(runbook §14)",
@@ -366,3 +366,23 @@ def test_factory_uses_injected_primary(conn, tmp_path) -> None:
     engine = on("low")
     assert engine.complete_structured("p", Verdict) == Verdict(score=1)
     assert made == ["low"]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (LLMError("codex 非0終了(1): 記事の本文そのものXYZ"), "codex 非0終了(1)"),
+        (LLMError("タイムアウト(120s)"), "タイムアウト"),
+        (LLMError("JSON パース失敗: x(先頭: '記事の本文そのものXYZ')"), "JSON パース失敗"),
+        (LLMUnavailableError("codex 起動失敗: [Errno 2]"), "codex 起動失敗"),
+        (LLMError("記事の本文そのものXYZ"), "その他の失敗"),
+    ],
+)
+def test_fallback_log_names_primary_failure_kind_without_body(conn, caplog, error, kind) -> None:
+    # ログには主の失敗の種類だけを書く(codex の stderr・応答の先頭は外部の文を含みうる)
+    primary = Scripted("codex-cli", [error])
+    fallback = Scripted("anthropic-api", [Verdict(score=1)])
+    with caplog.at_level(logging.WARNING):
+        build(conn, primary, fallback).complete_structured("p", Verdict)
+    assert f"{type(error).__name__}・{kind}" in caplog.text
+    assert "記事の本文そのもの" not in caplog.text

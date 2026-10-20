@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -41,6 +42,30 @@ PRIMARY_SKIPPED = "skipped"  # 台帳の primary_error: 主を飛ばした回
 # codex の effort → Claude API の effort(ほかは同じ名前。DIG_EFFORTS と ANTHROPIC_EFFORTS)
 _CLAUDE_EFFORTS = {"minimal": "low"}
 _STAGE_LABELS = {"analyze": "記事の判定", "trend": "トレンド", "dig": "深掘り", "answer": "返事"}
+# 主の失敗の種類(app/analysis/llm.py が上げるメッセージの書き出し)。ログにはこの種類だけを書き、
+# 続く本文(codex の stderr の末尾・応答の先頭など、外部の文を含みうる)は書かない
+_PRIMARY_FAILURE_KINDS = (
+    "タイムアウト",
+    "codex 非0終了",
+    "codex 起動失敗",
+    "codex の起動設定エラー",
+    "codex が最終応答ファイルを書かなかった",
+    "~/.codex/auth.json がない",
+    "JSON パース失敗",
+    "スキーマ検証失敗",
+)
+
+
+def _primary_failure_kind(error: LLMError | None) -> str:
+    """主の失敗の種類(本文を含まない)。非0終了は終了コードも付ける。"""
+    if error is None:
+        return "続けて失敗したので主を呼ばなかった"
+    message = str(error)
+    for kind in _PRIMARY_FAILURE_KINDS:
+        if message.startswith(kind):
+            code = re.match(r"codex 非0終了\((-?\d{1,4})\)", message)
+            return f"{kind}({code.group(1)})" if code else kind
+    return "その他の失敗"
 
 
 def fallback_cost_this_month(conn: sqlite3.Connection) -> float:
@@ -165,11 +190,13 @@ class FallbackEngine:
                 self._last = self._primary
                 return result
         reason = type(primary_error).__name__ if primary_error else PRIMARY_SKIPPED
+        # ログに書く主の失敗: 例外の型と種類だけ(本文は書かない)
+        primary = f"{reason}・{_primary_failure_kind(primary_error)}"
 
         if not self._ledger.allows():
             self._logger.warning(
                 f"主のエンジンが失敗したが、予備は今月の上限 ${self._ledger.cap_usd:.2f} に"
-                f"達しているので使わない(主: {reason})",
+                f"達しているので使わない(主: {primary})",
                 extra=self._extra,
             )
             raise self._error_like_primary(primary_error, "予備は今月の上限に達したため使わない")
@@ -177,7 +204,7 @@ class FallbackEngine:
             fallback = self._make_fallback()
         except LLMError as e:  # キーが無いなど。予備を作れない
             self._logger.warning(
-                f"主のエンジンが失敗したが、予備を作れない(主: {reason} / 予備: "
+                f"主のエンジンが失敗したが、予備を作れない(主: {primary} / 予備: "
                 f"{type(e).__name__}: {e})",
                 extra=self._extra,
             )
@@ -192,7 +219,7 @@ class FallbackEngine:
                 usage=getattr(fallback, "last_usage", None),
             )
             self._logger.warning(
-                f"主のエンジンも予備も失敗(主: {reason} / 予備: {type(e).__name__}: {e})",
+                f"主のエンジンも予備も失敗(主: {primary} / 予備: {type(e).__name__}: {e})",
                 extra=self._extra,
             )
             raise self._error_like_primary(
@@ -205,7 +232,7 @@ class FallbackEngine:
             usage=getattr(fallback, "last_usage", None),
         )
         self._logger.warning(
-            f"主のエンジンが失敗したため予備({self._fallback_model})で代行(主: {reason})",
+            f"主のエンジンが失敗したため予備({self._fallback_model})で代行(主: {primary})",
             extra=self._extra,
         )
         self._last = fallback
@@ -284,7 +311,7 @@ def run_fallback_notice(conn: sqlite3.Connection, run_id: str, cap_usd: float) -
     lines = ["⚠️ Codex(主のエンジン)が失敗したため、Claude API で代行しました"]
     for row in rows:
         failed = row["calls"] - row["answered"]
-        detail = f"(うち予備も失敗 {failed} 回)" if failed else ""
+        detail = f"(うち予備も失敗した呼び出し {failed} 回)" if failed else ""
         lines.append(f"・{_STAGE_LABELS[row['stage']]}: {row['calls']} 回{detail}")
     spent = sum(row["cost"] for row in rows)
     lines.append(
