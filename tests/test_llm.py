@@ -411,7 +411,8 @@ def test_anthropic_records_usage_and_cost() -> None:
 def test_anthropic_joins_text_blocks_and_skips_thinking() -> None:
     reply = anthropic_reply(
         content=[
-            {"type": "thinking", "thinking": '{"score": 1, "reason": "思考"}'},
+            # 種別で選ぶ(text の欄を持っていても、本文のブロックでなければ読まない)
+            {"type": "thinking", "thinking": "…", "text": '{"score": 1, "reason": "思考"}'},
             {"type": "text", "text": '```json\n{"score": 80,'},
             {"type": "text", "text": ' "reason": "ok"}\n```'},
         ]
