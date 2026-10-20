@@ -98,7 +98,9 @@ def _collect_source(
     try:
         cursor = json.loads(source.cursor) if source.cursor else {}
         result = connector.fetch(source, cursor)
-        counts = _store_result(conn, source, result.items, result.next_cursor, resolve_short)
+        counts = _store_result(
+            conn, source, result.items, result.next_cursor, result.moved_url, resolve_short
+        )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
         # (1本の壊れたフィード・コネクタのバグで他ソースの collect を止めない。
@@ -144,9 +146,13 @@ def _store_result(
     source: Source,
     items: list[RawItem],
     next_cursor: dict,
+    moved_url: str | None,
     resolve_short: Callable[[str], str] | None,
 ) -> dict[str, int]:
-    """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。"""
+    """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
+
+    moved_url は今回の取得の恒久移転の先(無ければ NULL に戻す。GH#150)。
+    """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -156,10 +162,10 @@ def _store_result(
             f"""
             UPDATE sources
             SET cursor = ?, last_success_at = {_NOW_UTC}, consecutive_failures = 0,
-                last_error = NULL
+                last_error = NULL, moved_url = ?
             WHERE id = ?
             """,
-            (json.dumps(next_cursor), source.id),
+            (json.dumps(next_cursor), moved_url, source.id),
         )
         conn.execute("COMMIT")
     except BaseException:

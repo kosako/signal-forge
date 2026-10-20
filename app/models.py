@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import Self
 
 RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
@@ -19,7 +19,12 @@ RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計
 class _Row:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Self:
-        return cls(**{f.name: row[f.name] for f in fields(cls)})
+        # 既定値のある(後の migration で足した)列は、行に無ければ既定値にする。intel doctor は
+        # migration を当てずに読むので、未適用の DB でも読めるように(既定値の無い列は必須のまま)
+        keys = set(row.keys())
+        return cls(
+            **{f.name: row[f.name] for f in fields(cls) if f.name in keys or f.default is MISSING}
+        )
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,7 @@ class Source(_Row):
     last_error: str | None
     consecutive_failures: int
     created_at: str
+    moved_url: str | None = None  # migration 016(GH#150)
 
 
 @dataclass(frozen=True)

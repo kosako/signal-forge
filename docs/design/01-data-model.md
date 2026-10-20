@@ -38,7 +38,7 @@ digests↔items に KPI 用の結合表を作らない理由: 参照は表示と
 
 ## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表)は §7・§8 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (

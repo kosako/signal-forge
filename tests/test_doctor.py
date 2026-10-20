@@ -332,6 +332,20 @@ def test_x_probe_success_is_pass(config_dir, tmp_path) -> None:
     assert "users/me OK(@aki)" in result.detail
 
 
+def test_x_checks_work_before_migration_016(config_dir, tmp_path) -> None:
+    # doctor は migration を当てない。sources.moved_url(016)の無い DB でも X の検査を続ける
+    _enable_x(config_dir, tmp_path)
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute("ALTER TABLE sources DROP COLUMN moved_url")
+    conn.execute("DELETE FROM schema_migrations WHERE version = 16")
+    conn.commit()
+    conn.close()
+    results = doctor(config_dir, tmp_path, x_oauth1_probe=lambda env: "aki")
+    assert by_number(results, 3).status == "FAIL"  # 未適用は未適用として知らせる
+    assert by_number(results, 5).status == "PASS"
+    assert "users/me OK(@aki)" in by_number(results, 5).detail
+
+
 def _probe_session(status: int, body: dict) -> XApiSession:
     """既定 probe の判定写像(_users_me_username)を実 HTTP なしで検証するセッション。"""
     return XApiSession(

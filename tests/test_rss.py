@@ -91,6 +91,63 @@ def test_conditional_get_headers_sent() -> None:
     assert result.stats.http_status == 304
 
 
+@pytest.mark.parametrize("not_modified", [False, True])
+def test_permanent_redirect_reports_moved_url(not_modified) -> None:
+    # 301 を経由したら移転先を返す(304 でも。GH#150)。一時的な転送(302)は移転にしない
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/feed.xml":
+            return httpx.Response(301, headers={"location": "https://example.com/new/feed.xml"})
+        if request.url.path == "/new/feed.xml":
+            if not_modified:
+                return httpx.Response(304)
+            return httpx.Response(200, content=FEED.encode())
+        return httpx.Response(404)
+
+    result = make_connector(handler).fetch(make_source(), {})
+    assert result.moved_url == "https://example.com/new/feed.xml"
+
+
+@pytest.mark.parametrize(
+    "chain",
+    [
+        [(308, "/new/feed.xml")],
+        [(301, "/moved/feed.xml"), (302, "/cdn/feed.xml")],  # 恒久のあとに一時的な転送
+        [(302, "/tmp/feed.xml"), (301, "/final/feed.xml")],  # 一時的な転送のあとに恒久
+    ],
+)
+@pytest.mark.parametrize("not_modified", [False, True])
+def test_redirect_chain_with_permanent_hop_reports_final_url(chain, not_modified) -> None:
+    # 恒久移転を 1 度でも経由したら、連鎖の最後の URL を移転先にする
+    hops = {"/feed.xml": chain[0]}
+    for (_, here), nxt in zip(chain, chain[1:], strict=False):
+        hops[here] = nxt
+    final_path = chain[-1][1]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in hops:
+            status, to = hops[request.url.path]
+            return httpx.Response(status, headers={"location": f"https://example.com{to}"})
+        if request.url.path == final_path:
+            if not_modified:
+                return httpx.Response(304)
+            return httpx.Response(200, content=FEED.encode())
+        return httpx.Response(404)
+
+    result = make_connector(handler).fetch(make_source(), {})
+    assert result.moved_url == f"https://example.com{final_path}"
+
+
+def test_temporary_redirect_is_not_moved() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/feed.xml":
+            return httpx.Response(302, headers={"location": "https://example.com/tmp/feed.xml"})
+        return httpx.Response(200, content=FEED.encode())
+
+    assert make_connector(handler).fetch(make_source(), {}).moved_url is None
+    ok = make_connector(lambda request: httpx.Response(200, content=FEED.encode()))
+    assert ok.fetch(make_source(), {}).moved_url is None
+
+
 def test_410_gone_is_fatal() -> None:
     connector = make_connector(lambda request: httpx.Response(410))
     with pytest.raises(FatalError, match="410"):

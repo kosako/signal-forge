@@ -28,10 +28,13 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
 class FakeConnector:
     source_type = "rss"
 
-    def __init__(self, items: list[RawItem], next_cursor: dict | None = None, error=None):
+    def __init__(
+        self, items: list[RawItem], next_cursor: dict | None = None, error=None, moved_url=None
+    ):
         self.items = items
         self.next_cursor = next_cursor or {"etag": "e1", "last_modified": None}
         self.error = error
+        self.moved_url = moved_url
         self.seen_cursors: list[dict] = []
 
     def fetch(self, source_row, cursor):
@@ -48,6 +51,7 @@ class FakeConnector:
                 http_status=200,
                 duration_ms=5,
             ),
+            moved_url=self.moved_url,
         )
 
 
@@ -113,6 +117,29 @@ def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:
 
     run = conn.execute("SELECT status, items_fetched FROM collect_runs").fetchone()
     assert (run["status"], run["items_fetched"]) == ("ok", 2)
+
+
+def test_moved_feed_is_recorded_and_cleared(conn: sqlite3.Connection) -> None:
+    # 恒久移転(301)の先を残し、移転なしで取れたら消す(GH#150。config の URL は書き換えない)
+    def moved() -> str | None:
+        return conn.execute("SELECT moved_url FROM sources WHERE type='rss'").fetchone()[0]
+
+    collect_all(conn, {"rss": FakeConnector([], moved_url="https://new.example/feed")}, logger)
+    assert moved() == "https://new.example/feed"
+    config = conn.execute("SELECT config FROM sources WHERE type='rss'").fetchone()[0]
+    assert json.loads(config) == {"url": "https://a"}
+
+    collect_all(conn, {"rss": FakeConnector([])}, logger)
+    assert moved() is None
+
+
+def test_failed_fetch_keeps_moved_url(conn: sqlite3.Connection) -> None:
+    # 取れなかった回は移転の記録を変えない(分からないので消さない)
+    collect_all(conn, {"rss": FakeConnector([], moved_url="https://new.example/feed")}, logger)
+    collect_all(conn, {"rss": FakeConnector([], error=RetryableError("一時障害"))}, logger)
+    assert conn.execute("SELECT moved_url FROM sources WHERE type='rss'").fetchone()[0] == (
+        "https://new.example/feed"
+    )
 
 
 def test_rerun_with_same_cursor_is_idempotent(conn: sqlite3.Connection) -> None:
