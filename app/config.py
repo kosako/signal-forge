@@ -146,6 +146,27 @@ class AnthropicApiConfig:
     output_usd_per_mtok: float = 20.0
 
 
+# 予備のエンジンの語彙(GH#156)。"" = 切り替えない
+LLM_FALLBACK_ENGINES = ("", "anthropic-api")
+
+
+@dataclass(frozen=True)
+class LLMFallbackConfig:
+    """主のエンジン(Codex)が失敗した呼び出しを予備でやり直す(GH#156 / 設計 00 §5)。
+
+    予備は anthropic-api(キーは .env の INTEL_ANTHROPIC_API_KEY)。effort は主の effort に
+    合わせる。単価は費用の見積もりに使う(モデルを替えたら単価も合わせる)。
+    """
+
+    engine: str = ""  # "" = 切り替えない(既定)/ "anthropic-api"
+    model: str = "claude-sonnet-5-5"
+    max_tokens: int = 16_000  # 出力の上限(思考 + 本文の合計)
+    input_usd_per_mtok: float = 2.0  # Sonnet 5.5 の単価(2026-10 時点)
+    output_usd_per_mtok: float = 10.0
+    # 予備の費用の月(UTC の暦月 = doctor #9 の当月)の上限。達したらその月は予備を使わない
+    monthly_cap_usd: float = 10.0
+
+
 @dataclass(frozen=True)
 class RetentionConfig:
     cache_ttl_days: int = 30  # RSS/manual(設計 01 §6)
@@ -216,6 +237,7 @@ class Config:
     dig: DigConfig = field(default_factory=DigConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     anthropic_api: AnthropicApiConfig = field(default_factory=AnthropicApiConfig)
+    llm_fallback: LLMFallbackConfig = field(default_factory=LLMFallbackConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -252,6 +274,7 @@ _SECTIONS = {
     "dig": DigConfig,
     "llm": LLMConfig,
     "anthropic_api": AnthropicApiConfig,
+    "llm_fallback": LLMFallbackConfig,
     "retention": RetentionConfig,
     "budget": BudgetConfig,
     "telegram": TelegramConfig,
@@ -364,12 +387,24 @@ def _validate(path: Path, config: Config) -> None:
             f"{path}: [anthropic_api].effort は {'/'.join(ANTHROPIC_EFFORTS)} のいずれか: "
             f"{config.anthropic_api.effort!r}"
         )
-    if not config.anthropic_api.model.strip():
-        raise ConfigError(f"{path}: [anthropic_api].model が空文字")
-    for key in ("input_usd_per_mtok", "output_usd_per_mtok"):
-        price = getattr(config.anthropic_api, key)
-        if not (math.isfinite(price) and price >= 0):
-            raise ConfigError(f"{path}: [anthropic_api].{key} は 0 以上の有限値: {price}")
+    if config.llm_fallback.engine not in LLM_FALLBACK_ENGINES:
+        raise ConfigError(
+            f"{path}: [llm_fallback].engine は \"\"(切り替えない)か anthropic-api: "
+            f"{config.llm_fallback.engine!r}"
+        )
+    for section, settings in (
+        ("anthropic_api", config.anthropic_api),
+        ("llm_fallback", config.llm_fallback),
+    ):
+        if not settings.model.strip():
+            raise ConfigError(f"{path}: [{section}].model が空文字")
+        for key in ("input_usd_per_mtok", "output_usd_per_mtok"):
+            price = getattr(settings, key)
+            if not (math.isfinite(price) and price >= 0):
+                raise ConfigError(f"{path}: [{section}].{key} は 0 以上の有限値: {price}")
+    fallback_cap = config.llm_fallback.monthly_cap_usd
+    if not (math.isfinite(fallback_cap) and fallback_cap > 0):
+        raise ConfigError(f"{path}: [llm_fallback].monthly_cap_usd は正の有限値: {fallback_cap}")
     for key in ("reasoning_effort", "answer_reasoning_effort"):
         if getattr(config.dig, key) not in DIG_EFFORTS:
             raise ConfigError(
@@ -394,6 +429,7 @@ def _validate(path: Path, config: Config) -> None:
         ("analysis", "body_max_chars", config.analysis.body_max_chars),
         ("ranking", "max_per_source", config.ranking.max_per_source),
         ("anthropic_api", "max_tokens", config.anthropic_api.max_tokens),
+        ("llm_fallback", "max_tokens", config.llm_fallback.max_tokens),
     ]
     nonnegatives = [
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),

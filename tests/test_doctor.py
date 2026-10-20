@@ -219,6 +219,22 @@ def test_review_on_requires_anthropic_key(config_dir, tmp_path) -> None:
     assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
 
 
+def test_llm_fallback_requires_anthropic_key(config_dir, tmp_path) -> None:
+    # 予備(GH#156)を使う設定ならキーが要る。無いと主が失敗したときに予備が動かない
+    config_path = config_dir / "config.toml"
+    base = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        base + '\n[llm_fallback]\nengine = "anthropic-api"\n', encoding="utf-8"
+    )
+    result = by_number(doctor(config_dir, tmp_path), 2)
+    assert result.status == "FAIL"
+    assert "INTEL_ANTHROPIC_API_KEY" in result.detail and "予備" in result.detail
+    (config_dir / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=tok\nINTEL_ANTHROPIC_API_KEY=k\n", encoding="utf-8"
+    )
+    assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
+
+
 def test_pending_migration_fails(config_dir, tmp_path) -> None:
     # 台帳を1件消して「未適用」状態を作る
     conn = sqlite3.connect(tmp_path / "intel.db")
@@ -811,6 +827,36 @@ def test_month_cost_summary_review_cost_month_boundary(config_dir, tmp_path) -> 
     summary = month_cost_summary(conn, load_config(config_dir))
     conn.close()
     assert summary["llm_usd"] == 0.5
+
+
+def test_month_cost_summary_includes_fallback_cost(config_dir, tmp_path) -> None:
+    # 予備で使った額(GH#156)も LLM に入れる。月は UTC の暦月
+    from datetime import UTC, datetime, timedelta
+
+    start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    conn = connect(tmp_path / "intel.db")
+    for moment, cost in ((start, 0.75), (start - timedelta(seconds=1), 5.0)):
+        conn.execute(
+            "INSERT INTO llm_fallback_calls (stage, model, primary_error, ok, cost_usd,"
+            " created_at) VALUES ('analyze', 'm', 'LLMError', 1, ?, ?)",
+            (cost, moment.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["llm_usd"] == 0.75
+
+
+def test_month_cost_summary_without_fallback_table(config_dir, tmp_path) -> None:
+    # migration を当てない doctor が 018 より前の DB で落ちない
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("DROP TABLE llm_fallback_calls")
+    from app.config import load_config
+
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert summary["llm_usd"] == 0
 
 
 def test_month_cost_summary_without_review_column(config_dir, tmp_path) -> None:

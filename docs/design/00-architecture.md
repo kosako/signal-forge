@@ -77,7 +77,8 @@ app/
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   insights.py     # X 興味シグナルの週次インサイト(読取専用・S1c)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
-  analysis/       # llm.py(LLMEngine 抽象層)、stage1.py(事前選別)、analyzer.py(本分析)、
+  analysis/       # llm.py(LLMEngine 抽象層)、fallback.py(主のエンジンが失敗した呼び出しを予備で
+                  #   やり直す。GH#156)、stage1.py(事前選別)、analyzer.py(本分析)、
                   #   trend.py(今日の全体トレンド)、profile.py(関心プロファイルの読込)— analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
   digest/         # digests(日本語 Markdown)を produce
@@ -100,7 +101,7 @@ tests/
 
 - `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`prompting.py`・`vault_guard.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
 - 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
-  - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う
+  - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う。`analysis/fallback.py`(予備への切り替え。§5)は LLMEngine を作る側(cli・run)が使う
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)
   - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
   - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
@@ -112,7 +113,7 @@ tests/
 
 ## 4. 設定・secrets 管理
 
-- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 読取上限(ホームTL `x.daily_read_cap`・検索 `x_search.daily_read_cap`・合算の単一ノブ `x.combined_daily_read_cap`。ADR 0001)、検索スロット `x_search.slots`(最大3・入れ替え式)、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、深掘り調査段 `[dig]`(日次上限 `daily_cap` 既定2・0=無効、解説生成の `reasoning_effort`、LLM 1呼び出しの `timeout_s`、本文入力上限 `body_max_chars` / 対訳上限 `translation_max_chars`、材料不足しきい値 `min_body_chars`。GH#105 / 設計 06 §3〜4。カードへの質問への返事の effort `answer_reasoning_effort` 既定 low・材料に渡す原文/対訳ノートの上限 `answer_source_max_chars`・1 日に受け付ける質問の上限 `answer_daily_cap` 既定 20(0 = 返事をしない)。GH#126。解説ノートの別系統の AI のレビュー `review` 既定 off・その月の上限額 `review_monthly_cap_usd` 既定 $10。GH#153)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、Claude API のモデル・effort・出力上限・単価 `[anthropic_api]`(GH#153)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
+- **config.toml**: `~/.config/intel/config.toml`(リポジトリ外)。X 読取上限(ホームTL `x.daily_read_cap`・検索 `x_search.daily_read_cap`・合算の単一ノブ `x.combined_daily_read_cap`。ADR 0001)、検索スロット `x_search.slots`(最大3・入れ替え式)、夜アンケート時刻 `telegram.survey_time`・watchdog 時刻 `telegram.watchdog_time`(朝の配信時刻自体は config キーでなく launchd plist の StartCalendarInterval。設計 05 §1.1)、配信件数上限 `digest.max_items`(既定10。「無効日3日連続なら5件に削減」の運用ノブ。設計 03 §6)、深掘り調査段 `[dig]`(日次上限 `daily_cap` 既定2・0=無効、解説生成の `reasoning_effort`、LLM 1呼び出しの `timeout_s`、本文入力上限 `body_max_chars` / 対訳上限 `translation_max_chars`、材料不足しきい値 `min_body_chars`。GH#105 / 設計 06 §3〜4。カードへの質問への返事の effort `answer_reasoning_effort` 既定 low・材料に渡す原文/対訳ノートの上限 `answer_source_max_chars`・1 日に受け付ける質問の上限 `answer_daily_cap` 既定 20(0 = 返事をしない)。GH#126。解説ノートの別系統の AI のレビュー `review` 既定 off・その月の上限額 `review_monthly_cap_usd` 既定 $10。GH#153)、Telegram allowlist(user_id/chat_id)、Vault パス、LLM エンジン指定(§5)、Claude API のモデル・effort・出力上限・単価 `[anthropic_api]`(GH#153)、主のエンジンが失敗したときの予備 `[llm_fallback]`(既定 off・モデル・出力上限・単価・月の上限額。GH#156)、documents TTL(既定30日)、月次コスト上限、DB・バックアップ先パス(`storage.db_path` / `storage.backup_dir`)。**ソース定義(RSS の feed URL・enabled)の正本は DB の sources テーブル**(01 §3。カーソル・死活カウンタと同居させ、config との二重管理・同期を持たない。plan #7 で確定)。ソースの追加・無効化は手動 SQL(週次レビューの棚卸しと同じ操作面)。
 - **secrets**: `~/.config/intel/.env`(chmod 600)に X API キー・Telegram bot token。launchd の plist には secrets を書かない(plist は誰でも読めるため)。
 - **ANTHROPIC_API_KEY は launchd 実行環境に載せない**(理由: claude -p が API 課金へ無自覚フォールバックするのを設定で遮断)。API エンジン(`anthropic-api`。GH#153)は .env の別名キー `INTEL_ANTHROPIC_API_KEY` だけから読み、AnthropicApiEngine がリクエストのヘッダにだけ載せる(環境変数にはしない)。
 - `intel doctor` が検査: .env のパーミッション、token 有効性(getMe)、Vault 書き込み可否(TCC/Full Disk Access)、DB マイグレーション適用状態、月次コストの実績と着地見込み(全項目は設計 05 §2)。
@@ -136,7 +137,12 @@ class LLMEngine(Protocol):
   4. プロンプトは **argv でなく stdin 渡し**(ps でのプロンプト露出防止と、シェル解釈の事故防止を兼ねる)。
   5. `anthropic-api` は素の Messages API で呼び、リクエストに tools・MCP・コンテナを**一切付けない**(モデルが読む・書く・取りに行く手段を構造的に持たない。CLI と違い、塞ぐべき既定のツールが無い)。宛先は API の URL に固定し、プロキシの環境変数は読まない。キーは .env の別名キーだけから読み、印字可能な ASCII 以外を含むキーは送る前に止める。通信の失敗は元の例外をつながずに正規化する(通信の例外のメッセージはヘッダの値 = キーを含みうり、つなぐと traceback 経由でログに出るため)。モデル・effort・出力の上限(思考 + 本文)・単価は config `[anthropic_api]`(既定 Opus 5.5・medium)。応答ごとに使ったトークン数と見積もり額を返し、打ち切り(`max_tokens`)・拒否(`refusal`)は失敗にする。認証・権限・モデル ID の誤り(401/403/404)は環境障害(`LLMUnavailableError`)、それ以外の失敗は一時的な失敗(同一エンジンで 1 回やり直す)。
 - **呼び出し規約**: 1呼び出し10〜20件のバッチ判定。subprocess 実行、timeout 120s。出力は Pydantic でスキーマ検証(フィールド allowlist・スコア値域・理由の長さ上限)。
-- **失敗時**: 検証失敗またはタイムアウト → 同一エンジンで1リトライ(失敗はチャンク単位に局所化し、該当チャンクのみ再実行)→ なお失敗ならタイトルのみの degraded ダイジェストへ直行(理由: 無配信より劣化配信。黙って止まらない)。エンジンフォールバックは複数エンジン導入時の拡張点。**例外(GH#74)**: 環境障害(エンジン起動不能・認証不在 = `LLMUnavailableError`)はリトライ・degraded で回復しないため、per-chunk で握らず analyze 段の失敗として raise する(silent full-degradation 防止。#72 の実障害)。
+- **失敗時**: 検証失敗またはタイムアウト → 同一エンジンで1リトライ(失敗はチャンク単位に局所化し、該当チャンクのみ再実行)→ なお失敗ならタイトルのみの degraded ダイジェストへ直行(理由: 無配信より劣化配信。黙って止まらない)。**例外(GH#74)**: 環境障害(エンジン起動不能・認証不在 = `LLMUnavailableError`)はリトライ・degraded で回復しないため、per-chunk で握らず analyze 段の失敗として raise する(silent full-degradation 防止。#72 の実障害)。
+- **予備への切り替え(GH#156。config `[llm_fallback]`、既定 off)**: 主のエンジン(Codex)が失敗した呼び出しだけを、予備(`anthropic-api`。既定 Sonnet 5.5)でやり直す(`analysis/fallback.py` の FallbackEngine)。使い分けは「残量を見て切り替える」ではなく「落ちたら次へ」で、主の失敗そのものを合図にする(サブスクの残量は外から読めない。GH#153 の相談)。
+  - 主が続けて 2 回失敗したら(起動できない = `LLMUnavailableError` は 1 回で)、同じ factory から作るエンジンは主を飛ばして予備へ行く(Codex が止まった朝に、チャンクごとに主の失敗を待たない)。主に戻るのは次のプロセスから(朝バッチは毎朝、返事は質問ごとに起動し直す)。
+  - 予備も失敗したら、**主の失敗と同じ種類のエラー**にする(LLMError なら劣化、LLMUnavailableError なら段の失敗、という各段の扱いを変えない)。予備を作れない(キーが無い)・月の上限に達したときも同じ。LLM の失敗以外の例外(実装の誤り)は予備に回さない。
+  - effort は主の effort に合わせる(codex の minimal は Claude の low)。`name` / `model` は最後に答えたエンジンのものにする(analyses の engine / model に、実際に答えたエンジンが残る)。
+  - 予備の呼び出しは台帳 `llm_fallback_calls`(migration 018。予備も失敗した呼び出しも課金されうるので残す)に記録し、月(UTC の暦月。doctor #9 の当月と同じ)の合計が `[llm_fallback].monthly_cap_usd`(既定 $10)に達したら予備を使わない。費用は doctor #9 に入る。
 - 外部本文はプロンプト内で明示フェンス(ランダム nonce 区切り。設計 03 §3.2)で囲み、data として扱う旨を毎回指示。title・author 等のメタデータも未検証データとしてサニタイズする(同 §3.2)。配信・ノートに載せる URL は LLM 出力でなく DB 上の正規 URL のみ。
 
 ## 6. エラーハンドリング方針

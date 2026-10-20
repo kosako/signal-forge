@@ -34,14 +34,14 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | # | 項目 | 判定 |
 |---|------|------|
 | 1 | config.toml 存在・スキーマ検証(Pydantic) | FAIL |
-| 2 | `.env` のパーミッション(600 以外は FAIL)・必須キー存在(深掘りのレビュー `[dig].review` を使う設定で深掘りが有効なら `INTEL_ANTHROPIC_API_KEY` も。無くても深掘りは届くが、レビューが毎回失敗するため。GH#153) | FAIL |
+| 2 | `.env` のパーミッション(600 以外は FAIL)・必須キー存在(Claude API を使う設定なら `INTEL_ANTHROPIC_API_KEY` も: 深掘りのレビュー `[dig].review` を使い深掘りが有効なとき(GH#153)と、予備 `[llm_fallback].engine = anthropic-api` のとき(GH#156)。無くても本体は動くが、レビュー・予備が毎回失敗するため) | FAIL |
 | 3 | SQLite 接続+マイグレーション適用状態(未適用番号の検出) | FAIL |
 | 4 | Telegram: `getMe` 成功+allowlist(user_id/chat_id)設定済み | FAIL |
 | 5 | X API: 認証確認 = `users/me` の実疎通(読取課金なし。GH#63)。成功 PASS(@username 表示)/ 401・403 = キー・権限の恒久異常で FAIL / 429・5xx・transport = 一時異常で WARN(恒久 FAIL にしない)/ 他の非 200・username 欠損 = 想定外の恒久異常で FAIL(WARN に埋めない)。**X 無効時(config `x.enabled = false`、または sources の type='x' 全行が enabled=0)は SKIP 表示**(「RSS+手動URLのみ」縮退運用を恒久 FAIL にしない。設定はあるが無効化されている場合は WARN 1行で明示)。X 有効時は **mode 整合検査**も行う: `[x_search].slots` ⟷ mode=search 行の相互欠落・同一 mode の複数 enabled 行(二重課金)・mode 不正行を WARN(設計 02 §2。mode WARN 時は疎通検査に進まない) | FAIL(X 無効時は SKIP/WARN) |
 | 6 | LLM: 設定エンジン(MVP は1本。設計 00 §5)で固定プロンプト1件の `complete_structured` 成功+推論専用モードの**動的検査(隔離 canary 3プローブ)**。read-only sandbox はファイル読取・読取系コマンドの実行自体は許す(Issue #3 実測)ため「拒否確認」は構造的に不成立。代わりに**隔離が効いているか**を客観確認する: (1) HOME 隔離 = 実 HOME 直下の canary を `~` 相対で読ませ内容が漏れないこと (2) ネットワーク遮断 = ローカル canary サーバの URL を fetch させ到達が観測されないこと(自己申告に依存しない) (3) CODEX_HOME 隔離(codex-cli のみ)= auth.json と同居させた canary が漏れないこと(credential 流出経路の実測。auth 実内容は載せず canary で代替)。いずれか漏れ・到達で FAIL。**(3) は当初 read-only sandbox が読取を許すため真陽性 FAIL だった(Issue #54)→ engine 側を permission profile の deny-read に変更し塞いだ(設計 00 §5)。プローブ自体は不変** | FAIL |
 | 7 | Obsidian Vault パスへのテスト書き込み・削除(TCC/FDA 検査を兼ねる) | FAIL |
 | 8 | launchd 2ジョブのロード状態(`launchctl print`) | WARN |
-| 9 | 当月コストの実績と着地見込み(LLM = `analyses.estimated_cost_usd` と深掘りのレビューの `dig_results.review_cost_usd`(GH#153)の合算 + X の読み取り費用 = `collect_runs` と `x_signal_runs` の `estimated_cost_usd` の合算)と `[budget].monthly_cap_usd` の比 | 超過ペースで WARN |
+| 9 | 当月コストの実績と着地見込み(LLM = `analyses.estimated_cost_usd` と深掘りのレビューの `dig_results.review_cost_usd`(GH#153)と予備の `llm_fallback_calls.cost_usd`(GH#156)の合算 + X の読み取り費用 = `collect_runs` と `x_signal_runs` の `estimated_cost_usd` の合算)と `[budget].monthly_cap_usd` の比 | 超過ペースで WARN |
 | 10 | バックアップ最新世代の日付(48h 超で WARN)+アーカイブのパーミッション(600 以外は WARN) | WARN |
 | 11 | documents の TTL 超過残存件数+**全ソース**の `items.raw_payload` の TTL 超過残存件数(ソース別 TTL — X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days` — で判定。削除経路の故障検知。01 §6) | WARN |
 | 12 | 環境に `ANTHROPIC_API_KEY` が存在したら WARN(無自覚 API 課金防止) | WARN |
@@ -97,6 +97,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | HTTP 取得(RSS・本文・X) | connect 10s / read 30s | 2回、指数バックオフ(1s→4s)+ jitter | 429 は Retry-After 尊重。恒久 4xx はリトライしない |
 | LLM `complete_structured`(analyze・トレンド) | 120s/呼 | 同一エンジン1回(analyze は失敗チャンクのみ再実行) | スキーマ検証失敗も同じ扱い。analyze はなお失敗なら degraded 直行(エンジンフォールバックは拡張点。設計 00 §5)。トレンドは失敗したら節を省くだけで digest を止めない(設計 03 §3.5) |
 | LLM `complete_structured`(深掘りの調査段・対訳・質問への返事) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回 | 調査段はアイテム単位で隔離し、失敗は段の失敗として朝バッチ失敗通知に載せる。返事は作れなければ失敗の知らせをリプライで送る(GH#126) |
+| 予備への切り替え(`[llm_fallback]`。GH#156) | 呼び出し元と同じ | 主が失敗した呼び出しを予備で 1 回(その外側の同一エンジン 1 回のやり直しは各経路のまま)。主が続けて 2 回失敗したら(起動できないときは 1 回で)そのプロセスの残りは主を飛ばす | 予備も失敗・予備を作れない・月の上限なら、主の失敗と同じ種類のエラーにして各経路の扱い(劣化・段の失敗)に戻す(設計 00 §5) |
 | LLM `complete_structured`(深掘りのレビュー = `anthropic-api` と、指摘を受けた直し) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回(401/403/404 = キー・権限・モデル ID の誤りはやり直さない) | 失敗しても段の失敗にしない。未レビュー(直しの失敗なら直す前)のまま届け、ノートとカードに明示する(設計 06 §4。GH#153) |
 | Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |

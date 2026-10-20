@@ -383,7 +383,8 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 - LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率の表示は未実装 = 拡張点)。
 - X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。
-- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿。
+- Claude API(GH#153・#156): 深掘りのレビューは `dig_results.review_cost_usd`、主のエンジンが失敗したときの予備は `llm_fallback_calls`(migration 018。1 呼び出し = 1 行。段・朝バッチの run_id・モデル・主の失敗の種類(`skipped` = 主を飛ばした)・予備が答えたか・トークン数・見積もり額。予備も失敗した呼び出しも残す)。予備の月の上限の判定にも使う(UTC の暦月)。
+- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(dig_results.review_cost_usd) + sum(llm_fallback_calls.cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿(月は UTC の暦月)。
 
 ## 10. マイグレーション運用
 
