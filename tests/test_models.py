@@ -24,6 +24,18 @@ def test_source_from_row(conn: sqlite3.Connection) -> None:
     assert source.consecutive_failures == 0
 
 
+def test_source_from_row_without_later_column(conn: sqlite3.Connection) -> None:
+    # 後の migration の列(既定値あり)が無い行は既定値で読む。既定値の無い列は必須のまま
+    row = conn.execute(
+        "SELECT id, type, name, config, cursor, enabled, last_success_at, last_error_at, "
+        "last_error, consecutive_failures, created_at FROM sources WHERE name='manual'"
+    ).fetchone()
+    assert Source.from_row(row).moved_url is None
+    missing_required = conn.execute("SELECT id, type FROM sources WHERE name='manual'").fetchone()
+    with pytest.raises(IndexError):
+        Source.from_row(missing_required)
+
+
 def test_item_from_row_round_trip(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, content_hash, raw_payload) "

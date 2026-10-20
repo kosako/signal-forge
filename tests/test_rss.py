@@ -107,6 +107,36 @@ def test_permanent_redirect_reports_moved_url(not_modified) -> None:
     assert result.moved_url == "https://example.com/new/feed.xml"
 
 
+@pytest.mark.parametrize(
+    "chain",
+    [
+        [(308, "/new/feed.xml")],
+        [(301, "/moved/feed.xml"), (302, "/cdn/feed.xml")],  # 恒久のあとに一時的な転送
+        [(302, "/tmp/feed.xml"), (301, "/final/feed.xml")],  # 一時的な転送のあとに恒久
+    ],
+)
+@pytest.mark.parametrize("not_modified", [False, True])
+def test_redirect_chain_with_permanent_hop_reports_final_url(chain, not_modified) -> None:
+    # 恒久移転を 1 度でも経由したら、連鎖の最後の URL を移転先にする
+    hops = {"/feed.xml": chain[0]}
+    for (_, here), nxt in zip(chain, chain[1:], strict=False):
+        hops[here] = nxt
+    final_path = chain[-1][1]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in hops:
+            status, to = hops[request.url.path]
+            return httpx.Response(status, headers={"location": f"https://example.com{to}"})
+        if request.url.path == final_path:
+            if not_modified:
+                return httpx.Response(304)
+            return httpx.Response(200, content=FEED.encode())
+        return httpx.Response(404)
+
+    result = make_connector(handler).fetch(make_source(), {})
+    assert result.moved_url == f"https://example.com{final_path}"
+
+
 def test_temporary_redirect_is_not_moved() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/feed.xml":
