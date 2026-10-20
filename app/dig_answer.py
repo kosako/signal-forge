@@ -26,10 +26,11 @@ from pydantic import BaseModel, Field
 from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
+from app.dig import DigInstruction, apply_instructions
 from app.prompting import fill_template, sanitize_body
 from app.vault_guard import VaultGuard, VaultStalled
 
-PROMPT_VERSION = "dig-answer-v001"
+PROMPT_VERSION = "dig-answer-v002"
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # 返事の目安はプロンプトで 1,500 字。スキーマの上限は余裕を持たせる(少し超えただけで
@@ -40,6 +41,14 @@ EXPLAINER_MAX_CHARS = 20_000  # 解説ノート(平均 3,500 字。本人の追�
 HISTORY_TURNS = 5  # 材料に含めるそれまでのやり取り(直近から)
 
 FAILURE_TEXT = "⚠️ 答えを作れませんでした。時間をおいて、もう一度リプライしてください"
+
+# 調べ直しの依頼(GH#137)。観点は本人のリプライの原文(LLM の出力は使わない。材料の外部本文が
+# 翌朝の深掘りの指定観点 = プロンプトの信頼される側に入らないように)。上限は調査段が観点に使う長さ
+REDIG_ANGLE_MAX_CHARS = 500
+REDIG_NOTICE = (
+    "\n\n🔁 次の朝の深掘りで、このリプライを観点にして調べ直します"
+    "(新しい解説ノートとカードで届きます)"
+)
 
 # カードのボタンからの依頼(GH#141)。台帳の question にこの文を入れ、質問と同じ流れで答える
 # (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)
@@ -62,10 +71,16 @@ SendReply = Callable[[int, str], int]
 
 
 class DigAnswer(BaseModel):
-    """返事の構造化出力(prompts/dig-answer-v001.md)。kind は take の記録(#106)が使う。"""
+    """返事の構造化出力(prompts/dig-answer-v002.md)。kind は take の記録(#106)が使う。
+
+    redig = 本人が観点を足して調べ直してほしいと求めている(GH#137。翌朝の深掘りのキューに積む)。
+    既定値を持たせない(書き漏らしを「依頼でない」と黙って受け付けて依頼を失わない。欠ければ
+    検証の失敗として扱う)。
+    """
 
     kind: Literal["question", "take", "both"]
     answer: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
+    redig: bool
 
 
 def enqueue_question(
@@ -183,15 +198,57 @@ def _answer_one(
         conn.commit()
         logger.error(f"返事を作れなかった: {type(e).__name__}: {e}", extra=log_extra)
         return
-    # ボタンからの依頼は本人の take ではない(LLM の分類によらず question。GH#106 が記録しない)
+    # ボタンからの依頼は本人の take でも調べ直しの依頼でもない(LLM の分類によらず question。
+    # GH#106 が記録しない)
     kind = "question" if row["request"] is not None else result.kind
+    # 調べ直しは深掘りの段が動いているときだけ受ける(daily_cap = 0 では翌朝に掘られない)
+    redig = row["request"] is None and result.redig and config.dig.daily_cap > 0
+    if redig and not _record_answer_with_redig(conn, row, kind, result.answer, logger, log_extra):
+        redig = False
+    if not redig:
+        _record_answer(conn, row["id"], kind, result.answer, redig=False)
+    logger.info(f"返事を作った(kind={kind}・調べ直し={redig})", extra=log_extra)
+
+
+def _record_answer(
+    conn: sqlite3.Connection, question_id: int, kind: str, answer: str, *, redig: bool
+) -> None:
     conn.execute(
-        f"UPDATE dig_questions SET status = 'answered', kind = ?, answer = ?, "
+        f"UPDATE dig_questions SET status = 'answered', kind = ?, answer = ?, redig = ?, "
         f"answered_at = {_NOW_UTC} WHERE id = ?",
-        (kind, result.answer, row["id"]),
+        (kind, answer, int(redig), question_id),
     )
-    conn.commit()
-    logger.info(f"返事を作った(kind={kind})", extra=log_extra)
+
+
+def _record_answer_with_redig(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    kind: str,
+    answer: str,
+    logger: logging.Logger,
+    log_extra: dict,
+) -> bool:
+    """返事(調べ直しの知らせ付き)と深掘りのキューへの依頼を 1 つのトランザクションで記録する。
+
+    キューに積めたときだけ知らせを付ける(積めなかったのに「調べ直します」と送らない)。
+    キューへの積み方は未消化一覧へのリプライ指定と同じ(dig.apply_instructions: queued へ戻し、
+    requested_at を更新して優先し、観点を上書きする。source は変えない)。
+    """
+    angle = row["question"].strip()[:REDIG_ANGLE_MAX_CHARS] or None
+    try:
+        conn.execute("BEGIN IMMEDIATE")  # 接続は autocommit
+        _record_answer(conn, row["id"], kind, answer + REDIG_NOTICE, redig=True)
+        apply_instructions(conn, [DigInstruction(row["item_id"], "request", angle=angle)])
+        conn.execute("COMMIT")
+    except sqlite3.Error as e:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        logger.error(
+            f"調べ直しをキューに積めなかった(返事だけ送る): {type(e).__name__}: {e}",
+            extra=log_extra,
+        )
+        return False
+    return True
 
 
 class _Sender:

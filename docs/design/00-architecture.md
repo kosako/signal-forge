@@ -103,7 +103,7 @@ tests/
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)
   - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
   - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
-  - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)
+  - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)。カードへの返事(`dig_answer.py`)も、調べ直しの依頼を同じ規則でキューに積む(`dig.py`。GH#137)
   - ソースの失敗の知らせ(`collect.py` の `source_failure_alerts`)を、doctor と watchdog(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む
   - `doctor.py` は検査のために各段を読む
 - 外部 I/O(httpx・feedparser・trafilatura・LLM CLI)は connectors/extraction/analysis/delivery の内側に閉じ込め、models の語彙(items, documents, …)に変換してから外へ出す。

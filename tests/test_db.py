@@ -40,6 +40,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (12, "012_dig_questions_unique_message.sql"),
         (13, "013_dig_questions_take_recorded.sql"),
         (14, "014_dig_questions_card_requests.sql"),
+        (15, "015_dig_questions_redig.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -232,3 +233,35 @@ def test_card_requests_migration_keeps_questions_and_enforces_rules(tmp_path: Pa
         )
     conn.close()
 
+
+
+def test_redig_migration_defaults_existing_questions_to_zero(tmp_path: Path) -> None:
+    # GH#137(migration 015): 既存の質問は「調べ直しの依頼でない」になり、0 / 1 以外は入らない
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 14:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    conn.execute(
+        "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 2, 'https://a/1', 'https://a/1', 'sha256:x')"
+    )
+    conn.execute(
+        "INSERT INTO dig_results (id, item_id, note_name, card_text, message_id) "
+        "VALUES (1, 1, 'n', 'カード', 700)"
+    )
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (1, '質問', 81)"
+    )
+
+    apply_migrations(conn, db)
+
+    assert conn.execute("SELECT redig FROM dig_questions").fetchone()["redig"] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE dig_questions SET redig = 2")
+    conn.close()
