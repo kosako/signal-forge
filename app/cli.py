@@ -171,7 +171,7 @@ def dig(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """深掘りキューから本日分を調査し、DeepDive ノート生成+概要カード送信(GH#105)。"""
-    from app.analysis.llm import create_engine
+    from app.analysis.llm import create_anthropic_engine, create_engine
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.deepdive import run_dig_stage
@@ -193,6 +193,11 @@ def dig(
         lambda effort: create_engine(config.llm.engine, model_reasoning_effort=effort),
         api,
         logger,
+        review_engine_factory=(  # GH#153
+            (lambda: create_anthropic_engine(config.anthropic_api, env))
+            if config.dig.review
+            else None
+        ),
     )
     typer.echo("dig 完了(生成・送信の内訳はログ参照)")
 

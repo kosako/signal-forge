@@ -179,7 +179,7 @@ def _dig(
     Telegram 未設定でもノート生成は行い、カードは台帳(dig_results)に未送信で残す
     (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。
     """
-    from app.analysis.llm import create_engine
+    from app.analysis.llm import create_anthropic_engine, create_engine
     from app.deepdive import run_dig_stage
 
     api = create_api(env) if is_telegram_configured(config, env) else None
@@ -190,6 +190,12 @@ def _dig(
         api,
         logger,
         run_id=run_id,
+        # 別系統の AI のレビュー(GH#153)。キーが無ければレビューだけが失敗し、深掘りは届く
+        review_engine_factory=(
+            (lambda: create_anthropic_engine(config.anthropic_api, env))
+            if config.dig.review
+            else None
+        ),
     )
 
 

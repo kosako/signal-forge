@@ -339,3 +339,28 @@ def test_dig_stage_absent_when_cap_zero(conn, tmp_path) -> None:
         lambda: ScriptedEngine(conn), logger, "01RUNID",
     )
     assert failures == []  # 段ごと省かれ、材料不足でも失敗しない
+
+
+@pytest.mark.parametrize("review", [True, False])
+def test_dig_stage_wires_review_engine_from_config(conn, tmp_path, monkeypatch, review) -> None:
+    # 深掘りのレビュー(GH#153)は [dig].review のときだけ。キーは .env の dict から読む
+    from app import deepdive
+    from app.analysis.llm import AnthropicApiEngine, LLMUnavailableError
+    from app.config import DigConfig
+    from app.run import _dig
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        deepdive, "run_dig_stage", lambda *args, **kwargs: captured.update(kwargs)
+    )
+    config = Config(config_dir=tmp_path, dig=DigConfig(review=review))
+    _dig(conn, config, {"INTEL_ANTHROPIC_API_KEY": "k"}, logger, "run-1")
+    factory = captured["review_engine_factory"]
+    if not review:
+        assert factory is None
+        return
+    engine = factory()
+    assert isinstance(engine, AnthropicApiEngine) and engine.model == "claude-opus-5-5"
+    _dig(conn, config, {}, logger, "run-2")
+    with pytest.raises(LLMUnavailableError):
+        captured["review_engine_factory"]()

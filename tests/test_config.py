@@ -344,3 +344,15 @@ def test_anthropic_api_rejects_bad_values(tmp_path: Path, body: str, match: str)
     write_config(tmp_path, f"[anthropic_api]\n{body}\n")
     with pytest.raises(ConfigError, match=match):
         load_config(tmp_path)
+
+
+def test_dig_review_defaults_and_validation(tmp_path: Path) -> None:
+    default = load_config(tmp_path).dig
+    assert (default.review, default.review_monthly_cap_usd) == (False, 10.0)
+    write_config(tmp_path, "[dig]\nreview = true\nreview_monthly_cap_usd = 3\n")
+    config = load_config(tmp_path).dig
+    assert (config.review, config.review_monthly_cap_usd) == (True, 3)
+    for bad in ("0", "-1", "inf"):
+        write_config(tmp_path, f"[dig]\nreview_monthly_cap_usd = {bad}\n")
+        with pytest.raises(ConfigError, match="review_monthly_cap_usd"):
+            load_config(tmp_path)
