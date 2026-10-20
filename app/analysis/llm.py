@@ -16,6 +16,9 @@
 - 出力は Pydantic でスキーマ検証。検証失敗・タイムアウトは LLMError に正規化し、
   リトライ(同一エンジンで1回)は complete_with_retry が担う。なお失敗したチャンクの
   degraded 直行は analyzer 側(設計 00 §6)
+- `anthropic-api`(AnthropicApiEngine)は深掘りノートのレビュー役(GH#153)。推論専用は
+  構造で作る: ツールを一切渡さない素の Messages API で、宛先は API に固定。キーは .env の
+  別名キーだけから読む(設計 00 §4)。主経路(config `llm.engine`)にはまだ配線しない
 """
 
 from __future__ import annotations
@@ -27,10 +30,15 @@ import re
 import signal
 import subprocess
 import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeVar
 
+import httpx
 from pydantic import BaseModel, ValidationError
+
+from app.config import AnthropicApiConfig
 
 DEFAULT_TIMEOUT_S = 120
 
@@ -326,6 +334,173 @@ def create_engine(engine_name: str, *, model_reasoning_effort: str = "low") -> L
     if engine_name == "codex-cli":
         return CodexCliEngine(model_reasoning_effort=model_reasoning_effort)
     raise LLMError(
-        f"エンジン {engine_name!r} は未実装(MVP は codex-cli のみ。claude-cli / "
-        "anthropic-api は拡張点。設計 00 §5)"
+        f"エンジン {engine_name!r} は主経路に未実装(主経路は codex-cli のみ。anthropic-api は"
+        "深掘りのレビュー役だけ(GH#153)、claude-cli は拡張点。設計 00 §5)"
+    )
+
+
+# --- anthropic-api(GH#153) ---
+
+# .env の別名キー。ANTHROPIC_API_KEY は使わない(claude -p の無自覚な API 課金を防ぐため、
+# 環境に載せない方針。設計 00 §4 / doctor #12)
+ANTHROPIC_API_KEY_ENV = "INTEL_ANTHROPIC_API_KEY"
+_ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_CONNECT_TIMEOUT_S = 10
+# 一時的な失敗(同一エンジンで 1 回だけやり直す)。他の非 200 も LLMError だが、
+# 認証・権限・モデル ID の誤りはやり直しても直らない環境障害として分ける
+_ANTHROPIC_UNAVAILABLE_STATUSES = frozenset({401, 403, 404})
+# 正常終了の stop_reason。max_tokens(打ち切り)・refusal(拒否)などは出力が
+# スキーマを満たす保証がないので失敗にする
+_ANTHROPIC_OK_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
+
+
+@dataclass(frozen=True)
+class LLMUsage:
+    """1 呼び出しで使ったトークン数と見積もり額(思考のトークンは output に含まれる)。"""
+
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
+class AnthropicApiEngine:
+    """Claude の Messages API による推論(深掘りノートのレビュー役。GH#153)。
+
+    推論専用は宣言でなく構造で作る: リクエストに tools・mcp_servers・container を
+    一切付けないので、モデルは読む・書く・取りに行く手段を持たない。宛先は API の
+    URL に固定し、プロキシの環境変数は読まない(trust_env=False)。
+
+    課金は応答ごとに発生するので、成功・失敗にかかわらず応答の usage を
+    `last_usage` に残す(呼び出し側が費用を記録する)。
+    """
+
+    name = "anthropic-api"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        effort: str,
+        max_tokens: int,
+        input_usd_per_mtok: float,
+        output_usd_per_mtok: float,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._api_key = api_key
+        self.model = model  # analyses.model への記録と同じ属性名(analyzer の getattr)
+        self._effort = effort
+        self._max_tokens = max_tokens
+        self._input_price = input_usd_per_mtok
+        self._output_price = output_usd_per_mtok
+        self._transport = transport
+        self.last_usage: LLMUsage | None = None
+
+    def complete_structured(
+        self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
+    ) -> M:
+        self.last_usage = None
+        body = {
+            "model": self.model,
+            "max_tokens": self._max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            "output_config": {"effort": self._effort},
+        }
+        headers = {
+            "x-api-key": self._api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        timeout = httpx.Timeout(timeout_s, connect=_ANTHROPIC_CONNECT_TIMEOUT_S)
+        try:
+            with httpx.Client(
+                transport=self._transport, trust_env=False, timeout=timeout
+            ) as client:
+                response = client.post(_ANTHROPIC_MESSAGES_URL, headers=headers, json=body)
+        except httpx.TimeoutException as e:
+            raise LLMError(f"タイムアウト({timeout_s}s)") from e
+        except httpx.HTTPError as e:
+            raise LLMError(f"Anthropic API への通信失敗: {type(e).__name__}") from e
+
+        if response.status_code != 200:
+            # 応答本文のメッセージは載せない(種別だけ)。ログに残る文字列を有界に保つ
+            detail = f"Anthropic API {response.status_code}({_anthropic_error_type(response)})"
+            if response.status_code in _ANTHROPIC_UNAVAILABLE_STATUSES:
+                raise LLMUnavailableError(detail)
+            raise LLMError(detail)
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise LLMError("Anthropic API の応答が JSON でない") from e
+        if not isinstance(data, dict):
+            raise LLMError("Anthropic API の応答の形が不正")
+
+        self.last_usage = self._usage(data.get("usage"))
+        stop_reason = data.get("stop_reason")
+        if stop_reason not in _ANTHROPIC_OK_STOP_REASONS:
+            reason = re.sub(r"[^\w-]", "", str(stop_reason))[:40]
+            raise LLMError(f"Anthropic API の応答が途中で終わった(stop_reason={reason})")
+        content = data.get("content")
+        if not isinstance(content, list):
+            raise LLMError("Anthropic API の応答に content が無い")
+        # 思考のブロック(thinking)は読まず、本文のテキストだけをつなぐ
+        text = "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+        return parse_structured(text, schema)
+
+    def _usage(self, usage: object) -> LLMUsage | None:
+        if not isinstance(usage, dict):
+            return None
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if not (
+            isinstance(input_tokens, int)
+            and not isinstance(input_tokens, bool)
+            and isinstance(output_tokens, int)
+            and not isinstance(output_tokens, bool)
+        ):
+            return None
+        cost = (input_tokens * self._input_price + output_tokens * self._output_price) / 1_000_000
+        return LLMUsage(input_tokens, output_tokens, round(cost, 6))
+
+
+def _anthropic_error_type(response: httpx.Response) -> str:
+    """エラー応答の種別(`error.type`)だけを取り出す。読めなければ "unknown"。"""
+    try:
+        error = response.json().get("error", {})
+        kind = error.get("type") if isinstance(error, dict) else None
+    except (ValueError, AttributeError):
+        kind = None
+    if not isinstance(kind, str):
+        return "unknown"
+    return re.sub(r"[^\w-]", "", kind)[:40] or "unknown"
+
+
+def create_anthropic_engine(
+    settings: AnthropicApiConfig,
+    env: Mapping[str, str],
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> AnthropicApiEngine:
+    """config `[anthropic_api]` と .env(load_env の結果)から生成する。
+
+    キーが無ければ環境障害(LLMUnavailableError)。os.environ は読まない(設計 00 §4)。
+    """
+    api_key = env.get(ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        raise LLMUnavailableError(f".env に {ANTHROPIC_API_KEY_ENV} が無い")
+    return AnthropicApiEngine(
+        api_key=api_key,
+        model=settings.model,
+        effort=settings.effort,
+        max_tokens=settings.max_tokens,
+        input_usd_per_mtok=settings.input_usd_per_mtok,
+        output_usd_per_mtok=settings.output_usd_per_mtok,
+        transport=transport,
     )
