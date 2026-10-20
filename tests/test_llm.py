@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import traceback
 from pathlib import Path
 
 import httpx
@@ -496,3 +497,55 @@ def test_create_anthropic_engine_reads_alias_key_only() -> None:
 def test_create_engine_keeps_anthropic_off_main_path() -> None:
     with pytest.raises(LLMError, match="主経路に未実装"):
         create_engine("anthropic-api")
+
+
+def test_anthropic_transport_error_does_not_chain_key_into_traceback() -> None:
+    # 通信の例外のメッセージにキーが入っても、ログ(traceback)に出さない
+    def leaky(request: httpx.Request) -> httpx.Response:
+        raise httpx.LocalProtocolError(f"Illegal header value {request.headers['x-api-key']!r}")
+
+    def leaky_timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.WriteTimeout(f"stalled {request.headers['x-api-key']}", request=request)
+
+    for handler in (leaky, leaky_timeout):
+        with pytest.raises(LLMError) as excinfo:
+            anthropic_engine(handler).complete_structured("p", Verdict)
+        assert excinfo.value.__cause__ is None
+        rendered = "".join(traceback.format_exception(excinfo.value))
+        assert FAKE_KEY not in rendered
+
+
+@pytest.mark.parametrize("key", ["", "abc\x00def", "abc def", "鍵abc", "abc\n"])
+def test_anthropic_rejects_malformed_key_without_echo(key: str) -> None:
+    with pytest.raises(LLMUnavailableError, match="形が不正") as excinfo:
+        anthropic_engine(lambda request: httpx.Response(200), api_key=key)
+    if key:
+        assert key not in str(excinfo.value)
+
+
+def test_anthropic_ignores_proxy_environment(monkeypatch) -> None:
+    # transport を注入しない本番の構築経路で、プロキシの環境変数を読まない(trust_env=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    proxies: list[object] = []
+    original_init = httpx.HTTPTransport.__init__
+
+    def recording_init(self, *args, **kwargs):
+        proxies.append(kwargs.get("proxy"))
+        original_init(self, *args, **kwargs)
+
+    def fake_send(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=anthropic_reply())
+
+    monkeypatch.setattr(httpx.HTTPTransport, "__init__", recording_init)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", fake_send)  # 実通信を遮断
+    engine = anthropic_engine(None, transport=None)
+    assert engine.complete_structured("p", Verdict) == Verdict(score=80, reason="ok")
+    assert proxies and all(proxy is None for proxy in proxies)
+
+
+def test_create_anthropic_engine_ignores_os_environ(monkeypatch) -> None:
+    monkeypatch.setenv(ANTHROPIC_API_KEY_ENV, "from-environ")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-environ")
+    with pytest.raises(LLMUnavailableError, match=ANTHROPIC_API_KEY_ENV):
+        create_anthropic_engine(AnthropicApiConfig(), {})

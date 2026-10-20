@@ -388,6 +388,10 @@ class AnthropicApiEngine:
         output_usd_per_mtok: float,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        # 印字可能な ASCII 以外(空白・制御文字・非 ASCII)を含むキーは、HTTP ヘッダの検査で
+        # キーを含む例外になりうるため、送る前に止める(例外にキーを載せない)
+        if not re.fullmatch(r"[\x21-\x7e]+", api_key):
+            raise LLMUnavailableError("API キーの形が不正(印字可能な ASCII 以外を含む)")
         self._api_key = api_key
         self.model = model  # analyses.model への記録と同じ属性名(analyzer の getattr)
         self._effort = effort
@@ -418,10 +422,12 @@ class AnthropicApiEngine:
                 transport=self._transport, trust_env=False, timeout=timeout
             ) as client:
                 response = client.post(_ANTHROPIC_MESSAGES_URL, headers=headers, json=body)
+        # 元の例外はつながない(from None)。通信の例外のメッセージはヘッダの値(= キー)を
+        # 含みうり、つなぐと traceback 経由でログに出る(logs は原因の例外も書き出す)
         except httpx.TimeoutException as e:
-            raise LLMError(f"タイムアウト({timeout_s}s)") from e
+            raise LLMError(f"タイムアウト({timeout_s}s)・{type(e).__name__}") from None
         except httpx.HTTPError as e:
-            raise LLMError(f"Anthropic API への通信失敗: {type(e).__name__}") from e
+            raise LLMError(f"Anthropic API への通信失敗: {type(e).__name__}") from None
 
         if response.status_code != 200:
             # 応答本文のメッセージは載せない(種別だけ)。ログに残る文字列を有界に保つ
