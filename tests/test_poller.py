@@ -22,6 +22,16 @@ OWNER_ID = 10
 CHAT_ID = 777
 
 
+@pytest.fixture(autouse=True)
+def _source_report_not_today(monkeypatch):
+    """週 1 回のソースの健康診断(GH#150)を今日以外の曜日にする。ほかのタイマーのテストは
+    実際の今日の日時で動くので、日曜に流すと通数が 1 通増えて落ちるため(+3 日 = 日付を
+    跨いでも今日・明日にならない)。健康診断のテストは日付を固定して曜日を戻す。"""
+    from app import source_health
+
+    monkeypatch.setattr(source_health, "REPORT_WEEKDAY", (datetime.now(JST).weekday() + 3) % 7)
+
+
 @pytest.fixture
 def conn(tmp_path: Path) -> sqlite3.Connection:
     db_path = tmp_path / "intel.db"

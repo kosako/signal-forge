@@ -733,7 +733,7 @@ def _check_source_health(
     """#14 連続失敗がしきい値以上の enabled なソース(設計 02 §2・§3)。自動 disable はしない。"""
     if conn is None or config is None or not _table_exists(conn, "sources"):
         return CheckResult(14, "ソース死活", "WARN", "config/DB 未初期化のため算出不可")
-    from app.collect import RSS_FAILURE_ALERT, X_FAILURE_ALERT, source_failure_alerts
+    from app.source_health import RSS_FAILURE_ALERT, X_FAILURE_ALERT, source_failure_alerts
 
     alerts = [
         f"RSS{alert}(死亡疑い)"

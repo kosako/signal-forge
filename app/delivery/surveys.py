@@ -14,7 +14,7 @@ import logging
 import sqlite3
 from datetime import datetime, time, timedelta
 
-from app.collect import X_FAILURE_ALERT, source_failure_alerts
+from app import source_health
 from app.config import Config
 from app.delivery.state import get_state, set_state
 from app.delivery.telegram import (
@@ -24,10 +24,12 @@ from app.delivery.telegram import (
     escape_attr,
 )
 from app.jst import JST, today_jst
+from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
 STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
 STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
+STATE_SOURCE_REPORT_SENT = "source_report_sent_date"
 
 READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
 
@@ -38,6 +40,7 @@ DIG_BACKLOG_TITLE_MAX_CHARS = 80
 # watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると送信が毎周期失敗し、
 # 同じ周期の getUpdates まで止まる。GH#124 でソースの行が可変長になった)
 WATCHDOG_TEXT_MAX_CHARS = 4000
+SOURCE_REPORT_MAX_CHARS = 4000
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -84,7 +87,8 @@ def run_due_timers(
     logger: logging.Logger,
     now: datetime,
 ) -> None:
-    """期限が来たタイマー(夜アンケート・watchdog)を実行する。poll ループから毎周期呼ぶ。
+    """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断)を実行する。
+    poll ループから毎周期呼ぶ。
 
     now は JST aware。ポーラー停止中に時刻を跨いだ場合は次の起動周期で送る(遅延送信)。
     日付を跨いだ分は送らない(昨日の夜アンケートを今日送っても回答が汚れるだけ)。
@@ -110,6 +114,19 @@ def run_due_timers(
             )
             set_state(conn, STATE_WATCHDOG_NOTIFIED, today)
             logger.warning(f"watchdog 通知: {' / '.join(problems)}", extra={"stage": "poll"})
+    # 週 1 回のソースの健康診断(GH#150)。夜アンケートと同じ時刻。日曜を逃したらその週は送らない
+    # (夜アンケートと同じく、日付を跨いだ分は送らない)。通知系なので送れた後に state を立てる
+    if (
+        now.weekday() == source_health.REPORT_WEEKDAY
+        and _is_due(now, config.telegram.survey_time)
+        and get_state(conn, STATE_SOURCE_REPORT_SENT) != today
+    ):
+        report = source_health.source_health_report(conn, config, today)
+        api.send_message(
+            _require_chat_id(config), escape_and_truncate(report, SOURCE_REPORT_MAX_CHARS)
+        )
+        set_state(conn, STATE_SOURCE_REPORT_SENT, today)
+        logger.info("ソースの健康診断を送った", extra={"stage": "poll"})
 
 
 def send_evening_survey(
