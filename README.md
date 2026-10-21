@@ -255,8 +255,8 @@ repo 固有の決まり:
 4. 関心に応じて [docs/design/](docs/design/) の 01〜06 と [docs/adr/](docs/adr/)(覆しにくい設計判断)。フェーズ 2 の用語は [CONTEXT.md](CONTEXT.md)
 5. 運用するなら [ops/runbook.md](ops/runbook.md)
 
-全文書の一覧、正本の優先順位、ADR の一覧は [docs/README.md](docs/README.md) にまとめている。
+全文書の一覧、正本の優先順位、repo に置くもの・置かないもの、ADR の一覧は [docs/README.md](docs/README.md) にまとめている。
 
 ## ライセンス
 
-個人利用のため、ライセンスは付けていない。
+ライセンスは付けていない。個人で使うための道具を、読んでもらうために公開している。コードと文書の複製・改変・再配布は許諾していない。
