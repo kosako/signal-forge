@@ -1,0 +1,18 @@
+# 依存の version updates を週 1 回確かめる(GH#162)。
+# minor と patch は 1 本の PR にまとめ、major は個別の PR。security updates も 1 本にまとめる
+# (ここに groups を書くと、画面の Grouped security updates の設定よりこちらが優先される)。
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
