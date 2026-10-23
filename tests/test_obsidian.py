@@ -9,6 +9,7 @@ import yaml
 from app.config import Config, ObsidianConfig
 from app.db import apply_migrations, connect
 from app.export import ExportError, export_digest, export_pending_notes
+from app.export import obsidian as obsidian_module
 
 logger = logging.getLogger("test-obsidian")
 
@@ -432,3 +433,137 @@ def test_bookmark_items_exported_as_notes_and_wikilinks(conn, tmp_path) -> None:
     assert sum(1 for line in daily.splitlines() if line.startswith("[[")) == 2
     front = read_front(base / "Items" / next(n for n in notes if "ブクマ記事" in n))
     assert front["title"] == "保存の見出し"
+
+
+# --- 読み取り後の変更の検出(GH#189)---
+
+
+def hook_before_write(monkeypatch, note: Path, on_write) -> list[int]:
+    """note の atomic_write の直前(= ノートの読み取り後)に on_write(回数) を差し込む。
+
+    本人や同期ツールが、export がノートを読んだあと・書く前に保存した状況を再現する。
+    """
+    original = obsidian_module.atomic_write
+    calls: list[int] = []
+
+    def hooked(path, content, **kwargs):
+        if path == note:
+            calls.append(len(calls) + 1)
+            on_write(len(calls))
+        return original(path, content, **kwargs)
+
+    monkeypatch.setattr(obsidian_module, "atomic_write", hooked)
+    return calls
+
+
+def test_regeneration_without_change_after_read_writes_once(
+    conn, tmp_path, monkeypatch, caplog
+) -> None:
+    # 通常のケース: 読み取り後に変更が無ければ 1 回で書き、退避も WARN も出さない
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    items_dir = tmp_path / "vault" / "SignalForge" / "Items"
+    note = next(items_dir.glob("*.md"))
+    note.write_text(note.read_text() + "\n手書きのメモ\n")
+
+    calls = hook_before_write(monkeypatch, note, lambda n: None)
+    conn.execute("UPDATE analyses SET summary = '更新された要約'")
+    with caplog.at_level(logging.WARNING, logger="test-obsidian"):
+        export_digest(conn, config, digest_id, logger)
+
+    text = note.read_text()
+    assert "更新された要約" in text
+    assert "手書きのメモ" in text
+    assert calls == [1]  # やり直しなし
+    assert list(items_dir.glob("*.conflict*.md")) == []
+    assert "退避" not in caplog.text
+
+
+def test_note_saved_after_read_is_reread_not_overwritten(conn, tmp_path, monkeypatch) -> None:
+    # 読み取り後・書き込みの直前に本人が保存した → 上書きせず読み直して 1 回だけやり直す
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    items_dir = tmp_path / "vault" / "SignalForge" / "Items"
+    note = next(items_dir.glob("*.md"))
+    note.write_text(note.read_text() + "\n手書きのメモ\n")
+
+    def save_once(n: int) -> None:
+        if n == 1:
+            note.write_text(note.read_text() + "\n直前に保存したメモ\n")
+
+    calls = hook_before_write(monkeypatch, note, save_once)
+    conn.execute("UPDATE analyses SET summary = '更新された要約'")
+    export_digest(conn, config, digest_id, logger)
+
+    text = note.read_text()
+    assert "直前に保存したメモ" in text  # 後から保存した手書きを古い内容で上書きしない
+    assert "手書きのメモ" in text
+    assert "更新された要約" in text  # やり直しで GENERATED は更新される
+    assert calls == [1, 2]
+    assert list(items_dir.glob("*.conflict*.md")) == []
+    assert list((tmp_path / "vault").rglob("*.tmp")) == []
+
+
+def test_note_keeps_changing_goes_to_conflict_and_keeps_pending(
+    conn, tmp_path, monkeypatch, caplog
+) -> None:
+    # やり直しでも変わり続ける → 正本ノートに触れず新版を .conflict.md に退避して WARN。
+    # 未更新の扱いなので感想の exported_at は立てない(翌 run で再試行。マーカー欠損と同じ契約)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("20260706-*.md"))
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (digest_id, item),
+    )
+    add_note(conn, item, "後で深掘りする")
+
+    def save_every_time(n: int) -> None:
+        note.write_text(note.read_text() + f"\n{n} 回目の保存\n")
+
+    calls = hook_before_write(monkeypatch, note, save_every_time)
+    with caplog.at_level(logging.WARNING, logger="test-obsidian"):
+        export_pending_notes(conn, config, logger)
+
+    saved = note.read_text()
+    assert "1 回目の保存" in saved
+    assert "2 回目の保存" in saved  # 本人の保存は上書きされない
+    assert "後で深掘りする" not in saved  # 正本ノートは未更新
+    assert calls == [1, 2]  # 読み直しての やり直しは 1 回だけ
+    conflict = note.with_suffix(".conflict.md")
+    assert "後で深掘りする" in conflict.read_text()  # 新版は退避側に保全
+    assert f"読み取り後にノートが変更され続けたため、新版を .conflict に退避: {note.name}" in (
+        caplog.text
+    )
+    assert "1 件を .conflict.md に退避" in caplog.text
+    pending = conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    assert pending == 1
+    assert list((tmp_path / "vault").rglob("*.tmp")) == []
+
+
+def test_new_note_created_before_write_is_not_overwritten(conn, tmp_path, monkeypatch) -> None:
+    # 新規作成の途中(無いと読んだあと・rename の前)に同期でノートが届いた → 上書きしない。
+    # 読み直すとマーカーが無いので、既存の fail-safe どおり .conflict.md に退避する
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    note = tmp_path / "vault" / "SignalForge" / "Items" / f"20260706-{item}-記事タイトル.md"
+
+    def arrive_once(n: int) -> None:
+        if n == 1:
+            note.write_text("同期で先に届いた手書きノート")
+
+    calls = hook_before_write(monkeypatch, note, arrive_once)
+    export_digest(conn, config, digest_id, logger)
+
+    assert calls == [1]
+    assert note.read_text() == "同期で先に届いた手書きノート"
+    assert note.with_suffix(".conflict.md").exists()

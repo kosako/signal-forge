@@ -72,7 +72,7 @@
 
 ## 7. Obsidian 出力
 
-- **設定**: config.toml の `[obsidian] vault_path` + `folder`(既定 `SignalForge`)。パスはハードコード禁止。書込は **一時ファイル→rename のアトミック書き**(同期ツールとの競合対策)。
+- **設定**: config.toml の `[obsidian] vault_path` + `folder`(既定 `SignalForge`)。パスはハードコード禁止。書込は **一時ファイル→rename のアトミック書き**(同期ツールとの競合対策。防ぐのは書きかけのファイルが残ることで、読み取り後に保存された変更との競合は下の「読み取り後の変更の検出」で扱う)。
 - **ディレクトリ**: `{vault}/{folder}/Daily/` と `{vault}/{folder}/Items/`。
 - **ファイル名規則**:
   - Daily: `YYYY-MM-DD.md`(digest 生成日)
@@ -111,6 +111,8 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 - **frontmatter の生成規則**: 外部由来文字列(title・url)を含むため、文字列連結で組み立てず **YAML シリアライザで生成する**(`yaml.safe_dump`。クオート形式はシリアライザ任せで、必要な値だけ適切にクオート・エスケープされる。改行・引用符入りタイトルによる frontmatter 破壊や任意キー偽造 — 例: フェーズ2で意味を持つ `reaction` の注入 — を構造的に防ぐ)。
 - **GENERATED マーカーの防御**: GENERATED 領域へ書き込む前に、生成コンテンツ(LLM 出力は untrusted 本文の影響下にある)から `<!-- GENERATED:BEGIN -->` / `<!-- GENERATED:END -->` のマーカー文字列を除去してから書く(境界誤認による手書きメモ破壊の防止)。
 - **再生成ポリシー**: ファイルが存在すれば GENERATED マーカー内だけ置換、frontmatter は機械管理キーのみ更新 — 手書きメモを絶対に壊さないための境界。マーカー欠損時は上書きせず `.conflict.md` を並置して警告(fail-safe)。
+- **読み取り後の変更の検出(GH#189)**: ノートを読んだあとに本人や同期ツールが保存した変更を、古い内容から作った新版で上書きしないための仕組み。一時ファイルを書いたあと rename の直前に、読んだときの内容と今の内容(ファイルの有無を含む)をバイト列で比べ、変わっていれば上書きしない。読み直して 1 回だけやり直し(新しい内容の手書き領域と frontmatter をもとに作り直す)、それでも変わっていれば生成した新版を `.conflict.md`(既にあれば `.conflict-2.md`、`.conflict-3.md` と続く空いている名前。マーカー欠損時と同じ規則)へ退避し、ノート名を添えて WARN を出す。退避したノートは未更新の扱いで、感想の追いパスは `exported_at` を立てず翌 run で再試行する(マーカー欠損時と同じ契約)。新規作成も同じで、rename の直前にファイルができていれば読み直して既存ノートとして扱う。
+- **保証の範囲**: 比べてから rename までの短い窓に保存された変更は検出できず、ファイル全体の置換で失われうる(OS の rename に「内容が変わっていなければ置き換える」という条件は付けられないため)。手書きを確実に守るには生成部分と手書き部分を別ファイルに分ける必要があるが、今のノートの形(同居)を保ち、検出と退避で窓を短くするにとどめた(GH#189 の判断)。export は朝バッチで 1 日 1 回、書くのは本人 1 人の Vault なので、この窓に保存が重なる頻度は低いと見ている。
 - **感想の投影(GH#92 / GH#96)**: 感想の正本は `item_notes` / `digest_notes`(01)で、GENERATED 領域の「## 感想」節は **DB の純関数**(全感想を毎回描画 = 再生成・再 export で消えない)。記事感想は Items ノート、日次感想は Daily ノートに投影。既 export のノートに感想が付いた場合は export 段の追加パス(`export_pending_notes`)が該当ノートだけ再描画し(item は `digest_messages`→`digests` で digest_date を解決・digest は digests.digest_date で直接)、`exported_at` で差分管理する。感想を GENERATED 領域内で直接編集した場合は次回再描画で DB 側の内容に戻る(編集は手書き領域で)。
 - **反応の書き戻し**: MVP では実施しない(signals は SQLite のみ、PROPOSAL のスコープ)。frontmatter `reaction` と GENERATED 領域の分離が済んでいるため、フェーズ2では「frontmatter の1キー更新」だけで実現できる — これが本設計で仕込む唯一の拡張点。
 - **保持ポリシー**: Obsidian に置くのは自作要約+メタデータ+URL+(RSS/manual のみ)抜粋。X 由来は本文・抜粋を置かない — **確定(Day 0 の Developer Agreement 確認 2026-07-06、Issue #2)**。規約上は自分専用・非公開への抜粋表示自体は許諾範囲だが、Obsidian は恒久保存層であり「X 側の削除・変更との同期」義務(Policy: Content compliance)を構造的に満たせないため緩和しない。恒久保存してよいのは Post ID / URL / 自作要約(analyses.summary)+メタまで。位置情報は本文と切り離して保存しない(Agreement III.E。現設計は geo フィールドを取得自体しないので追加対応なし)。

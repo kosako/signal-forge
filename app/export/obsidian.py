@@ -4,7 +4,8 @@
 - frontmatter は YAML シリアライザで生成(外部由来文字列による構造破壊・キー偽造の防止)
 - 再生成は GENERATED マーカー内のみ置換。手書きメモ・ユーザー変更 frontmatter キーは
   保持し、マーカー欠損時は上書きせず .conflict.md を並置(fail-safe)
-- 書込は一時ファイル→rename のアトミック書き(同期ツールとの競合対策)
+- 書込は一時ファイル→rename のアトミック書き(同期ツールとの競合対策)。rename の直前に
+  読み取り後の変更を確かめ、変わっていれば上書きしない(GH#189)
 - X 由来は抜粋を出力しない(恒久保存層に本文を置かない。Issue #2 の確定ポリシー)
 """
 
@@ -16,7 +17,9 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import yaml
@@ -72,16 +75,25 @@ def export_digest(
             items_dir / f"{note_name}.md",
             _item_frontmatter(row, digest["digest_date"]),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
+            logger=logger,
+            run_id=run_id,
         ):
             conflicts += 1
 
     daily_front, daily_body = _daily_note_content(conn, digest, wikilinks)
-    if not _write_note(daily_dir / f"{digest['digest_date']}.md", daily_front, daily_body):
+    if not _write_note(
+        daily_dir / f"{digest['digest_date']}.md",
+        daily_front,
+        daily_body,
+        logger=logger,
+        run_id=run_id,
+    ):
         conflicts += 1
 
     if conflicts:
         logger.warning(
-            f"GENERATED マーカー欠損のため {conflicts} 件を .conflict.md に退避",
+            f"GENERATED マーカー欠損または読み取り後の変更のため {conflicts} 件を "
+            ".conflict.md に退避",
             extra={"run_id": run_id, "stage": "export"},
         )
     logger.info(
@@ -148,6 +160,8 @@ def export_pending_notes(
             items_dir / f"{note_name}.md",
             _item_frontmatter(row, entry["digest_date"]),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
+            logger=logger,
+            run_id=run_id,
         ):
             # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
             # (立てると DB とノートが恒久不一致になる。Codex must)
@@ -164,7 +178,13 @@ def export_pending_notes(
     daily_dir.mkdir(parents=True, exist_ok=True)
     for digest in pending_digests:
         front, body = _daily_note_content(conn, digest, _daily_wikilinks(conn, digest))
-        if not _write_note(daily_dir / f"{digest['digest_date']}.md", front, body):
+        if not _write_note(
+            daily_dir / f"{digest['digest_date']}.md",
+            front,
+            body,
+            logger=logger,
+            run_id=run_id,
+        ):
             # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
             conflicts += 1
             continue
@@ -176,7 +196,8 @@ def export_pending_notes(
         conn.commit()
     if conflicts:
         logger.warning(
-            f"GENERATED マーカー欠損のため {conflicts} 件を .conflict.md に退避",
+            f"GENERATED マーカー欠損または読み取り後の変更のため {conflicts} 件を "
+            ".conflict.md に退避",
             extra={"run_id": run_id, "stage": "export"},
         )
     logger.info(
@@ -309,7 +330,14 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
 # --- ファイル書き込み(GENERATED マーカー・アトミック書き) ---
 
 
-def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
+def _write_note(
+    path: Path,
+    frontmatter: dict,
+    generated_body: str,
+    *,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> bool:
     """ノートを書く。fail-safe 退避(.conflict)した場合は False を返す。
 
     - 新規: frontmatter + GENERATED ブロック + 手書き領域
@@ -317,31 +345,48 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
       frontmatter はユーザー所有キーを保持して更新
     - 既存の構造が判定不能(マーカー欠損/多重・frontmatter 欠落/破損): 元ファイルに
       触れず、新版を別名の .conflict に退避する(既存 conflict も上書きしない)
+    - 読み取り後の変更(GH#189): rename の直前に読んだときの内容(有無を含む)と今の内容を
+      比べ、変わっていれば上書きしない。読み直して 1 回だけやり直し、それでも変わって
+      いれば新版を .conflict に退避して WARN を出す。比べてから rename までの短い窓は
+      残る(保証の範囲は設計 04 §7)
     """
     generated_body = _strip_markers(generated_body)
-    if not path.exists():
-        atomic_write(path, _render(frontmatter, generated_body))
-        return True
-
-    existing = path.read_text(encoding="utf-8")
     fresh = _render(frontmatter, generated_body)
+    for _attempt in range(2):  # 初回 + 読み直しての 1 回
+        snapshot = _read_snapshot(path)
+        if snapshot is None:
+            content = fresh
+        else:
+            content = _merge_existing(_decode_note(snapshot), frontmatter, generated_body)
+            if content is None:
+                return _write_conflict(path, fresh)
+        if atomic_write(path, content, precondition=partial(_unchanged, path, snapshot)):
+            return True
+    logger.warning(
+        f"読み取り後にノートが変更され続けたため、新版を .conflict に退避: {path.name}",
+        extra={"run_id": run_id, "stage": "export"},
+    )
+    return _write_conflict(path, fresh)
 
+
+def _merge_existing(existing: str, frontmatter: dict, generated_body: str) -> str | None:
+    """既存ノートの GENERATED 内だけを置き換えた全文。構造が判定不能なら None(退避)。"""
     # 境界判定は fail-safe: BEGIN/END がちょうど1個ずつで正順のときだけ置換する
     if existing.count(GENERATED_BEGIN) != 1 or existing.count(GENERATED_END) != 1:
-        return _write_conflict(path, fresh)
+        return None
     begin = existing.find(GENERATED_BEGIN)
     end = existing.find(GENERATED_END)
     if end < begin:
-        return _write_conflict(path, fresh)
+        return None
 
     m = _FRONT_MATTER.match(existing)
     current = _parse_frontmatter(m.group(1)) if m else None
     if current is None:
         # frontmatter 欠落/破損時に {} で再構成するとユーザー追加キーが消えるため退避
-        return _write_conflict(path, fresh)
+        return None
     if begin < m.end():
         # マーカーが frontmatter 内にある等、境界が本文領域にない場合も誤接合せず退避
-        return _write_conflict(path, fresh)
+        return None
 
     merged = dict(current)
     for key, value in frontmatter.items():
@@ -352,7 +397,7 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
 
     pre = existing[m.end() : begin]  # BEGIN より前の手書きも verbatim 保持
     post = existing[end + len(GENERATED_END) :]
-    content = (
+    return (
         render_frontmatter(merged)
         + pre
         + GENERATED_BEGIN
@@ -362,8 +407,24 @@ def _write_note(path: Path, frontmatter: dict, generated_body: str) -> bool:
         + GENERATED_END
         + post
     )
-    atomic_write(path, content)
-    return True
+
+
+def _read_snapshot(path: Path) -> bytes | None:
+    """ノートの今の中身(バイト列)。無ければ None。"""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _unchanged(path: Path, snapshot: bytes | None) -> bool:
+    """rename の直前の確認: 読んだときから中身(有無を含む)が変わっていないか(GH#189)。"""
+    return _read_snapshot(path) == snapshot
+
+
+def _decode_note(raw: bytes) -> str:
+    # read_text(encoding="utf-8") と同じ解釈(universal newlines: \r\n と \r を \n に)
+    return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _write_conflict(path: Path, content: str) -> bool:
@@ -411,12 +472,23 @@ def _strip_markers(content: str) -> str:
     return content.replace(GENERATED_BEGIN, "").replace(GENERATED_END, "")
 
 
-def atomic_write(path: Path, content: str) -> None:
+def atomic_write(
+    path: Path, content: str, *, precondition: Callable[[], bool] | None = None
+) -> bool:
+    """一時ファイル→rename で書く(部分ファイルを残さない)。
+
+    precondition は rename の直前に呼ぶ。False なら置換せず、一時ファイルを消して False を
+    返す(読み取り後の変更の検出。GH#189)。置換したら True。
+    """
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        if precondition is not None and not precondition():
+            Path(tmp_name).unlink(missing_ok=True)
+            return False
         os.replace(tmp_name, path)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+    return True
