@@ -101,6 +101,8 @@ _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 # 本文の言語の判定(GH#173): 日本語の文字(かな・漢字)のうち、かながこの割合に満たなければ
 # 日本語にしない(かなは日本語にしか無い。漢字だけの中国語を外す)
 _JA_KANA_MIN_SHARE = 0.2
+# かぎ括弧の引用(「」『』)。内側から 1 段ずつ外す(入れ子も外れる。閉じの無い括弧は残す)
+_JA_QUOTE_RE = re.compile(r"「[^「」『』]*」|『[^「」『』]*』")
 
 
 class DigError(Exception):
@@ -1069,14 +1071,16 @@ def _is_japanese_source(candidate: DigCandidate) -> bool:
 
 
 def _looks_japanese(text: str) -> bool:
-    """本文が日本語か。日本語の語の数が、それ以外の語の数以上なら日本語とする。
+    """本文が日本語か。引用を除いた地の文で、日本語の語の数がそれ以外の語の数より多ければ日本語。
 
     語 = 同じ文字種の文字の連なり(ひらがな・カタカナ・漢字は文字種ごとに区切る。それ以外は
     英単語やコードの識別子)。文字の数で比べないのは、日本語は 1 字あたりの情報が多く、英単語や
-    コードの多い日本語の記事を取りこぼすため。語の数なら、日本語の文を引用する英語の記事も
-    (引用の語は少ないので)日本語にならない。英語の記事を日本語と誤ると対訳が無くなるので、
-    コードが本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
+    コードの多い日本語の記事を取りこぼすため。かぎ括弧(「」『』)の中は数えない: 長い日本語の文を
+    引用する英語の記事を、引用の語の数で日本語と誤らないため(日本語の記事は引用を除いても地の文が
+    日本語のまま残る)。英語の記事を日本語と誤ると対訳が無くなるので、語の数が同じものや、コードが
+    本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
     """
+    text = _strip_ja_quotes(text)
     kana_chars = ja_chars = ja_words = other_words = 0
     previous: str | None = None
     for ch in text:
@@ -1093,7 +1097,16 @@ def _looks_japanese(text: str) -> bool:
         previous = script
     if kana_chars == 0 or kana_chars < ja_chars * _JA_KANA_MIN_SHARE:
         return False
-    return ja_words >= other_words
+    return ja_words > other_words
+
+
+def _strip_ja_quotes(text: str) -> str:
+    """かぎ括弧の引用を空白に置き換える(前後の語がつながらないように空白にする)。"""
+    while True:
+        stripped = _JA_QUOTE_RE.sub(" ", text)
+        if stripped == text:
+            return text
+        text = stripped
 
 
 def _char_script(ch: str) -> str:

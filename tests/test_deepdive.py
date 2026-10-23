@@ -371,6 +371,14 @@ EN_QUOTING_JA = (
     "「このコードのバグをみつけてください」 as a Japanese test case. Keep the task, model, "
     "and settings fixed, then compare accuracy and latency across runs. "
 ) * 2
+# 長い日本語の文を引用する英語の記事(引用の日本語の語が地の文の英単語より多い。Codex の R2 の例)
+EN_QUOTING_LONG_JA = (
+    "This guide explains how to evaluate multilingual assistants. Use the prompt "
+    "「このコードのバグを見つけて修正し、変更内容と理由を日本語で説明してください。"
+    "修正前と修正後の動作を比較し、テスト結果も報告してください。変更したファイルも示してください。」"
+    " as a Japanese test case. Keep the task, model, and settings fixed, then compare accuracy "
+    "and latency across runs."
+)
 # 英単語とコードの多い日本語の記事
 JA_WITH_CODE = (
     "Claude Code の hooks を使うと、ツールを実行する前に command を検査できます。"
@@ -389,8 +397,9 @@ JA_WITH_CODE = (
         (EN_ARTICLE, "対訳", True),
         (ZH_ARTICLE, "対訳", True),
         (EN_QUOTING_JA, "対訳", True),
+        (EN_QUOTING_LONG_JA, "対訳", True),
     ],
-    ids=["ja", "en", "zh", "en-quoting-ja"],
+    ids=["ja", "en", "zh", "en-quoting-ja", "en-quoting-long-ja"],
 )
 def test_extracted_article_language_picks_source_note(
     conn, config, article, kind, translated
@@ -437,13 +446,38 @@ def test_extracted_article_language_picks_source_note(
         # 英単語の多い日本語の文・コードの混ざる日本語の記事も日本語
         ("Claude Code の hooks で PreToolUse を使い、Bash の command を検査する方法です。", True),
         (JA_WITH_CODE, True),
-        # 日本語の文や語句を引く英語の記事は日本語にしない
+        # 英語の文を引用する日本語の記事は、引用を除いた地の文で日本語
+        (
+            "この記事は「Agents should run with the least privilege and a single write target,"
+            " and every write should be reviewed by a human before it lands」と結論づけている。",
+            True,
+        ),
+        # 日本語の文や語句を引く英語の記事は日本語にしない(引用が長くても、入れ子でも)
         (EN_QUOTING_JA, False),
+        (EN_QUOTING_LONG_JA, False),
+        (
+            "Use the prompt 「『テスト』と書かれたファイルを開いて、中身を読んでください」"
+            " as a test case.",
+            False,
+        ),
         (EN_ARTICLE + "The phrase いただきます is quoted once.", False),
         (ZH_ARTICLE, False),
+        ("Claude Code の設定", False),  # 語の数が同じ(2 対 2)なら日本語以外に倒す
         ("2026-10-23 12:00", False),  # 文字が無い
     ],
-    ids=["ja", "ja-terms", "ja-with-code", "en-quoting-ja", "en-phrase", "zh", "no-letters"],
+    ids=[
+        "ja",
+        "ja-terms",
+        "ja-with-code",
+        "ja-quoting-en",
+        "en-quoting-ja",
+        "en-quoting-long-ja",
+        "en-quoting-nested",
+        "en-phrase",
+        "zh",
+        "tie",
+        "no-letters",
+    ],
 )
 def test_looks_japanese(text, expected) -> None:
     assert _looks_japanese(text) is expected
