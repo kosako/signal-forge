@@ -1,7 +1,9 @@
 """受信デーモン intel poll(設計 04 §3, §5, §6 / 00 §2)。
 
 - getUpdates long polling(50s)。offset は telegram_state に永続化し、再起動で
-  取りこぼし・二重処理しない(at-least-once。signals は追記型なので重複は集計側で吸収)
+  取りこぼし・二重処理しない(at-least-once。signals は追記型なので重複は集計側で吸収し、
+  感想は受信したリプライの chat_id・message_id で 1 回だけ記帳する。GH#193)。受信の内容を
+  DB のロック競合で保存できなかった update は offset を進めず、次の poll で再処理する(GH#181)
 - callback 処理順: ①認可(from.id)→ ②検証(item 実在+digests 帰属)→
   ③signals INSERT → ④結果に応じて answerCallbackQuery(記帳成功=記録しました /
   検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback
@@ -52,6 +54,9 @@ from app.normalize import (
 
 OFFSET_KEY = "getupdates_offset"
 RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
+# 受信の内容を DB の一時的な失敗(ロック競合)で保存できなかった同じ update を、やり直す回数
+# (初回 + やり直し 3 回。設計 05 §8 の Telegram 送信のリトライ回数に揃える。GH#181)
+TRANSIENT_RETRIES = 3
 
 # callback_data の code → signals.value(設計 04 §3 / 01 §7)
 _REACTION_VALUES = {"up": "useful", "dig": "dig", "knw": "known", "no": "noise"}
@@ -86,13 +91,18 @@ def run_poller(
     if answer_worker is None:
         answer_worker = AnswerWorker(config.config_dir)
     logger.info("poller 起動", extra={"stage": "poll"})
+    # 一時的な失敗で再処理を待つ update の、続けて失敗した回数(周期をまたいで持つ。GH#181)
+    transient_failures: dict[int, int] = {}
     while not should_stop():
         try:
             # 質問への返事の取りこぼしを拾う(GH#126)。受信やタイマーが失敗する周期でも
             # 終わった子の回収と起動し直しを止めないよう、周期の最初に行う
             answer_worker.sweep(conn, logger)
             run_due_timers(conn, config, api, logger, now_fn())
-            poll_once(conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker)
+            poll_once(
+                conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker,
+                transient_failures=transient_failures,
+            )
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
@@ -101,9 +111,10 @@ def run_poller(
             # "database is locked/busy" が出うる。これは一過性なので待って再開する
             # (クラッシュ→KeepAlive 再起動のループより穏当)。
             # それ以外(no such table 等のスキーマ破損)は恒久エラーなので握らず落とす
-            # (KeepAlive が再起動し、doctor #3 で検知できる)
-            message = str(e)
-            if "locked" not in message and "busy" not in message:
+            # (KeepAlive が再起動し、doctor #3 で検知できる)。受信の内容を保存できなかった
+            # update は、poll_once が offset を進めずにここへ投げ直す(待った後に、再配達で
+            # 再処理する。GH#181)
+            if not _is_transient_db_error(e):
                 raise
             logger.error(f"DB ロック競合(30s 後に再開): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
@@ -117,8 +128,18 @@ def poll_once(
     *,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
     answer_worker: AnswerWorker | None = None,
+    transient_failures: dict[int, int] | None = None,
 ) -> int:
-    """getUpdates 1回分を処理し、処理した update 数を返す。"""
+    """getUpdates 1回分を処理し、処理した update 数を返す。
+
+    受信の内容を DB の一時的な失敗(ロック競合)で保存できなかった update は、offset を進めずに
+    例外を投げ直す(GH#181)。run_poller が待ってから同じ offset で取り直し、再配達された同じ
+    update を再処理する(後ろの update も、その offset より後なので一緒に再配達される)。
+    transient_failures は update_id → 続けて一時的に失敗した回数で、周期をまたいで run_poller が
+    持つ。TRANSIENT_RETRIES 回やり直しても失敗する update は隔離して進める。
+    """
+    if transient_failures is None:
+        transient_failures = {}
     offset = _load_offset(conn, logger)
     updates = api.get_updates(offset)
     for update in updates:
@@ -127,19 +148,52 @@ def poll_once(
             logger.warning("update_id のない update を破棄", extra={"stage": "poll"})
             continue
         # 個別 update の処理失敗は poller を殺さず、offset を進めて次へ
-        # (poison update を無限再処理しない。プロセス終了は launchd KeepAlive の責務)
+        # (poison update を無限再処理しない。プロセス終了は launchd KeepAlive の責務)。
+        # ただし DB の一時的な失敗は、待てば保存できるので offset を進めない(GH#181)
         try:
             handle_update(
                 conn, config, api, update, logger, now_fn=now_fn, answer_worker=answer_worker
             )
         except Exception as e:
-            logger.error(
-                f"update 処理失敗: {type(e).__name__}: {e}",
-                extra={"stage": "poll"},
-                exc_info=True,
-            )
+            if not _is_transient_db_error(e):
+                logger.error(
+                    f"update 処理失敗: {type(e).__name__}: {e}",
+                    extra={"stage": "poll"},
+                    exc_info=True,
+                )
+            else:
+                failures = transient_failures.get(update_id, 0) + 1
+                if failures <= TRANSIENT_RETRIES:
+                    transient_failures.clear()  # 再処理を待つのは常に先頭の未確認の 1 件
+                    transient_failures[update_id] = failures
+                    raise
+                # やり直しても保存できない update は隔離して進める(無限に再処理しない)。
+                # 本文は残さない(設計 04 §6 と同じく、update_id と種別だけ)
+                logger.warning(
+                    f"一時的な保存の失敗が {failures} 回続いた update を隔離して進める: "
+                    f"{type(e).__name__}: {e}",
+                    extra={
+                        "stage": "poll",
+                        "extra": {
+                            "update_id": update_id,
+                            "keys": sorted(set(update) - {"update_id"}),
+                        },
+                    },
+                )
         _save_offset(conn, update_id + 1)
+        transient_failures.pop(update_id, None)
     return len(updates)
+
+
+def _is_transient_db_error(e: BaseException) -> bool:
+    """DB のロック競合(busy_timeout 超過の "database is locked/busy")か。待てば解ける。
+
+    それ以外(no such table 等のスキーマ破損・制約違反)は待っても直らない。
+    """
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    message = str(e)
+    return "locked" in message or "busy" in message
 
 
 def handle_update(
@@ -554,16 +608,21 @@ def _handle_message(
         thread = _replied_dig_thread(conn, message.get("reply_to_message"))
         if thread is not None:
             _handle_dig_card_reply(
-                conn, config, thread, message, text.strip(), reply, logger, now, answer_worker
+                conn, config, thread, message, chat_id, text.strip(), reply, logger, now,
+                answer_worker,
             )
             return
         note_item_id = _replied_item_id(conn, message.get("reply_to_message"))
         if note_item_id is not None:
-            conn.execute(
-                "INSERT INTO item_notes (item_id, note) VALUES (?, ?)",
-                (note_item_id, text.strip()),
+            recorded = _insert_note(
+                conn, _ITEM_NOTE_SQL, note_item_id, text.strip(), chat_id, message
             )
             conn.commit()
+            if not recorded:
+                logger.info(
+                    "記録済みの感想の再配達を破棄", extra={"stage": "poll", "item_id": note_item_id}
+                )
+                return
             logger.info(
                 "感想を記録",
                 extra={"stage": "poll", "item_id": note_item_id},
@@ -572,11 +631,13 @@ def _handle_message(
             return
         note_digest_id = _replied_digest_id(conn, message.get("reply_to_message"))
         if note_digest_id is not None:
-            conn.execute(
-                "INSERT INTO digest_notes (digest_id, note) VALUES (?, ?)",
-                (note_digest_id, text.strip()),
+            recorded = _insert_note(
+                conn, _DIGEST_NOTE_SQL, note_digest_id, text.strip(), chat_id, message
             )
             conn.commit()
+            if not recorded:
+                logger.info("記録済みのダイジェスト感想の再配達を破棄", extra={"stage": "poll"})
+                return
             logger.info("ダイジェスト感想を記録", extra={"stage": "poll"})
             reply(
                 "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します"
@@ -803,6 +864,7 @@ def _handle_dig_card_reply(
     config: Config,
     thread: tuple[int, int],
     message: dict,
+    chat_id: int,
     text: str,
     reply: Callable[[str], None],
     logger: logging.Logger,
@@ -839,19 +901,50 @@ def _handle_dig_card_reply(
     # 感想と質問は一緒に記帳する(接続は autocommit。間で止まると、再配達で感想だけ二重になる)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, text))
-        if accept:
+        recorded = _insert_note(conn, _ITEM_NOTE_SQL, item_id, text, chat_id, message)
+        if recorded and accept:
             enqueue_question(conn, dig_result_id, text, message_id)
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    if not recorded:
+        # 質問として受け付けなかった感想(上限・上限 0)は台帳に無く、上の判定では分からない。
+        # 感想の記帳で判定する(GH#193)
+        logger.info("記録済みの感想の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
+        return
     logger.info(
         "質問を受け付けた" if accept else "感想を記録", extra={"stage": "poll", "item_id": item_id}
     )
     reply(notice)
     if accept and answer_worker is not None:
         answer_worker.kick(logger)
+
+
+# 感想の記帳(GH#92 / GH#96)。受信したリプライの (chat_id, message_id) を冪等キーにする
+# (GH#193。migration 019 の UNIQUE)
+_ITEM_NOTE_SQL = (
+    "INSERT INTO item_notes (item_id, note, chat_id, message_id) VALUES (?, ?, ?, ?) "
+    "ON CONFLICT (chat_id, message_id) DO NOTHING"
+)
+_DIGEST_NOTE_SQL = (
+    "INSERT INTO digest_notes (digest_id, note, chat_id, message_id) VALUES (?, ?, ?, ?) "
+    "ON CONFLICT (chat_id, message_id) DO NOTHING"
+)
+
+
+def _insert_note(
+    conn: sqlite3.Connection, sql: str, parent_id: int, note: str, chat_id: int, message: dict
+) -> bool:
+    """感想を記帳し、記帳したら True を返す(GH#193)。
+
+    記帳した後、offset を保存する前に止まる(または保存に失敗する)と同じ update が再配達される。
+    同じリプライを記帳済みなら記帳せずに False を返す(記帳と処理済みの判定を同じ 1 文で確定する)。
+    message_id が int でない(Telegram は必ず付ける)ときは、キーなしで記帳する。
+    """
+    message_id = message.get("message_id")
+    key = message_id if type(message_id) is int else None  # bool は int の派生型のため除く
+    return conn.execute(sql, (parent_id, note, chat_id, key)).rowcount == 1
 
 
 def _replied_digest_id(conn: sqlite3.Connection, replied: object) -> int | None:

@@ -36,9 +36,9 @@ schema_migrations                              (マイグレーション台帳�
 
 digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定の台帳(設計 04 §2)。記事が実際に届いたかの記録として、分析の既知判定の履歴(設計 03 §3.2。GH#177)の基準にも使う。
 
-## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006 の追加)
+## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -195,28 +195,39 @@ CREATE UNIQUE INDEX ux_digest_messages_header ON digest_messages(digest_id)
 -- (X 本文の TTL 制約)の対象外で恒久保存する。正本は本テーブル、Obsidian の item ノート
 -- (GENERATED 領域「## 感想」節)は DB の純関数として投影。KPI には接続しない
 -- (reaction を自動記帳しない = 測定定義の汚染防止)。
+-- chat_id・message_id(migration 019。GH#193)= 感想を書いたリプライの chat と message_id。
+-- 組で UNIQUE にし、poller は INSERT … ON CONFLICT DO NOTHING で記帳する(記帳と処理済みの
+-- 判定を同じ 1 文で確定する)。記帳の後、offset を保存する前に止まって同じ update が
+-- 再配達されても、同じ感想を 2 行にしない(設計 04 §1)。019 より前の行は NULL。
 CREATE TABLE item_notes (
   id          INTEGER PRIMARY KEY,
   item_id     INTEGER NOT NULL REFERENCES items(id),
   note        TEXT    NOT NULL,
   created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  exported_at TEXT                          -- Obsidian へ反映済みか(NULL = 未反映)
+  exported_at TEXT,                         -- Obsidian へ反映済みか(NULL = 未反映)
+  chat_id     INTEGER,                      -- migration 019
+  message_id  INTEGER                       -- migration 019
 ) STRICT;
 CREATE INDEX ix_item_notes_item ON item_notes(item_id);
 CREATE INDEX ix_item_notes_pending ON item_notes(item_id) WHERE exported_at IS NULL;
+CREATE UNIQUE INDEX ux_item_notes_message ON item_notes(chat_id, message_id);
 
 -- 日次感想(ダイジェストのヘッダメッセージへのリプライ。GH#96 / migration 006)。
 -- item_notes の相似形。正本は本テーブル、Obsidian の Daily ノート(GENERATED 領域
 -- 「## 感想」節)は DB の純関数として投影。KPI・シグナル未接続(活用は後決め)。
+-- chat_id・message_id は item_notes と同じ受信の冪等キー(migration 019。GH#193)。
 CREATE TABLE digest_notes (
   id          INTEGER PRIMARY KEY,
   digest_id   INTEGER NOT NULL REFERENCES digests(id),
   note        TEXT    NOT NULL,
   created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  exported_at TEXT                          -- Obsidian へ反映済みか(NULL = 未反映)
+  exported_at TEXT,                         -- Obsidian へ反映済みか(NULL = 未反映)
+  chat_id     INTEGER,                      -- migration 019
+  message_id  INTEGER                       -- migration 019
 ) STRICT;
 CREATE INDEX ix_digest_notes_digest ON digest_notes(digest_id);
 CREATE INDEX ix_digest_notes_pending ON digest_notes(digest_id) WHERE exported_at IS NULL;
+CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id);
 
 -- manual ソースは1行固定(手動URL投入の親)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
