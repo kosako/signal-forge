@@ -1,12 +1,14 @@
 import logging
+import shutil
 import sqlite3
 import tarfile
 from pathlib import Path
 
 import pytest
 
+from app.analysis.profile import load_interest_profile
 from app.backup import GENERATIONS, backup_daily
-from app.config import Config, StorageConfig
+from app.config import Config, StorageConfig, load_config
 from app.db import apply_migrations, connect
 
 logger = logging.getLogger("test-backup")
@@ -145,3 +147,66 @@ def test_backup_skips_circular_symlink_config_dir_with_warning(conn, tmp_path, c
     assert any(
         r.levelno == logging.WARNING and "config/" in r.getMessage() for r in caplog.records
     )
+
+
+# --- 設定ディレクトリの外の関心プロファイル(GH#199) ---
+
+PROFILE_TEXT = "---\nupdated: 2026-10-01\n---\n# 関心プロファイル\n本文\n"
+
+
+def test_outside_profile_is_backed_up_and_restorable(conn, tmp_path) -> None:
+    # [analysis].profile_path で設定ディレクトリの外に置いたプロファイルも世代に入り、
+    # 元のファイルを失っても、復元した config.toml が指す場所へ置けば分析が読める(設計 05 §5)
+    profile = tmp_path / "vault" / "my-profile.md"
+    profile.parent.mkdir()
+    profile.write_text(PROFILE_TEXT, encoding="utf-8")
+    config_dir = tmp_path / "conf"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        f'[analysis]\nprofile_path = "{profile}"\n\n'
+        f'[storage]\nbackup_dir = "{tmp_path / "backups"}"\n',
+        encoding="utf-8",
+    )
+    config = load_config(config_dir)
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+    profile.unlink()  # 元のプロファイルを失った
+
+    restore_dir = tmp_path / "restore"
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        tar.extractall(path=restore_dir, filter="data")
+    assert "profile/my-profile.md" in names
+    assert "config/config.toml" in names
+    restored = load_config(restore_dir / "config")
+    shutil.copy2(restore_dir / "profile" / restored.profile_path.name, restored.profile_path)
+    assert load_interest_profile(restored.profile_path).updated == "2026-10-01"
+    assert restored.profile_path.read_text(encoding="utf-8") == PROFILE_TEXT
+
+
+def test_profile_inside_config_dir_is_not_added_twice(conn, tmp_path) -> None:
+    config = make_config(tmp_path)  # profile_path 未設定 = <config_dir>/interest-profile.md
+    (config.config_dir / "interest-profile.md").write_text(PROFILE_TEXT, encoding="utf-8")
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+    assert "config/interest-profile.md" in names
+    assert not [n for n in names if n.split("/")[0] == "profile"]  # config/ と二重に入れない
+
+
+def test_symlinked_profile_in_config_dir_backs_up_its_content(conn, tmp_path) -> None:
+    # 設定ディレクトリの中の symlink が外を指すと config/ にはリンクしか残らないので、中身を入れる
+    target = tmp_path / "vault" / "real-profile.md"
+    target.parent.mkdir()
+    target.write_text(PROFILE_TEXT, encoding="utf-8")
+    config = make_config(tmp_path)
+    (config.config_dir / "interest-profile.md").symlink_to(target)
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        member = tar.getmember("profile/interest-profile.md")  # 読む名前で入る
+        assert member.isfile()
+        assert tar.extractfile(member).read().decode("utf-8") == PROFILE_TEXT

@@ -2,7 +2,8 @@
 
 - SQLite は backup API で一貫スナップショット(WAL 中のファイルコピーは破損リスク)
 - 同梱: DB スナップショット / ~/.config/intel/(config.toml・.env・関心プロファイル)/
-  prompts/(git 管理だが世代の一貫性のため)
+  prompts/(git 管理だが世代の一貫性のため)/ 設定ディレクトリの外の関心プロファイル
+  ([analysis].profile_path で外に置いた場合だけ profile/ に。GH#199)
 - tar.gz は 600 を強制(.env の secrets が同梱されるため。doctor #10 が検査)
 - 日次14世代。同日の再実行は当日世代を置換(冪等)
 - ~/Backups/intel/ をクラウド同期対象外に置く確認は運用(runbook)の責務
@@ -57,6 +58,7 @@ def backup_daily(
             with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
                 tar.add(snapshot, arcname="intel.db")
                 _add_dir_if_exists(tar, config.config_dir, "config", logger, run_id=run_id)
+                _add_profile_if_outside(tar, config)
                 _add_dir_if_exists(tar, prompts_dir, "prompts", logger, run_id=run_id)
             os.replace(partial_path, archive_path)  # 当日再実行は置換(冪等)
         except BaseException:
@@ -100,6 +102,18 @@ def _add_dir_if_exists(
             return
     if directory.is_dir():
         tar.add(directory, arcname=arcname)
+
+
+def _add_profile_if_outside(tar: tarfile.TarFile, config: Config) -> None:
+    # 関心プロファイルは分析・深掘り・返事が読む正本で、欠落すると止まる(設計 03 §4)。
+    # [analysis].profile_path で設定ディレクトリの外に置くと config/ に入らないので、
+    # 実際に読むファイルを profile/<読む名前> に別に入れる(GH#199)。中にあれば config/ に
+    # 入っているので二重に入れない。中の symlink が外を指す場合は config/ にリンクしか
+    # 残らないので、解決した先で中か外かを決め、中身を入れる。無ければ入れない
+    profile = config.profile_path.resolve()
+    if not profile.is_file() or profile.is_relative_to(config.config_dir.resolve()):
+        return
+    tar.add(profile, arcname=f"profile/{config.profile_path.name}")
 
 
 def _rotate(backup_dir: Path) -> list[str]:

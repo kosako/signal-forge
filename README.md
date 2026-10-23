@@ -163,7 +163,7 @@ doctor の各項目は [設計 05 §2](docs/design/05-ops-runtime.md)。
 | 設定 | `~/.config/intel/`(`config.toml`・`.env`・`interest-profile.md`、X の OAuth 2.0 を使うなら `x-oauth2-token.json`) | `--config-dir`。プロファイルだけは `[analysis].profile_path` |
 | DB | `~/.local/share/intel/intel.db` | `[storage].db_path` |
 | ログ | `~/.local/state/intel/logs/`(`morning.log`・`poller.log`・`answer.log`。JSON Lines、日次で 14 世代) | launchd 側の出力は `morning-launchd.log`・`poller-launchd.log` |
-| バックアップ | `~/Backups/intel/intel-YYYYMMDD.tar.gz`(chmod 600、日次で 14 世代。中身は DB・設定ディレクトリ・`prompts/`) | `[storage].backup_dir`。secrets を含むのでクラウド同期の外に置く |
+| バックアップ | `~/Backups/intel/intel-YYYYMMDD.tar.gz`(chmod 600、日次で 14 世代。中身は DB・設定ディレクトリ・`prompts/`、設定ディレクトリの外に置いた関心プロファイル) | `[storage].backup_dir`。secrets を含むのでクラウド同期の外に置く |
 | Obsidian の出力 | `<vault>/SignalForge/` の下の `Daily/`・`Items/`・`DeepDive/` | `[obsidian].vault_path` / `folder` |
 
 ## 運用
