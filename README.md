@@ -54,7 +54,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   3. 概要カードを Telegram に送る。カードのボタンで、元記事を開く・元記事の要約(英語なら和訳)・もう少し詳しい説明を頼める。
   4. カードへのリプライ: poller が台帳に積み、`intel answer` を別プロセスで起動して返事をリプライで送る(1 日の上限は既定 20 件)。LLM が結論・感想(take)と分けたリプライは、原文を解説ノートの末尾に足す(ノートは書き直さず追記だけ)。
 - **データ**: SQLite が正本で、Obsidian は書き出し先。Daily / Items ノートの生成部分は SQLite のデータから export が書く(ノートに足した手書きメモは vault にしか無い)。DeepDive ノートだけは書き出した後に本文を DB に残さず、vault 側が恒久の置き場になる([設計 01 §7](docs/design/01-data-model.md)、[ADR 0004](docs/adr/0004-deepdive-in-agent-obsidian-substrate.md))。vault は intel のバックアップの対象外(runbook §7)なので、守るなら別に手当てする。
-- **LLM**: 使い捨ての `codex exec` を、ツールなし・ネットワーク遮断などで隔離して呼ぶ。今実装しているエンジンは `codex-cli` だけ([設計 00 §5](docs/design/00-architecture.md))。
+- **LLM**: 主のエンジンは `codex-cli` で、使い捨ての `codex exec` を、ツールなし・ネットワーク遮断などで隔離して呼ぶ。`[llm].engine` に書けるほかの値(`claude-cli` / `anthropic-api`)は主のエンジンとしては未実装で、エンジンを作る時点で失敗する。Claude API(`anthropic-api`。tools を付けない素の Messages API)は、深掘りノートのレビュー(`[dig].review`)と、Codex が失敗した呼び出しの予備(`[llm_fallback]`)に使う(どちらも既定 off)([設計 00 §5](docs/design/00-architecture.md))。
 
 ## 必要なもの
 
@@ -225,7 +225,7 @@ repo 固有の決まり:
 - **migration は forward-only**。適用済みのファイルは編集も改名もせず、新しい番号のファイルを足す([設計 01 §10](docs/design/01-data-model.md)、[app/db.py](app/db.py))。
 - **prompt は既存のファイルを書き換えない**。新しい版のファイルを足し、それを指すモジュールの版の定数(`PROMPT_VERSION`。深掘りの対訳・レビュー・直しは `app/deepdive.py` の `TRANSLATE_PROMPT_VERSION`・`REVIEW_PROMPT_VERSION`・`REVISE_PROMPT_VERSION`)を更新する([設計 03 §5](docs/design/03-analysis-ranking.md))。
 - **runbook の §番号を変えない**。コードのメッセージが §番号で参照している([app/cli.py](app/cli.py)、[app/insights.py](app/insights.py))。
-- **LLM は隔離した `codex exec` で呼ぶ**。ツールや書き込み・送信の権限を LLM に与えず、vault への書き込みと Telegram への送信は Python 側が行う。外部の本文はプロンプトの中で実行ごとの nonce の囲みに入れ、データとして扱う([設計 00 §5](docs/design/00-architecture.md)、[設計 03 §3.2](docs/design/03-analysis-ranking.md))。
+- **LLM は隔離して呼ぶ**(`codex exec` は隔離した使い捨ての起動で、Claude API は tools を付けない素の Messages API で)。ツールや書き込み・送信の権限を LLM に与えず、vault への書き込みと Telegram への送信は Python 側が行う。外部の本文はプロンプトの中で実行ごとの nonce の囲みに入れ、データとして扱う([設計 00 §5](docs/design/00-architecture.md)、[設計 03 §3.2](docs/design/03-analysis-ranking.md))。
 
 ## ディレクトリ構成
 
