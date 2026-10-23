@@ -92,8 +92,9 @@ app/
   export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し(DeepDive/ への書き出しも
                   #   同じ atomic_write を使う。DeepDive ノートの中身は deepdive.py が作る)
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
-prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer。
-                  #   analyses は prompt_version 列で追跡し、ほかは各モジュールの PROMPT_VERSION 定数)
+prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer・dig-review・
+                  #   dig-revise。analyses は prompt_version 列で追跡し、ほかは各モジュールの版の定数。
+                  #   PROMPT_VERSION と、deepdive.py の TRANSLATE_・REVIEW_・REVISE_PROMPT_VERSION)
 tests/
 ```
 

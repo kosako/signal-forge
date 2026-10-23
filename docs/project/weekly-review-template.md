@@ -11,8 +11,8 @@
 
 | 項目 | 値 | 出典 |
 |---|---|---|
-| 有効測定日数(配信日数) | | 08 `delivered_days` |
-| 日次 KPI 達成日数 | /(有効測定日) | 08 `kpi_met_days`(合格: 70%以上) |
+| 有効測定日数(配信日数 − 無効日数) | | 08 `delivered_days` − `invalid_days`(無効日は分母から除く。PROPOSAL §測定無効日ルール) |
+| 日次 KPI 達成日数(有効測定日のうち) | /(有効測定日数) | 01 の行のうち、`digest_date` が 08 と同じ範囲(JST の今日の 7 日前以降)で `invalid_day = 0` かつ `kpi_met = 1` の日数(合格: 70%以上)。08 の `kpi_met_days` は無効日の達成も数えるので使わない |
 | 無効日数(fail-closed 突合後) | | 08 + kpi-queries.md の突合手順 |
 | 週 fail-closed 判定(無効日≥3) | 達成 / 未達 | 08 `week_fail_closed` |
 | 巡回代替日数 | /7 | 02(未回答日は代替失敗として加算) |
