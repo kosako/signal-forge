@@ -25,6 +25,16 @@ X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
 X_SEARCH_QUERY_MAX = 512  # クエリ長上限(Basic tier)
 X_SEARCH_QUERY_SUFFIX = "-is:retweet -is:reply"  # 各スロットに自動付加(設計 02 §2)
 
+
+def x_search_query(slot: str) -> str:
+    """スロットから実際に送る検索クエリ(コネクタの送信と長さの検証が共有する。設計 02 §2)。
+
+    スロットを括弧で囲んでから除外句を付ける。X の検索は AND を OR より先に結び付けるため、
+    括弧なしの `a OR b -is:retweet -is:reply` では除外が右の枝にしか掛からない(GH#230)。
+    """
+    return f"({slot}) {X_SEARCH_QUERY_SUFFIX}"
+
+
 # S1b 取込の 1 ページ下限(liked_tweets / user tweets の max_results 下限 = 5 に統一。
 # 設計 02 §2)。コネクタ側に置くと config が httpx 依存を吸うため、軽い側 = ここに置く
 X_SIGNALS_MIN_PAGE = 5
@@ -81,7 +91,7 @@ class XSignalsConfig:
 class XSearchConfig:
     # 検索クエリのスロット(最大 X_SEARCH_MAX_SLOTS 本・入れ替え式。ADR 0001)。
     # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
-    # `-is:retweet -is:reply` はコネクタが自動付加する(設計 02 §2)
+    # `-is:retweet -is:reply` はコネクタがスロットを括弧で囲んで自動付加する(設計 02 §2)
     slots: tuple[str, ...] = ()
     daily_read_cap: int = 35  # 検索の日次読取上限(全スロットで均等割。ADR 0001 予算配分)
 
@@ -476,11 +486,16 @@ def _validate_x_search(path: Path, config: Config) -> None:
     for slot in slots:
         if not slot.strip():
             raise ConfigError(f"{path}: [x_search].slots に空のクエリがある")
-        effective = f"{slot} {X_SEARCH_QUERY_SUFFIX}"
+        effective = x_search_query(slot)
         if len(effective) > X_SEARCH_QUERY_MAX:
             raise ConfigError(
-                f"{path}: [x_search].slots のクエリが長すぎる(自動付加分込みで"
+                f"{path}: [x_search].slots のクエリが長すぎる(括弧と自動付加分込みで"
                 f" {len(effective)} > {X_SEARCH_QUERY_MAX}): {slot[:40]}…"
+            )
+        if not _parens_balanced(slot):
+            raise ConfigError(
+                f"{path}: [x_search].slots のクエリの括弧か引用符が対応していない"
+                f"(囲んだ括弧が途中で閉じ、除外句が全体に掛からない。GH#230): {slot[:40]}…"
             )
     if slots and config.x_search.daily_read_cap // len(slots) < X_SEARCH_MIN_PAGE:
         raise ConfigError(
@@ -498,6 +513,29 @@ def _validate_x_search(path: Path, config: Config) -> None:
             f"{path}: X 読取の内訳合計({cap_sum})が [x].combined_daily_read_cap"
             f"({config.x.combined_daily_read_cap})を超えている(ADR 0001 予算配分)"
         )
+
+
+def _parens_balanced(slot: str) -> bool:
+    """スロットの括弧(引用符の外)が正しく入れ子になり、引用符が閉じているか(GH#230)。
+
+    `ai) OR (llm` は囲むと `(ai) OR (llm) -is:retweet -is:reply` になり、除外が後ろの枝にしか
+    掛からない。閉じていない引用符も囲んだ閉じ括弧と除外句を句の中に飲み込む。引用符(完全一致の
+    句)の中の括弧は数えない。
+    """
+    depth = 0
+    quoted = False
+    for char in slot:
+        if char == '"':
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not quoted
 
 
 def load_env(config_dir: Path) -> dict[str, str]:

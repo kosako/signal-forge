@@ -1,8 +1,9 @@
 """X 検索コネクタ(`GET /2/tweets/search/recent`・3スロット固定。設計 02 §2 / ADR 0001)。
 
-- スロット(検索クエリ)は config.toml の `[x_search].slots`(最大3・入れ替え式)。各クエリに
-  `-is:retweet -is:reply` を自動付加し、RT・リプライを課金前にサーバ側で除外する
+- スロット(検索クエリ)は config.toml の `[x_search].slots`(最大3・入れ替え式)。各クエリを
+  括弧で囲んで `-is:retweet -is:reply` を自動付加し、RT・リプライを課金前にサーバ側で除外する
   (ホームTL の「RT は元ツイに正規化・他人宛リプライ除外」と方針整合。取ってから捨てない)。
+  括弧で囲むのは OR を含むスロットでも除外を全体に掛けるため(GH#230)。
 - 予算(daily_read_cap)はスロット数で均等割(端数は先頭から)。スロット間の再配分はしない
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
   そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。
@@ -29,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from app.config import X_SEARCH_MIN_PAGE, X_SEARCH_QUERY_SUFFIX
+from app.config import X_SEARCH_MIN_PAGE, x_search_query
 from app.connectors.base import FetchResult, FetchStats, RawItem
 from app.connectors.x import (
     API_BASE,
@@ -144,7 +145,7 @@ class XSearchConnector:
         http_status: int | None = None
         while budget - len(tweets) >= X_SEARCH_MIN_PAGE:
             params: dict[str, str | int] = {
-                "query": f"{query} {X_SEARCH_QUERY_SUFFIX}",
+                "query": x_search_query(query),  # (スロット) + 除外句(GH#230)
                 "max_results": min(MAX_RESULTS, budget - len(tweets)),
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
