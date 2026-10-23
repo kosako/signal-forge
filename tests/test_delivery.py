@@ -39,7 +39,9 @@ def add_item(
     title_ja=None,
     published_at="2026-07-04T10:00:00Z",
     summary="要約テキスト。",
+    reason="理由",
     implication="示唆テキスト。",
+    degraded=0,
 ) -> int:
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, published_at, content_hash, "
@@ -48,9 +50,10 @@ def add_item(
     ).lastrowid
     conn.execute(
         "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
-        "recommendation_reason, implication, engine, model, prompt_version, input_hash) "
-        "VALUES (?, ?, ?, '課題直結', 80, 'new', '理由', ?, 'codex-cli', 'm', 'analyze-v001', ?)",
-        (item_id, title_ja, summary, implication, f"sha256:{url}"),
+        "recommendation_reason, implication, degraded, engine, model, prompt_version, "
+        "input_hash) "
+        "VALUES (?, ?, ?, '課題直結', 80, 'new', ?, ?, ?, 'codex-cli', 'm', 'analyze-v001', ?)",
+        (item_id, title_ja, summary, reason, implication, degraded, f"sha256:{url}"),
     )
     return item_id
 
@@ -175,8 +178,46 @@ def test_title_ja_preferred_in_item_text(conn, tmp_path) -> None:
     assert "English Title" not in text
 
 
+def test_recommendation_reason_shown_between_summary_and_implication(conn, tmp_path) -> None:
+    # どの角度で推薦したか(analyses.recommendation_reason)を 🎯 行で出す(GH#90)
+    a = add_item(
+        conn, "https://a/1",
+        summary="要約。", reason="すぐ試せる <Tips> & 手順", implication="示唆。",
+    )
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    lines = recorder.texts()[1].splitlines()
+    assert lines[2:] == ["要約。", "🎯 すぐ試せる &lt;Tips&gt; &amp; 手順", "💡 示唆。"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "degraded"),
+    [
+        ("", 0),  # 理由が空なら行ごと省く
+        ("LLM 分析失敗のため degraded 記録", 1),  # degraded の理由欄は記録用の定型文
+    ],
+)
+def test_recommendation_reason_line_omitted(conn, tmp_path, reason, degraded) -> None:
+    a = add_item(
+        conn, "https://a/1",
+        summary="要約。", reason=reason, implication="示唆。", degraded=degraded,
+    )
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert "🎯" not in text
+    assert text.splitlines()[2:] == ["要約。", "💡 示唆。"]
+
+
 def test_long_summary_truncated_but_title_url_implication_kept(conn, tmp_path) -> None:
-    a = add_item(conn, "https://a/1", summary="あ" * 3000, implication="示唆は残る。")
+    a = add_item(
+        conn, "https://a/1",
+        summary="あ" * 3000, reason="理由は残る。", implication="示唆は残る。",
+    )
     digest_id = add_digest(conn, [a])
     recorder = ApiRecorder()
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
@@ -184,7 +225,7 @@ def test_long_summary_truncated_but_title_url_implication_kept(conn, tmp_path) -
     text = recorder.texts()[1]
     assert len(text) <= ITEM_TEXT_MAX_CHARS
     assert "…" in text  # 要約が切り詰められた
-    assert text.endswith("💡 示唆は残る。")  # 示唆は削らない
+    assert text.endswith("🎯 理由は残る。\n💡 示唆は残る。")  # 推薦の理由と示唆は削らない
     assert '<a href="https://a/1">' in text  # URL も削らない
 
 
