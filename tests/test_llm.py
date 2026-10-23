@@ -218,21 +218,37 @@ def _group_gone(pgid: int) -> bool:
     return False
 
 
+# 中断の時点の子の状態ごとの、偽の codex の本文({pid_file} に自分の pid を書く)
+_INTERRUPT_SCENARIOS = {
+    # 推論を続けている: 孫の sleep を起こしてから待つ
+    "running": 'sleep 30 &\necho $$ > "{pid_file}"\nwait\n',
+    # 子だけ先に終わり、pipe を持つ孫が残る。communicate は KeyboardInterrupt を返す前に
+    # 子を待つので、後片付けの時点で子が回収済みのことがある(Codex レビュー)
+    "reaped": 'sleep 30 &\necho $$ > "{pid_file}"\n',
+    # 子だけ先に終わり、回収はまだ(孫なし)。timeout と kill の間に自然終了したときと同じ形
+    "zombie": 'echo $$ > "{pid_file}"\n',
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_INTERRUPT_SCENARIOS))
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, RuntimeError])
 def test_engine_interrupt_stops_and_reaps_codex(
-    tmp_path: Path, monkeypatch, interrupt: type[BaseException]
+    tmp_path: Path, monkeypatch, interrupt: type[BaseException], scenario: str
 ) -> None:
     # GH#244: communicate の途中の中断(手動実行の Ctrl-C)や例外でも、別セッションの codex を
     # 孫ごと止めて回収し、作業ディレクトリはその後に消す。例外は LLMError に変えずに返す
     pid_file = tmp_path / "codex.pid"
-    # 推論を続けている codex の代わり: 孫の sleep を起こしてから自分の pid を書き、待つ
-    codex = fake_codex(tmp_path, f'sleep 30 &\necho $$ > "{pid_file}"\nwait\n')
+    codex = fake_codex(tmp_path, _INTERRUPT_SCENARIOS[scenario].format(pid_file=pid_file))
     started: list[subprocess.Popen[str]] = []
     reaped_at_cleanup: list[bool] = []
 
     def interrupted_communicate(self, *args, **kwargs):
         started.append(self)
         assert _wait_until(lambda: pid_file.exists() and pid_file.read_text().strip())
+        if scenario == "reaped":
+            self.wait()
+        elif scenario == "zombie":
+            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)  # 終わりを待ち、回収しない
         raise interrupt
 
     real_exit = tempfile.TemporaryDirectory.__exit__
@@ -251,12 +267,11 @@ def test_engine_interrupt_stops_and_reaps_codex(
         assert reaped_at_cleanup == [True]  # 作業ディレクトリを消す前に回収した
         assert _wait_until(lambda: _group_gone(pgid))  # 孫の sleep も残らない
     finally:
-        # 後片付けの無い実装で落ちたときにも、偽の codex を残さない
+        # 後片付けの無い(または孫を残す)実装で落ちたときにも、偽の codex を残さない
         for process in started:
-            if process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
             for pipe in (process.stdin, process.stdout, process.stderr):
                 if pipe is not None:
                     pipe.close()

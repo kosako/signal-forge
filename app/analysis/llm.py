@@ -216,9 +216,13 @@ class CodexCliEngine:
 
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
     """別セッションで起動した子を、孫を含むプロセスグループごと SIGKILL して回収する。"""
-    # 止める前に自然終了していたら ProcessLookupError(取り残しなし)
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    # start_new_session で子はグループの長になるので、グループの ID は子の pid と同じ。
+    # getpgid(子の pid) は子が終わると(回収の前でも)引けず、pipe を持つ孫を止め損ねる。
+    # communicate は KeyboardInterrupt を返す前に子を待つので、子が回収済みのこともある
+    # (GH#244)。止める前にグループが空なら ProcessLookupError、終わった子だけが回収を
+    # 待っているなら macOS は PermissionError を返す(どちらも取り残しなし)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
     process.wait()
 
 
