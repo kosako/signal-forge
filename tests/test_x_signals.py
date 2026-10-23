@@ -146,7 +146,7 @@ def test_cap_limits_reads_and_skips_later_kinds(conn, tmp_path) -> None:
     )
     totals = collect_x_signals(conn, make_config(tmp_path, cap=12), session, logger)
     assert totals["api_reads"] == 12  # bookmark で予算を使い切る
-    # 差分取得の 1 ページ目は最小ページ、新着で埋まったら残枠を要求上限に反映
+    # 差分取得の 1 ページ目は最小ページ、既知到達で止まらなければ 2 ページ目から残枠を要求上限に反映
     assert [c["max_results"] for c in calls_to(session, "/bookmarks")] == [5, 7]
     assert calls_to(session, "/liked_tweets") == []  # 残 0 < 5 で like は skip
     assert rows(conn, "like") == []
