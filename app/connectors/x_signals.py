@@ -395,8 +395,25 @@ def _link_bookmark_item(
         "UPDATE x_signals SET item_id = ? WHERE kind = 'bookmark' AND tweet_id = ?",
         (item_id, str(tweet["id"])),
     )
+    _reactivate_skipped_item(conn, item_id)
     if enqueue:
         enqueue_bookmark(conn, item_id)
+
+
+def _reactivate_skipped_item(conn: sqlite3.Connection, item_id: int) -> None:
+    """ブックマークに適用しない規則で skip 済みの合流先を new に戻す(GH#176)。
+
+    前日以前に stale / x_noise / daily_cap で skipped になった既存 item へ合流すると、
+    事前選別(new だけが対象)にも保存節(analyzed / digested だけが対象)にも載らない。
+    new に戻し、以後の事前選別でブックマークとして扱わせる(設計 02: ブックマークには
+    blocklist だけを適用する)。blocklist(明示 NG)による skip は戻さない。
+    """
+    conn.execute(
+        "UPDATE items SET status = 'new', skip_reason = NULL "
+        "WHERE id = ? AND status = 'skipped' "
+        "AND skip_reason IN ('stale', 'x_noise', 'daily_cap')",
+        (item_id,),
+    )
 
 
 def _itemize_bookmark(

@@ -228,7 +228,7 @@ INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 
 | status | 意味 | 遷移契機(書き手) |
 |---|---|---|
-| `new` | 収集直後。手動URL投入も `new` | collect / 受信デーモン(manual) |
+| `new` | 収集直後。手動URL投入も `new` | collect / 受信デーモン(manual)/ x_signals(ブックマークが合流した `skipped` の item を戻す。blocklist 以外の規則のときだけ。設計 02 §2・GH#176) |
 | `skipped` | 事前選別で除外。規則名は `skip_reason` に記録 | analyze Stage 1(設計 03 §2) |
 | `duplicate` | 24h 内容 dedup の子(§6)。以後の段の対象外 | collect(挿入直後) |
 | `analyzed` | LLM 分析済み(degraded 含む) | analyze Stage 2 |
