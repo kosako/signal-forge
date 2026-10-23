@@ -20,8 +20,11 @@ def test_help_lists_all_subcommands() -> None:
         assert command in result.output
 
 
-def test_doctor_accepts_documented_options(tmp_path) -> None:
+def test_doctor_accepts_documented_options(tmp_path, monkeypatch) -> None:
     # --purge/--cost が受理され、隔離した config_dir + 空 DB で完走する
+    from app import logs
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない(GH#207)
     (tmp_path / "config.toml").write_text(
         f'[storage]\ndb_path = "{tmp_path}/intel.db"\n', encoding="utf-8"
     )
@@ -31,6 +34,7 @@ def test_doctor_accepts_documented_options(tmp_path) -> None:
     assert result.exit_code == 0
     assert "purge 完了" in result.output
     assert "着地見込み" in result.output
+    assert (tmp_path / "logs" / "morning.log").exists()  # purge の記録は隔離先に書かれる
 
 
 def _answer_config(tmp_path, *, telegram: bool) -> None:
