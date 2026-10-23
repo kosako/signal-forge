@@ -99,10 +99,12 @@ FDA を付与する:
 
 ## 6. 配信時刻の変更(宿題 H5 の確定時)
 
-1. plist の `StartCalendarInterval`(Hour/Minute)を配信時刻の30分前に変更。
+1. 雛形 `ops/launchd/com.intel.morning.plist` の `StartCalendarInterval`(Hour/Minute)を配信時刻の30分前に変更。
+   `~/Library/LaunchAgents/` に配置済みの plist は直さない(手順 4 の §1 の再生成で雛形から上書きされ、元の時刻に戻る)。
+   雛形の時刻は `tests/test_ops.py`(`test_morning_plist_contract`)が固定し、設計 05 §1・本書 §3・README にも書いてあるので、同じ変更で合わせる。
 2. `sudo pmset repeat wakeorpoweron MTWRFSU <バッチ5分前>` を再設定。
 3. `config.toml` の `[telegram] watchdog_time` を配信時刻+15分に変更。
-4. §2 の bootout → §1 の再生成 → bootstrap で反映。
+4. §2 の bootout → §1 の再生成 → bootstrap で反映(poller も入れ直す。`watchdog_time` は poller が起動時に読むため)。
 
 ## 7. バックアップと復旧(設計 05 §5 / plan #23)
 
@@ -119,7 +121,10 @@ FDA を付与する:
 **復旧手順**(リハーサルを1回実施すること):
 
 ```sh
-# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)
+# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)。bootout で止まるのは launchd の
+#    2 ジョブだけ。poller が起動した `intel answer`(python -m app.cli answer)は別セッションで
+#    動くので、poller を止めても終わらずに残りうる(設計 05 §1.2)。手で起動した intel コマンドも
+#    止まらない。bootout の成否だけで止まったと扱わず、手順 3 で確かめる
 launchctl bootout "gui/$(id -u)/com.intel.morning" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/com.intel.poller" 2>/dev/null || true
 
@@ -134,7 +139,12 @@ chmod 600 "${HOME}/.config/intel/.env"
 #    その値、未設定なら既定の ~/.local/share/intel/intel.db
 DB_PATH="${HOME}/.local/share/intel/intel.db"   # ← [storage].db_path 設定時は書き換える
 
-# 3. 既存 DB 一式を退避してから配置する。WAL/SHM を残すと、復元した本体に
+# 3. DB を開いているプロセスが無いことを確かめる。一覧が出たら、終わるのを待つ(返事を
+#    作っている `intel answer` は LLM の待ちで数分以上かかることがある)か、手で開いたもの
+#    (sqlite3 など)なら閉じてから、もう一度実行する。何も出なくなってから次へ進む
+[ -f "${DB_PATH}" ] && lsof -- "${DB_PATH}"
+
+# 4. 既存 DB 一式を退避してから配置する。WAL/SHM を残すと、復元した本体に
 #    古い WAL が適用されて不整合になるため、必ず 3 ファイルまとめて扱う
 mkdir -p "${DB_PATH%/*}"
 for suffix in "" "-wal" "-shm"; do
@@ -142,7 +152,7 @@ for suffix in "" "-wal" "-shm"; do
 done
 mv "${RESTORE_DIR}/intel.db" "${DB_PATH}"
 
-# 4. 健全性確認 → 問題なければ launchd を再 bootstrap(§2)
+# 5. 健全性確認 → 問題なければ launchd を再 bootstrap(§2)
 uv run intel doctor
 ```
 
@@ -151,8 +161,17 @@ Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成
 ## 8. secrets ローテーション(設計 05 §6)
 
 - X: Developer Portal で再発行 → `.env` 差し替え → `intel doctor`
-- Telegram: BotFather で revoke → 再発行 → `.env` 差し替え → `intel doctor`
-  (allowlist は chat_id 不変なので変更不要)
+  (朝バッチは毎回 `.env` を読むので入れ直しは要らない)
+- Telegram: BotFather で revoke → 再発行 → `.env` 差し替え → `intel doctor` → poller を入れ直す
+  (allowlist は chat_id 不変なので変更不要)。poller は起動時に token を読んで持ち続けるので、
+  入れ直すまでは失効した token で再接続を繰り返し、受信・夜アンケート・watchdog が止まったままになる
+  (doctor は `.env` の新しい token で PASS するので、これでは気づけない)。朝バッチと `intel answer` は
+  毎回 `.env` を読むので入れ直しは要らない。
+  ```sh
+  launchctl bootout "gui/$(id -u)/com.intel.poller"
+  launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.poller.plist"
+  ```
+  確認: §5 の 2 と同じく、Telegram でボタン付きメッセージに反応し、`✓` が付くこと。
 
 ## 9. X OAuth 2.0 セットアップ(S1 = GH#58・設計 02 §2)
 
