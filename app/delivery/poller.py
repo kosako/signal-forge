@@ -39,7 +39,7 @@ from app.delivery.surveys import (
     run_due_timers,
     survey_deadline,
 )
-from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
+from app.delivery.telegram import DeliveryError, TelegramApi, escape_text, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.jst import JST
@@ -689,9 +689,24 @@ def _handle_dig_reply(
     for instruction in instructions:
         if instruction.action == "pass":
             lines.append(f"⏭️ {instruction.item_id} を深掘り対象から外しました")
-        elif instruction.angle:
+            continue
+        # 返信は parse_mode=HTML。観点は本人の自由文なので escape して埋め込む
+        # (設計 04 §1。キューには原文のまま記録する。GH#194)
+        if instruction.angle:
             lines.append(
-                f"🔍 {instruction.item_id} を登録しました(観点: {instruction.angle})"
+                f"🔍 {instruction.item_id} を登録しました"
+                f"(観点: {escape_text(instruction.angle)})"
+            )
+            continue
+        # 観点を省いた再指定は前回の観点を引き継ぐ(apply_instructions の COALESCE)。
+        # 入力ではなく反映後のキューの観点を出す(GH#228)
+        kept = conn.execute(
+            "SELECT angle FROM dig_queue WHERE item_id = ?", (instruction.item_id,)
+        ).fetchone()
+        if kept is not None and kept["angle"]:
+            lines.append(
+                f"🔍 {instruction.item_id} を登録しました"
+                f"(前回の観点を引き継ぎ: {escape_text(kept['angle'])})"
             )
         else:
             lines.append(f"🔍 {instruction.item_id} を登録しました(観点なし)")
