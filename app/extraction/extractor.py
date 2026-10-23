@@ -2,7 +2,8 @@
 
 - 対象: status='new' かつ documents 未生成の items(duplicate/skipped/error は対象外)
 - raw_payload の raw_content(RSS 全文フィード等)から十分な本文が取れれば HTTP を
-  節約する。取れないときのみ共通 HTTP クライアント(SSRF ガード付き)で取得
+  節約する。取れないときのみ共通 HTTP クライアント(SSRF ガード付き)で取得し、HTTP の
+  charset と HTML 内の meta の宣言を考慮して復号する(GH#187)
 - failed も documents 行を作って黙って脱落させない(タイトルのみの degraded 分析に
   回る。設計 00 §6)
 - expires_at は挿入時に確定: ソース別 TTL(RSS/manual 30日・X 7日。設計 01 §6)
@@ -10,10 +11,13 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
+import re
 import sqlite3
 
+import httpx
 import trafilatura
 
 from app.config import Config
@@ -22,6 +26,17 @@ from app.http import HttpClient
 
 # これ未満の抽出結果は partial(本文の体をなしていない可能性が高く、分析品質に注意が要る)
 MIN_OK_CHARS = 200
+
+# HTML 内の文字コード宣言(<meta charset="..."> と <meta http-equiv="Content-Type"
+# content="text/html; charset=...">)。宣言は <head> の冒頭に置かれるので先頭だけを探す
+_META_CHARSET_RE = re.compile(
+    rb"""<meta\s[^>]*?charset\s*=\s*["']?\s*([A-Za-z0-9._:-]+)""", re.IGNORECASE
+)
+_META_SCAN_BYTES = 4096
+# ラベルの読み替え(ブラウザが従う WHATWG Encoding に合わせる): Shift_JIS は Windows の拡張
+# (①・㈱ など)を含む cp932 として読む。x-sjis / x-euc-jp は Python の codecs が知らない古いラベル
+_LEGACY_LABELS = {"x-sjis": "cp932", "x-euc-jp": "euc_jp"}
+_CODEC_OVERRIDES = {"shift_jis": "cp932"}
 
 
 def extract_pending(
@@ -147,4 +162,41 @@ def _fetch_and_extract(http: HttpClient, url: str) -> tuple[str | None, str | No
         return None, f"{type(e).__name__}: {e}"
     if fetched.response.status_code != 200:
         return None, f"HTTP {fetched.response.status_code}"
-    return _extract_text(fetched.response.text), None
+    return _extract_text(_decode_html(fetched.response)), None
+
+
+def _decode_html(response: httpx.Response) -> str:
+    """本文のバイト列を、HTTP の charset と HTML 内の宣言を考慮して復号する(GH#187)。
+
+    response.text はヘッダに charset が無いと UTF-8 で復号するため、meta だけで Shift_JIS 等を
+    宣言したページが U+FFFD だらけになり、それでも長さで ok と判定されていた。
+    順序: HTTP の charset → (ヘッダに無ければ)正しい UTF-8 ならそのまま(従来と同じ結果。
+    宣言の誤りより確か)→ HTML 内の meta の宣言 → 従来どおり UTF-8(読めないバイトは置換)
+    """
+    content = response.content
+    codec = _codec(response.charset_encoding)
+    if codec is None:
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        match = _META_CHARSET_RE.search(content[:_META_SCAN_BYTES])
+        codec = _codec(match.group(1).decode("ascii")) if match else None
+        if codec is not None and codec.startswith(("utf-16", "utf-32")):
+            codec = None  # ASCII として読めた宣言が UTF-16/32 なのは誤り(WHATWG と同じく無視)
+    try:
+        return content.decode(codec or "utf-8", errors="replace")
+    except LookupError:  # テキスト用でない codec(rot13・base64 等)を宣言したページ
+        return content.decode("utf-8", errors="replace")
+
+
+def _codec(label: str | None) -> str | None:
+    """文字コードのラベルを復号に使う codec 名にする。ラベルが無い・未知なら None。"""
+    if not label:
+        return None
+    label = label.strip().lower()
+    try:
+        name = codecs.lookup(_LEGACY_LABELS.get(label, label)).name
+    except LookupError:
+        return None
+    return _CODEC_OVERRIDES.get(name, name)
