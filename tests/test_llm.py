@@ -215,6 +215,10 @@ def _group_gone(pgid: int) -> bool:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return True
+    except PermissionError:
+        # 止めた孫が回収を待つ間(ゾンビだけのグループ)は、macOS の killpg が signal 0 でも
+        # PermissionError を返す。まだ消えていないとして待ち続ける(Codex レビュー round 2)
+        return False
     return False
 
 
