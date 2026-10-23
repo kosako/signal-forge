@@ -20,6 +20,8 @@
   「打ち切り時も今回の最大 id へ進める」(古い側は追わない)
 - 予算: [x_signals].daily_read_cap(既定 0 = 無効)。読取 = 取得ツイート数で
   collect と同じ意味論。途中失敗でも取得済みページぶんは必ず予算・台帳に計上する。
+  差分取得の各 kind の 1 ページ目は最小ページにし、既知到達なら残りを次の kind に
+  残す(既知の読み直しで予算を使い切り like / self_rt が毎日 skip されない。GH#174)
   cold start は日次 run でなく intel x-signals --backfill の手動実行(課金操作は
   人間ゲート。ADR 0001)。backfill は「kind ごと直近 N 件を種に」の上限つき
   (全ページ辿りは過去のいいねが多いとコスト事故になる。GH#84)
@@ -194,6 +196,7 @@ def _collect_kind(
 
     打ち切り条件: (a) 既知 tweet_id に到達(backfill 時は無効)(b) 予算残 < 下限
     (c) next_token なし (d) rate limit 残 0(429 は待たない)。
+    差分取得(backfill でない)の 1 ページ目は最小ページで要求する(GH#174)。
     """
     url = API_BASE + KIND_ENDPOINTS[kind].format(me_id=me_id)
     # ブックマークは items にも登録する(GH#99)。帰属先 sources 行はページ処理前に確保
@@ -205,8 +208,16 @@ def _collect_kind(
         remaining = budget - stats["api_reads"]
         if remaining < X_SIGNALS_MIN_PAGE:
             break
+        page_size = min(PAGE_MAX, remaining)
+        if not backfill and next_token is None:
+            # 差分取得の 1 ページ目は最小ページにする(GH#174)。読取は既知の判定より先に
+            # ページ全件ぶん計上されるため、残予算の全量を要求すると、既知が上限以上
+            # 並ぶ日に読み直しだけで予算を使い切り後続 kind が毎日 skip される。
+            # 打ち切り条件(既知到達など)に当たらず次のページがあるときは、2 ページ目
+            # から残予算と PAGE_MAX の小さい方まで広げる
+            page_size = X_SIGNALS_MIN_PAGE
         params: dict[str, str | int] = {
-            "max_results": min(PAGE_MAX, remaining),
+            "max_results": page_size,
             "tweet.fields": TWEET_FIELDS,
             "expansions": EXPANSIONS,
         }

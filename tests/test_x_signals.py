@@ -55,7 +55,11 @@ def page(*tweets: dict, next_token: str | None = None, users=(), ref_tweets=()) 
 
 
 class FakeSession:
-    """URL 部分一致 → ページ列(dict = 200 body / int = ステータス)の順次応答。"""
+    """URL 部分一致 → ページ列(dict = 200 body / int = ステータス)の順次応答。
+
+    実 API と同じく、ページの data は max_results 件までに切り詰めて返す
+    (要求したページの大きさで読取数が決まることを再現する。GH#174)。
+    """
 
     def __init__(self, routes: dict[str, list]):
         self.routes = {key: list(pages) for key, pages in routes.items()}
@@ -70,6 +74,8 @@ class FakeSession:
                 item = pages.pop(0)
                 if isinstance(item, int):
                     return httpx.Response(item)
+                if params and "max_results" in params and "data" in item:
+                    item = {**item, "data": item["data"][: params["max_results"]]}
                 return httpx.Response(200, json=item)
         raise AssertionError(f"経路未定義の URL: {url}")
 
@@ -130,13 +136,40 @@ def test_diff_stops_at_known_tweet(conn, tmp_path) -> None:
 
 
 def test_cap_limits_reads_and_skips_later_kinds(conn, tmp_path) -> None:
+    # 新着が続く間はページを進め、強シグナル(bookmark)が先に予算を使う(GH#174)
     session = session_with(
-        [page(*[tw(f"b{i}") for i in range(10)], next_token="more")], [page(tw("l1"))]
+        [
+            page(*[tw(f"b{i:02d}") for i in range(5)], next_token="p2"),
+            page(*[tw(f"b{i:02d}") for i in range(5, 12)], next_token="more"),
+        ],
+        [page(tw("l1"))],
     )
-    totals = collect_x_signals(conn, make_config(tmp_path, cap=10), session, logger)
-    assert totals["api_reads"] == 10  # bookmark で予算を使い切る
-    assert calls_to(session, "/bookmarks")[0]["max_results"] == 10  # 残枠を要求上限に反映
-    assert rows(conn, "like") == []  # 残 0 < 5 で like は skip
+    totals = collect_x_signals(conn, make_config(tmp_path, cap=12), session, logger)
+    assert totals["api_reads"] == 12  # bookmark で予算を使い切る
+    # 差分取得の 1 ページ目は最小ページ、既知到達で止まらなければ 2 ページ目から残枠を要求上限に反映
+    assert [c["max_results"] for c in calls_to(session, "/bookmarks")] == [5, 7]
+    assert calls_to(session, "/liked_tweets") == []  # 残 0 < 5 で like は skip
+    assert rows(conn, "like") == []
+
+
+def test_known_bookmarks_leave_budget_for_later_kinds(conn, tmp_path) -> None:
+    # 既知のブックマークが上限以上あり新着が無い日も、既知の読み直しで予算を
+    # 使い切らず like / self_rt を取り込む(GH#174)
+    known = [tw(f"b{i:02d}") for i in range(20)]
+    for tweet in known:
+        conn.execute(
+            "INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', ?)", (tweet["id"],)
+        )
+    session = session_with(
+        [page(*known, next_token="older")], [page(tw("l1"))], [page(rt("1000", "900"))]
+    )
+    totals = collect_x_signals(conn, make_config(tmp_path, cap=15), session, logger)
+    # 1 ページ目は最小ページで、既知到達で次ページに行かない
+    assert [c["max_results"] for c in calls_to(session, "/bookmarks")] == [5]
+    assert calls_to(session, "/liked_tweets")[0]["max_results"] == 5
+    assert [r["tweet_id"] for r in rows(conn, "like")] == ["l1"]
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["900"]
+    assert totals == {"api_reads": 7, "new_signals": 2}  # bookmark 5 + like 1 + self_rt 1
 
 
 def test_partial_page_failure_still_counts_reads_and_cost(conn, tmp_path) -> None:
