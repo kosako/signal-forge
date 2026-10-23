@@ -72,7 +72,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 対象: SQLite 本体、`~/.config/intel/` の全体(config.toml・.env・関心プロファイル、X の OAuth 2.0 を使うなら `x-oauth2-token.json`)、`prompts/`(git 管理だが世代の一貫性のため同梱)。
 - 方式: 朝バッチ末尾で `sqlite3 ... ".backup"`(オンラインバックアップ API。ファイルコピーは WAL 破損リスクがあるため不可)→ 設定類と併せ tar.gz、`~/Backups/intel/` に **日次14世代**。
 - **secrets 拡散防止**: tar.gz は作成時に **umask/chmod 600 を強制**する(.env の X API キー・bot token・Anthropic キーと X の OAuth 2.0 token が同梱されるため、.env 本体の 600 と同水準を複製側にも要求)。`~/Backups/intel/` は **クラウド同期(iCloud 等)の対象外に置く**(Time Machine 込みの扱いはユーザー判断だが、同期経由の secrets 拡散を既定で作らない)。パーミッションは doctor #10 が検査。
-- 復旧手順: DB に書くプロセスを止める(launchd の 2 ジョブの bootout に加え、poller とは別セッションで動く `intel answer`(§1.2)と手で起動したコマンドが終わり、DB を開いているプロセスが無いことを確かめる)→ tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は SQLite のデータから書き出せる(ただし通常の `intel run` の export が書くのは当日分と、まだ反映していない感想のある分だけで、過去分を一括では書き直さない)が、DeepDive ノート(公開した後は本文を DB に残さない。設計 01 §7)と、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する。
+- 復旧手順: DB に書くプロセスを止める(bootout の成否だけで止まったと扱わず、launchd の 2 ジョブが外れたこと、poller とは別セッションで動く `intel answer`(§1.2)と手で起動したコマンドが終わったこと、DB を開いているプロセスが無いことを確かめてから先へ進む)→ tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は SQLite のデータから書き出せる(ただし通常の `intel run` の export が書くのは当日分と、まだ反映していない感想のある分だけで、過去分を一括では書き直さない)が、DeepDive ノート(公開した後は本文を DB に残さない。設計 01 §7)と、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する。
 - リモート退避(Time Machine 外のクラウド等)は拡張点に留める。
 
 ## 6. secrets 保管

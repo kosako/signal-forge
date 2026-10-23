@@ -121,12 +121,19 @@ FDA を付与する:
 **復旧手順**(リハーサルを1回実施すること):
 
 ```sh
-# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)。bootout で止まるのは launchd の
-#    2 ジョブだけ。poller が起動した `intel answer`(python -m app.cli answer)は別セッションで
-#    動くので、poller を止めても終わらずに残りうる(設計 05 §1.2)。手で起動した intel コマンドも
-#    止まらない。bootout の成否だけで止まったと扱わず、手順 3 で確かめる
+# 0. 書き込みプロセスを止める(復旧中の DB 書込を防ぐ)。bootout の成否だけで止まったと扱わず、
+#    下の (a)(b) で何も出なくなるまで先へ進まない
 launchctl bootout "gui/$(id -u)/com.intel.morning" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/com.intel.poller" 2>/dev/null || true
+#    (a) 2 ジョブが外れたこと。出たら bootout をやり直す(poller が残ると KeepAlive で起動し直す)
+for job in com.intel.morning com.intel.poller; do
+  launchctl print "gui/$(id -u)/${job}" >/dev/null 2>&1 && echo "${job} がまだロードされている"
+done
+#    (b) intel のプロセスが残っていないこと。poller が起動した `intel answer`(python -m app.cli answer)は
+#    別セッションで動くので、poller を止めても終わらずに残りうる(設計 05 §1.2)。手で起動した intel
+#    コマンドも bootout では止まらない。一覧が出たら終わるのを待ち(返事を作っている answer は LLM の
+#    待ちで数分以上かかることがある)、もう一度実行する
+pgrep -fl 'app\.cli|/intel '
 
 RESTORE_DIR="$(mktemp -d)"
 tar -xzf "${HOME}/Backups/intel/intel-<日付>.tar.gz" -C "${RESTORE_DIR}"
@@ -139,9 +146,8 @@ chmod 600 "${HOME}/.config/intel/.env"
 #    その値、未設定なら既定の ~/.local/share/intel/intel.db
 DB_PATH="${HOME}/.local/share/intel/intel.db"   # ← [storage].db_path 設定時は書き換える
 
-# 3. DB を開いているプロセスが無いことを確かめる。一覧が出たら、終わるのを待つ(返事を
-#    作っている `intel answer` は LLM の待ちで数分以上かかることがある)か、手で開いたもの
-#    (sqlite3 など)なら閉じてから、もう一度実行する。何も出なくなってから次へ進む
+# 3. 補助の確認: DB を開いているプロセスが無いこと(手順 0 の (b) に出ない sqlite3 なども含む)。
+#    一覧が出たら閉じるか終わるのを待ってから、もう一度実行する。何も出なくなってから次へ進む
 [ -f "${DB_PATH}" ] && lsof -- "${DB_PATH}"
 
 # 4. 既存 DB 一式を退避してから配置する。WAL/SHM を残すと、復元した本体に
