@@ -171,9 +171,12 @@ def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path) -> Non
     assert conn.execute("SELECT item_count FROM digests").fetchone()["item_count"] == 0
 
 
-def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(conn, tmp_path) -> None:
+def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(
+    conn, tmp_path, monkeypatch
+) -> None:
     # transient 由来の全滅(FullDegradationError)も analyze 段の失敗になるが、
     # degraded 行は書き込み済みで digest は劣化配信のまま完走する(GH#74 案2の二重ガード)
+    from app import run as run_module
     from app.analysis.llm import LLMError
 
     class AlwaysFailEngine:
@@ -182,6 +185,20 @@ def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(conn, tm
 
         def complete_structured(self, prompt, schema, timeout_s=120):
             raise LLMError("常に失敗")
+
+    # 全滅の判定は当日(JST)に分析された候補を見る(GH#175)。analyze 段は分析の時刻を既定の
+    # 「今」で書くので、digest 段の直前に当日の時刻へ置き換え、当日も固定する(段の間で JST の
+    # 0 時をまたいでも食い違わないように)
+    today = "2026-07-06"
+    monkeypatch.setattr("app.digest.builder.today_jst", lambda: today)
+    monkeypatch.setattr(run_module, "today_jst", lambda: today)  # 生成済みの確認・export の当日
+    generate_digest = run_module.generate_digest
+
+    def generate_digest_analyzed_today(db, *args, **kwargs):
+        db.execute("UPDATE analyses SET analyzed_at = '2026-07-06T00:00:00Z'")  # today の JST 9:00
+        return generate_digest(db, *args, **kwargs)
+
+    monkeypatch.setattr(run_module, "generate_digest", generate_digest_analyzed_today)
 
     failures = run_pipeline(
         conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
