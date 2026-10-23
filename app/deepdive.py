@@ -98,10 +98,9 @@ _REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
 _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 
-# 本文の言語の判定(GH#173): 文字のうちかな(ひらがな・カタカナ)がこの割合以上なら日本語。
-# かなは日本語にしか無いので、漢字だけの中国語は日本語にならない。英語の記事に日本語の語句が
-# 少し混ざっても、英単語やコードの多い日本語の記事でも揺れないよう低めにとる
-_JA_KANA_MIN_RATIO = 0.05
+# 本文の言語の判定(GH#173): 日本語の文字(かな・漢字)のうち、かながこの割合に満たなければ
+# 日本語にしない(かなは日本語にしか無い。漢字だけの中国語を外す)
+_JA_KANA_MIN_SHARE = 0.2
 
 
 class DigError(Exception):
@@ -1070,9 +1069,39 @@ def _is_japanese_source(candidate: DigCandidate) -> bool:
 
 
 def _looks_japanese(text: str) -> bool:
-    letters = [ch for ch in text if ch.isalpha()]
-    if not letters:
+    """本文が日本語か。日本語の語の数が、それ以外の語の数以上なら日本語とする。
+
+    語 = 同じ文字種の文字の連なり(ひらがな・カタカナ・漢字は文字種ごとに区切る。それ以外は
+    英単語やコードの識別子)。文字の数で比べないのは、日本語は 1 字あたりの情報が多く、英単語や
+    コードの多い日本語の記事を取りこぼすため。語の数なら、日本語の文を引用する英語の記事も
+    (引用の語は少ないので)日本語にならない。英語の記事を日本語と誤ると対訳が無くなるので、
+    コードが本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
+    """
+    kana_chars = ja_chars = ja_words = other_words = 0
+    previous: str | None = None
+    for ch in text:
+        script = _char_script(ch) if ch.isalpha() else None
+        if script is not None and script != previous:
+            if script == "other":
+                other_words += 1
+            else:
+                ja_words += 1
+        if script in ("hiragana", "katakana"):
+            kana_chars += 1
+        if script in ("hiragana", "katakana", "kanji"):
+            ja_chars += 1
+        previous = script
+    if kana_chars == 0 or kana_chars < ja_chars * _JA_KANA_MIN_SHARE:
         return False
-    # ひらがな・カタカナ(U+3040〜U+30FF)と半角カタカナ(U+FF66〜U+FF9D)
-    kana = sum(1 for ch in letters if "\u3040" <= ch <= "\u30ff" or "\uff66" <= ch <= "\uff9d")
-    return kana / len(letters) >= _JA_KANA_MIN_RATIO
+    return ja_words >= other_words
+
+
+def _char_script(ch: str) -> str:
+    code = ord(ch)
+    if 0x3040 <= code <= 0x309F:
+        return "hiragana"
+    if 0x30A0 <= code <= 0x30FF or 0xFF66 <= code <= 0xFF9F:  # 全角・半角のカタカナ
+        return "katakana"
+    if code == 0x3005 or 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:  # 々・漢字
+        return "kanji"
+    return "other"

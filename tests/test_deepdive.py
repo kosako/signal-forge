@@ -365,12 +365,32 @@ JA_ARTICLE = "エージェントの権限は最小にして、書き込み先を
 EN_ARTICLE = "Agents should run with the least privilege and a single write target. " * 10
 # 中国語: かなの無い漢字だけの文
 ZH_ARTICLE = "代理应当以最小权限运行,并且只写入一个位置。这是本文的主要观点。" * 10
+# 日本語の文を引用する英語の記事(引用のかなは文字の 1 割ほど。Codex のレビューの例)
+EN_QUOTING_JA = (
+    "This guide explains how to evaluate multilingual assistants. Use the prompt "
+    "「このコードのバグをみつけてください」 as a Japanese test case. Keep the task, model, "
+    "and settings fixed, then compare accuracy and latency across runs. "
+) * 2
+# 英単語とコードの多い日本語の記事
+JA_WITH_CODE = (
+    "Claude Code の hooks を使うと、ツールを実行する前に command を検査できます。"
+    "ここでは PreToolUse の hook で git push だけを止める設定を、実際に動かしながら説明します。\n\n"
+    "import json, sys\npayload = json.load(sys.stdin)\n"
+    "if payload['tool_input']['command'].startswith('git push'):\n    sys.exit(2)\n\n"
+    "スクリプトは標準入力から JSON を受け取り、止めるときは終了コード 2 を返します。"
+    "標準エラーに書いた文はそのまま Claude に返るので、止めた理由を書いておきます。"
+)
 
 
 @pytest.mark.parametrize(
     ("article", "kind", "translated"),
-    [(JA_ARTICLE, "原文", False), (EN_ARTICLE, "対訳", True), (ZH_ARTICLE, "対訳", True)],
-    ids=["ja", "en", "zh"],
+    [
+        (JA_ARTICLE, "原文", False),
+        (EN_ARTICLE, "対訳", True),
+        (ZH_ARTICLE, "対訳", True),
+        (EN_QUOTING_JA, "対訳", True),
+    ],
+    ids=["ja", "en", "zh", "en-quoting-ja"],
 )
 def test_extracted_article_language_picks_source_note(
     conn, config, article, kind, translated
@@ -414,13 +434,16 @@ def test_extracted_article_language_picks_source_note(
     ("text", "expected"),
     [
         (JA_ARTICLE, True),
-        # 英単語の多い日本語の文も日本語
+        # 英単語の多い日本語の文・コードの混ざる日本語の記事も日本語
         ("Claude Code の hooks で PreToolUse を使い、Bash の command を検査する方法です。", True),
-        # 日本語の語句を少しだけ引く英語の記事は日本語にしない
+        (JA_WITH_CODE, True),
+        # 日本語の文や語句を引く英語の記事は日本語にしない
+        (EN_QUOTING_JA, False),
         (EN_ARTICLE + "The phrase いただきます is quoted once.", False),
         (ZH_ARTICLE, False),
         ("2026-10-23 12:00", False),  # 文字が無い
     ],
+    ids=["ja", "ja-terms", "ja-with-code", "en-quoting-ja", "en-phrase", "zh", "no-letters"],
 )
 def test_looks_japanese(text, expected) -> None:
     assert _looks_japanese(text) is expected
