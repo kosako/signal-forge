@@ -377,7 +377,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
 - `trend_markdown`(migration 003。GH#75)= その日の「今日のトレンド」節のプレーンテキスト。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。
-- `delivery_status` で watchdog(digest 未生成・未送検知)が判定する。`status='degraded'` は LLM 全滅時のタイトルのみ配信。
+- `delivery_status` で watchdog(digest 未生成・未送検知)が判定する。`status='degraded'` は LLM 全滅時(当日に分析された候補の最新の分析がすべて degraded。GH#175)のタイトルのみ配信。
 
 ## 9. コスト記録
 

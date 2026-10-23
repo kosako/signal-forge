@@ -8,6 +8,7 @@ import pytest
 from app.config import Config, DigestConfig
 from app.db import apply_migrations, connect
 from app.digest import generate_digest
+from app.jst import jst_day_bounds_utc, today_jst
 from tests.test_ranking import add_analyzed
 
 logger = logging.getLogger("test-digest")
@@ -172,16 +173,17 @@ def test_degraded_judgement_ignores_bookmark_items(conn, tmp_path) -> None:
 
 
 def test_degraded_judgement_uses_latest_analysis(conn, tmp_path) -> None:
-    # 全滅の判定はランキングと同じく最新の分析で行う(候補の条件は 1 か所。GH#112)
+    # 全滅の判定はランキングと同じく最新の分析で行う(候補の条件は 1 か所。GH#112)。
+    # 古い分析も当日の時刻にする(当日に分析された候補だけを見る判定で外れないように。GH#175)
     item = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
-    conn.execute("UPDATE analyses SET analyzed_at = '2026-01-01T00:00:00Z' WHERE item_id = ?",
-                 (item,))
+    day_start, _ = jst_day_bounds_utc(today_jst())
+    set_analyzed_at(conn, item, day_start)
     conn.execute(
         "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
         "negative_labels, recommendation_reason, implication, degraded, engine, model, "
-        "prompt_version, input_hash, analyzed_at) "
+        "prompt_version, input_hash) "  # analyzed_at は既定(今)= 古い分析より後
         "VALUES (?, '要約', '課題直結', 90, 'new', '[]', '理由', '示唆', 0, 'codex-cli', 'm', "
-        "'analyze-v001', 'sha256:re', '2026-01-02T00:00:00Z')",
+        "'analyze-v001', 'sha256:re')",
         (item,),
     )
 
@@ -189,6 +191,59 @@ def test_degraded_judgement_uses_latest_analysis(conn, tmp_path) -> None:
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert row["status"] == "ok"  # 古い degraded の分析で全滅と判定しない
     assert json.loads(row["item_ids"]) == [item]
+
+
+def set_analyzed_at(conn, item_id: int, analyzed_at: str) -> None:
+    conn.execute("UPDATE analyses SET analyzed_at = ? WHERE item_id = ?", (analyzed_at, item_id))
+
+
+PAST = "2026-01-01T00:00:00Z"  # 当日より前の分析時刻(選外で analyzed のまま残った過去の記事)
+
+
+def test_all_degraded_today_ignores_past_leftovers(conn, tmp_path) -> None:
+    # 閾値に届かず analyzed のまま残った過去の記事(非 degraded も)があっても、当日の分析が
+    # 全滅なら当日の分だけでタイトルのみの劣化配信にする(GH#175。設計 00 §6)
+    past_ok = add_analyzed(conn, "https://a/past-ok", relevance=10)  # 非 degraded・選外
+    past_degraded = add_analyzed(conn, "https://a/past-degraded", relevance=0, degraded=1)
+    set_analyzed_at(conn, past_ok, PAST)
+    set_analyzed_at(conn, past_degraded, PAST)
+    a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+    b = add_analyzed(conn, "https://a/2", relevance=0, degraded=1)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "degraded"
+    assert json.loads(row["item_ids"]) == [a, b]  # 当日の分だけ(過去の記事は載せない)
+    assert "推薦理由" not in row["markdown"]  # タイトルのみ
+    # 過去の記事は候補(analyzed)のまま残す(通常のランキングの日の扱いを変えない)
+    statuses = {r["id"]: r["status"] for r in conn.execute("SELECT id, status FROM items")}
+    assert statuses[past_ok] == statuses[past_degraded] == "analyzed"
+
+
+def test_no_analysis_today_is_not_full_degradation(conn, tmp_path) -> None:
+    # 当日に分析が無い朝は全滅ではない。過去に残った degraded の記事だけで劣化配信
+    # (「LLM 分析が失敗した」の表示)にせず、通常のランキングに任せる(GH#175)
+    past = add_analyzed(conn, "https://a/past", relevance=0, degraded=1)
+    set_analyzed_at(conn, past, PAST)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "ok"
+    assert row["item_count"] == 0  # min_score 未満は載せない(通常のランキング)
+    assert conn.execute("SELECT status FROM items").fetchone()["status"] == "analyzed"
+
+
+def test_partial_degradation_today_ranks_past_candidates_too(conn, tmp_path) -> None:
+    # 当日が全滅でなければ従来どおり、過去の候補も含めて通常のランキング(GH#175 で変えない)
+    past = add_analyzed(conn, "https://a/past", relevance=90)
+    set_analyzed_at(conn, past, PAST)
+    add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+    ok = add_analyzed(conn, "https://a/2", relevance=80)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "ok"
+    assert json.loads(row["item_ids"]) == [past, ok]
 
 
 def link_bookmark(conn, item_id: int, tweet_id: str, observed_at: str) -> None:
