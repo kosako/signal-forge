@@ -72,7 +72,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 対象: SQLite 本体、`~/.config/intel/` の全体(config.toml・.env・関心プロファイル、X の OAuth 2.0 を使うなら `x-oauth2-token.json`)、`prompts/`(git 管理だが世代の一貫性のため同梱)。
 - 方式: 朝バッチ末尾で `sqlite3 ... ".backup"`(オンラインバックアップ API。ファイルコピーは WAL 破損リスクがあるため不可)→ 設定類と併せ tar.gz、`~/Backups/intel/` に **日次14世代**。
 - **secrets 拡散防止**: tar.gz は作成時に **umask/chmod 600 を強制**する(.env の X API キー・bot token・Anthropic キーと X の OAuth 2.0 token が同梱されるため、.env 本体の 600 と同水準を複製側にも要求)。`~/Backups/intel/` は **クラウド同期(iCloud 等)の対象外に置く**(Time Machine 込みの扱いはユーザー判断だが、同期経由の secrets 拡散を既定で作らない)。パーミッションは doctor #10 が検査。
-- 復旧手順: tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は SQLite のデータから書き出せる(ただし通常の `intel run` の export が書くのは当日分と、まだ反映していない感想のある分だけで、過去分を一括では書き直さない)が、DeepDive ノート(公開した後は本文を DB に残さない。設計 01 §7)と、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する。
+- 復旧手順: DB に書くプロセスを止める(bootout の成否だけで止まったと扱わず、launchd の 2 ジョブが外れたこと、poller とは別セッションで動く `intel answer`(§1.2)と手で起動したコマンドが終わったこと、DB を開いているプロセスが無いことを確かめてから先へ進む)→ tar 展開→ `.backup` ファイルを DB パスへ配置→ `intel doctor`。Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成部分は SQLite のデータから書き出せる(ただし通常の `intel run` の export が書くのは当日分と、まだ反映していない感想のある分だけで、過去分を一括では書き直さない)が、DeepDive ノート(公開した後は本文を DB に残さない。設計 01 §7)と、ノートに足した手書きのメモ・take は vault にしか無いので、vault は別に保全する。
 - リモート退避(Time Machine 外のクラウド等)は拡張点に留める。
 
 ## 6. secrets 保管
@@ -80,7 +80,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 置き場: `~/.config/intel/.env`(chmod 600、リポジトリ外)。キー: X API・Telegram bot token・Anthropic API キー(`INTEL_ANTHROPIC_API_KEY`。深掘りノートのレビュー用。GH#153)・(confidential client のみ・任意)`X_OAUTH2_CLIENT_SECRET`。Keychain 対応は拡張点(security CLI 呼び出しの抽象は config.py に閉じる)。
 - X OAuth2 token(S1): `~/.config/intel/x-oauth2-token.json`(chmod 600)。`intel x-auth` が生成し、refresh のローテーションで自動更新される(手編集しない)。無効化は X 側のアプリ連携解除 + ファイル削除。
 - **Anthropic キーは .env にのみ置き、シェル環境・launchd 環境に export しない**。AnthropicApiEngine だけが .env から直接読む。キー名を `ANTHROPIC_API_KEY` にしないのは、環境に載ったときに claude -p が無自覚に API 課金へ回るのを防ぐため(doctor #12 が環境の `ANTHROPIC_API_KEY` を WARN にする)。
-- ローテーション手順(runbook): X = ポータルで再発行→.env 差し替え→doctor。Telegram = BotFather revoke→再発行→.env 差し替え→doctor(allowlist は chat_id 不変なので変更不要)。
+- ローテーション手順(runbook): X = ポータルで再発行→.env 差し替え→doctor。Telegram = BotFather revoke→再発行→.env 差し替え→doctor→poller の入れ直し(allowlist は chat_id 不変なので変更不要。poller は起動時に token を読んで持ち続けるので、入れ直さないと失効した token で再接続を繰り返し、受信・夜アンケート・watchdog が止まる。朝バッチと `intel answer` は毎回 `.env` を読む)。
 
 ## 7. 月次コストレポート
 
