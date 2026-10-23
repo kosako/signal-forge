@@ -60,7 +60,7 @@
 
 ### 5.1 解説ノート(`kind: deepdive`)
 
-- 置き場所: `SignalForge/DeepDive/`、ファイル名は Items 準拠の `YYYYMMDD-<item_id>-<slug>-深掘り.md`(日付は調査した日)。
+- 置き場所: `SignalForge/DeepDive/`、ファイル名は Items 準拠の `YYYYMMDD-<item_id>-<slug>-深掘り.md`(日付は調査した日)。slug の作り方は Items と同じ(設計 04 §7)だが、原文タイトルが無い(X の投稿など)ときは分析の日本語の見出し(`analyses.title_ja`)から作り、どちらも無ければ `untitled`(GH#167)。Items と違ってノート名は台帳(`dig_results.note_name`)に残して引くので、規則を変えても既存のノートとの対応は崩れない。§5.2 の原文・対訳ノートも同じ slug を使う。
 - frontmatter: `id` / `kind` / `title` / `url` / `author` / `published` / `requested`(観点 or 「観点指定なし: 自動キュー」)/ `auto_brief` / `status`(作成時は `take待ち`。`take済` への書き換えは本人に任せる。take の記録の正本は台帳。§6)/ `related` / `previous`(同じ記事の前回の解説ノート。調べ直しのときだけ。§6・GH#137)/ `review`(別系統の AI のレビューの結果。§4 のレビューを使うときだけ。`clean` / `revised` / `revise_failed` / `failed` / `skipped`。GH#153)。
 - 節構成(順序も含めデモで確定):
   1. **概要(2 方面)**: 「あなたにとって」(観点への答えの核心 + 自分の文脈への具体的含意)と「世の中にとって」(なぜ話題か・何が新しいか)。アウトカムベースで書く(キーワード羅列にしない)。

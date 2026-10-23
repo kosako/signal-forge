@@ -355,6 +355,39 @@ def test_dig_www_tweet_url_is_also_tweet_body(conn, config) -> None:
     ] is None
 
 
+@pytest.mark.parametrize(
+    ("title", "title_ja", "slug"),
+    [
+        ("Sample Article Title", "日本語の見出し", "Sample-Article-Title"),  # 原文タイトルが先
+        (None, "MCP サーバの権限 / 設計", "MCP-サーバの権限-設計"),  # X の投稿など(GH#167)
+        ("???", "見出し", "見出し"),  # 禁止文字だけのタイトルは空になるので次へ
+        (None, "あ" * 50, "あ" * 40),
+        (None, None, "untitled"),
+    ],
+)
+def test_note_name_slug_falls_back_to_title_ja(conn, config, title, title_ja, slug) -> None:
+    item = add_item(conn, "https://ja.example/post", title=title, language="ja")
+    if title_ja is not None:
+        conn.execute(
+            "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score,"
+            " novelty, recommendation_reason, implication, engine, model, prompt_version,"
+            " input_hash) VALUES (?, ?, '要約', '課題直結', 80, 'new', '理由', '示唆',"
+            " 'codex-cli', 'm', 'analyze-v001', 'sha256:a')",
+            (item, title_ja),
+        )
+    enqueue(conn, item)
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+
+    notes = sorted(p.name for p in deepdive_dir(config).glob("*.md"))
+    assert notes == sorted(
+        [f"20260722-{item}-{slug}-深掘り.md", f"20260722-{item}-原文-{slug}.md"]
+    )
+    row = conn.execute("SELECT note_name, source_note_name FROM dig_results").fetchone()
+    assert row["note_name"] == f"20260722-{item}-{slug}-深掘り"
+    assert row["source_note_name"] == f"20260722-{item}-原文-{slug}"
+
+
 def test_unpublished_note_published_from_ledger_without_llm(conn, config) -> None:
     # 生成記帳→公開の間で中断 → 次回 run は台帳の本文から書き出す(LLM 再呼び出しなし)
     item = add_item(conn, "https://blog.example/post")

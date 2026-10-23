@@ -338,7 +338,7 @@ def _dig_one(
     生成元が食い違わない。Codex P2)。
     """
     date_prefix = day.replace("-", "")
-    slug = FORBIDDEN_IN_SLUG.sub("-", candidate.title or "untitled").strip("-")[:40]
+    slug = _note_slug(candidate)
     note_name = f"{date_prefix}-{candidate.item_id}-{slug}-深掘り"
 
     # 原文/対訳ノート: ツイート本文のみのアイテムは作らない(X 本文非保持 = GH#2。
@@ -1033,6 +1033,16 @@ def _card_text(
         f"{note_line}\n"
         f"{guide}"
     )
+
+
+def _note_slug(candidate: DigCandidate) -> str:
+    # 原文タイトルの無い item(X の投稿)は、分析の日本語の見出しから名前を付ける(GH#167)。
+    # ノート名は台帳(dig_results.note_name)に残して引くので、既存のノートとの対応は崩れない
+    for text in (candidate.title, candidate.title_ja):
+        slug = FORBIDDEN_IN_SLUG.sub("-", text or "").strip("-")[:40]
+        if slug:
+            return slug
+    return "untitled"
 
 
 def _is_tweet_url(url: str) -> bool:
