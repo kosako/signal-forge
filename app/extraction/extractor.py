@@ -27,16 +27,22 @@ from app.http import HttpClient
 # これ未満の抽出結果は partial(本文の体をなしていない可能性が高く、分析品質に注意が要る)
 MIN_OK_CHARS = 200
 
-# HTML 内の文字コード宣言。宣言は <head> の冒頭に置かれるので先頭だけを探し、WHATWG の
-# prescan と同じく、コメントの中は見ずに <meta> の charset 属性か、http-equiv="Content-Type"
-# の content 属性の charset= だけを使う(別の属性の値に含まれる charset= は使わない)
+# HTML 内の文字コード宣言。宣言は <head> の冒頭に置かれるので先頭だけを、WHATWG の prescan と
+# 同じく先頭から順に、コメント・タグ(引用符の中の値は値として読み飛ばす)・<! や <? の区切りに
+# 分けて読む。<meta> の charset 属性か、http-equiv="Content-Type" の content 属性の charset=
+# だけを使う(コメントの中・別の属性の値に含まれる宣言は使わない)
 _META_SCAN_BYTES = 4096
-_COMMENT_RE = re.compile(rb"<!--.*?(?:-->|\Z)", re.DOTALL)
-_META_TAG_RE = re.compile(rb"""<meta[\s/]((?:[^>"']|"[^"]*"|'[^']*')*)""", re.IGNORECASE)
+_PRESCAN_RE = re.compile(
+    rb"""<!--.*?(?:-->|\Z)"""
+    rb"""|<(/?)([A-Za-z][^\s/>]*)((?:[^>"']|"[^"]*"|'[^']*')*)>?"""
+    rb"""|<[!/?][^>]*>?""",
+    re.DOTALL,
+)
 _ATTR_RE = re.compile(rb"""([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*)))?""")
 _CONTENT_CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([^\s"';]+)""", re.IGNORECASE)
-# 宣言は ASCII で書かれている。これを同じ文字として読めない codec(UTF-16/32・EBCDIC など)の
-# 宣言は誤り(WHATWG が meta の UTF-16 の宣言を UTF-8 として扱うのと同じ考え)
+# 宣言は ASCII で書かれている。これを同じ文字として読めない codec(UTF-16/32・EBCDIC など)や
+# 置換つきで復号できない codec(idna など)の宣言は誤りとして、次の宣言を見る(WHATWG が meta
+# の UTF-16 の宣言を UTF-8 として扱うのと同じ考え)
 _ASCII_PROBE = b'<meta charset="">'
 # ラベルの読み替え(ブラウザが従う WHATWG Encoding に合わせる): Shift_JIS は Windows の拡張
 # (①・㈱ など)を含む cp932 として読む。x-sjis / x-euc-jp は Python の codecs が知らない古いラベル
@@ -189,17 +195,18 @@ def _decode_html(response: httpx.Response) -> str:
             except UnicodeDecodeError:
                 pass
         codec = _meta_codec(content[:_META_SCAN_BYTES])
-        if codec is not None and _decode(_ASCII_PROBE, codec) != _ASCII_PROBE.decode("ascii"):
-            codec = None  # 宣言そのものを読めない codec(UTF-16 等)の宣言は誤り
     decoded = _decode(content, codec) if codec is not None else None
     return decoded if decoded is not None else content.decode("utf-8", errors="replace")
 
 
 def _meta_codec(head: bytes) -> str | None:
-    """HTML の先頭にある、使えるラベルの最初の文字コード宣言の codec 名。無ければ None。"""
-    for tag in _META_TAG_RE.finditer(_COMMENT_RE.sub(b"", head)):
+    """HTML の先頭にある、使える最初の文字コード宣言の codec 名。無ければ None。"""
+    for token in _PRESCAN_RE.finditer(head):
+        end_tag, name, attr_text = token.groups()
+        if name is None or end_tag or name.lower() != b"meta":
+            continue
         attrs: dict[bytes, bytes] = {}
-        for attr in _ATTR_RE.finditer(tag.group(1)):
+        for attr in _ATTR_RE.finditer(attr_text):
             value = attr.group(2) or attr.group(3) or attr.group(4) or b""
             attrs.setdefault(attr.group(1).lower(), value)  # 同じ名前は最初を使う(WHATWG と同じ)
         label = attrs.get(b"charset")
@@ -207,7 +214,7 @@ def _meta_codec(head: bytes) -> str | None:
             match = _CONTENT_CHARSET_RE.search(attrs.get(b"content", b""))
             label = match.group(1) if match else None
         codec = _codec(label.decode("latin-1")) if label else None
-        if codec is not None:
+        if codec is not None and _decode(_ASCII_PROBE, codec) == _ASCII_PROBE.decode("ascii"):
             return codec
     return None
 

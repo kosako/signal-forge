@@ -218,7 +218,7 @@ def fetch_text(conn, tmp_path, content: bytes, content_type: str) -> str:
         # 全バイトが ASCII の範囲になる文字コード(UTF-8 としても正しく読めてしまう)
         ('<meta charset="ISO-2022-JP">', "iso2022_jp", LONG_BODY),
         # コメントの中の宣言・別の属性の値の charset=・使えないラベルは使わず、次の宣言を使う
-        ('<!-- <meta charset="UTF-8"> --><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        ('<!-- a > b <meta charset="UTF-8"> --><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
         (
             '<meta name="description" content="charset=utf-8" data-charset="utf-8">'
             '<meta charset="Shift_JIS">',
@@ -226,6 +226,15 @@ def fetch_text(conn, tmp_path, content: bytes, content_type: str) -> str:
             SJIS_BODY,
         ),
         ('<meta charset="no-such-charset"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        ('<meta charset="idna"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        ('<meta charset="utf-16"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        # 属性の値の中の "<!--" や "<meta ...>" はコメントやタグではない
+        ('<meta name="description" content="<!--"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        (
+            """<link title='a > <meta charset="utf-8">'><meta charset="Shift_JIS">""",
+            "cp932",
+            SJIS_BODY,
+        ),
     ],
     ids=[
         "meta-charset-sjis",
@@ -236,6 +245,10 @@ def fetch_text(conn, tmp_path, content: bytes, content_type: str) -> str:
         "commented-out-meta",
         "other-attributes",
         "unknown-label-then-sjis",
+        "idna-then-sjis",
+        "utf16-then-sjis",
+        "comment-start-in-attribute",
+        "meta-in-attribute",
     ],
 )
 def test_meta_declared_charset_used_without_header_charset(
