@@ -234,13 +234,17 @@ def test_concurrent_apply_runs_each_migration_once(
 
     first = threading.Thread(target=run, name="first", daemon=True)
     second = threading.Thread(target=run, name="second", daemon=True)
-    first.start()
-    assert first_paused.wait(_HANG_GUARD_SECONDS)
-    second.start()
-    assert second_arrived.wait(_HANG_GUARD_SECONDS)
-    resume_first.set()
-    first.join(_HANG_GUARD_SECONDS)
-    second.join(_HANG_GUARD_SECONDS)
+    try:
+        first.start()
+        assert first_paused.wait(_HANG_GUARD_SECONDS)
+        second.start()
+        assert second_arrived.wait(_HANG_GUARD_SECONDS)
+    finally:
+        # 途中の assert で抜けても先の方を止めたままにせず、起動したスレッドの終わりを待つ
+        resume_first.set()
+        for thread in (first, second):
+            if thread.ident is not None:  # 起動前のスレッドは join できない
+                thread.join(_HANG_GUARD_SECONDS)
     assert not first.is_alive() and not second.is_alive()
 
     all_files = [m.filename for m in discover_migrations(MIGRATIONS_DIR)]
