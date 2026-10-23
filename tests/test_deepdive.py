@@ -379,6 +379,8 @@ EN_QUOTING_LONG_JA = (
     " as a Japanese test case. Keep the task, model, and settings fixed, then compare accuracy "
     "and latency across runs."
 )
+# 同じ引用を英語の二重引用符で囲んだもの(Codex の R3 の例)
+EN_DQUOTING_LONG_JA = EN_QUOTING_LONG_JA.replace("「", '"').replace("」", '"')
 # 英単語とコードの多い日本語の記事
 JA_WITH_CODE = (
     "Claude Code の hooks を使うと、ツールを実行する前に command を検査できます。"
@@ -398,8 +400,9 @@ JA_WITH_CODE = (
         (ZH_ARTICLE, "対訳", True),
         (EN_QUOTING_JA, "対訳", True),
         (EN_QUOTING_LONG_JA, "対訳", True),
+        (EN_DQUOTING_LONG_JA, "対訳", True),
     ],
-    ids=["ja", "en", "zh", "en-quoting-ja", "en-quoting-long-ja"],
+    ids=["ja", "en", "zh", "en-quoting-ja", "en-quoting-long-ja", "en-dquoting-long-ja"],
 )
 def test_extracted_article_language_picks_source_note(
     conn, config, article, kind, translated
@@ -452,14 +455,21 @@ def test_extracted_article_language_picks_source_note(
             " and every write should be reviewed by a human before it lands」と結論づけている。",
             True,
         ),
-        # 日本語の文や語句を引く英語の記事は日本語にしない(引用が長くても、入れ子でも)
+        # 閉じの無い括弧や、行をまたぐ " で本文を捨てない
+        ("「" + JA_ARTICLE, True),
+        ('The 5" model.\n' + JA_ARTICLE + '\nThe 3" model.', True),
+        # 日本語の文や語句を引く英語の記事は日本語にしない(引用が長くても、入れ子でも、
+        # 引用符の種類が違っても)
         (EN_QUOTING_JA, False),
         (EN_QUOTING_LONG_JA, False),
+        (EN_DQUOTING_LONG_JA, False),
+        (EN_QUOTING_LONG_JA.replace("「", "“").replace("」", "”"), False),
         (
             "Use the prompt 「『テスト』と書かれたファイルを開いて、中身を読んでください」"
             " as a test case.",
             False,
         ),
+        ("Use the prompt " + "「" * 50_000 + "日本語の文を引用しています" + "」" * 50_000, False),
         (EN_ARTICLE + "The phrase いただきます is quoted once.", False),
         (ZH_ARTICLE, False),
         ("Claude Code の設定", False),  # 語の数が同じ(2 対 2)なら日本語以外に倒す
@@ -470,9 +480,14 @@ def test_extracted_article_language_picks_source_note(
         "ja-terms",
         "ja-with-code",
         "ja-quoting-en",
+        "ja-unclosed-quote",
+        "ja-inch-marks",
         "en-quoting-ja",
         "en-quoting-long-ja",
+        "en-dquoting-long-ja",
+        "en-curly-quoting-long-ja",
         "en-quoting-nested",
+        "en-quoting-deeply-nested",
         "en-phrase",
         "zh",
         "tie",

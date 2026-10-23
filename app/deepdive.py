@@ -101,8 +101,10 @@ _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 # 本文の言語の判定(GH#173): 日本語の文字(かな・漢字)のうち、かながこの割合に満たなければ
 # 日本語にしない(かなは日本語にしか無い。漢字だけの中国語を外す)
 _JA_KANA_MIN_SHARE = 0.2
-# かぎ括弧の引用(「」『』)。内側から 1 段ずつ外す(入れ子も外れる。閉じの無い括弧は残す)
-_JA_QUOTE_RE = re.compile(r"「[^「」『』]*」|『[^「」『』]*』")
+# 引用の括弧(開き → 閉じ)。地の文の言語の根拠にしない部分(GH#173)
+_QUOTE_PAIRS = {"「": "」", "『": "』", "“": "”"}
+# 開きと閉じが同じ字の二重引用符は、同じ行の中で前から 2 つずつ組にする
+_ASCII_QUOTE_RE = re.compile(r'"[^"\n]*"')
 
 
 class DigError(Exception):
@@ -1075,12 +1077,12 @@ def _looks_japanese(text: str) -> bool:
 
     語 = 同じ文字種の文字の連なり(ひらがな・カタカナ・漢字は文字種ごとに区切る。それ以外は
     英単語やコードの識別子)。文字の数で比べないのは、日本語は 1 字あたりの情報が多く、英単語や
-    コードの多い日本語の記事を取りこぼすため。かぎ括弧(「」『』)の中は数えない: 長い日本語の文を
-    引用する英語の記事を、引用の語の数で日本語と誤らないため(日本語の記事は引用を除いても地の文が
-    日本語のまま残る)。英語の記事を日本語と誤ると対訳が無くなるので、語の数が同じものや、コードが
-    本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
+    コードの多い日本語の記事を取りこぼすため。引用(「」『』“” と同じ行の中の "…")の中は数えない:
+    長い日本語の文を引用する英語の記事を、引用の語の数で日本語と誤らないため(日本語の記事は引用を
+    除いても地の文が日本語のまま残る)。英語の記事を日本語と誤ると対訳が無くなるので、語の数が同じ
+    ものや、コードが本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
     """
-    text = _strip_ja_quotes(text)
+    text = _strip_quotes(text)
     kana_chars = ja_chars = ja_words = other_words = 0
     previous: str | None = None
     for ch in text:
@@ -1100,13 +1102,24 @@ def _looks_japanese(text: str) -> bool:
     return ja_words > other_words
 
 
-def _strip_ja_quotes(text: str) -> str:
-    """かぎ括弧の引用を空白に置き換える(前後の語がつながらないように空白にする)。"""
-    while True:
-        stripped = _JA_QUOTE_RE.sub(" ", text)
-        if stripped == text:
-            return text
-        text = stripped
+def _strip_quotes(text: str) -> str:
+    """引用を空白に置き換える(前後の語がつながらないように空白にする)。
+
+    「」『』“” は 1 回の走査で開きと閉じを対応づける(入れ子は外側ごと除く。本文の長さに比例する
+    手間で済ませ、深い入れ子でも全文を何度も走査しない)。対応の取れない閉じは無視し、閉じの無い
+    開きは中身ごと残す(閉じ忘れの括弧ひとつで本文の残りを捨てない)。" は同じ行の中だけで組にする。
+    """
+    out: list[str] = []
+    opened: list[tuple[str, int]] = []  # (待っている閉じ, 開きを置いた out の位置)
+    for ch in _ASCII_QUOTE_RE.sub(" ", text):
+        if opened and ch == opened[-1][0]:
+            del out[opened.pop()[1] :]
+            out.append(" ")
+        else:
+            if ch in _QUOTE_PAIRS:
+                opened.append((_QUOTE_PAIRS[ch], len(out)))
+            out.append(ch)
+    return "".join(out)
 
 
 def _char_script(ch: str) -> str:
