@@ -27,12 +27,17 @@ from app.http import HttpClient
 # これ未満の抽出結果は partial(本文の体をなしていない可能性が高く、分析品質に注意が要る)
 MIN_OK_CHARS = 200
 
-# HTML 内の文字コード宣言(<meta charset="..."> と <meta http-equiv="Content-Type"
-# content="text/html; charset=...">)。宣言は <head> の冒頭に置かれるので先頭だけを探す
-_META_CHARSET_RE = re.compile(
-    rb"""<meta\s[^>]*?charset\s*=\s*["']?\s*([A-Za-z0-9._:-]+)""", re.IGNORECASE
-)
+# HTML 内の文字コード宣言。宣言は <head> の冒頭に置かれるので先頭だけを探し、WHATWG の
+# prescan と同じく、コメントの中は見ずに <meta> の charset 属性か、http-equiv="Content-Type"
+# の content 属性の charset= だけを使う(別の属性の値に含まれる charset= は使わない)
 _META_SCAN_BYTES = 4096
+_COMMENT_RE = re.compile(rb"<!--.*?(?:-->|\Z)", re.DOTALL)
+_META_TAG_RE = re.compile(rb"""<meta[\s/]((?:[^>"']|"[^"]*"|'[^']*')*)""", re.IGNORECASE)
+_ATTR_RE = re.compile(rb"""([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]*)))?""")
+_CONTENT_CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([^\s"';]+)""", re.IGNORECASE)
+# 宣言は ASCII で書かれている。これを同じ文字として読めない codec(UTF-16/32・EBCDIC など)の
+# 宣言は誤り(WHATWG が meta の UTF-16 の宣言を UTF-8 として扱うのと同じ考え)
+_ASCII_PROBE = b'<meta charset="">'
 # ラベルの読み替え(ブラウザが従う WHATWG Encoding に合わせる): Shift_JIS は Windows の拡張
 # (①・㈱ など)を含む cp932 として読む。x-sjis / x-euc-jp は Python の codecs が知らない古いラベル
 _LEGACY_LABELS = {"x-sjis": "cp932", "x-euc-jp": "euc_jp"}
@@ -170,24 +175,41 @@ def _decode_html(response: httpx.Response) -> str:
 
     response.text はヘッダに charset が無いと UTF-8 で復号するため、meta だけで Shift_JIS 等を
     宣言したページが U+FFFD だらけになり、それでも長さで ok と判定されていた。
-    順序: HTTP の charset → (ヘッダに無ければ)正しい UTF-8 ならそのまま(従来と同じ結果。
-    宣言の誤りより確か)→ HTML 内の meta の宣言 → 従来どおり UTF-8(読めないバイトは置換)
+    順序: HTTP の charset → (ヘッダに無ければ)非 ASCII を含む正しい UTF-8 ならそのまま(従来と
+    同じ結果。ほかの文字コードの本文が偶然 UTF-8 として正しくなることはまず無く、宣言の誤りより
+    確か)→ HTML 内の meta の宣言(全バイトが ASCII の ISO-2022-JP もここで読む)→ 従来どおり
+    UTF-8(読めないバイトは置換)
     """
     content = response.content
     codec = _codec(response.charset_encoding)
     if codec is None:
-        try:
-            return content.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-        match = _META_CHARSET_RE.search(content[:_META_SCAN_BYTES])
-        codec = _codec(match.group(1).decode("ascii")) if match else None
-        if codec is not None and codec.startswith(("utf-16", "utf-32")):
-            codec = None  # ASCII として読めた宣言が UTF-16/32 なのは誤り(WHATWG と同じく無視)
-    try:
-        return content.decode(codec or "utf-8", errors="replace")
-    except LookupError:  # テキスト用でない codec(rot13・base64 等)を宣言したページ
-        return content.decode("utf-8", errors="replace")
+        if not content.isascii():
+            try:
+                return content.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        codec = _meta_codec(content[:_META_SCAN_BYTES])
+        if codec is not None and _decode(_ASCII_PROBE, codec) != _ASCII_PROBE.decode("ascii"):
+            codec = None  # 宣言そのものを読めない codec(UTF-16 等)の宣言は誤り
+    decoded = _decode(content, codec) if codec is not None else None
+    return decoded if decoded is not None else content.decode("utf-8", errors="replace")
+
+
+def _meta_codec(head: bytes) -> str | None:
+    """HTML の先頭にある、使えるラベルの最初の文字コード宣言の codec 名。無ければ None。"""
+    for tag in _META_TAG_RE.finditer(_COMMENT_RE.sub(b"", head)):
+        attrs: dict[bytes, bytes] = {}
+        for attr in _ATTR_RE.finditer(tag.group(1)):
+            value = attr.group(2) or attr.group(3) or attr.group(4) or b""
+            attrs.setdefault(attr.group(1).lower(), value)  # 同じ名前は最初を使う(WHATWG と同じ)
+        label = attrs.get(b"charset")
+        if not label and attrs.get(b"http-equiv", b"").strip().lower() == b"content-type":
+            match = _CONTENT_CHARSET_RE.search(attrs.get(b"content", b""))
+            label = match.group(1) if match else None
+        codec = _codec(label.decode("latin-1")) if label else None
+        if codec is not None:
+            return codec
+    return None
 
 
 def _codec(label: str | None) -> str | None:
@@ -197,6 +219,14 @@ def _codec(label: str | None) -> str | None:
     label = label.strip().lower()
     try:
         name = codecs.lookup(_LEGACY_LABELS.get(label, label)).name
-    except LookupError:
+    except (LookupError, ValueError):  # ValueError: NUL を含むラベル
         return None
     return _CODEC_OVERRIDES.get(name, name)
+
+
+def _decode(content: bytes, codec: str) -> str | None:
+    """読めないバイトは置換して復号する。この使い方ができない codec(rot13・idna 等)なら None。"""
+    try:
+        return content.decode(codec, errors="replace")
+    except (LookupError, UnicodeError):
+        return None

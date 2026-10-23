@@ -215,8 +215,28 @@ def fetch_text(conn, tmp_path, content: bytes, content_type: str) -> str:
             "euc_jp",
             LONG_BODY,
         ),
+        # 全バイトが ASCII の範囲になる文字コード(UTF-8 としても正しく読めてしまう)
+        ('<meta charset="ISO-2022-JP">', "iso2022_jp", LONG_BODY),
+        # コメントの中の宣言・別の属性の値の charset=・使えないラベルは使わず、次の宣言を使う
+        ('<!-- <meta charset="UTF-8"> --><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        (
+            '<meta name="description" content="charset=utf-8" data-charset="utf-8">'
+            '<meta charset="Shift_JIS">',
+            "cp932",
+            SJIS_BODY,
+        ),
+        ('<meta charset="no-such-charset"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
     ],
-    ids=["meta-charset-sjis", "http-equiv-sjis", "x-sjis", "euc-jp"],
+    ids=[
+        "meta-charset-sjis",
+        "http-equiv-sjis",
+        "x-sjis",
+        "euc-jp",
+        "iso-2022-jp",
+        "commented-out-meta",
+        "other-attributes",
+        "unknown-label-then-sjis",
+    ],
 )
 def test_meta_declared_charset_used_without_header_charset(
     conn, tmp_path, meta, encoding, body
@@ -247,14 +267,16 @@ def test_header_charset_takes_precedence_over_meta(conn, tmp_path) -> None:
     assert SJIS_BODY in text
 
 
-def test_meta_utf16_declaration_ignored(conn, tmp_path) -> None:
-    # ASCII として読めた meta の UTF-16 宣言は誤りなので従わない(UTF-8 として置換つきで読む)
-    content = legacy_html('<meta charset="utf-16">', LONG_BODY).encode("utf-8") + b"\xff"
+@pytest.mark.parametrize("label", ["utf-16", "utf-32", "cp037", "idna", "rot13", "utf\x008"])
+def test_unusable_meta_declaration_falls_back_to_utf8(conn, tmp_path, label) -> None:
+    # 宣言そのもの(ASCII)を読めない codec(UTF-16 等)・置換つきで復号できない codec・NUL を
+    # 含むラベルの宣言は使わず、UTF-8 として置換つきで読む(例外で failed にしない)
+    content = legacy_html(f'<meta charset="{label}">', LONG_BODY).encode("utf-8") + b"\xff"
     text = fetch_text(conn, tmp_path, content, "text/html")
     assert LONG_BODY in text
 
 
-@pytest.mark.parametrize("label", ["no-such-charset", "rot13"])
+@pytest.mark.parametrize("label", ["no-such-charset", "rot13", "idna"])
 def test_unusable_header_charset_falls_back_to_utf8(conn, tmp_path, label) -> None:
     # 未知のラベル・テキスト用でない codec の宣言は使わない(例外で failed にしない)
     content = ARTICLE_HTML.encode("utf-8")
