@@ -492,6 +492,11 @@ def _validate_x_search(path: Path, config: Config) -> None:
                 f"{path}: [x_search].slots のクエリが長すぎる(括弧と自動付加分込みで"
                 f" {len(effective)} > {X_SEARCH_QUERY_MAX}): {slot[:40]}…"
             )
+        if not _parens_balanced(slot):
+            raise ConfigError(
+                f"{path}: [x_search].slots のクエリの括弧か引用符が対応していない"
+                f"(囲んだ括弧が途中で閉じ、除外句が全体に掛からない。GH#230): {slot[:40]}…"
+            )
     if slots and config.x_search.daily_read_cap // len(slots) < X_SEARCH_MIN_PAGE:
         raise ConfigError(
             f"{path}: [x_search].daily_read_cap({config.x_search.daily_read_cap})が"
@@ -508,6 +513,29 @@ def _validate_x_search(path: Path, config: Config) -> None:
             f"{path}: X 読取の内訳合計({cap_sum})が [x].combined_daily_read_cap"
             f"({config.x.combined_daily_read_cap})を超えている(ADR 0001 予算配分)"
         )
+
+
+def _parens_balanced(slot: str) -> bool:
+    """スロットの括弧(引用符の外)が正しく入れ子になり、引用符が閉じているか(GH#230)。
+
+    `ai) OR (llm` は囲むと `(ai) OR (llm) -is:retweet -is:reply` になり、除外が後ろの枝にしか
+    掛からない。閉じていない引用符も囲んだ閉じ括弧と除外句を句の中に飲み込む。引用符(完全一致の
+    句)の中の括弧は数えない。
+    """
+    depth = 0
+    quoted = False
+    for char in slot:
+        if char == '"':
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not quoted
 
 
 def load_env(config_dir: Path) -> dict[str, str]:

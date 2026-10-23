@@ -76,6 +76,28 @@ def test_x_search_slot_length_counts_grouping_parens(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "ai) OR (llm",  # 囲むと (ai) OR (llm) -is:retweet -is:reply → 除外が llm の側だけ
+        "(ai OR llm",
+        "ai OR llm)",
+        '"ai OR llm',  # 閉じていない引用符が囲んだ閉じ括弧と除外句を飲み込む
+    ],
+)
+def test_x_search_slot_rejects_unbalanced_parens_or_quotes(tmp_path: Path, slot: str) -> None:
+    # 括弧で囲んでも途中で閉じるスロットは、除外句が全体に掛からない(GH#230)。起動時に止める
+    write_config(tmp_path, f"[x_search]\nslots = ['{slot}']\n")  # TOML のリテラル文字列
+    with pytest.raises(ConfigError, match="対応していない"):
+        load_config(tmp_path)
+
+
+def test_x_search_slot_accepts_nested_parens_and_parens_in_quotes(tmp_path: Path) -> None:
+    slots = ("((ai OR llm) agents) lang:ja", '"ai :)" OR llm')  # 引用符の中の括弧は数えない
+    write_config(tmp_path, f"[x_search]\nslots = ['{slots[0]}', '{slots[1]}']\n")
+    assert load_config(tmp_path).x_search.slots == slots
+
+
 def test_x_search_cap_requires_min_page_per_slot(tmp_path: Path) -> None:
     # 20 // 3 = 6 < 10(search/recent の max_results 下限)→ 黙って 0 件にせず起動時に止める
     write_config(tmp_path, '[x_search]\nslots = ["a", "b", "c"]\ndaily_read_cap = 20\n')
