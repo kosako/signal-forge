@@ -98,6 +98,11 @@ _REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
 _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 
+# 本文の言語の判定(GH#173): 文字のうちかな(ひらがな・カタカナ)がこの割合以上なら日本語。
+# かなは日本語にしか無いので、漢字だけの中国語は日本語にならない。英語の記事に日本語の語句が
+# 少し混ざっても、英単語やコードの多い日本語の記事でも揺れないよう低めにとる
+_JA_KANA_MIN_RATIO = 0.05
+
 
 class DigError(Exception):
     """調査段の失敗(材料不足の明示指定・全件失敗など)。"""
@@ -347,7 +352,7 @@ def _dig_one(
     source_note_name: str | None = None
     source_note_body: str | None = None
     if not is_tweet_body:
-        if candidate.language == "ja":
+        if _is_japanese_source(candidate):
             source_note_name = f"{date_prefix}-{candidate.item_id}-原文-{slug}"
             source_note_body = _source_note_ja(candidate, note_name)
         else:
@@ -1050,3 +1055,24 @@ def _is_tweet_url(url: str) -> bool:
     # 判定する(www.x.com がポリシー判定をすり抜けて本文が恒久保存される穴。Codex P1)
     host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
     return host in _TWEET_HOSTS
+
+
+def _is_japanese_source(candidate: DigCandidate) -> bool:
+    """原文ノート(日本語)か対訳ノート(日本語以外)か(設計 06 §5.2)。
+
+    documents.language は抽出で書いておらず(既存の行もすべて NULL)、NULL を日本語以外と
+    扱うと日本語の記事まで対訳(LLM)に回る(GH#173)。値があればそれに従い、無ければ本文から
+    判定する。
+    """
+    if candidate.language is not None:
+        return candidate.language == "ja"
+    return _looks_japanese(candidate.body or "")
+
+
+def _looks_japanese(text: str) -> bool:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return False
+    # ひらがな・カタカナ(U+3040〜U+30FF)と半角カタカナ(U+FF66〜U+FF9D)
+    kana = sum(1 for ch in letters if "\u3040" <= ch <= "\u30ff" or "\uff66" <= ch <= "\uff9d")
+    return kana / len(letters) >= _JA_KANA_MIN_RATIO
