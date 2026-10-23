@@ -81,16 +81,17 @@ def test_same_day_rerun_replaces_archive(conn, tmp_path) -> None:
     assert not list(config.backup_dir.glob(".*partial*"))  # 一時ファイルが残らない
 
 
-def test_rotation_keeps_14_generations(conn, tmp_path) -> None:
+def test_rotation_keeps_14_generations(conn, tmp_path, monkeypatch) -> None:
+    # 当日の世代名は実時計の暦日で決まる。旧世代の直後の日に固定し、年が変わっても
+    # 結果が変わらないようにする(GH#210)
+    monkeypatch.setattr("app.backup.today_jst", lambda: "2026-06-17")
     config = make_config(tmp_path)
     config.backup_dir.mkdir(parents=True)
-    for day in range(1, GENERATIONS + 3):  # 16 世代分の旧ファイル
+    for day in range(1, GENERATIONS + 3):  # 16 世代分の旧ファイル(06-01〜06-16)
         (config.backup_dir / f"intel-202606{day:02d}.tar.gz").write_bytes(b"")
 
     backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
 
-    archives = sorted(config.backup_dir.glob("intel-*.tar.gz"))
-    assert len(archives) == GENERATIONS
-    # 最古の世代から削除され、当日分が残る
-    assert archives[-1].name.startswith("intel-2026")
-    assert not (config.backup_dir / "intel-20260601.tar.gz").exists()
+    archives = sorted(p.name for p in config.backup_dir.glob("intel-*.tar.gz"))
+    # 最古の世代から削除され、当日分(06-17)を含む新しい 14 世代が残る
+    assert archives == [f"intel-202606{day:02d}.tar.gz" for day in range(4, 18)]

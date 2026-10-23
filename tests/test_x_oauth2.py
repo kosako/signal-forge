@@ -478,7 +478,8 @@ def test_session_load_without_token_guides_auth(tmp_path: Path) -> None:
 
 
 def hit(url: str) -> httpx.Response:
-    with httpx.Client() as client:
+    # 実行環境の proxy 設定(HTTP_PROXY 等)を使わず、loopback の callback へ直接つなぐ(GH#258)
+    with httpx.Client(trust_env=False) as client:
         return client.get(url, timeout=5)
 
 
