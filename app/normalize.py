@@ -61,9 +61,13 @@ def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None
 
     # 手順1: 既知短縮ドメインのみ解決し、結果 URL に対して以降の手順を適用
     if resolve_short is not None and split.hostname in SHORT_URL_HOSTS:
-        resolved = _split_url(
-            resolve_short(url.strip()), f"短縮 URL の解決先を分解できない: {url[:80]}"
-        )
+        unsplittable = f"短縮 URL の解決先を分解できない: {url[:80]}"
+        try:
+            target = resolve_short(url.strip())
+        except ValueError as e:
+            # 解決の途中(転送先の Location 等)で分解できない URL に当たった(GH#186)
+            raise InvalidUrlError(unsplittable) from e
+        resolved = _split_url(target, unsplittable)
         if resolved.scheme.lower() not in ("http", "https"):
             raise UnsupportedSchemeError(f"短縮 URL の解決先が http/https でない: {url[:80]}")
         split = resolved

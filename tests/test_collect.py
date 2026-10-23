@@ -4,11 +4,13 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.collect import collect_all
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
 from app.db import apply_migrations, connect
+from app.http import HttpClient
 
 logger = logging.getLogger("test-collect")
 
@@ -209,6 +211,27 @@ def test_unsplittable_url_item_recorded_as_error_and_rest_saved(
     assert source["consecutive_failures"] == 0
     run = conn.execute("SELECT status FROM collect_runs").fetchone()
     assert run["status"] == "ok"
+
+
+def test_short_url_redirecting_to_unsplittable_url_recorded_as_error(
+    conn: sqlite3.Connection,
+) -> None:
+    # 短縮 URL の解決の途中(転送先の Location)で分解できない URL に当たっても、
+    # その 1 件の error に留めて正常な記事は保存する(GH#186)
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(301, headers={"location": "https://example.com]/bad"})
+
+    http = HttpClient(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["93.184.216.34"],
+        sleep=lambda _s: None,
+    )
+    connector = FakeConnector([item("https://t.co/bad"), item("https://example.com/ok")])
+    collect_all(conn, {"rss": connector}, logger, resolve_short=http.resolve_short_url)
+    rows = {r["url"]: r["status"] for r in conn.execute("SELECT url, status FROM items")}
+    assert rows == {"https://t.co/bad": "error", "https://example.com/ok": "new"}
+    source = conn.execute("SELECT consecutive_failures FROM sources WHERE type='rss'").fetchone()
+    assert source["consecutive_failures"] == 0
 
 
 def test_rss_external_id_fallback_to_urlhash(conn: sqlite3.Connection) -> None:

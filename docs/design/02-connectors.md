@@ -113,7 +113,7 @@ class Connector(Protocol):
 ## 3. RSS コネクタ(`connectors/rss.py`)
 
 - **取得**: httpx で GET し、レスポンスボディを feedparser に渡す(feedparser 内蔵HTTPは使わない。理由: timeout・UA・エラー分類・条件付きGETを全コネクタで httpx に統一)。timeout とリトライは設計 05 §8 の共通規約(connect 10s / read 30s)。
-- **相対リンク(GH#185)**: 相対の記事リンクは、取得した URL(リダイレクト後の最終 URL)を基準に絶対 URL へ解決する。`xml:base` があればそちらを優先する。解決は feedparser に任せ、基準は content-location として渡す(文字コードの推定は変えない)。同じ基準で、本文(content / summary)の中の相対リンクと、URI として扱う id(`isPermaLink="false"` でない guid など)も絶対化される。
+- **相対リンク(GH#185)**: 相対の記事リンクは、取得した URL(リダイレクト後の最終 URL)を基準に絶対 URL へ解決する。`xml:base` があればそちらを優先する。解決は feedparser に任せ、基準は content-location として渡す(文字コードの推定は変えない)。同じ基準で、本文(content / summary)の中の相対リンクと、URI として扱う id(`isPermaLink="false"` でない guid など)も絶対化される。基準と合わせて分解できない記事リンクは feedparser が空にするので、その entry は取り込まない(link の無い entry と同じ扱い。error 行も残らない)。
 - **条件付き GET**: `cursor = {"etag": str|None, "last_modified": str|None}` を保存し、`If-None-Match` / `If-Modified-Since` を送る。304 は正常 no-op(collect_runs に `status='ok'`・`items_fetched=0` で記録。error 列には書かない正常系。01 の status CHECK に値を増やさない)。
 - **重複排除キー**: entry の `id`(guid)を external_id に。無ければ正規化 URL の hash にフォールバック。
 - **raw_content**: `content` / `summary` があれば RawItem.raw_content に同梱。全文フィードなら本文抽出の HTTP を節約できる(使うかは extraction 層が判断)。

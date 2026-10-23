@@ -122,6 +122,15 @@ def test_short_url_resolving_to_unsplittable_url_rejected() -> None:
         normalize_url("https://t.co/x", resolve_short=lambda _: "https://[::1/a")
 
 
+def test_short_url_resolver_value_error_rejected() -> None:
+    # 解決の途中(転送先の Location 等)の分解の失敗も UrlError 系にする(GH#186)
+    def resolver(url: str) -> str:
+        raise ValueError("Invalid IPv6 URL")
+
+    with pytest.raises(InvalidUrlError, match="短縮 URL の解決先を分解できない"):
+        normalize_url("https://t.co/x", resolve_short=resolver)
+
+
 # --- content_hash (h1) ---
 
 

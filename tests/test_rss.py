@@ -278,3 +278,18 @@ def test_unresolvable_guid_falls_back_to_none() -> None:
     (only,) = connector.fetch(make_source(), {}).items
     assert only.url == "https://example.com/posts/7"
     assert only.external_id is None
+
+
+def test_unsplittable_link_entry_skipped_and_rest_kept() -> None:
+    # 基準と合わせて分解できない記事リンクは feedparser が空にする。link の無い entry と
+    # 同じく取り込まず、ほかの entry は返す(設計 02 §3)
+    feed = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>t</title>
+  <item><title>a</title><link>https://example.com]/8</link></item>
+  <item><title>b</title><link>/posts/9</link></item>
+</channel></rss>
+"""
+    connector = make_connector(lambda request: httpx.Response(200, content=feed.encode()))
+    assert [item.url for item in connector.fetch(make_source(), {}).items] == [
+        "https://example.com/posts/9"
+    ]
