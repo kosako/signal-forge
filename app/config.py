@@ -25,6 +25,16 @@ X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
 X_SEARCH_QUERY_MAX = 512  # クエリ長上限(Basic tier)
 X_SEARCH_QUERY_SUFFIX = "-is:retweet -is:reply"  # 各スロットに自動付加(設計 02 §2)
 
+
+def x_search_query(slot: str) -> str:
+    """スロットから実際に送る検索クエリ(コネクタの送信と長さの検証が共有する。設計 02 §2)。
+
+    スロットを括弧で囲んでから除外句を付ける。X の検索は AND を OR より先に結び付けるため、
+    括弧なしの `a OR b -is:retweet -is:reply` では除外が右の枝にしか掛からない(GH#230)。
+    """
+    return f"({slot}) {X_SEARCH_QUERY_SUFFIX}"
+
+
 # S1b 取込の 1 ページ下限(liked_tweets / user tweets の max_results 下限 = 5 に統一。
 # 設計 02 §2)。コネクタ側に置くと config が httpx 依存を吸うため、軽い側 = ここに置く
 X_SIGNALS_MIN_PAGE = 5
@@ -81,7 +91,7 @@ class XSignalsConfig:
 class XSearchConfig:
     # 検索クエリのスロット(最大 X_SEARCH_MAX_SLOTS 本・入れ替え式。ADR 0001)。
     # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
-    # `-is:retweet -is:reply` はコネクタが自動付加する(設計 02 §2)
+    # `-is:retweet -is:reply` はコネクタがスロットを括弧で囲んで自動付加する(設計 02 §2)
     slots: tuple[str, ...] = ()
     daily_read_cap: int = 35  # 検索の日次読取上限(全スロットで均等割。ADR 0001 予算配分)
 
@@ -476,10 +486,10 @@ def _validate_x_search(path: Path, config: Config) -> None:
     for slot in slots:
         if not slot.strip():
             raise ConfigError(f"{path}: [x_search].slots に空のクエリがある")
-        effective = f"{slot} {X_SEARCH_QUERY_SUFFIX}"
+        effective = x_search_query(slot)
         if len(effective) > X_SEARCH_QUERY_MAX:
             raise ConfigError(
-                f"{path}: [x_search].slots のクエリが長すぎる(自動付加分込みで"
+                f"{path}: [x_search].slots のクエリが長すぎる(括弧と自動付加分込みで"
                 f" {len(effective)} > {X_SEARCH_QUERY_MAX}): {slot[:40]}…"
             )
     if slots and config.x_search.daily_read_cap // len(slots) < X_SEARCH_MIN_PAGE:

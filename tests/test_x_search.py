@@ -74,8 +74,9 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
             seen.append(request)
         query = parse_qs(urlsplit(str(request.url)).query)
         raw_query = query["query"][0]
-        assert raw_query.endswith(f" {X_SEARCH_QUERY_SUFFIX}")  # 演算子の自動付加
-        slot = raw_query.removesuffix(f" {X_SEARCH_QUERY_SUFFIX}")
+        # 演算子の自動付加: スロットを括弧で囲んでから除外句を付ける(GH#230)
+        assert raw_query.startswith("(") and raw_query.endswith(f") {X_SEARCH_QUERY_SUFFIX}")
+        slot = raw_query.removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
         token = query.get("next_token", [None])[0]
         status, body, headers = pages[slot][0 if token is None else token_index[token]]
         if status == 200:
@@ -121,6 +122,18 @@ def test_three_slots_fetch_parse_and_cost() -> None:
     # 予算はスロット数で均等割・端数は先頭から(35 → 12/12/11)
     limits = [parse_qs(urlsplit(str(r.url)).query)["max_results"][0] for r in seen]
     assert limits == ["12", "12", "11"]
+
+
+def test_or_slot_is_grouped_so_exclusions_cover_every_branch() -> None:
+    # X の検索は AND を OR より先に結び付ける。括弧なしの `ai OR llm -is:retweet -is:reply` では
+    # 除外が llm の枝にしか掛からないため、スロット全体を括弧で囲んで送る(GH#230)
+    seen: list[httpx.Request] = []
+    pages = {"ai OR llm": [(200, page([tweet("300")]), {})]}
+    result = connector_from(pages, slots=("ai OR llm",), seen=seen).fetch(make_source(), {})
+    assert [parse_qs(urlsplit(str(r.url)).query)["query"] for r in seen] == [
+        ["(ai OR llm) -is:retweet -is:reply"]
+    ]
+    assert result.items[0].meta == {"query": "ai OR llm"}  # meta は括弧を付けないスロットのまま
 
 
 def test_since_id_passed_and_kept_when_no_results() -> None:
@@ -277,7 +290,8 @@ def test_failure_after_prior_slot_returns_partial_without_advancing_cursor() -> 
     assert [i.external_id for i in result.items] == ["500"]  # 部分取得。c は取らない
     # カーソルを 500 に進めると b/c の当日ぶんが恒久欠落する → 据え置き(翌日再取得)
     assert result.next_cursor == {}
-    assert sum("query=b" in str(r.url) for r in seen) == 3  # 5xx は初回+2回リトライ
+    sent = [parse_qs(urlsplit(str(r.url)).query)["query"][0] for r in seen]
+    assert sent.count(f"(b) {X_SEARCH_QUERY_SUFFIX}") == 3  # 5xx は初回+2回リトライ
 
 
 def test_auth_error_is_fatal() -> None:
