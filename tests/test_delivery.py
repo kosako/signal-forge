@@ -424,7 +424,7 @@ def test_concurrent_deliveries_send_each_message_once(conn, tmp_path, caplog) ->
     assert "別の配信が実行中のため、終わるのを待つ" in caplog.text
     ledger = conn.execute("SELECT item_id, message_id FROM digest_messages ORDER BY id").fetchall()
     assert [(r["item_id"], r["message_id"]) for r in ledger] == [(None, 101), (a, 102), (b, 103)]
-    assert (tmp_path / "deliver.lock").exists()  # ロックは DB の隣
+    assert (tmp_path / "intel.db.deliver.lock").exists()  # ロックは DB の隣
 
 
 class FlakyLedgerConn:

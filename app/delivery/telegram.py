@@ -6,7 +6,7 @@
   ボタンをアイテム単位に付けるため)
 - 冪等性: `digest_messages` 台帳にある message は再送しない(部分再送)。全通完了で
   `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を記録して例外。
-  同じ DB への配信は DB の隣の `deliver.lock`(flock)で直列化する(GH#192)。送信できた
+  同じ DB への配信は DB の隣の `<DB>.deliver.lock`(flock)で直列化する(GH#192)。送信できた
   message の記帳に失敗したら記帳だけをやり直し、それでも駄目なら message_id をログに残して
   止める(GH#225)
 - token は `.env` の TELEGRAM_BOT_TOKEN。URL に token が入るため、httpx の例外を
@@ -42,8 +42,8 @@ MAX_RETRIES = 3  # 初回 + リトライ3回(同上)
 BACKOFF_S = (1.0, 2.0, 4.0)
 LONG_POLL_S = 50  # getUpdates の long polling 秒(設計 05 §8)
 
-# 配信の直列化のロック(GH#192)。DB の隣に置く(answer.lock と同じ流儀)
-DELIVER_LOCK_FILENAME = "deliver.lock"
+# 配信の直列化のロック(GH#192)。DB の隣の `<DB>.deliver.lock`(migrate.lock と同じ名付け)
+DELIVER_LOCK_SUFFIX = ".deliver.lock"
 # 送信できた message の記帳だけのやり直し(GH#225)。待ちは BACKOFF_S
 RECORD_RETRIES = 3
 
@@ -586,7 +586,8 @@ def _delivery_lock(
     if not db_file:
         yield
         return
-    lock_path = Path(db_file).with_name(DELIVER_LOCK_FILENAME)
+    db_path = Path(db_file)
+    lock_path = db_path.with_name(db_path.name + DELIVER_LOCK_SUFFIX)
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         try:

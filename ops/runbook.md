@@ -421,5 +421,5 @@ digest の配信で、Telegram には送れたのに台帳(`digest_messages`)に
 4. `uv run intel deliver` で残りを送る(台帳にある分は送らない)。`intel deliver` は当日の digest だけを
    送るので、日をまたいだら残りは送らない(届かなかった記事は Obsidian の Daily ノートで見る)。
 
-- 配信は同じ DB に対して 1 つずつ走る(DB の隣の `deliver.lock`。GH#192)。朝バッチの配信中に手で
+- 配信は同じ DB に対して 1 つずつ走る(DB の隣の `intel.db.deliver.lock`。GH#192)。朝バッチの配信中に手で
   `intel deliver` を打つと、先の配信が終わるまで待ってから、未送信の分だけを送る。
