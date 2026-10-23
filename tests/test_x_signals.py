@@ -5,9 +5,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.analysis.stage1 import preselect
 from app.config import Config, XSignalsConfig
 from app.connectors.x_signals import XSignalsError, collect_x_signals
 from app.db import apply_migrations, connect
+from app.normalize import normalize_url
 
 logger = logging.getLogger("test-x-signals")
 
@@ -413,6 +415,74 @@ def test_bookmark_merges_into_existing_item(conn, tmp_path) -> None:
         "SELECT item_id FROM x_signals WHERE tweet_id = 'b1'"
     ).fetchone()
     assert linked["item_id"] == existing_id
+
+
+def rss_item_with_status(conn, url: str, status: str, skip_reason: str | None) -> int:
+    conn.execute("INSERT OR IGNORE INTO sources (type, name) VALUES ('rss', 'feed')")
+    source_id = conn.execute("SELECT id FROM sources WHERE name='feed'").fetchone()["id"]
+    return conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash, status, skip_reason) "
+        "VALUES (?, ?, ?, '', ?, ?)",
+        (source_id, url, url, status, skip_reason),
+    ).lastrowid
+
+
+def status_of(conn, item_id: int) -> tuple[str, str | None]:
+    row = conn.execute(
+        "SELECT status, skip_reason FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    return (row["status"], row["skip_reason"])
+
+
+@pytest.mark.parametrize("reason", ["stale", "x_noise", "daily_cap"])
+def test_bookmark_merge_reactivates_item_skipped_by_exempt_rule(conn, tmp_path, reason) -> None:
+    # 前日以前にブックマークへ適用しない規則で skip 済みの item への合流は new に戻す
+    # (戻さないと事前選別にも保存節にも載らない。GH#176)
+    existing_id = rss_item_with_status(conn, "https://example.com/post", "skipped", reason)
+
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    assert item_for(conn, "b1")["id"] == existing_id
+    assert status_of(conn, existing_id) == ("new", None)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [("skipped", "blocklist"), ("analyzed", None), ("digested", None)],
+)
+def test_bookmark_merge_keeps_other_statuses(conn, tmp_path, status, reason) -> None:
+    # blocklist(明示 NG)はブックマークにも適用する規則なので戻さない。
+    # 分析済み・配信済みの合流先にも触れない(保存節は台帳で拾う)
+    existing_id = rss_item_with_status(conn, "https://example.com/post", status, reason)
+
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+
+    assert item_for(conn, "b1")["id"] == existing_id
+    assert status_of(conn, existing_id) == (status, reason)
+
+
+def test_bookmark_merge_into_previous_day_skip_is_preselected(conn, tmp_path) -> None:
+    # Issue の経路: ホームTL で stale になったリンクなし投稿を後からブックマークすると、
+    # canonical(ツイート URL)が同じ既存 item に合流する。翌朝の事前選別で採用される
+    config = make_config(tmp_path)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home-tl')")
+    home_id = conn.execute("SELECT id FROM sources WHERE name='home-tl'").fetchone()["id"]
+    canonical = normalize_url("https://x.com/i/web/status/b1")
+    existing_id = conn.execute(
+        "INSERT INTO items (source_id, external_id, url, canonical_url, published_at, "
+        "content_hash) VALUES (?, 'b1', ?, ?, '2026-07-13T00:00:00Z', '')",
+        (home_id, canonical, canonical),
+    ).lastrowid
+    preselect(conn, config, logger)  # 前日の朝: 72h 超で stale
+    assert status_of(conn, existing_id) == ("skipped", "stale")
+
+    session = session_with([page(tw("b1", text="リンクなしの学び"))], [])
+    collect_x_signals(conn, config, session, logger)
+
+    assert item_for(conn, "b1")["id"] == existing_id
+    assert existing_id in preselect(conn, config, logger).selected_ids
 
 
 def test_backfill_relinks_known_signal_without_item(conn, tmp_path) -> None:
