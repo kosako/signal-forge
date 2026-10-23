@@ -12,7 +12,7 @@
 
 ### Stage 1: 事前選別(安価・機械的・LLM 不使用)
 
-`intel analyze` の冒頭で、`status='new'` の items に対し上から順に適用する。除外は `items.status='skipped'` とし、規則名を別列 `skip_reason`(01 §3。例 `blocklist` / `stale` / `x_noise` / `daily_cap`)に記録して黙って脱落させない(`skipped:<rule>` のような合成値を enum 列に入れない)。
+`intel analyze` の冒頭で、`status='new'` の items に対し上から順に適用する(X ブックマークの例外は表の下)。除外は `items.status='skipped'` とし、規則名を別列 `skip_reason`(01 §3。例 `blocklist` / `stale` / `x_noise` / `daily_cap`)に記録して黙って脱落させない(`skipped:<rule>` のような合成値を enum 列に入れない)。
 
 重複排除は本段の責務ではない: 完全重複は 01 §6 の挿入時 2 層(UNIQUE 制約+24h 内容 dedup)で除外済みであり、analyze は `status='duplicate'` を対象にしないだけでよい(期間無制限の content_hash 除外規則は置かない。24h 超の再掲を「再浮上」として分析する 01 の設計意図を壊すため)。
 
@@ -23,11 +23,13 @@
 | 3 | X ノイズ | リプライ(コネクタが残した自分宛のもの)・自 RT(自分のリツイート)・本文 20 字未満かつリンク無し → 除外。判定は X ホームTL コネクタが書く `raw_payload.meta` の `reply` / `self_retweet` で行う。他人の RT は元ツイートに正規化した通常のポストとして残す(02 §2) | TL 固有の低情報量パターン。自 RT は本人が既に見たもの |
 | 4 | 日次上限 | 残件が `analysis.daily_llm_limit`(既定 150 件)超 → published_at 降順で切り、ソース間はラウンドロビンで多様性を保って採用 | コストとクォータの上限執行点 |
 
+**X ブックマークの例外(GH#99。設計 02 §2)**: `x_signals` の bookmark 行に `item_id` で紐付く item は、規則 1(静的 NG リスト)だけを適用し、規則 2〜4(`stale` / `x_noise` / `daily_cap`)は適用しない(本人意思の保存アイテム = manual と同じ理屈。件数は x_signals の日次上限・`--backfill --limit` で有界)。日次上限の外で必ず採用し、上限はほかの item にだけ当てる。判定は帰属ソースでなく `x_signals.item_id` の紐付けで行う(RSS 等の既存 item へ合流した場合も例外になる)。
+
 extraction_status=failed の items は除外**しない**(タイトル+メタで degraded 分析に回す。PROPOSAL 準拠)。
 
 ### Stage 2: 本分析(LLM)
 
-- 1 呼び出し 10〜20 件のバッチ(既定 15、config で調整)。timeout 120s・リトライ 1 回・スキーマ検証失敗は失敗チャンクのみ再実行。なお失敗なら該当チャンクを degraded 記録して先へ進む(エンジンフォールバックは複数エンジン導入時の拡張点。設計 00 §5)。例外(GH#74): 環境障害(`LLMUnavailableError`)は degraded にせず raise。全チャンク degraded(analyzed=0)も全チャンク処理後に raise して失敗通知に載せる(degraded 行は書き込み済みのため劣化配信は維持)。
+- 1 呼び出し 10〜20 件のバッチ(既定 15、config で調整)。timeout 120s・リトライ 1 回・スキーマ検証失敗は失敗チャンクのみ再実行。なお失敗なら該当チャンクを degraded 記録して先へ進む(予備 `[llm_fallback]`(既定 off)を有効にしているときは、主のエンジンが失敗した呼び出しを予備の `anthropic-api` でやり直し、予備も失敗した呼び出しだけが失敗になる。設計 00 §5・GH#156)。例外(GH#74): 環境障害(`LLMUnavailableError`)は degraded にせず raise。全チャンク degraded(analyzed=0)も全チャンク処理後に raise して失敗通知に載せる(degraded 行は書き込み済みのため劣化配信は維持)。
 - 本文は先頭 2,000 字に切り詰めて注入(config `analysis.body_max_chars`)。理由: 要約とランキングには冒頭で十分で、トークン費を上限管理可能にする。
 
 ## 3. 分析プロンプト設計
@@ -229,4 +231,4 @@ negativeペナルティ: negative ラベル 1 個につき −15
 
 - signals からの実例自動還流・ランキング自動調整(フェーズ2): analyses・signals の記録項目で入力は既に揃う。
 - topic 一致の高度化(embedding 類似): ranking/ の重複判定関数 1 箇所の差し替えで足りる。
-- 複数 LLM エンジンのフォールバック網: 設計 00 §5 の拡張点(MVP は第一候補エンジン1本+degraded 直行)。
+- 複数 LLM エンジンのフォールバック網(優先順リスト `llm.engines`): 設計 00 §5 の拡張点。主のエンジン 1 本 + 予備 1 本(`anthropic-api`)の切り替えは実装済み(`[llm_fallback]`、既定 off。GH#156)。
