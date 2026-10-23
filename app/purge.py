@@ -17,6 +17,13 @@ from app.config import Config
 
 VACUUM_THRESHOLD_ROWS = 1000
 
+# x_signals の本文抜粋の TTL 超過の条件(パラメータは x_cache_ttl_days)。purge の NULL 化と
+# doctor #11 の残存の集計が同じ条件を使う(GH#250)
+X_SIGNAL_EXCERPT_EXPIRED = (
+    "text_excerpt IS NOT NULL"
+    " AND observed_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' days')"
+)
+
 
 def purge_expired(
     conn: sqlite3.Connection,
@@ -47,11 +54,7 @@ def purge_expired(
     # x_signals の本文抜粋も X 由来の TTL キャッシュ(Issue #2 / GH#58 S1b)。
     # シグナル行(id・著者・時刻)は残し、本文だけ落とす
     excerpts_nullified = conn.execute(
-        """
-        UPDATE x_signals SET text_excerpt = NULL
-        WHERE text_excerpt IS NOT NULL
-          AND observed_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' days')
-        """,
+        f"UPDATE x_signals SET text_excerpt = NULL WHERE {X_SIGNAL_EXCERPT_EXPIRED}",
         (config.retention.x_cache_ttl_days,),
     ).rowcount
 

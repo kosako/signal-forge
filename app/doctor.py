@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -24,9 +25,13 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from app.config import Config, ConfigError, load_config, load_env
-from app.db import MIGRATIONS_DIR, connect, discover_migrations
+from app.db import MIGRATIONS_DIR, MigrationError, connect, discover_migrations, verify_ledger
+from app.purge import X_SIGNAL_EXCERPT_EXPIRED
 
 BACKUP_STALE_HOURS = 48
+# 生成側(app/backup.py の backup_daily)が作る世代名 intel-YYYYMMDD.tar.gz。置き場にある
+# 別用途の tar.gz を最新世代と取り違えて、欠落や古さを隠さない(GH#253)
+BACKUP_ARCHIVE_NAME = re.compile(r"intel-\d{8}\.tar\.gz")
 LAUNCHD_JOBS = ("com.intel.morning", "com.intel.poller")  # 設計 05 §1
 
 # X コネクタ(plan #15)が要求する .env キー(scripts/day0_x_probe.py と同一)
@@ -176,14 +181,21 @@ _CONFIG_UNAVAILABLE = "config 無効のため検査不可(#1 を先に解消)"
 def _check_migrations(conn: sqlite3.Connection | None) -> CheckResult:
     if conn is None:
         return CheckResult(3, "SQLite/migrations", "FAIL", _CONFIG_UNAVAILABLE)
-    applied: set[int] = set()
+    applied: dict[int, str] = {}
     if _table_exists(conn, "schema_migrations"):
         applied = {
-            row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+            row["version"]: row["filename"]
+            for row in conn.execute("SELECT version, filename FROM schema_migrations")
         }
-    pending = [
-        m.version for m in discover_migrations(MIGRATIONS_DIR) if m.version not in applied
-    ]
+    migrations = discover_migrations(MIGRATIONS_DIR)
+    # 台帳の不整合は apply_migrations が起動時に拒否する(同じ検査を使う。GH#252)
+    try:
+        verify_ledger(applied, migrations)
+    except MigrationError as e:
+        return CheckResult(
+            3, "SQLite/migrations", "FAIL", f"台帳の不整合(run・poll は起動できない): {e}"
+        )
+    pending = [m.version for m in migrations if m.version not in applied]
     if pending:
         return CheckResult(3, "SQLite/migrations", "FAIL", f"未適用: {pending}(intel run で適用)")
     return CheckResult(3, "SQLite/migrations", "PASS", f"適用済み {len(applied)} 件")
@@ -707,9 +719,15 @@ def _check_backup(config: Config | None) -> CheckResult:
     if config is None:
         return CheckResult(10, "バックアップ", "WARN", _CONFIG_UNAVAILABLE)
     backup_dir = config.backup_dir
-    archives = sorted(backup_dir.glob("*.tar.gz")) if backup_dir.exists() else []
+    archives = (
+        sorted(p for p in backup_dir.glob("*.tar.gz") if BACKUP_ARCHIVE_NAME.fullmatch(p.name))
+        if backup_dir.exists()
+        else []
+    )
     if not archives:
-        return CheckResult(10, "バックアップ", "WARN", f"{backup_dir} に世代なし(plan #23)")
+        return CheckResult(
+            10, "バックアップ", "WARN", f"{backup_dir} に世代(intel-YYYYMMDD.tar.gz)なし(plan #23)"
+        )
     newest = max(archives, key=lambda p: p.stat().st_mtime)
     age_hours = (datetime.now(UTC).timestamp() - newest.stat().st_mtime) / 3600
     problems = []
@@ -750,12 +768,20 @@ def _check_ttl_leftovers(
         """,
         (config.retention.x_cache_ttl_days, config.retention.cache_ttl_days),
     ).fetchone()[0]
-    if expired_docs or stale_payloads:
+    # x_signals の本文抜粋も purge の対象(記事行を持たないシグナルの分は上の 2 つに出ない。GH#250)
+    stale_excerpts = 0
+    if _table_exists(conn, "x_signals"):
+        stale_excerpts = conn.execute(
+            f"SELECT count(*) FROM x_signals WHERE {X_SIGNAL_EXCERPT_EXPIRED}",
+            (config.retention.x_cache_ttl_days,),
+        ).fetchone()[0]
+    if expired_docs or stale_payloads or stale_excerpts:
         return CheckResult(
             11,
             "TTL 残存",
             "WARN",
-            f"documents {expired_docs} 件 / raw_payload {stale_payloads} 件が TTL 超過"
+            f"documents {expired_docs} 件 / raw_payload {stale_payloads} 件 / "
+            f"text_excerpt {stale_excerpts} 件が TTL 超過"
             "(purge 経路の故障疑い。intel doctor --purge で削除可)",
         )
     return CheckResult(11, "TTL 残存", "PASS", "TTL 超過の残存なし")

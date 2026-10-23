@@ -512,7 +512,8 @@ def doctor(
             counts = purge_expired(conn, config, logger)
             typer.echo(
                 f"purge 完了: documents {counts['documents_deleted']} 件削除 / "
-                f"raw_payload {counts['raw_payload_nullified']} 件 NULL 化"
+                f"raw_payload {counts['raw_payload_nullified']} 件 / "
+                f"text_excerpt {counts['x_signal_excerpts_nullified']} 件 NULL 化"
             )
         if cost:
             summary = month_cost_summary(conn, config)

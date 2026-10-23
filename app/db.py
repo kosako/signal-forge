@@ -65,6 +65,21 @@ def discover_migrations(migrations_dir: Path) -> list[Migration]:
     return migrations
 
 
+def verify_ledger(applied: dict[int, str], migrations: list[Migration]) -> None:
+    """台帳(version → filename)の全行がファイルと一致することを確かめる(読み取りのみ)。
+
+    ファイルに無い適用済み番号(DB より古い checkout)と filename の不一致は MigrationError。
+    apply_migrations の起動時の検査と doctor #3 が共有する(GH#252)。
+    """
+    for version, filename in applied.items():
+        expected = next((m.filename for m in migrations if m.version == version), None)
+        if expected != filename:
+            raise MigrationError(
+                f"台帳の {version:03d} は {filename} だがファイルは {expected}"
+                "(適用済みファイルの編集・改名は禁止。設計 01 §10)"
+            )
+
+
 def apply_migrations(
     conn: sqlite3.Connection, db_path: Path, migrations_dir: Path = MIGRATIONS_DIR
 ) -> list[str]:
@@ -100,13 +115,7 @@ def _apply_pending(
         row["version"]: row["filename"]
         for row in conn.execute("SELECT version, filename FROM schema_migrations")
     }
-    for version, filename in applied.items():
-        expected = next((m.filename for m in migrations if m.version == version), None)
-        if expected != filename:
-            raise MigrationError(
-                f"台帳の {version:03d} は {filename} だがファイルは {expected}"
-                "(適用済みファイルの編集・改名は禁止。設計 01 §10)"
-            )
+    verify_ledger(applied, migrations)
 
     pending = [m for m in migrations if m.version not in applied]
     if not pending:
