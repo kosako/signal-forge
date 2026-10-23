@@ -1,7 +1,7 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -319,6 +319,31 @@ def test_placeholder_in_inputs_not_reinterpreted(conn, tmp_path) -> None:
 
 # --- 既知判定の履歴(直近 14 日の配信済みタイトル。GH#177) ---
 
+# UTC では 10/23、JST では 10/24 の朝。期間を JST 暦日で数えていることも確かめられる
+FIXED_NOW = datetime(2026, 10, 23, 20, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def pinned_today(conn: sqlite3.Connection):
+    """SQLite の 'now' を FIXED_NOW に固定し、JST の今を返す。
+
+    fixture の digest_date と、_recent_titles の SQL が見る今日を同じ時刻から作る(実行中に
+    日付が変わってもテストが揺れない)。Python の時計だけを固定しても SQL 側は動くため、
+    この接続の date() を差し替えて 'now' だけを置き換える。
+    """
+    real = sqlite3.connect(":memory:")
+    fixed = FIXED_NOW.strftime("%Y-%m-%d %H:%M:%S")
+
+    def pinned_date(value, *modifiers):
+        marks = "".join(", ?" for _ in modifiers)
+        return real.execute(
+            f"SELECT date(?{marks})", (fixed if value == "now" else value, *modifiers)
+        ).fetchone()[0]
+
+    conn.create_function("date", -1, pinned_date)
+    yield FIXED_NOW.astimezone(JST)
+    real.close()
+
 
 def add_analyzed(conn, url, *, title, title_ja, source_id=2, analyzed_at="2026-10-01T00:00:00Z"):
     """分析済みの item を作る。title_ja=None は degraded の分析(見出しを持たない)。"""
@@ -343,10 +368,10 @@ def add_analysis(conn, item_id, title_ja, *, analyzed_at) -> None:
 
 
 def add_sent_digest(
-    conn, days_ago, item_ids, *, sent_item_ids, header_sent=True, delivery_status="sent"
+    conn, today, days_ago, item_ids, *, sent_item_ids, header_sent=True, delivery_status="sent"
 ) -> int:
     """digest と送信台帳(digest_messages)を作る。台帳に載るのは実際に送れたメッセージだけ。"""
-    digest_date = (datetime.now(JST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    digest_date = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
     digest_id = conn.execute(
         "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status) "
         "VALUES (?, '# md', ?, ?, ?)",
@@ -361,7 +386,7 @@ def add_sent_digest(
     return digest_id
 
 
-def test_recent_titles_use_delivered_headline_including_titleless_x(conn) -> None:
+def test_recent_titles_use_delivered_headline_including_titleless_x(conn, pinned_today) -> None:
     # 見出しは配信に使ったもの(最新の title_ja、無ければ items.title)。原文タイトルを
     # 持たない X の投稿も、配信した見出しで履歴に入る(GH#177)
     x_source = conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')").lastrowid
@@ -381,29 +406,32 @@ def test_recent_titles_use_delivered_headline_including_titleless_x(conn) -> Non
         conn, "https://x.com/i/web/status/2", title=None, title_ja=None, source_id=x_source
     )
     ids = [x_post, rss, reanalyzed, degraded, degraded_x]
-    add_sent_digest(conn, 1, ids, sent_item_ids=ids)
+    add_sent_digest(conn, pinned_today, 1, ids, sent_item_ids=ids)
 
     assert _recent_titles(conn) == sorted(
         ["X の投稿の見出し", "訳した見出し", "新しい見出し", "原文のタイトル"]
     )
 
 
-def test_recent_titles_exclude_items_not_delivered(conn) -> None:
+def test_recent_titles_exclude_items_not_delivered(conn, pinned_today) -> None:
     # 「配信済み」は送信台帳(digest_messages)で決める。digest に載っていても、配信に
     # 失敗して届いていない記事は既知にしない(GH#177)
+    today = pinned_today
     sent = add_analyzed(conn, "https://a.example/1", title="t1", title_ja="届いた記事")
     unsent = add_analyzed(conn, "https://a.example/2", title="t2", title_ja="届かなかった記事")
-    add_sent_digest(conn, 2, [sent, unsent], sent_item_ids=[sent], delivery_status="failed")
+    add_sent_digest(
+        conn, today, 2, [sent, unsent], sent_item_ids=[sent], delivery_status="failed"
+    )
     header_only = add_analyzed(conn, "https://a.example/3", title="t3", title_ja="ヘッダだけの日")
-    add_sent_digest(conn, 3, [header_only], sent_item_ids=[], delivery_status="failed")
+    add_sent_digest(conn, today, 3, [header_only], sent_item_ids=[], delivery_status="failed")
     pending = add_analyzed(conn, "https://a.example/4", title="t4", title_ja="未配信の記事")
     add_sent_digest(
-        conn, 0, [pending], sent_item_ids=[], header_sent=False, delivery_status="pending"
+        conn, today, 0, [pending], sent_item_ids=[], header_sent=False, delivery_status="pending"
     )
     # 期間(直近 14 日。digest_date は JST 暦日)は従来どおり
     edge = add_analyzed(conn, "https://a.example/5", title="t5", title_ja="14 日前の記事")
-    add_sent_digest(conn, 14, [edge], sent_item_ids=[edge])
+    add_sent_digest(conn, today, 14, [edge], sent_item_ids=[edge])
     old = add_analyzed(conn, "https://a.example/6", title="t6", title_ja="15 日前の記事")
-    add_sent_digest(conn, 15, [old], sent_item_ids=[old])
+    add_sent_digest(conn, today, 15, [old], sent_item_ids=[old])
 
     assert _recent_titles(conn) == sorted(["届いた記事", "14 日前の記事"])
