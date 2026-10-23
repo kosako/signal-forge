@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 
@@ -21,6 +22,7 @@ from app.deepdive import (
     DigReview,
     ReviewFinding,
     TranslationChunk,
+    _looks_japanese,
     _revise_draft,
     _select_candidates,
     _split_paragraphs,
@@ -28,6 +30,8 @@ from app.deepdive import (
     build_review_prompt,
     run_dig_stage,
 )
+from app.extraction import extract_pending
+from app.http import HttpClient
 
 logger = logging.getLogger("test-deepdive")
 
@@ -353,6 +357,145 @@ def test_dig_www_tweet_url_is_also_tweet_body(conn, config) -> None:
     assert conn.execute("SELECT source_note_name FROM dig_results").fetchone()[
         "source_note_name"
     ] is None
+
+
+# --- 抽出から深掘りまで(GH#173)。言語は fixture で入れず、本文抽出の結果だけから決まる ---
+
+JA_ARTICLE = "エージェントの権限は最小にして、書き込み先を一つに絞るのがよいという話です。" * 10
+EN_ARTICLE = "Agents should run with the least privilege and a single write target. " * 10
+# 中国語: かなの無い漢字だけの文
+ZH_ARTICLE = "代理应当以最小权限运行,并且只写入一个位置。这是本文的主要观点。" * 10
+# 日本語の文を引用する英語の記事(引用のかなは文字の 1 割ほど。Codex のレビューの例)
+EN_QUOTING_JA = (
+    "This guide explains how to evaluate multilingual assistants. Use the prompt "
+    "「このコードのバグをみつけてください」 as a Japanese test case. Keep the task, model, "
+    "and settings fixed, then compare accuracy and latency across runs. "
+) * 2
+# 長い日本語の文を引用する英語の記事(引用の日本語の語が地の文の英単語より多い。Codex の R2 の例)
+EN_QUOTING_LONG_JA = (
+    "This guide explains how to evaluate multilingual assistants. Use the prompt "
+    "「このコードのバグを見つけて修正し、変更内容と理由を日本語で説明してください。"
+    "修正前と修正後の動作を比較し、テスト結果も報告してください。変更したファイルも示してください。」"
+    " as a Japanese test case. Keep the task, model, and settings fixed, then compare accuracy "
+    "and latency across runs."
+)
+# 同じ引用を英語の二重引用符で囲んだもの(Codex の R3 の例)
+EN_DQUOTING_LONG_JA = EN_QUOTING_LONG_JA.replace("「", '"').replace("」", '"')
+# 英単語とコードの多い日本語の記事
+JA_WITH_CODE = (
+    "Claude Code の hooks を使うと、ツールを実行する前に command を検査できます。"
+    "ここでは PreToolUse の hook で git push だけを止める設定を、実際に動かしながら説明します。\n\n"
+    "import json, sys\npayload = json.load(sys.stdin)\n"
+    "if payload['tool_input']['command'].startswith('git push'):\n    sys.exit(2)\n\n"
+    "スクリプトは標準入力から JSON を受け取り、止めるときは終了コード 2 を返します。"
+    "標準エラーに書いた文はそのまま Claude に返るので、止めた理由を書いておきます。"
+)
+
+
+@pytest.mark.parametrize(
+    ("article", "kind", "translated"),
+    [
+        (JA_ARTICLE, "原文", False),
+        (EN_ARTICLE, "対訳", True),
+        (ZH_ARTICLE, "対訳", True),
+        (EN_QUOTING_JA, "対訳", True),
+        (EN_QUOTING_LONG_JA, "対訳", True),
+        (EN_DQUOTING_LONG_JA, "対訳", True),
+    ],
+    ids=["ja", "en", "zh", "en-quoting-ja", "en-quoting-long-ja", "en-dquoting-long-ja"],
+)
+def test_extracted_article_language_picks_source_note(
+    conn, config, article, kind, translated
+) -> None:
+    url = "https://blog.example/post"
+    html = f"<html><body><article><p>{article}</p></article></body></html>"
+    item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, title, author, content_hash,"
+        " raw_payload) VALUES (2, ?, ?, 'Article', 'author', 'sha256:x', ?)",
+        (url, url, json.dumps({"raw_content": html})),
+    ).lastrowid
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404)
+
+    http = HttpClient(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["93.184.216.34"],
+        sleep=lambda _s: None,
+    )
+    assert extract_pending(conn, config, http, logger) == {"ok": 1, "partial": 0, "failed": 0}
+    assert calls == []  # 本文は raw_content から取れる
+    enqueue(conn, item)
+    engines: dict[str, ScriptedEngine] = {}
+
+    run_dig_stage(conn, config, make_factory(engines), FakeApi(), logger, today="2026-07-22")
+
+    notes = sorted(p.name for p in deepdive_dir(config).glob("*.md"))
+    assert notes == sorted(
+        [f"20260722-{item}-Article-深掘り.md", f"20260722-{item}-{kind}-Article.md"]
+    )
+    assert ("low" in engines) is translated  # 対訳の LLM は日本語以外のときだけ呼ぶ
+    if not translated:  # 日本語は抽出テキストの保全コピー(設計 06 §5.2)
+        source = deepdive_dir(config) / f"20260722-{item}-原文-Article.md"
+        assert JA_ARTICLE[:40] in source.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (JA_ARTICLE, True),
+        # 英単語の多い日本語の文・コードの混ざる日本語の記事も日本語
+        ("Claude Code の hooks で PreToolUse を使い、Bash の command を検査する方法です。", True),
+        (JA_WITH_CODE, True),
+        # 英語の文を引用する日本語の記事は、引用を除いた地の文で日本語
+        (
+            "この記事は「Agents should run with the least privilege and a single write target,"
+            " and every write should be reviewed by a human before it lands」と結論づけている。",
+            True,
+        ),
+        # 閉じの無い括弧や、行をまたぐ " で本文を捨てない
+        ("「" + JA_ARTICLE, True),
+        ('The 5" model.\n' + JA_ARTICLE + '\nThe 3" model.', True),
+        # 日本語の文や語句を引く英語の記事は日本語にしない(引用が長くても、入れ子でも、
+        # 引用符の種類が違っても)
+        (EN_QUOTING_JA, False),
+        (EN_QUOTING_LONG_JA, False),
+        (EN_DQUOTING_LONG_JA, False),
+        (EN_QUOTING_LONG_JA.replace("「", "“").replace("」", "”"), False),
+        (
+            "Use the prompt 「『テスト』と書かれたファイルを開いて、中身を読んでください」"
+            " as a test case.",
+            False,
+        ),
+        ("Use the prompt " + "「" * 50_000 + "日本語の文を引用しています" + "」" * 50_000, False),
+        (EN_ARTICLE + "The phrase いただきます is quoted once.", False),
+        (ZH_ARTICLE, False),
+        ("Claude Code の設定", False),  # 語の数が同じ(2 対 2)なら日本語以外に倒す
+        ("2026-10-23 12:00", False),  # 文字が無い
+    ],
+    ids=[
+        "ja",
+        "ja-terms",
+        "ja-with-code",
+        "ja-quoting-en",
+        "ja-unclosed-quote",
+        "ja-inch-marks",
+        "en-quoting-ja",
+        "en-quoting-long-ja",
+        "en-dquoting-long-ja",
+        "en-curly-quoting-long-ja",
+        "en-quoting-nested",
+        "en-quoting-deeply-nested",
+        "en-phrase",
+        "zh",
+        "tie",
+        "no-letters",
+    ],
+)
+def test_looks_japanese(text, expected) -> None:
+    assert _looks_japanese(text) is expected
 
 
 @pytest.mark.parametrize(

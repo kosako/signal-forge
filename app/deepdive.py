@@ -98,6 +98,14 @@ _REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
 _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 
+# 本文の言語の判定(GH#173): 日本語の文字(かな・漢字)のうち、かながこの割合に満たなければ
+# 日本語にしない(かなは日本語にしか無い。漢字だけの中国語を外す)
+_JA_KANA_MIN_SHARE = 0.2
+# 引用の括弧(開き → 閉じ)。地の文の言語の根拠にしない部分(GH#173)
+_QUOTE_PAIRS = {"「": "」", "『": "』", "“": "”"}
+# 開きと閉じが同じ字の二重引用符は、同じ行の中で前から 2 つずつ組にする
+_ASCII_QUOTE_RE = re.compile(r'"[^"\n]*"')
+
 
 class DigError(Exception):
     """調査段の失敗(材料不足の明示指定・全件失敗など)。"""
@@ -347,7 +355,7 @@ def _dig_one(
     source_note_name: str | None = None
     source_note_body: str | None = None
     if not is_tweet_body:
-        if candidate.language == "ja":
+        if _is_japanese_source(candidate):
             source_note_name = f"{date_prefix}-{candidate.item_id}-原文-{slug}"
             source_note_body = _source_note_ja(candidate, note_name)
         else:
@@ -1050,3 +1058,76 @@ def _is_tweet_url(url: str) -> bool:
     # 判定する(www.x.com がポリシー判定をすり抜けて本文が恒久保存される穴。Codex P1)
     host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
     return host in _TWEET_HOSTS
+
+
+def _is_japanese_source(candidate: DigCandidate) -> bool:
+    """原文ノート(日本語)か対訳ノート(日本語以外)か(設計 06 §5.2)。
+
+    documents.language は抽出で書いておらず(既存の行もすべて NULL)、NULL を日本語以外と
+    扱うと日本語の記事まで対訳(LLM)に回る(GH#173)。値があればそれに従い、無ければ本文から
+    判定する。
+    """
+    if candidate.language is not None:
+        return candidate.language == "ja"
+    return _looks_japanese(candidate.body or "")
+
+
+def _looks_japanese(text: str) -> bool:
+    """本文が日本語か。引用を除いた地の文で、日本語の語の数がそれ以外の語の数より多ければ日本語。
+
+    語 = 同じ文字種の文字の連なり(ひらがな・カタカナ・漢字は文字種ごとに区切る。それ以外は
+    英単語やコードの識別子)。文字の数で比べないのは、日本語は 1 字あたりの情報が多く、英単語や
+    コードの多い日本語の記事を取りこぼすため。引用(「」『』“” と同じ行の中の "…")の中は数えない:
+    長い日本語の文を引用する英語の記事を、引用の語の数で日本語と誤らないため(日本語の記事は引用を
+    除いても地の文が日本語のまま残る)。英語の記事を日本語と誤ると対訳が無くなるので、語の数が同じ
+    ものや、コードが本文より多い日本語の記事のように迷うものは日本語以外(対訳)に倒す。
+    """
+    text = _strip_quotes(text)
+    kana_chars = ja_chars = ja_words = other_words = 0
+    previous: str | None = None
+    for ch in text:
+        script = _char_script(ch) if ch.isalpha() else None
+        if script is not None and script != previous:
+            if script == "other":
+                other_words += 1
+            else:
+                ja_words += 1
+        if script in ("hiragana", "katakana"):
+            kana_chars += 1
+        if script in ("hiragana", "katakana", "kanji"):
+            ja_chars += 1
+        previous = script
+    if kana_chars == 0 or kana_chars < ja_chars * _JA_KANA_MIN_SHARE:
+        return False
+    return ja_words > other_words
+
+
+def _strip_quotes(text: str) -> str:
+    """引用を空白に置き換える(前後の語がつながらないように空白にする)。
+
+    「」『』“” は 1 回の走査で開きと閉じを対応づける(入れ子は外側ごと除く。本文の長さに比例する
+    手間で済ませ、深い入れ子でも全文を何度も走査しない)。対応の取れない閉じは無視し、閉じの無い
+    開きは中身ごと残す(閉じ忘れの括弧ひとつで本文の残りを捨てない)。" は同じ行の中だけで組にする。
+    """
+    out: list[str] = []
+    opened: list[tuple[str, int]] = []  # (待っている閉じ, 開きを置いた out の位置)
+    for ch in _ASCII_QUOTE_RE.sub(" ", text):
+        if opened and ch == opened[-1][0]:
+            del out[opened.pop()[1] :]
+            out.append(" ")
+        else:
+            if ch in _QUOTE_PAIRS:
+                opened.append((_QUOTE_PAIRS[ch], len(out)))
+            out.append(ch)
+    return "".join(out)
+
+
+def _char_script(ch: str) -> str:
+    code = ord(ch)
+    if 0x3040 <= code <= 0x309F:
+        return "hiragana"
+    if 0x30A0 <= code <= 0x30FF or 0xFF66 <= code <= 0xFF9F:  # 全角・半角のカタカナ
+        return "katakana"
+    if code == 0x3005 or 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:  # 々・漢字
+        return "kanji"
+    return "other"

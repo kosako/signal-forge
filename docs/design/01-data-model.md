@@ -84,7 +84,7 @@ CREATE TABLE documents (
   id                INTEGER PRIMARY KEY,
   item_id           INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
   extracted_text    TEXT,
-  language          TEXT,
+  language          TEXT,                    -- 本文抽出では書かない(NULL)。深掘りは NULL なら本文から判定する(設計 06 §5.2・GH#173)
   extraction_status TEXT NOT NULL CHECK (extraction_status IN ('ok','partial','failed')),
   extraction_error  TEXT,
   extracted_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
