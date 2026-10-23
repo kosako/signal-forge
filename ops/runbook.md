@@ -125,15 +125,19 @@ FDA を付与する:
 #    下の (a)(b) で何も出なくなるまで先へ進まない
 launchctl bootout "gui/$(id -u)/com.intel.morning" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/com.intel.poller" 2>/dev/null || true
-#    (a) 2 ジョブが外れたこと。出たら bootout をやり直す(poller が残ると KeepAlive で起動し直す)
+#    (a) 2 ジョブが外れたこと。launchctl print が「見つからない」(exit 113)で終わるときだけ外れたと
+#    みなす。出たら(exit 0 = まだロードされている、ほかの exit = 確かめられない)bootout をやり直すか
+#    原因を調べる(poller が残ると KeepAlive で起動し直す)
 for job in com.intel.morning com.intel.poller; do
-  launchctl print "gui/$(id -u)/${job}" >/dev/null 2>&1 && echo "${job} がまだロードされている"
+  err="$(launchctl print "gui/$(id -u)/${job}" 2>&1 >/dev/null)"; rc=$?
+  [ "${rc}" -eq 113 ] || echo "${job}: 外れたと確かめられない(exit ${rc}) ${err}"
 done
 #    (b) intel のプロセスが残っていないこと。poller が起動した `intel answer`(python -m app.cli answer)は
 #    別セッションで動くので、poller を止めても終わらずに残りうる(設計 05 §1.2)。手で起動した intel
-#    コマンドも bootout では止まらない。一覧が出たら終わるのを待ち(返事を作っている answer は LLM の
-#    待ちで数分以上かかることがある)、もう一度実行する
-pgrep -fl 'app\.cli|/intel '
+#    コマンド(`uv run intel …` の uv が環境を整えている間も含む)も bootout では止まらない。一覧が
+#    出たら終わるのを待ち(返事を作っている answer は LLM の待ちで数分以上かかることがある)、もう一度
+#    実行する
+pgrep -fl 'app\.cli|(^|[ /])intel( |$)'
 
 RESTORE_DIR="$(mktemp -d)"
 tar -xzf "${HOME}/Backups/intel/intel-<日付>.tar.gz" -C "${RESTORE_DIR}"
