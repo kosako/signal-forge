@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 import httpx
@@ -358,6 +359,155 @@ def test_midway_failure_marks_failed_and_keeps_ledger(conn, tmp_path) -> None:
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "failed"
     ledger = conn.execute("SELECT item_id FROM digest_messages ORDER BY id").fetchall()
     assert [r["item_id"] for r in ledger] == [None, a]  # ヘッダ + a は記録済み
+
+
+def test_concurrent_deliveries_send_each_message_once(conn, tmp_path, caplog) -> None:
+    # 朝バッチと手動の intel deliver が重なっても 1 回だけ送る(GH#192)。flock は開いた
+    # ファイルごとに効くので、同じプロセスの 2 スレッド(別々の接続)で 2 プロセスを模す
+    a = add_item(conn, "https://a/1")
+    b = add_item(conn, "https://a/2")
+    digest_id = add_digest(conn, [a, b])
+    db_path = tmp_path / "intel.db"
+    recorder = ApiRecorder()
+    guard = threading.Lock()
+    first_send = threading.Event()  # 先の配信が 1 通目を送り始めた
+    release = threading.Event()  # 先の配信の 1 通目を返す
+    send_while_held = threading.Event()  # 先の配信が止まっている間に別の送信が来た
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with guard:
+            response = recorder.handler(request)
+            count = len(recorder.requests)
+        if count == 1:
+            first_send.set()
+            release.wait(timeout=10)
+        elif not release.is_set():
+            send_while_held.set()
+        return response
+
+    results: dict[str, int] = {}
+    errors: list[BaseException] = []
+
+    def run(name: str) -> None:
+        thread_conn = connect(db_path)
+        api = TelegramApi(
+            "test-token", transport=httpx.MockTransport(handler), sleep=lambda _s: None
+        )
+        try:
+            results[name] = deliver_digest(
+                thread_conn, make_config(tmp_path), api, digest_id, logger
+            )
+        except BaseException as e:  # スレッドの例外は本体で検査する
+            errors.append(e)
+        finally:
+            thread_conn.close()
+
+    first = threading.Thread(target=run, args=("first",))
+    second = threading.Thread(target=run, args=("second",))
+    with caplog.at_level(logging.INFO, logger="test-delivery"):
+        first.start()
+        try:
+            assert first_send.wait(timeout=10)
+            second.start()
+            # 後の配信は、先の配信が台帳に書き終えるまで台帳を読まずに待つ
+            sent_while_held = send_while_held.wait(timeout=0.5)
+        finally:  # 検査が落ちてもスレッドを残さない
+            release.set()
+            first.join(timeout=10)
+            if second.ident is not None:
+                second.join(timeout=10)
+
+    assert not sent_while_held
+    assert errors == []
+    assert results == {"first": 3, "second": 0}
+    assert len(recorder.requests) == 3  # ヘッダ + 2 件。二重に送らない
+    assert "別の配信が実行中のため、終わるのを待つ" in caplog.text
+    ledger = conn.execute("SELECT item_id, message_id FROM digest_messages ORDER BY id").fetchall()
+    assert [(r["item_id"], r["message_id"]) for r in ledger] == [(None, 101), (a, 102), (b, 103)]
+    assert (tmp_path / "deliver.lock").exists()  # ロックは DB の隣
+
+
+class FlakyLedgerConn:
+    """digest_messages への INSERT を先頭から fail 回だけ失敗させる接続の代理(GH#225)。"""
+
+    def __init__(self, conn: sqlite3.Connection, fail: int, error=sqlite3.OperationalError):
+        self._conn = conn
+        self._fail = fail
+        self._error = error
+        self.inserts = 0
+
+    def execute(self, sql: str, params=()):
+        if sql.startswith("INSERT INTO digest_messages"):
+            self.inserts += 1
+            if self._fail > 0:
+                self._fail -= 1
+                raise self._error("disk I/O error")
+        return self._conn.execute(sql, params)
+
+
+def test_ledger_write_failure_retries_record_without_resending(conn, tmp_path) -> None:
+    # 送信の後の記帳が一時的に失敗しても、送り直さず記帳だけをやり直す(GH#225)
+    a = add_item(conn, "https://a/1")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    sleeps: list[float] = []
+
+    sent = deliver_digest(
+        FlakyLedgerConn(conn, fail=2), make_config(tmp_path), recorder.api(), digest_id,
+        logger, sleep=sleeps.append,
+    )
+
+    assert sent == 2
+    assert len(recorder.requests) == 2  # ヘッダを送り直していない
+    assert sleeps == [1.0, 2.0]
+    ledger = conn.execute("SELECT item_id, message_id FROM digest_messages ORDER BY id").fetchall()
+    assert [(r["item_id"], r["message_id"]) for r in ledger] == [(None, 101), (a, 102)]
+    # 再走しても二重に送らない
+    assert deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger) == 0
+    assert len(recorder.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "inserts"),
+    [
+        (sqlite3.OperationalError, 4),  # 初回 + やり直し 3 回
+        (sqlite3.IntegrityError, 1),  # 制約違反はやり直しても通らない
+    ],
+)
+def test_ledger_write_failure_that_persists_logs_message_id_and_stops(
+    conn, tmp_path, caplog, error, inserts
+) -> None:
+    # やり直しても記帳できなければ、送信済みの message_id をログに残して止める(GH#225)
+    a = add_item(conn, "https://a/1")
+    b = add_item(conn, "https://a/2")
+    digest_id = add_digest(conn, [a, b])
+    recorder = ApiRecorder()
+    flaky = FlakyLedgerConn(conn, fail=99, error=error)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="test-delivery"),
+        pytest.raises(DeliveryError, match="message_id=101"),
+    ):
+        deliver_digest(
+            flaky, make_config(tmp_path), recorder.api(), digest_id, logger,
+            sleep=lambda _s: None,
+        )
+
+    assert len(recorder.requests) == 1  # 記帳できないまま先へ送らない
+    assert flaky.inserts == inserts
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "failed"
+    record = next(r for r in caplog.records if "台帳に記帳できない" in r.getMessage())
+    assert record.item_id is None  # ヘッダ
+    assert record.extra["digest_id"] == digest_id
+    assert record.extra["message_id"] == 101
+    # 復旧(runbook §15): ログの message_id を台帳に入れてから再走すると、ヘッダを送り直さない
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+        (record.extra["digest_id"], record.item_id, record.extra["message_id"]),
+    )
+    assert deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger) == 2
+    assert len(recorder.requests) == 3
+    assert all("のダイジェスト" not in text for text in recorder.texts()[1:])
 
 
 def test_retry_on_429_honors_retry_after_then_succeeds(conn, tmp_path) -> None:

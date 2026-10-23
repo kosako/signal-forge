@@ -100,7 +100,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | LLM `complete_structured`(深掘りの調査段・対訳・質問への返事) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回 | 調査段はアイテム単位で隔離し、失敗は段の失敗として朝バッチ失敗通知に載せる。返事は作れなければ失敗の知らせをリプライで送る(GH#126) |
 | 予備への切り替え(`[llm_fallback]`。GH#156) | 呼び出し元と同じ | 主が失敗した呼び出しを予備で 1 回(その外側の同一エンジン 1 回のやり直しは各経路のまま)。主が続けて 2 回失敗したら(起動できないときは 1 回で)そのプロセスの残りは主を飛ばす | 予備も失敗・予備を作れない・月の上限なら、主の失敗と同じ種類のエラーにして各経路の扱い(劣化・段の失敗)に戻す(設計 00 §5) |
 | LLM `complete_structured`(深掘りのレビュー = `anthropic-api` と、指摘を受けた直し) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回(401/403/404 = キー・権限・モデル ID の誤りはやり直さない) | 失敗しても段の失敗にしない。未レビュー(直しの失敗なら直す前)のまま届け、ノートとカードに明示する(設計 06 §4。GH#153) |
-| Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
+| Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する。digest の配信で送信の後の台帳の記帳が失敗したときは、送り直さず記帳だけを 3 回までやり直し、なお駄目なら message_id をログに残して止める(設計 04 §2。GH#225) |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |
 
 - **SSRF ガード(外部 URL を fetch する全経路の共通 HTTP クライアント規約)**: 本文抽出・短縮 URL 展開・RSS 取得を含むすべての外向き HTTP は、**DNS 解決後の接続先 IP が global でなければ接続を拒否する(`is_global` を基本にした allowlist 方式。private / loopback / link-local に加え shared address space 100.64.0.0/10 等のブラックリスト漏れも遮断)**。**リダイレクト追跡の各ホップで再検査**し(悪意ある RSS entry・短縮 URL のリダイレクト先から、常時稼働機の LAN 内・localhost へのプローブを遮断)、接続は**検証済み IP にピン留め**する(URL ホストを IP に書き換え、Host ヘッダ+SNI で元ホスト名を維持。検証と接続で DNS を別々に引くと、1回目 public・2回目 private を返す DNS rebinding で検査を回避できるため)。

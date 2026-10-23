@@ -14,6 +14,7 @@
 - §12: ソースの見直し(週 1 回の健康診断を受けて止める・URL を直す)
 - §13: 深掘りノートのレビュー(別系統の AI が見る。既定は off)
 - §14: Codex が失敗したときの予備(Claude API でやり直す。既定は off)
+- §15: 配信の記帳に失敗したとき(届いた 1 通を台帳に入れてから再走する)
 
 ## 前提
 
@@ -395,3 +396,30 @@ SQL
   `run_id` が空の行で見る。
 
 **止める**: `[llm_fallback].engine = ""`(または行ごと消す)。
+
+## 15. 配信の記帳に失敗したとき(GH#225・設計 04 §2)
+
+digest の配信で、Telegram には送れたのに台帳(`digest_messages`)に記帳できなかったときは、送り直さず
+記帳だけを 3 回までやり直す。それでも駄目なら配信を止め、ERROR「送信済みの message を台帳に記帳できない」を
+`morning.log` に残す(朝バッチも手動の `intel deliver` も同じファイル。日をまたいだら `morning.log.<日付>`)。
+朝バッチなら失敗通知の段は `deliver` になる。
+
+この 1 通は届いているが台帳に無い。このまま再走すると同じ記事をもう一度送り、先に届いた方への
+リプライは感想として記録されない。再走の前に、次の手順で台帳に入れる。
+
+1. ログから値を取る(`item_id` が null の行はヘッダ):
+   ```sh
+   grep '台帳に記帳できない' ~/.local/state/intel/logs/morning.log \
+     | jq -c '{item_id, digest_id: .extra.digest_id, message_id: .extra.message_id, error: .extra.error}'
+   ```
+2. `error` の原因(`database or disk is full` ならディスクの空きなど)を直す。
+3. 台帳に入れる(値は 1 の出力。ヘッダは `item_id` を `NULL` にする):
+   ```sh
+   db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+   sqlite3 "$db" "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (<digest_id>, <item_id>, <message_id>);"
+   ```
+4. `uv run intel deliver` で残りを送る(台帳にある分は送らない)。`intel deliver` は当日の digest だけを
+   送るので、日をまたいだら残りは送らない(届かなかった記事は Obsidian の Daily ノートで見る)。
+
+- 配信は同じ DB に対して 1 つずつ走る(DB の隣の `deliver.lock`。GH#192)。朝バッチの配信中に手で
+  `intel deliver` を打つと、先の配信が終わるまで待ってから、未送信の分だけを送る。
