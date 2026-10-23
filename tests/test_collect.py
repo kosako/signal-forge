@@ -193,6 +193,24 @@ def test_invalid_scheme_item_recorded_as_error(conn: sqlite3.Connection) -> None
     assert rows["https://example.com/ok"] == "new"
 
 
+def test_unsplittable_url_item_recorded_as_error_and_rest_saved(
+    conn: sqlite3.Connection,
+) -> None:
+    # 分解できない URL(urlsplit の ValueError)も 1 件の error に留め、同じソースの正常な
+    # 記事とカーソルは保存する(ソース全体をロールバックしない。GH#186)
+    connector = FakeConnector([item("https://example.com]/bad"), item("https://example.com/ok")])
+    collect_all(conn, {"rss": connector}, logger)
+    rows = {r["url"]: r["status"] for r in conn.execute("SELECT url, status FROM items")}
+    assert rows == {"https://example.com]/bad": "error", "https://example.com/ok": "new"}
+    source = conn.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE type='rss'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"etag": "e1", "last_modified": None}
+    assert source["consecutive_failures"] == 0
+    run = conn.execute("SELECT status FROM collect_runs").fetchone()
+    assert run["status"] == "ok"
+
+
 def test_rss_external_id_fallback_to_urlhash(conn: sqlite3.Connection) -> None:
     collect_all(conn, {"rss": FakeConnector([item("https://example.com/1")])}, logger)
     row = conn.execute("SELECT external_id FROM items").fetchone()

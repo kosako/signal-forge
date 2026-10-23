@@ -177,3 +177,104 @@ def test_missing_url_config_is_fatal() -> None:
     connector = make_connector(lambda request: httpx.Response(200))
     with pytest.raises(FatalError, match="設定不備"):
         connector.fetch(make_source(config="{}"), {})
+
+
+RELATIVE_ATOM = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Relative</title>
+  <entry>
+    <id>tag:example.com,2026:rel-1</id>
+    <title>ルートからの相対</title>
+    <link href="/posts/1"/>
+  </entry>
+  <entry>
+    <id>tag:example.com,2026:rel-2</id>
+    <title>フィードの場所からの相対</title>
+    <link href="posts/2"/>
+  </entry>
+  <entry xml:base="https://other.example/base/">
+    <id>tag:example.com,2026:rel-3</id>
+    <title>xml:base が優先</title>
+    <link href="posts/3"/>
+  </entry>
+  <entry>
+    <id>tag:example.com,2026:rel-4</id>
+    <title>前の entry の xml:base を引き継がない</title>
+    <link href="/posts/4"/>
+  </entry>
+</feed>
+"""
+
+RELATIVE_RSS = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Relative</title>
+    <item>
+      <title>相対リンクの記事</title>
+      <link>/posts/5</link>
+      <guid isPermaLink="false">post-5</guid>
+    </item>
+    <item>
+      <title>絶対リンクの記事</title>
+      <link>https://example.com/posts/6</link>
+      <guid>https://example.com/posts/6</guid>
+    </item>
+  </channel>
+</rss>
+"""
+
+
+def test_relative_atom_links_resolved_against_final_feed_url() -> None:
+    # 基準はリダイレクト後の最終 URL。xml:base があればそちらを使う(GH#185)
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/feed.xml":
+            return httpx.Response(302, headers={"location": "https://example.com/blog/atom.xml"})
+        return httpx.Response(200, content=RELATIVE_ATOM.encode())
+
+    result = make_connector(handler).fetch(make_source(), {})
+    assert [item.url for item in result.items] == [
+        "https://example.com/posts/1",
+        "https://example.com/blog/posts/2",
+        "https://other.example/base/posts/3",
+        "https://example.com/posts/4",
+    ]
+    # URI でない id(tag:)は基準 URI で書き換わらない
+    assert result.items[0].external_id == "tag:example.com,2026:rel-1"
+
+
+def test_relative_rss_link_resolved_against_feed_url() -> None:
+    connector = make_connector(lambda request: httpx.Response(200, content=RELATIVE_RSS.encode()))
+    first, second = connector.fetch(make_source(), {}).items
+    assert first.url == "https://example.com/posts/5"
+    assert first.external_id == "post-5"  # isPermaLink="false" の guid は解決しない
+    assert second.url == "https://example.com/posts/6"
+
+
+def test_relative_link_keeps_charset_detection_without_xml_declaration() -> None:
+    # 基準 URI を渡しても文字コードの推定を変えない(宣言の無い UTF-8 は UTF-8 のまま。GH#185)
+    feed = """<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:example.com,2026:ja</id>
+    <title>日本語のパス</title>
+    <link href="/記事/1"/>
+  </entry>
+</feed>
+"""
+    connector = make_connector(lambda request: httpx.Response(200, content=feed.encode()))
+    (only,) = connector.fetch(make_source(), {}).items
+    assert only.url == "https://example.com/記事/1"
+    assert only.title == "日本語のパス"
+
+
+def test_unresolvable_guid_falls_back_to_none() -> None:
+    # 基準 URI で解決できない guid は feedparser が空文字にする。空文字のままだと
+    # (source_id, external_id) の UNIQUE で別の記事と衝突するため None にする
+    feed = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>t</title>
+  <item><title>a</title><link>/posts/7</link><guid>https://example.com]/7</guid></item>
+</channel></rss>
+"""
+    connector = make_connector(lambda request: httpx.Response(200, content=feed.encode()))
+    (only,) = connector.fetch(make_source(), {}).items
+    assert only.url == "https://example.com/posts/7"
+    assert only.external_id is None

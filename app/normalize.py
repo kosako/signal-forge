@@ -14,7 +14,7 @@ import hashlib
 import re
 import unicodedata
 from collections.abc import Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
 # u1 手順1: これらのドメインのみ 1 回の GET で最終 URL に解決する(全 URL は解決しない)
 SHORT_URL_HOSTS = frozenset({"t.co", "bit.ly", "buff.ly", "goo.gl", "ow.ly", "tinyurl.com"})
@@ -42,7 +42,7 @@ class UnsupportedSchemeError(UrlError):
 
 
 class InvalidUrlError(UrlError):
-    """構造が不正・許容しない URL(userinfo 付き・不正ポート等)。
+    """構造が不正・許容しない URL(分解できない・userinfo 付き・不正ポート等)。
 
     userinfo(`user:pass@`)は無言で落とすと別リソースの誤 dedup になり、保持すると
     canonical_url 経由で credential が配信・ノートへ漏れるため reject する。
@@ -55,13 +55,15 @@ def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None
     resolve_short: 既知短縮ドメインの最終 URL 解決(1回)。None なら展開しない
     (X は expanded_url 済み、テスト・オフライン時)。
     """
-    split = urlsplit(url.strip())
+    split = _split_url(url.strip(), f"URL を分解できない: {url[:80]}")
     if split.scheme.lower() not in ("http", "https"):
         raise UnsupportedSchemeError(f"scheme が http/https でない: {url[:80]}")
 
     # 手順1: 既知短縮ドメインのみ解決し、結果 URL に対して以降の手順を適用
     if resolve_short is not None and split.hostname in SHORT_URL_HOSTS:
-        resolved = urlsplit(resolve_short(url.strip()))
+        resolved = _split_url(
+            resolve_short(url.strip()), f"短縮 URL の解決先を分解できない: {url[:80]}"
+        )
         if resolved.scheme.lower() not in ("http", "https"):
             raise UnsupportedSchemeError(f"短縮 URL の解決先が http/https でない: {url[:80]}")
         split = resolved
@@ -102,6 +104,19 @@ def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None
         path = path.rstrip("/")
 
     return urlunsplit((scheme, host, path, query, ""))
+
+
+def _split_url(url: str, error_message: str) -> SplitResult:
+    """入力 URL と短縮 URL の解決先の分解に共通。分解できなければ InvalidUrlError。
+
+    urlsplit は IPv6 の括弧の不整合・NFKC で不正になる netloc などで ValueError を送出する。
+    呼び出し側の隔離は UrlError 単位のため、素の ValueError のままだと不正な 1 件で
+    ソース全体の保存がロールバックされる(GH#186)。
+    """
+    try:
+        return urlsplit(url)
+    except ValueError as e:
+        raise InvalidUrlError(error_message) from e
 
 
 def normalize_text_for_hash(title: str | None, body: str | None) -> str:

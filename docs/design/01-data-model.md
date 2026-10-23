@@ -241,7 +241,7 @@ INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 
 適用順:
 
-0. **scheme allowlist(全ソース共通)**: scheme が `http` / `https` 以外の URL(`javascript:` 等)はアイテムごと reject(`status='error'`)。manual 投入経路だけでなく X・RSS 由来にも適用する。
+0. **scheme allowlist(全ソース共通)**: scheme が `http` / `https` 以外の URL(`javascript:` 等)はアイテムごと reject(`status='error'`)。manual 投入経路だけでなく X・RSS 由来にも適用する。分解できない URL(IPv6 の括弧の不整合など。短縮 URL の解決先も同じ)も同じくアイテムごと reject し、同じソースの他のアイテムは保存する(GH#186)。
 1. 短縮 URL 展開: X は API の `entities.expanded_url` を使う(HTTP 不要)。RSS で `t.co` / `bit.ly` 等の既知短縮ドメインのみ 1 回 GET で最終 URL に解決。それ以外はリダイレクト解決しない。理由: 全 URL の解決はコストと失敗点を増やす。**例外: manual(Telegram 投入。plan #18)は展開しない** — 受信デーモンの外向き HTTP を Telegram API のみに保つ(SSRF 面と失敗点を増やさない)。短縮 URL の手動投入は collect 由来と canonical が割れて重複しうるが、頻度・実害とも小さく許容する。
 2. scheme・host を小文字化。デフォルトポート(:80/:443)除去。scheme の書き換え(http→https)はしない。
 3. `twitter.com` / `mobile.twitter.com` → `x.com` に統一。X ポストの canonical は `https://x.com/i/web/status/{id}` 形式で組み立てる。理由: screen_name 変更に対して不変。

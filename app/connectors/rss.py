@@ -64,7 +64,18 @@ class RssConnector:
         if response.status_code >= 500:
             raise RetryableError(f"HTTP {response.status_code}: {feed_url}")
 
-        feed = feedparser.parse(response.content)
+        # 相対の記事リンクは取得した URL(リダイレクト後の最終 URL)を基準に絶対 URL へ解決する。
+        # xml:base があればそちらを優先する(feedparser の解決。GH#185)。基準 URI を渡す口は
+        # response_headers の content-location だけ。headers を渡すと content-type の無い応答は
+        # 既定の文字コードが iso-8859-1 になり、XML 宣言の無い UTF-8 の属性(href 等)が化ける。
+        # headers なしの今の推定(BOM・XML 宣言・既定 utf-8)と同じになる application/xml を添える
+        feed = feedparser.parse(
+            response.content,
+            response_headers={
+                "content-location": fetched.final_url,
+                "content-type": "application/xml",
+            },
+        )
         if feed.bozo and not feed.entries:
             raise RetryableError(f"フィードのパース失敗: {feed_url}({feed.bozo_exception})")
 
@@ -110,7 +121,9 @@ def _to_raw_item(entry: feedparser.util.FeedParserDict) -> RawItem | None:
         published_at = datetime.fromtimestamp(timegm(parsed), tz=UTC)
 
     return RawItem(
-        external_id=entry.get("id"),  # 無ければ None(collect が正規化 URL hash で補完)
+        # 無ければ None(collect が正規化 URL hash で補完)。基準 URI で解決できない guid は
+        # feedparser が空文字にするので None に寄せる(空文字どうしが UNIQUE で衝突するため)
+        external_id=entry.get("id") or None,
         url=link,
         title=entry.get("title"),
         author=entry.get("author"),
