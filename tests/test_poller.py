@@ -1044,6 +1044,42 @@ def test_dig_reply_ack_shows_retained_angle_on_bare_rerequest(conn, tmp_path) ->
     )]
 
 
+def test_dig_reply_ack_with_many_long_retained_angles_fits_message_limit(
+    conn, tmp_path
+) -> None:
+    # GH#228 の Codex must: 長い観点を引き継ぐ item を何件もまとめて再指定しても、確認の
+    # 返信が Telegram の 1 通の上限を超えない(観点は表示だけ切り詰め、行単位で複数通に分ける)
+    from app.delivery.poller import DIG_ACK_ANGLE_MAX_CHARS, DIG_ACK_MAX_CHARS
+    from app.delivery.telegram import escape_and_truncate
+
+    long_angle = "あ&" * 1_050  # 2,100 字(escape 後はもっと長い)
+    items = [add_dig_candidate(conn, f"https://a/{n}") for n in range(15)]
+    for item in items:
+        conn.execute(
+            "INSERT INTO dig_queue (item_id, status, source, angle) "
+            "VALUES (?, 'passed', 'request', ?)",
+            (item, long_angle),
+        )
+    conn.commit()
+    text = "、".join(f"{item} も" for item in items)
+    api = FakeApi([[make_reply_update(text, BACKLOG_MSG_ID)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    # キューの観点は原文のまま(切り詰めは表示だけ)
+    angles = {r["angle"] for r in conn.execute("SELECT angle FROM dig_queue")}
+    assert angles == {long_angle}
+    assert len(api.sent) >= 2
+    assert all(chat == CHAT_ID for chat, _ in api.sent)
+    assert all(len(message) <= DIG_ACK_MAX_CHARS for _, message in api.sent)
+    lines = [line for _, message in api.sent for line in message.split("\n")]
+    shown = escape_and_truncate(long_angle, DIG_ACK_ANGLE_MAX_CHARS)
+    assert shown.endswith("…")
+    assert lines == [
+        f"🔍 {item} を登録しました(前回の観点を引き継ぎ: {shown})" for item in items
+    ]
+
+
 def dig_button(dig_id: int, code: str, *, card_message_id: int = 700, update_id: int = 1,
                chat_id: int = CHAT_ID) -> dict:
     return {
