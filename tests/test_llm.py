@@ -1,6 +1,11 @@
+import contextlib
 import json
 import os
+import signal
 import stat
+import subprocess
+import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -194,6 +199,67 @@ def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "sleep 5\n")
     with pytest.raises(LLMError, match="タイムアウト"):
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict, timeout_s=1)
+
+
+def _wait_until(cond, timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return bool(cond())
+
+
+def _group_gone(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, RuntimeError])
+def test_engine_interrupt_stops_and_reaps_codex(
+    tmp_path: Path, monkeypatch, interrupt: type[BaseException]
+) -> None:
+    # GH#244: communicate の途中の中断(手動実行の Ctrl-C)や例外でも、別セッションの codex を
+    # 孫ごと止めて回収し、作業ディレクトリはその後に消す。例外は LLMError に変えずに返す
+    pid_file = tmp_path / "codex.pid"
+    # 推論を続けている codex の代わり: 孫の sleep を起こしてから自分の pid を書き、待つ
+    codex = fake_codex(tmp_path, f'sleep 30 &\necho $$ > "{pid_file}"\nwait\n')
+    started: list[subprocess.Popen[str]] = []
+    reaped_at_cleanup: list[bool] = []
+
+    def interrupted_communicate(self, *args, **kwargs):
+        started.append(self)
+        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text().strip())
+        raise interrupt
+
+    real_exit = tempfile.TemporaryDirectory.__exit__
+
+    def exit_records_reap(self, *exc_info):
+        reaped_at_cleanup.append(bool(started) and started[0].returncode is not None)
+        return real_exit(self, *exc_info)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted_communicate)
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "__exit__", exit_records_reap)
+    try:
+        with pytest.raises(interrupt):
+            CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+        pgid = int(pid_file.read_text())
+        assert started[0].returncode is not None  # 子を回収した
+        assert reaped_at_cleanup == [True]  # 作業ディレクトリを消す前に回収した
+        assert _wait_until(lambda: _group_gone(pgid))  # 孫の sleep も残らない
+    finally:
+        # 後片付けの無い実装で落ちたときにも、偽の codex を残さない
+        for process in started:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
 
 
 def test_engine_nonzero_exit_raises(tmp_path: Path) -> None:

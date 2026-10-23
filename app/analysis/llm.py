@@ -177,11 +177,14 @@ class CodexCliEngine:
             try:
                 _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
             except subprocess.TimeoutExpired as e:
-                # timeout と kill の間に自然終了していたら ProcessLookupError(取り残しなし)
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                process.wait()
+                _kill_process_group(process)
                 raise LLMError(f"タイムアウト({timeout_s}s)") from e
+            except BaseException:
+                # 手動実行の中断(Ctrl-C の KeyboardInterrupt)や想定外の例外でも子を残さない
+                # (GH#244)。子は別セッションなので端末の SIGINT が届かず、放っておくと推論を
+                # 続ける。with を抜けて作業ディレクトリを消す前に止めて回収し、例外はそのまま返す
+                _kill_process_group(process)
+                raise
             if process.returncode != 0:
                 # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。
                 # 例外(=ログ)には制御文字を除去した末尾200字だけを載せる
@@ -209,6 +212,14 @@ class CodexCliEngine:
             "HOME": workdir,
             "CODEX_HOME": codex_home,
         }
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    """別セッションで起動した子を、孫を含むプロセスグループごと SIGKILL して回収する。"""
+    # 止める前に自然終了していたら ProcessLookupError(取り残しなし)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    process.wait()
 
 
 _ISOLATION_PROFILE = "intel_isolated"
