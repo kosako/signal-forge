@@ -178,7 +178,22 @@ def test_persistent_dns_failure_exhausts_retries() -> None:
     assert len(sleeps) == 2
     assert 1.0 <= sleeps[0] < 2.0
     assert 4.0 <= sleeps[1] < 5.0  # 1s→4s + jitter
-    assert "DNS 解決失敗" in str(excinfo.value.__cause__)  # 原因は例外の連鎖に残る
+    # 呼び出し側は例外の型と文字列だけを記録するため、DNS の原因を文言に残す
+    assert "DNS 解決失敗: nxdomain.example" in str(excinfo.value)
+
+
+def test_dns_failure_on_redirect_hop_names_failed_host() -> None:
+    # 記録される文字列に元 URL しか無いと、どのホップのホストが引けなかったか分からない
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["host"])
+        return httpx.Response(302, headers={"location": "https://gone.example/a"})
+
+    with pytest.raises(RetryableError, match="リトライ上限") as excinfo:
+        make_client(handler, sleeps=[]).get("https://example.com/short")
+    assert calls == ["example.com"] * 3  # 試行ごとに元 URL からたどり直す
+    assert "DNS 解決失敗: gone.example" in str(excinfo.value)
 
 
 def test_resolve_short_url_returns_final() -> None:
