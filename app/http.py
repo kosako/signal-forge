@@ -86,13 +86,16 @@ class HttpClient:
         """リトライ+リダイレクト追跡付き GET。
 
         2xx/3xx 以外もレスポンスとして返す(304 は正常系、4xx の業務分類は呼び出し側。
-        リトライ対象は transport エラー・5xx・429 のみ)。
+        リトライ対象は transport エラー・DNS 解決失敗・5xx・429 のみ)。
         """
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             try:
                 fetched = self._follow_redirects(url, headers)
-            except (httpx.TransportError, httpx.TimeoutException) as e:
+            except (httpx.TransportError, httpx.TimeoutException, RetryableError) as e:
+                # RetryableError は _check_target の DNS 解決失敗(解決できない・結果が空)。
+                # スリープ復帰直後などの一時的な失敗として transport エラーと同じ回数・
+                # バックオフで再試行する(GH#188)
                 last_error = e
                 self._backoff(attempt)
                 continue
