@@ -60,7 +60,8 @@ def digest_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """digest の候補(status='analyzed' の items)を最新の分析と一緒に item_id 順で返す。
 
     通常のランキングと LLM 全滅(degraded)の判定は同じ集合を見る必要があるので、候補の条件は
-    ここにだけ置く(GH#112)。
+    ここにだけ置く(GH#112)。全滅の判定はこのうち当日に分析されたものだけを見る
+    (analyzed_at で絞るのは builder 側。GH#175)。
     """
     return conn.execute(
         """
@@ -70,7 +71,7 @@ def digest_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                analyses.id AS analysis_id, analyses.relevance_score, analyses.novelty,
                analyses.negative_labels, analyses.topic, analyses.title_ja, analyses.summary,
                analyses.category, analyses.recommendation_reason, analyses.implication,
-               analyses.degraded
+               analyses.degraded, analyses.analyzed_at
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (

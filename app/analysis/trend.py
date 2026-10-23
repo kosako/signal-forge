@@ -15,13 +15,12 @@ import json
 import logging
 import secrets
 import sqlite3
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
-from app.jst import JST
+from app.jst import jst_day_bounds_utc, today_jst
 from app.prompting import fill_template, sanitize
 
 PROMPT_VERSION = "trend-v002"
@@ -81,23 +80,13 @@ def synthesize_trend(
     return _render(result, valid_ids) or None
 
 
-def _today_jst_bounds_utc() -> tuple[str, str]:
-    """本日(JST 暦日)の [0:00, 翌 0:00) を UTC の ISO 文字列で返す(analyzed_at の範囲)。"""
-    start = datetime.now(UTC).astimezone(JST).replace(hour=0, minute=0, second=0, microsecond=0)
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return (
-        start.astimezone(UTC).strftime(fmt),
-        (start + timedelta(days=1)).astimezone(UTC).strftime(fmt),
-    )
-
-
 def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """本日 JST に分析された非 degraded アイテム(最新分析)。relevance 上位から。
 
     上限も持つ(未来時刻・時計ずれの分析を翌日ぶんとして拾わない)。'digested' 済みの
     item も含む(--force 再生成時に当日分を落とさない。status で絞らず analyzed_at で絞る)。
     """
-    start, end = _today_jst_bounds_utc()
+    start, end = jst_day_bounds_utc(today_jst())
     return conn.execute(
         """
         SELECT items.id AS item_id,

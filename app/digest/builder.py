@@ -2,8 +2,9 @@
 
 - 1 暦日(JST)1 行。生成済みなら skip、--force で置換(digest_date UNIQUE が冪等キー)
 - 通常: ランキング選抜(min_score 未満は載せない。0 件なら「該当なし」)
-- degraded: 当日候補の分析が LLM 全滅(全件 degraded)のとき、タイトルのみで
-  最大 max_items 件(min_score は適用しない — 無配信より劣化配信。設計 00 §6)
+- degraded: 当日候補(当日に分析された候補)の分析が LLM 全滅(全件 degraded)のとき、
+  当日候補をタイトルのみで最大 max_items 件(min_score は適用しない — 無配信より劣化配信。
+  設計 00 §6)。閾値に届かず analyzed のまま残る過去の記事は判定にも劣化配信にも入れない(GH#175)
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import logging
 import sqlite3
 
 from app.config import Config
-from app.jst import today_jst
+from app.jst import jst_day_bounds_utc, today_jst
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
 
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
@@ -71,9 +72,9 @@ def generate_digest(
                 # DELETE は FK 違反(CASCADE にすると感想が消える)。置換後も同じ
                 # digest_date への感想として意味が保たれるため id 維持が正しい
 
-            # 全候補の最新分析が degraded なら通常ランキングを使わない(min_score=0 等の
+            # 当日候補の最新分析がすべて degraded なら通常ランキングを使わない(min_score=0 等の
             # 許容設定でも degraded 配信の契約を守る)
-            ranked = _all_degraded_candidates(conn, config)
+            ranked = _all_degraded_candidates(conn, config, digest_date)
             degraded_digest = bool(ranked)
             if not degraded_digest:
                 ranked = rank_for_digest(conn, config)
@@ -202,12 +203,18 @@ def _pending_bookmark_items(
     ).fetchall()
 
 
-def _all_degraded_candidates(conn: sqlite3.Connection, config: Config) -> list[RankedItem]:
-    """LLM 全滅判定: 候補全件の最新分析が degraded なら、その候補をタイトルのみで返す。
+def _all_degraded_candidates(
+    conn: sqlite3.Connection, config: Config, digest_date: str
+) -> list[RankedItem]:
+    """LLM 全滅判定: 当日候補全件の最新分析が degraded なら、当日候補をタイトルのみで返す。
 
     候補はランキングと同じ集合(digest_candidates。ブックマーク紐付けの item を含まない。GH#99)。
+    当日候補 = そのうち最新の分析が digest_date(JST)に行われたもの。閾値に届かなかった過去の
+    記事は analyzed のまま候補に残るので、候補全体で見ると当日の全滅が隠れる(GH#175)。
+    当日候補が無い(当日の分析が無い)ときは全滅としない(通常のランキングに任せる)。
     """
-    rows = digest_candidates(conn)
+    start, end = jst_day_bounds_utc(digest_date)
+    rows = [row for row in digest_candidates(conn) if start <= row["analyzed_at"] < end]
     if not rows or any(row["degraded"] == 0 for row in rows):
         return []
     return [

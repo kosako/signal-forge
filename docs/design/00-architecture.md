@@ -156,7 +156,7 @@ class LLMEngine(Protocol):
 | 単一ソースの collect 失敗 | sources に失敗時刻を記録し他ソースは続行。連続失敗は doctor #14 が警告し、X は watchdog も通知(設計 02 §2・§3) |
 | 本文抽出失敗 | extraction_status=failed のままタイトル+メタで degraded 分析に回す(黙って脱落させない) |
 | LLM 失敗(transient: 検証失敗・タイムアウト) | §5 のリトライ→degraded ダイジェスト |
-| LLM 環境障害(起動不能・認証不在)・分析全滅(analyzed=0) | degraded で握らず analyze 段の失敗として raise → 失敗通知(設計 05 §4)。全滅時は degraded 行が書き込み済みのため劣化配信は併走する(GH#74) |
+| LLM 環境障害(起動不能・認証不在)・分析全滅(analyzed=0) | degraded で握らず analyze 段の失敗として raise → 失敗通知(設計 05 §4)。全滅時は degraded 行が書き込み済みのため劣化配信は併走する(GH#74)。digest は当日(JST)に分析された候補だけで全滅を判定し、劣化配信にも当日の分だけを載せる(閾値に届かず analyzed のまま残る過去の記事に当日の全滅を隠させない。過去の記事は候補のまま残す。GH#175) |
 | Telegram 送信失敗 | 指数バックオフで3回。export は deliver より前段(§2 の順序)なので Obsidian への蓄積は完了済み。全滅時は `delivery_status='failed'` のまま終了し、再走時に digest_messages 台帳で未送信のみ再送(SQLite が正本なので再送可能) |
 | Telegram 完全未設定 | deliver 段を skip(WARN ログ)。M2a 前の未セットアップ状態を段失敗にしない。欠落検知は doctor #4 の責務(設計 05 §2) |
 | 朝バッチ全体の異常終了 | watchdog(受信デーモン `intel poll` の内蔵タイマー。7:15 JST に digests の当日行を確認)が未生成を検知し Telegram に通知 |
