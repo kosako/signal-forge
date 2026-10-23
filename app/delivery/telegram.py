@@ -351,19 +351,21 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
         source_line += f" ・{published}"
 
     fixed_lines = [f"{position}. <b>{title}</b>", source_line]
+    # 🎯 推薦の理由と 💡 示唆の行は切り詰め対象外(設計 04 §2: タイトル・URL・理由・示唆は
+    # 削らない)。degraded の理由欄は記録用の定型文(LLM 分析失敗)なので出さない(GH#90)
+    reason = "" if row["degraded"] else (row["recommendation_reason"] or "").strip()
     implication = (row["implication"] or "").strip()
-    # 💡 行は切り詰め対象外(設計 04 §2: タイトル・URL・示唆は削らない)
-    trailer = f"💡 {escape_text(implication)}" if implication else ""
+    trailers = []
+    if reason:
+        trailers.append(f"🎯 {escape_text(reason)}")
+    if implication:
+        trailers.append(f"💡 {escape_text(implication)}")
 
     summary = (row["summary"] or "").strip()
-    budget = ITEM_TEXT_MAX_CHARS - sum(len(line) + 1 for line in fixed_lines)
-    if trailer:
-        budget -= len(trailer) + 1
+    budget = ITEM_TEXT_MAX_CHARS - sum(len(line) + 1 for line in fixed_lines + trailers)
     if summary and budget > 1:
         fixed_lines.append(escape_and_truncate(summary, budget))
-    if trailer:
-        fixed_lines.append(trailer)
-    return "\n".join(fixed_lines)
+    return "\n".join(fixed_lines + trailers)
 
 
 def escape_and_truncate(raw: str, budget: int) -> str:
@@ -462,7 +464,8 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
         f"""
         SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
                sources.name AS source_name,
-               analyses.title_ja, analyses.summary, analyses.implication
+               analyses.title_ja, analyses.summary, analyses.implication,
+               analyses.recommendation_reason, analyses.degraded
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (
