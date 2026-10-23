@@ -67,7 +67,7 @@ ADR の一覧は下の「ADR」の節にある。
 
 | 文書 | 説明 | 種別 |
 |---|---|---|
-| [../ops/runbook.md](../ops/runbook.md) | 運用手順書(手を動かす手順だけ。理由は設計 05)。§1〜§5 が launchd のセットアップ、§6 配信時刻の変更、§7 バックアップと復旧、§8 secrets のローテーション、§9〜§10 X の連携、§11 カードへの質問への返事 | 仕様 |
+| [../ops/runbook.md](../ops/runbook.md) | 運用手順書(手を動かす手順だけ。理由は設計 05)。§1〜§5 が launchd のセットアップ、§6 配信時刻の変更、§7 バックアップと復旧、§8 secrets のローテーション、§9〜§10 X の連携、§11 カードへの質問への返事、§12 ソースの見直し、§13 深掘りノートのレビュー、§14 Codex が失敗したときの予備 | 仕様 |
 | [../ops/launchd/com.intel.morning.plist](../ops/launchd/com.intel.morning.plist) | 朝バッチ(`intel run`)の LaunchAgent の雛形。プレースホルダを runbook §1 で置換して配置する | 雛形 |
 | [../ops/launchd/com.intel.poller.plist](../ops/launchd/com.intel.poller.plist) | 受信デーモン(`intel poll`)の LaunchAgent の雛形。プレースホルダを runbook §1 で置換して配置する | 雛形 |
 

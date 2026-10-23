@@ -183,6 +183,9 @@ doctor の各項目は [設計 05 §2](docs/design/05-ops-runtime.md)。
 | §9 | X OAuth 2.0 のセットアップ |
 | §10 | X 興味シグナルの取り込みの有効化 |
 | §11 | 深掘りカードへの質問への返事(既存のインストールの更新を含む) |
+| §12 | ソースの見直し(週 1 回の健康診断を受けて止める・URL を直す) |
+| §13 | 深掘りノートのレビュー(別系統の AI が見る。既定は off) |
+| §14 | Codex が失敗したときの予備(Claude API でやり直す。既定は off) |
 
 **コードを更新したとき**
 
@@ -220,7 +223,7 @@ uv run ruff check .
 repo 固有の決まり:
 
 - **migration は forward-only**。適用済みのファイルは編集も改名もせず、新しい番号のファイルを足す([設計 01 §10](docs/design/01-data-model.md)、[app/db.py](app/db.py))。
-- **prompt は既存のファイルを書き換えない**。新しい版のファイルを足し、それを指すモジュールの版の定数(`PROMPT_VERSION`。対訳だけは `app/deepdive.py` の `TRANSLATE_PROMPT_VERSION`)を更新する([設計 03 §5](docs/design/03-analysis-ranking.md))。
+- **prompt は既存のファイルを書き換えない**。新しい版のファイルを足し、それを指すモジュールの版の定数(`PROMPT_VERSION`。深掘りの対訳・レビュー・直しは `app/deepdive.py` の `TRANSLATE_PROMPT_VERSION`・`REVIEW_PROMPT_VERSION`・`REVISE_PROMPT_VERSION`)を更新する([設計 03 §5](docs/design/03-analysis-ranking.md))。
 - **runbook の §番号を変えない**。コードのメッセージが §番号で参照している([app/cli.py](app/cli.py)、[app/insights.py](app/insights.py))。
 - **LLM は隔離した `codex exec` で呼ぶ**。ツールや書き込み・送信の権限を LLM に与えず、vault への書き込みと Telegram への送信は Python 側が行う。外部の本文はプロンプトの中で実行ごとの nonce の囲みに入れ、データとして扱う([設計 00 §5](docs/design/00-architecture.md)、[設計 03 §3.2](docs/design/03-analysis-ranking.md))。
 
@@ -238,7 +241,7 @@ repo 固有の決まり:
 | `app/export/` | Obsidian への書き出し |
 | `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口)、朝の調査段、カードへの質問への返事、take の記録 |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
-| `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer) |
+| `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-review・dig-revise)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |
 | `scripts/` | `kpi/` は KPI 集計の SQL(使い方は [docs/project/kpi-queries.md](docs/project/kpi-queries.md))。`day0_x_probe.py` は Day 0 の使い捨てスクリプト |
 | `tests/` | pytest のテスト |
