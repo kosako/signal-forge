@@ -37,6 +37,20 @@ API = "https://api.twitter.com/2"
 TWEET_FIELDS = "created_at,author_id,entities,referenced_tweets,in_reply_to_user_id"
 EXPANSIONS = "author_id"
 
+# 表計算ソフトが数式として解釈しうるセルの先頭の文字(CSV インジェクション。GH#246)
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def spreadsheet_safe(value: str) -> str:
+    """外部由来の文字列を、表計算ソフトで開いても文字列のセルになる形にする(GH#246)。
+
+    先頭が数式の記号(= + - @)・タブ・CR なら先頭に ' を付け、それ以外はそのまま返す。
+    区切りと引用符の処理は csv.writer に任せる。
+    """
+    if value.startswith(FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 
 def load_env(path: Path) -> dict[str, str]:
     env = {}
@@ -154,17 +168,18 @@ def main() -> None:
     n_reply = sum(1 for t in tweets if t.get("in_reply_to_user_id"))
     print(f"内訳: RT {n_rt}件 / リプライ {n_reply}件 / その他 {len(tweets) - n_rt - n_reply}件")
 
-    # CSV 出力
+    # CSV 出力(API 由来の文字列は spreadsheet_safe を通す。数値の列はそのまま。GH#246)
     OUT_DIR.mkdir(exist_ok=True)
     with (OUT_DIR / "items.csv").open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["tweet_id", "created_at", "author_id", "username", "is_rt", "is_reply", "text"])
         for t in tweets:
             is_rt = any(ref.get("type") == "retweeted" for ref in t.get("referenced_tweets", []))
-            w.writerow([t["id"], t["created_at"], t["author_id"],
-                        users.get(t["author_id"], "?"), int(is_rt),
+            w.writerow([spreadsheet_safe(t["id"]), spreadsheet_safe(t["created_at"]),
+                        spreadsheet_safe(t["author_id"]),
+                        spreadsheet_safe(users.get(t["author_id"], "?")), int(is_rt),
                         int(bool(t.get("in_reply_to_user_id"))),
-                        t.get("text", "").replace("\n", " ")])
+                        spreadsheet_safe(t.get("text", "").replace("\n", " "))])
     counts: dict[str, int] = {}
     for t in tweets:
         name = users.get(t["author_id"], t["author_id"])
@@ -173,7 +188,7 @@ def main() -> None:
         w = csv.writer(f)
         w.writerow(["username", "count"])
         for name, c in sorted(counts.items(), key=lambda kv: -kv[1]):
-            w.writerow([name, c])
+            w.writerow([spreadsheet_safe(name), c])
     print(f"CSV: {OUT_DIR / 'items.csv'} / {OUT_DIR / 'authors.csv'}(ノイズ率は authors.csv を目視分類)")
 
     # リスト方式の小確認(任意)
