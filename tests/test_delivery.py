@@ -373,6 +373,8 @@ def test_concurrent_deliveries_send_each_message_once(conn, tmp_path, caplog) ->
     first_send = threading.Event()  # 先の配信が 1 通目を送り始めた
     release = threading.Event()  # 先の配信の 1 通目を返す
     send_while_held = threading.Event()  # 先の配信が止まっている間に別の送信が来た
+    lock_wait = threading.Event()  # 後の配信がロックで待ち始めた
+    second_reached = threading.Event()  # 上の 2 つのどちらか(後の配信が判断の所まで来た)
 
     def handler(request: httpx.Request) -> httpx.Response:
         with guard:
@@ -383,7 +385,14 @@ def test_concurrent_deliveries_send_each_message_once(conn, tmp_path, caplog) ->
             release.wait(timeout=10)
         elif not release.is_set():
             send_while_held.set()
+            second_reached.set()
         return response
+
+    class LockWaitSignal(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage() == "別の配信が実行中のため、終わるのを待つ":
+                lock_wait.set()
+                second_reached.set()
 
     results: dict[str, int] = {}
     errors: list[BaseException] = []
@@ -404,24 +413,29 @@ def test_concurrent_deliveries_send_each_message_once(conn, tmp_path, caplog) ->
 
     first = threading.Thread(target=run, args=("first",))
     second = threading.Thread(target=run, args=("second",))
+    signal = LockWaitSignal()
+    logger.addHandler(signal)
     with caplog.at_level(logging.INFO, logger="test-delivery"):
         first.start()
         try:
             assert first_send.wait(timeout=10)
             second.start()
-            # 後の配信は、先の配信が台帳に書き終えるまで台帳を読まずに待つ
-            sent_while_held = send_while_held.wait(timeout=0.5)
+            # 後の配信がロックで待ち始めるまで(ロックが無ければ、台帳を読んで送るまで)待つ。
+            # 時間で区切らないので、後の配信の起動が遅くても結果は変わらない
+            assert second_reached.wait(timeout=10)
         finally:  # 検査が落ちてもスレッドを残さない
             release.set()
             first.join(timeout=10)
             if second.ident is not None:
                 second.join(timeout=10)
+            logger.removeHandler(signal)
 
-    assert not sent_while_held
+    # 後の配信は、先の配信が台帳に書き終えるまで台帳を読まずに待った
+    assert not send_while_held.is_set()
+    assert lock_wait.is_set()
     assert errors == []
     assert results == {"first": 3, "second": 0}
     assert len(recorder.requests) == 3  # ヘッダ + 2 件。二重に送らない
-    assert "別の配信が実行中のため、終わるのを待つ" in caplog.text
     ledger = conn.execute("SELECT item_id, message_id FROM digest_messages ORDER BY id").fetchall()
     assert [(r["item_id"], r["message_id"]) for r in ledger] == [(None, 101), (a, 102), (b, 103)]
     assert (tmp_path / "intel.db.deliver.lock").exists()  # ロックは DB の隣

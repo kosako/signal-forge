@@ -407,10 +407,12 @@ digest の配信で、Telegram には送れたのに台帳(`digest_messages`)に
 この 1 通は届いているが台帳に無い。このまま再走すると同じ記事をもう一度送り、先に届いた方への
 リプライは感想として記録されない。再走の前に、次の手順で台帳に入れる。
 
-1. ログから値を取る(`item_id` が null の行はヘッダ):
+1. ログから値を取る(`item_id` が null の行はヘッダ。朝バッチの段の失敗の行にも同じ文が入るので、
+   `message_id` を持つ行だけに絞る):
    ```sh
    grep '台帳に記帳できない' ~/.local/state/intel/logs/morning.log \
-     | jq -c '{item_id, digest_id: .extra.digest_id, message_id: .extra.message_id, error: .extra.error}'
+     | jq -c 'select(.extra.message_id? != null)
+              | {item_id, digest_id: .extra.digest_id, message_id: .extra.message_id, error: .extra.error}'
    ```
 2. `error` の原因(`database or disk is full` ならディスクの空きなど)を直す。
 3. 台帳に入れる(値は 1 の出力。ヘッダは `item_id` を `NULL` にする):
