@@ -25,7 +25,8 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# uv.lock はビルド依存を固定しないので、確かめた版から次の major の手前までに絞る(GH#223)
+requires = ["hatchling>=1.32,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
