@@ -34,7 +34,7 @@ telegram_state                                 (getUpdates offset 等の単一�
 schema_migrations                              (マイグレーション台帳。ランナーが管理)
 ```
 
-digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定専用の台帳(設計 04 §2)。
+digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定の台帳(設計 04 §2)。記事が実際に届いたかの記録として、分析の既知判定の履歴(設計 03 §3.2。GH#177)の基準にも使う。
 
 ## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006 の追加)
 

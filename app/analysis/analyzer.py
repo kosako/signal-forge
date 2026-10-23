@@ -259,13 +259,30 @@ def _item_block(row: sqlite3.Row, nonce: str, body_max_chars: int) -> str:
 
 
 def _recent_titles(conn: sqlite3.Connection) -> list[str]:
+    """直近 RECENT_DAYS 日に配信した記事の見出し(既知判定の参照データ。設計 03 §3.2)。
+
+    「配信済み」は記事単位の送信台帳(digest_messages の記事の行)で決める。digests.item_ids
+    だけで作ると、配信に失敗して届いていない記事まで既知になる。見出しは配信に使ったもの
+    (最新の analyses.title_ja、無ければ items.title。配信の _item_text と同じ優先順)にし、
+    原文タイトルを持たない X の投稿も履歴に入れる(GH#177)。
+    """
     rows = conn.execute(
         """
-        SELECT DISTINCT items.title FROM digests, json_each(digests.item_ids) AS je
-        JOIN items ON items.id = je.value
-        WHERE digests.digest_date >= date('now', '+9 hours', ?)  -- digest_date は JST 暦日
-          AND items.title IS NOT NULL
-        ORDER BY items.title
+        WITH delivered AS (
+          SELECT DISTINCT digest_messages.item_id
+          FROM digest_messages JOIN digests ON digests.id = digest_messages.digest_id
+          WHERE digest_messages.item_id IS NOT NULL  -- NULL はヘッダの行
+            AND digests.digest_date >= date('now', '+9 hours', ?)  -- digest_date は JST 暦日
+        ),
+        headlines AS (
+          SELECT coalesce(
+                   nullif((SELECT a.title_ja FROM analyses AS a WHERE a.item_id = items.id
+                           ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1), ''),
+                   nullif(items.title, '')
+                 ) AS title
+          FROM delivered JOIN items ON items.id = delivered.item_id
+        )
+        SELECT DISTINCT title FROM headlines WHERE title IS NOT NULL ORDER BY title
         """,
         (f"-{RECENT_DAYS} days",),
     ).fetchall()

@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -9,12 +10,14 @@ from app.analysis.analyzer import (
     AnalysisBatch,
     FullDegradationError,
     ItemAnalysis,
+    _recent_titles,
     analyze_selected,
     build_prompt,
 )
 from app.analysis.llm import LLMError, LLMUnavailableError, parse_structured
 from app.config import AnalysisConfig, Config
 from app.db import apply_migrations, connect
+from app.jst import JST
 
 logger = logging.getLogger("test-analyzer")
 
@@ -312,3 +315,95 @@ def test_placeholder_in_inputs_not_reinterpreted(conn, tmp_path) -> None:
     )
     assert "悪意 {{nonce}} {{schema}}" in prompt  # 文字列のまま(展開されない)
     assert "profile に {{items}} を含む" in prompt
+
+
+# --- 既知判定の履歴(直近 14 日の配信済みタイトル。GH#177) ---
+
+
+def add_analyzed(conn, url, *, title, title_ja, source_id=2, analyzed_at="2026-10-01T00:00:00Z"):
+    """分析済みの item を作る。title_ja=None は degraded の分析(見出しを持たない)。"""
+    item_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
+        "VALUES (?, ?, ?, ?, 'sha256:x')",
+        (source_id, url, url, title),
+    ).lastrowid
+    add_analysis(conn, item_id, title_ja, analyzed_at=analyzed_at)
+    return item_id
+
+
+def add_analysis(conn, item_id, title_ja, *, analyzed_at) -> None:
+    conn.execute(
+        "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
+        "recommendation_reason, implication, degraded, engine, model, prompt_version, "
+        "input_hash, analyzed_at) "
+        "VALUES (?, ?, '要約', '課題直結', 80, 'new', '理由', '示唆', ?, 'codex-cli', 'm', "
+        "'analyze-v002', ?, ?)",
+        (item_id, title_ja, int(title_ja is None), f"sha256:{item_id}:{analyzed_at}", analyzed_at),
+    )
+
+
+def add_sent_digest(
+    conn, days_ago, item_ids, *, sent_item_ids, header_sent=True, delivery_status="sent"
+) -> int:
+    """digest と送信台帳(digest_messages)を作る。台帳に載るのは実際に送れたメッセージだけ。"""
+    digest_date = (datetime.now(JST) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    digest_id = conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status) "
+        "VALUES (?, '# md', ?, ?, ?)",
+        (digest_date, json.dumps(item_ids), len(item_ids), delivery_status),
+    ).lastrowid
+    ledger = ([None] if header_sent else []) + list(sent_item_ids)  # None = ヘッダの行
+    for n, item_id in enumerate(ledger, start=1):
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+            (digest_id, item_id, digest_id * 100 + n),
+        )
+    return digest_id
+
+
+def test_recent_titles_use_delivered_headline_including_titleless_x(conn) -> None:
+    # 見出しは配信に使ったもの(最新の title_ja、無ければ items.title)。原文タイトルを
+    # 持たない X の投稿も、配信した見出しで履歴に入る(GH#177)
+    x_source = conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')").lastrowid
+    x_post = add_analyzed(
+        conn, "https://x.com/i/web/status/1", title=None, title_ja="X の投稿の見出し",
+        source_id=x_source,
+    )
+    rss = add_analyzed(conn, "https://a.example/1", title="Original Title", title_ja="訳した見出し")
+    reanalyzed = add_analyzed(
+        conn, "https://a.example/2", title="Re", title_ja="古い見出し",
+        analyzed_at="2026-10-01T00:00:00Z",
+    )
+    add_analysis(conn, reanalyzed, "新しい見出し", analyzed_at="2026-10-02T00:00:00Z")
+    degraded = add_analyzed(conn, "https://a.example/3", title="原文のタイトル", title_ja=None)
+    # 見出しも原文タイトルも無い記事(degraded の X)は履歴に入れようがない
+    degraded_x = add_analyzed(
+        conn, "https://x.com/i/web/status/2", title=None, title_ja=None, source_id=x_source
+    )
+    ids = [x_post, rss, reanalyzed, degraded, degraded_x]
+    add_sent_digest(conn, 1, ids, sent_item_ids=ids)
+
+    assert _recent_titles(conn) == sorted(
+        ["X の投稿の見出し", "訳した見出し", "新しい見出し", "原文のタイトル"]
+    )
+
+
+def test_recent_titles_exclude_items_not_delivered(conn) -> None:
+    # 「配信済み」は送信台帳(digest_messages)で決める。digest に載っていても、配信に
+    # 失敗して届いていない記事は既知にしない(GH#177)
+    sent = add_analyzed(conn, "https://a.example/1", title="t1", title_ja="届いた記事")
+    unsent = add_analyzed(conn, "https://a.example/2", title="t2", title_ja="届かなかった記事")
+    add_sent_digest(conn, 2, [sent, unsent], sent_item_ids=[sent], delivery_status="failed")
+    header_only = add_analyzed(conn, "https://a.example/3", title="t3", title_ja="ヘッダだけの日")
+    add_sent_digest(conn, 3, [header_only], sent_item_ids=[], delivery_status="failed")
+    pending = add_analyzed(conn, "https://a.example/4", title="t4", title_ja="未配信の記事")
+    add_sent_digest(
+        conn, 0, [pending], sent_item_ids=[], header_sent=False, delivery_status="pending"
+    )
+    # 期間(直近 14 日。digest_date は JST 暦日)は従来どおり
+    edge = add_analyzed(conn, "https://a.example/5", title="t5", title_ja="14 日前の記事")
+    add_sent_digest(conn, 14, [edge], sent_item_ids=[edge])
+    old = add_analyzed(conn, "https://a.example/6", title="t6", title_ja="15 日前の記事")
+    add_sent_digest(conn, 15, [old], sent_item_ids=[old])
+
+    assert _recent_titles(conn) == sorted(["届いた記事", "14 日前の記事"])
