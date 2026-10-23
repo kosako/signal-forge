@@ -174,3 +174,124 @@ def test_already_extracted_and_non_new_items_skipped(conn, tmp_path) -> None:
     counts = extract_pending(conn, config(tmp_path), http, logger)
     assert counts == {"ok": 0, "partial": 0, "failed": 0}
     assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 1
+
+
+# --- 取得した本文の復号(GH#187) ---
+# ①・㈱ は Shift_JIS の Windows の拡張(cp932)にだけある文字。Python の shift_jis では読めない
+SJIS_BODY = "本文の段落。①㈱" * 60
+
+
+def legacy_html(meta: str, body: str) -> str:
+    return (
+        f"<!doctype html><html><head>{meta}<title>t</title></head>"
+        f"<body><article><h1>見出し</h1><p>{body}</p></article></body></html>"
+    )
+
+
+def fetch_text(conn, tmp_path, content: bytes, content_type: str) -> str:
+    add_item(conn)
+    http = make_http(
+        lambda request: httpx.Response(
+            200, headers={"Content-Type": content_type}, content=content
+        )
+    )
+    counts = extract_pending(conn, config(tmp_path), http, logger)
+    assert counts == {"ok": 1, "partial": 0, "failed": 0}
+    return conn.execute("SELECT extracted_text FROM documents").fetchone()[0]
+
+
+@pytest.mark.parametrize(
+    ("meta", "encoding", "body"),
+    [
+        ('<meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        (
+            '<meta http-equiv="Content-Type" content="text/html; charset=Shift_JIS">',
+            "cp932",
+            SJIS_BODY,
+        ),
+        ("<META HTTP-EQUIV='Content-Type' CONTENT='text/html;charset=x-sjis'>", "cp932", SJIS_BODY),
+        (
+            '<meta http-equiv="Content-Type" content="text/html; charset=EUC-JP">',
+            "euc_jp",
+            LONG_BODY,
+        ),
+        # 全バイトが ASCII の範囲になる文字コード(UTF-8 としても正しく読めてしまう)
+        ('<meta charset="ISO-2022-JP">', "iso2022_jp", LONG_BODY),
+        # コメントの中の宣言・別の属性の値の charset=・使えないラベルは使わず、次の宣言を使う
+        ('<!-- a > b <meta charset="UTF-8"> --><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        (
+            '<meta name="description" content="charset=utf-8" data-charset="utf-8">'
+            '<meta charset="Shift_JIS">',
+            "cp932",
+            SJIS_BODY,
+        ),
+        ('<meta charset="no-such-charset"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        ('<meta charset="idna"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        ('<meta charset="utf-16"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        # 属性の値の中の "<!--" や "<meta ...>" はコメントやタグではない
+        ('<meta name="description" content="<!--"><meta charset="Shift_JIS">', "cp932", SJIS_BODY),
+        (
+            """<link title='a > <meta charset="utf-8">'><meta charset="Shift_JIS">""",
+            "cp932",
+            SJIS_BODY,
+        ),
+    ],
+    ids=[
+        "meta-charset-sjis",
+        "http-equiv-sjis",
+        "x-sjis",
+        "euc-jp",
+        "iso-2022-jp",
+        "commented-out-meta",
+        "other-attributes",
+        "unknown-label-then-sjis",
+        "idna-then-sjis",
+        "utf16-then-sjis",
+        "comment-start-in-attribute",
+        "meta-in-attribute",
+    ],
+)
+def test_meta_declared_charset_used_without_header_charset(
+    conn, tmp_path, meta, encoding, body
+) -> None:
+    # ヘッダに charset が無く HTML の meta だけで宣言したページを UTF-8 で読んで化けさせない
+    content = legacy_html(meta, body).encode(encoding)
+    text = fetch_text(conn, tmp_path, content, "text/html")
+    assert body in text
+    assert "\ufffd" not in text  # 置換文字(読めなかったバイト)が無い
+
+
+@pytest.mark.parametrize(
+    "meta",
+    ["", '<meta charset="utf-8">', '<meta charset="Shift_JIS">'],
+    ids=["no-meta", "meta-utf8", "meta-sjis-misdeclared"],
+)
+def test_utf8_page_without_header_charset(conn, tmp_path, meta) -> None:
+    # 正しい UTF-8 のバイト列は、宣言の有無・誤りにかかわらず従来どおり UTF-8 で読む
+    content = legacy_html(meta, LONG_BODY).encode("utf-8")
+    text = fetch_text(conn, tmp_path, content, "text/html")
+    assert LONG_BODY in text
+
+
+def test_header_charset_takes_precedence_over_meta(conn, tmp_path) -> None:
+    # HTTP の charset が HTML 内の宣言より優先する。Shift_JIS は cp932 として読む
+    content = legacy_html('<meta charset="utf-8">', SJIS_BODY).encode("cp932")
+    text = fetch_text(conn, tmp_path, content, "text/html; charset=Shift_JIS")
+    assert SJIS_BODY in text
+
+
+@pytest.mark.parametrize("label", ["utf-16", "utf-32", "cp037", "idna", "rot13", "utf\x008"])
+def test_unusable_meta_declaration_falls_back_to_utf8(conn, tmp_path, label) -> None:
+    # 宣言そのもの(ASCII)を読めない codec(UTF-16 等)・置換つきで復号できない codec・NUL を
+    # 含むラベルの宣言は使わず、UTF-8 として置換つきで読む(例外で failed にしない)
+    content = legacy_html(f'<meta charset="{label}">', LONG_BODY).encode("utf-8") + b"\xff"
+    text = fetch_text(conn, tmp_path, content, "text/html")
+    assert LONG_BODY in text
+
+
+@pytest.mark.parametrize("label", ["no-such-charset", "rot13", "idna"])
+def test_unusable_header_charset_falls_back_to_utf8(conn, tmp_path, label) -> None:
+    # 未知のラベル・テキスト用でない codec の宣言は使わない(例外で failed にしない)
+    content = ARTICLE_HTML.encode("utf-8")
+    text = fetch_text(conn, tmp_path, content, f"text/html; charset={label}")
+    assert LONG_BODY in text
