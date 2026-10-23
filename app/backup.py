@@ -109,9 +109,13 @@ def _add_profile_if_outside(tar: tarfile.TarFile, config: Config) -> None:
     # [analysis].profile_path で設定ディレクトリの外に置くと config/ に入らないので、
     # 実際に読むファイルを profile/<読む名前> に別に入れる(GH#199)。中にあれば config/ に
     # 入っているので二重に入れない。中の symlink が外を指す場合は config/ にリンクしか
-    # 残らないので、解決した先で中か外かを決め、中身を入れる。無ければ入れない
+    # 残らないので、解決した先で中か外かを決め、中身を入れる。
+    # 無い・壊れた symlink(循環を含む)は入れない。解決より先に確かめるのは、Python 3.12 の
+    # resolve() が循環 symlink で RuntimeError を出し、DB を含む世代ごと作れなくなるため
+    if not config.profile_path.is_file():
+        return
     profile = config.profile_path.resolve()
-    if not profile.is_file() or profile.is_relative_to(config.config_dir.resolve()):
+    if profile.is_relative_to(config.config_dir.resolve()):
         return
     tar.add(profile, arcname=f"profile/{config.profile_path.name}")
 

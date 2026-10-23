@@ -197,7 +197,9 @@ def test_profile_inside_config_dir_is_not_added_twice(conn, tmp_path) -> None:
 
 
 def test_symlinked_profile_in_config_dir_backs_up_its_content(conn, tmp_path) -> None:
-    # 設定ディレクトリの中の symlink が外を指すと config/ にはリンクしか残らないので、中身を入れる
+    # 設定ディレクトリの中の symlink が外を指すと config/ にはリンクしか残らないので、中身を入れる。
+    # 復旧では、読む場所(未設定なら復旧で使う設定ディレクトリの interest-profile.md)の
+    # 切れたリンクを profile/ のファイルで置き換えれば読める(設計 05 §5)
     target = tmp_path / "vault" / "real-profile.md"
     target.parent.mkdir()
     target.write_text(PROFILE_TEXT, encoding="utf-8")
@@ -205,8 +207,30 @@ def test_symlinked_profile_in_config_dir_backs_up_its_content(conn, tmp_path) ->
     (config.config_dir / "interest-profile.md").symlink_to(target)
 
     archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+    target.unlink()  # リンクの先を失った
 
+    restore_dir = tmp_path / "restore"
     with tarfile.open(archive) as tar:
         member = tar.getmember("profile/interest-profile.md")  # 読む名前で入る
         assert member.isfile()
-        assert tar.extractfile(member).read().decode("utf-8") == PROFILE_TEXT
+        tar.extractall(path=restore_dir, filter="tar")  # config/ の絶対 path のリンクも戻す
+    restored = load_config(restore_dir / "config")  # 元と別の設定ディレクトリ(--config-dir)
+    assert restored.profile_path.is_symlink()
+    restored.profile_path.unlink()
+    shutil.copy2(restore_dir / "profile" / "interest-profile.md", restored.profile_path)
+    assert load_interest_profile(restored.profile_path).updated == "2026-10-01"
+
+
+def test_profile_symlink_loop_does_not_break_backup(conn, tmp_path) -> None:
+    # 循環 symlink のプロファイルは入れず、DB を含む世代は作る(Python 3.12 の resolve() は
+    # 循環で RuntimeError を出すため、解決より先に確かめる)
+    config = make_config(tmp_path)
+    loop = config.config_dir / "interest-profile.md"
+    loop.symlink_to(loop)
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+    assert "intel.db" in names
+    assert not [n for n in names if n.split("/")[0] == "profile"]
