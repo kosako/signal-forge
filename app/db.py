@@ -9,8 +9,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
 import re
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,9 +73,20 @@ def apply_migrations(
     - 台帳: schema_migrations(version PRIMARY KEY, filename, applied_at)
     - 1 ファイル = 1 トランザクション(BEGIN IMMEDIATE)
     - 未適用があるときのみ、適用前に `<name>.bak` へ一貫スナップショット(backup API)
+    - 台帳の読み取りから `.bak`・適用までを DB ごとのロックで直列化する(GH#200)
     """
     # 構成検証を台帳作成より先に行う(不正構成の検出だけで DB に痕跡を残さない)
     migrations = discover_migrations(migrations_dir)
+    # GH#200: 朝バッチと answer などが同時に起動すると、両方が同じ未適用分を読み、後の方が
+    # 適用済みの migration を流し直して起動に失敗する。後から来た方は先の適用が終わるまで待ち、
+    # 台帳を読み直す(適用済みなら何もしない。.bak も先の方の適用前の 1 回だけになる)
+    with _migration_lock(db_path):
+        return _apply_pending(conn, db_path, migrations)
+
+
+def _apply_pending(
+    conn: sqlite3.Connection, db_path: Path, migrations: list[Migration]
+) -> list[str]:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -189,6 +204,20 @@ def insert_item_with_dedup(
         (parent["id"], item_id),
     )
     return InsertOutcome(outcome="duplicate", item_id=item_id)
+
+
+@contextlib.contextmanager
+def _migration_lock(db_path: Path) -> Iterator[None]:
+    """migration のプロセス間直列化(GH#200)。SQLite のロックは 1 トランザクションの間しか
+    続かず、台帳の読み取り・.bak・ファイルごとの適用をまたげないため、DB の隣の専用ファイルに
+    flock を取る(DB ファイル自体を開いて閉じると SQLite の POSIX ロックが外れるので使わない)。"""
+    lock_path = db_path.with_name(db_path.name + ".migrate.lock")
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # close で flock は解放される
 
 
 def _backup(conn: sqlite3.Connection, db_path: Path) -> None:

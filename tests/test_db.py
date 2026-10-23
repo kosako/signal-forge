@@ -1,9 +1,14 @@
+import contextlib
 import sqlite3
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from app.db import MIGRATIONS_DIR, MigrationError, apply_migrations, connect, discover_migrations
+
+_HANG_GUARD_SECONDS = 30  # 並行のテストが止まったときだけ効く上限(正否の判定には使わない)
 
 
 @pytest.fixture
@@ -177,6 +182,75 @@ def test_failed_migration_rolls_back(tmp_path: Path) -> None:
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "will_rollback" not in tables
     assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == applied
+
+
+def test_concurrent_apply_runs_each_migration_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GH#200: 2 つの起動が重なっても、同じ migration を 2 回流さずに両方が成功する。
+    # 先の方を「未適用を確定した後・適用の前」(.bak の取得)で止め、その間に後の方を走らせる。
+    # 後の方が排他を待ちに入る(修正前は台帳を読んで .bak まで進む)のを合図に先の方を進める。
+    # 正否は時間に頼らない(上限は止まったときに suite を止めないためだけのもの)
+    from app import db
+
+    db_path = tmp_path / "intel.db"
+    connect(db_path).close()
+    first_paused = threading.Event()
+    second_arrived = threading.Event()
+    resume_first = threading.Event()
+    backups: list[str] = []
+    results: dict[str, object] = {}
+    real_backup, real_lock = db._backup, db._migration_lock
+
+    def paused_backup(conn: sqlite3.Connection, path: Path) -> None:
+        name = threading.current_thread().name
+        backups.append(name)
+        if name == "first":
+            first_paused.set()
+            assert resume_first.wait(_HANG_GUARD_SECONDS)
+        else:
+            second_arrived.set()
+        real_backup(conn, path)
+
+    @contextlib.contextmanager
+    def observed_lock(path: Path) -> Iterator[None]:
+        if threading.current_thread().name == "second":
+            second_arrived.set()
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(db, "_backup", paused_backup)
+    monkeypatch.setattr(db, "_migration_lock", observed_lock)
+
+    def run() -> None:
+        name = threading.current_thread().name
+        conn = connect(db_path)
+        try:
+            results[name] = apply_migrations(conn, db_path)
+        except Exception as e:  # スレッドの例外を本体の assert で見せる
+            results[name] = e
+        finally:
+            conn.close()
+
+    first = threading.Thread(target=run, name="first", daemon=True)
+    second = threading.Thread(target=run, name="second", daemon=True)
+    first.start()
+    assert first_paused.wait(_HANG_GUARD_SECONDS)
+    second.start()
+    assert second_arrived.wait(_HANG_GUARD_SECONDS)
+    resume_first.set()
+    first.join(_HANG_GUARD_SECONDS)
+    second.join(_HANG_GUARD_SECONDS)
+    assert not first.is_alive() and not second.is_alive()
+
+    all_files = [m.filename for m in discover_migrations(MIGRATIONS_DIR)]
+    assert results == {"first": all_files, "second": []}  # 後の方は台帳を読み直して何もしない
+    assert backups == ["first"]  # .bak は先の方の適用前の 1 回だけ(後の方が上書きしない)
+    conn = connect(db_path)
+    ledger = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+    versions = [row[0] for row in ledger]
+    assert versions == list(range(1, len(all_files) + 1))
+    conn.close()
 
 
 def _copy_real_migrations(other: Path) -> int:

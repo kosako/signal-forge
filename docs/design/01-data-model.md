@@ -390,6 +390,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 - `migrations/NNN_name.sql`(3桁ゼロ埋め連番・欠番禁止)。自前ランナー(`app/db.py`)が `schema_migrations(version INTEGER PRIMARY KEY, filename TEXT, applied_at TEXT)` を台帳に、未適用分を番号順に **1 ファイル = 1 トランザクション**(`BEGIN IMMEDIATE`)で適用する。
 - CLI 起動時(collect/run 等)に自動適用、`intel doctor` は未適用の有無を表示。理由: 単一ユーザー・単一ホストでは適用忘れによる稼働停止の方が怖い。
+- 台帳の読み取りから `.bak` の取得・適用までを、DB の隣の `<DB>.migrate.lock`(既定 `intel.db.migrate.lock`)の flock で直列化する(GH#200)。朝バッチと `intel answer` などの起動が重なっても、後から来た方は先の適用が終わるまで待ってから台帳を読むので、同じ migration を流し直して起動に失敗しない(適用済みなら何もせず、`.bak` も取り直さない)。SQLite のロックは 1 トランザクションの間しか続かず、ファイルごとの適用をまたげないため専用のファイルを使う。
 - **forward-only(down なし)**。未適用があるときだけ、適用前に backup API で `<DB>.bak`(既定 `intel.db.bak`)へ一貫したスナップショットを取ってから適用する(単純なファイルコピーは WAL に未反映の分を取りこぼしうるため)。理由: 個人運用ではロールバック SQL の保守より単一ファイルコピー復元が確実。
 - 適用済みファイルは編集禁止。修正・変更は必ず新番号のファイルで行う。
 
