@@ -749,8 +749,17 @@ def _handle_dig_reply(
     if not instructions:
         reply(DIG_REPLY_GUIDE)
         return
-    apply_instructions(conn, instructions)
-    conn.commit()
+    # 指定はまとめて 1 つのトランザクションで反映する(接続は autocommit)。途中でロック競合に
+    # なったら全部を戻し、再配達で全部をやり直す(GH#181)。反映済みの指定をやり直すと
+    # requested_at が動き、生成中の深掘りの compare-and-set(deepdive)が外れて同じ依頼を
+    # 翌朝も掘ってしまうため
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        apply_instructions(conn, instructions)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
     lines = []
     for instruction in instructions:
         if instruction.action == "pass":

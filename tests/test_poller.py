@@ -1183,6 +1183,39 @@ def test_dig_reply_pass_and_request_combined(conn, tmp_path) -> None:
     assert f"🔍 {second} を登録しました(観点なし)" in text
 
 
+def test_dig_reply_failed_midway_applies_nothing_until_redelivered(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # GH#181: 2 件目の反映がロック競合で失敗したら 1 件目も戻し、再配達で全部を 1 回で反映する
+    # (反映済みの 1 件目をやり直して requested_at を動かすと、生成中の深掘りの
+    # compare-and-set が外れて同じ依頼を翌朝も掘ってしまう)
+    from app.delivery import poller
+
+    first = add_dig_candidate(conn, "https://a/1")
+    second = add_dig_candidate(conn, "https://a/2")
+    api = RedeliveringApi([make_reply_update(f"{first} を観点Aで、{second} も", BACKLOG_MSG_ID)])
+    real_apply_instructions = poller.apply_instructions
+
+    def locked_at_second(conn, instructions):
+        monkeypatch.setattr(poller, "apply_instructions", real_apply_instructions)
+        real_apply_instructions(conn, instructions[:1])
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(poller, "apply_instructions", locked_at_second)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        poll_once(conn, make_config(tmp_path), api, logger)
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0  # 1 件目も戻した
+    assert saved_offset(conn) is None
+    assert api.sent == []
+
+    poll_once(conn, make_config(tmp_path), api, logger)  # 再配達
+    rows = conn.execute("SELECT item_id, status, angle FROM dig_queue ORDER BY item_id").fetchall()
+    assert [tuple(r) for r in rows] == [(first, "queued", "観点Aで"), (second, "queued", None)]
+    assert len(api.sent) == 1
+    assert saved_offset(conn) == "2"
+
+
 def test_dig_reply_without_valid_numbers_gets_guide(conn, tmp_path) -> None:
     add_dig_candidate(conn, "https://a/1")
     api = FakeApi([[make_reply_update("9999 をパスで", BACKLOG_MSG_ID)]])
