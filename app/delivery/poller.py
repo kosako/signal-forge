@@ -39,7 +39,7 @@ from app.delivery.surveys import (
     run_due_timers,
     survey_deadline,
 )
-from app.delivery.telegram import DeliveryError, TelegramApi, reaction_keyboard
+from app.delivery.telegram import DeliveryError, TelegramApi, escape_and_truncate, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.jst import JST
@@ -663,6 +663,11 @@ def _ingest_manual_urls(
 DIG_REPLY_GUIDE = (
     "一覧の番号で指定してください。例: 「3664 を◯◯の観点で」= 登録 / 「3664 はパス」= 除外"
 )
+# 深掘り指定の確認返信の長さの予算(Telegram の 1 通 4096 字に余裕を残す)。観点は 1 件
+# ごとに切り詰め、行を足すと 1 通の上限を超えるなら次の 1 通に分ける(引き継いだ長い観点が
+# 何件も並んでも送信が失敗しない。GH#228)。観点の上限は深掘りカードの観点の表示と揃える
+DIG_ACK_ANGLE_MAX_CHARS = 300
+DIG_ACK_MAX_CHARS = 3500
 
 
 def _handle_dig_reply(
@@ -689,13 +694,30 @@ def _handle_dig_reply(
     for instruction in instructions:
         if instruction.action == "pass":
             lines.append(f"⏭️ {instruction.item_id} を深掘り対象から外しました")
-        elif instruction.angle:
+            continue
+        # 返信は parse_mode=HTML。観点は本人の自由文なので escape して埋め込む
+        # (設計 04 §1。キューには原文のまま記録する。GH#194)。表示だけ上限で切る
+        if instruction.angle:
             lines.append(
-                f"🔍 {instruction.item_id} を登録しました(観点: {instruction.angle})"
+                f"🔍 {instruction.item_id} を登録しました"
+                f"(観点: {escape_and_truncate(instruction.angle, DIG_ACK_ANGLE_MAX_CHARS)})"
+            )
+            continue
+        # 観点を省いた再指定は前回の観点を引き継ぐ(apply_instructions の COALESCE)。
+        # 入力ではなく反映後のキューの観点を出す(GH#228)
+        kept = conn.execute(
+            "SELECT angle FROM dig_queue WHERE item_id = ?", (instruction.item_id,)
+        ).fetchone()
+        if kept is not None and kept["angle"]:
+            lines.append(
+                f"🔍 {instruction.item_id} を登録しました"
+                "(前回の観点を引き継ぎ: "
+                f"{escape_and_truncate(kept['angle'], DIG_ACK_ANGLE_MAX_CHARS)})"
             )
         else:
             lines.append(f"🔍 {instruction.item_id} を登録しました(観点なし)")
-    reply("\n".join(lines))
+    for message in _pack_lines(lines, DIG_ACK_MAX_CHARS):
+        reply(message)
     logger.info(
         "深掘り指定を記録",
         extra={
@@ -706,6 +728,24 @@ def _handle_dig_reply(
             },
         },
     )
+
+
+def _pack_lines(lines: list[str], budget: int) -> list[str]:
+    """行を改行でつなぎ、1 通が budget 字を超えないように分ける(行の途中では切らない)。
+
+    1 行が budget を超えないことは呼び出し側が保証する(観点を切り詰めて組み立てる)。
+    """
+    messages: list[str] = []
+    current = ""
+    for line in lines:
+        if current and len(current) + 1 + len(line) > budget:
+            messages.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        messages.append(current)
+    return messages
 
 
 def _replied_dig_backlog(conn: sqlite3.Connection, replied: object) -> bool:
