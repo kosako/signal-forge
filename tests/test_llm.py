@@ -1,6 +1,11 @@
+import contextlib
 import json
 import os
+import signal
 import stat
+import subprocess
+import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -194,6 +199,86 @@ def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
     codex = fake_codex(tmp_path, "sleep 5\n")
     with pytest.raises(LLMError, match="タイムアウト"):
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict, timeout_s=1)
+
+
+def _wait_until(cond, timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return bool(cond())
+
+
+def _group_gone(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # 止めた孫が回収を待つ間(ゾンビだけのグループ)は、macOS の killpg が signal 0 でも
+        # PermissionError を返す。まだ消えていないとして待ち続ける(Codex レビュー round 2)
+        return False
+    return False
+
+
+# 中断の時点の子の状態ごとの、偽の codex の本文({pid_file} に自分の pid を書く)
+_INTERRUPT_SCENARIOS = {
+    # 推論を続けている: 孫の sleep を起こしてから待つ
+    "running": 'sleep 30 &\necho $$ > "{pid_file}"\nwait\n',
+    # 子だけ先に終わり、pipe を持つ孫が残る。communicate は KeyboardInterrupt を返す前に
+    # 子を待つので、後片付けの時点で子が回収済みのことがある(Codex レビュー)
+    "reaped": 'sleep 30 &\necho $$ > "{pid_file}"\n',
+    # 子だけ先に終わり、回収はまだ(孫なし)。timeout と kill の間に自然終了したときと同じ形
+    "zombie": 'echo $$ > "{pid_file}"\n',
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_INTERRUPT_SCENARIOS))
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, RuntimeError])
+def test_engine_interrupt_stops_and_reaps_codex(
+    tmp_path: Path, monkeypatch, interrupt: type[BaseException], scenario: str
+) -> None:
+    # GH#244: communicate の途中の中断(手動実行の Ctrl-C)や例外でも、別セッションの codex を
+    # 孫ごと止めて回収し、作業ディレクトリはその後に消す。例外は LLMError に変えずに返す
+    pid_file = tmp_path / "codex.pid"
+    codex = fake_codex(tmp_path, _INTERRUPT_SCENARIOS[scenario].format(pid_file=pid_file))
+    started: list[subprocess.Popen[str]] = []
+    reaped_at_cleanup: list[bool] = []
+
+    def interrupted_communicate(self, *args, **kwargs):
+        started.append(self)
+        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text().strip())
+        if scenario == "reaped":
+            self.wait()
+        elif scenario == "zombie":
+            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)  # 終わりを待ち、回収しない
+        raise interrupt
+
+    real_exit = tempfile.TemporaryDirectory.__exit__
+
+    def exit_records_reap(self, *exc_info):
+        reaped_at_cleanup.append(bool(started) and started[0].returncode is not None)
+        return real_exit(self, *exc_info)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted_communicate)
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "__exit__", exit_records_reap)
+    try:
+        with pytest.raises(interrupt):
+            CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+        pgid = int(pid_file.read_text())
+        assert started[0].returncode is not None  # 子を回収した
+        assert reaped_at_cleanup == [True]  # 作業ディレクトリを消す前に回収した
+        assert _wait_until(lambda: _group_gone(pgid))  # 孫の sleep も残らない
+    finally:
+        # 後片付けの無い(または孫を残す)実装で落ちたときにも、偽の codex を残さない
+        for process in started:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
 
 
 def test_engine_nonzero_exit_raises(tmp_path: Path) -> None:
