@@ -1105,8 +1105,9 @@ def _note_slug(candidate: DigCandidate) -> str:
 
 
 def _is_tweet_url(url: str) -> bool:
-    # canonical_url の正規化(01 §4)は www を剥がさないため、ここで剥がしてから
-    # 判定する(www.x.com がポリシー判定をすり抜けて本文が恒久保存される穴。Codex P1)
+    # canonical_url の正規化(01 §4)が www.x.com を x.com に寄せるのは GH#232 からで、
+    # それより前の行は www つきのまま残るため、ここで剥がしてから判定する(www.x.com が
+    # ポリシー判定をすり抜けて本文が恒久保存される穴。Codex P1)
     host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
     return host in _TWEET_HOSTS
 
