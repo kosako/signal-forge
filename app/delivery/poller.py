@@ -1016,6 +1016,8 @@ def _replied_ledger_row(
     message_id = replied.get("message_id")
     if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
         return None
+    # --force の置換で印を付けた前の世代の行(superseded_at)も引く。Telegram に残る
+    # 置換の前のメッセージへのリプライも、そのメッセージの記事・digest に帰属させる(GH#190)
     return conn.execute(
         f"SELECT digest_id, item_id FROM digest_messages WHERE message_id = ? AND {where}",
         (message_id,),
