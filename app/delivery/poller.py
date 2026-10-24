@@ -954,7 +954,11 @@ def _handle_dig_card_reply(
     try:
         recorded = _insert_note(conn, _ITEM_NOTE_SQL, item_id, text, chat_id, message)
         if recorded and accept:
-            enqueue_question(conn, dig_result_id, text, message_id)
+            # 返信先(形は _replied_dig_thread が確かめ済み)も渡す。失敗の知らせへのリプライを
+            # 答えられなかった元の質問に結び付けるため(GH#236)
+            enqueue_question(
+                conn, dig_result_id, text, message_id, message["reply_to_message"]["message_id"]
+            )
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
