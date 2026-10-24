@@ -265,7 +265,6 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
     # 分析の障害で載せる記事が無い日は、空の digest を確定せず送らない。復旧後の同じ日の
     # 再実行で、回復した分析の結果を作って配信する(GH#191)
     from app.analysis.llm import LLMUnavailableError
-    from app.run import digest_held
 
     class UnavailableEngine:
         name = "codex-cli"
@@ -283,7 +282,7 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
     assert failures == ["analyze"]  # export・deliver は当日分を扱わず、失敗にしない
     assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
     assert sent == []  # 空のダイジェストを送らない
-    assert digest_held(conn, failures)  # 失敗通知は同じ日の再走を案内する
+    assert failures.digest_held  # 失敗通知は同じ日の再走を案内する
 
     assert run_pipeline(*args, lambda: ScriptedEngine(conn), logger, "01RUN2") == []
     digest = conn.execute("SELECT run_id, item_count, delivery_status FROM digests").fetchone()
@@ -291,11 +290,48 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
     assert sent  # 回復した分析の結果が同じ日に届く
 
 
+def test_date_change_after_digest_is_not_taken_as_held(conn, tmp_path, monkeypatch) -> None:
+    # analyze 段が失敗しても載せる記事があれば digest を作る。その後に JST の日付が変わっても
+    # 保留と取り違えない(deliver を黙って省かず、通知も「作れなかった」と言わない。GH#191)
+    from app import run as run_module
+    from app.analysis.llm import LLMUnavailableError
+    from tests.test_ranking import add_analyzed
+
+    class UnavailableEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 起動失敗")
+
+    carried = add_analyzed(conn, "https://carried.example/1", source_id=1, relevance=90)
+    day = {"today": "2026-07-06"}
+    monkeypatch.setattr("app.digest.builder.today_jst", lambda: "2026-07-06")
+    monkeypatch.setattr(run_module, "today_jst", lambda: day["today"])
+    generate_digest = run_module.generate_digest
+
+    def generate_then_cross_midnight(*args, **kwargs):
+        digest_id = generate_digest(*args, **kwargs)
+        day["today"] = "2026-07-07"  # digest 段の直後に JST の 0 時を越える
+        return digest_id
+
+    monkeypatch.setattr(run_module, "generate_digest", generate_then_cross_midnight)
+    sent = use_fake_telegram(monkeypatch)
+    failures = run_pipeline(
+        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        {"rss": StaticConnector()}, make_http(), lambda: UnavailableEngine(), logger, "01RUN",
+    )
+    digest = conn.execute("SELECT digest_date, item_ids, delivery_status FROM digests").fetchone()
+    assert tuple(digest) == ("2026-07-06", f"[{carried}]", "pending")  # 作った digest は残る
+    assert not failures.digest_held
+    # 日付をまたいだ扱いは従来どおり段の失敗として知らせる(保留として黙って省かない)
+    assert "deliver" in failures
+    assert sent == []
+
+
 def test_no_qualified_items_digest_is_finalized_as_before(conn, tmp_path, monkeypatch) -> None:
     # 分析が通って載せる記事が無い日は、今までどおり「該当なし」で確定して配信し、
     # 同じ日の再実行でも作り直さない(障害の空とは区別する。GH#191)
-    from app.run import digest_held
-
     class LowRelevanceEngine(ScriptedEngine):
         def complete_structured(self, prompt, schema, timeout_s=120):
             batch = super().complete_structured(prompt, schema, timeout_s)
@@ -310,7 +346,7 @@ def test_no_qualified_items_digest_is_finalized_as_before(conn, tmp_path, monkey
     )
     failures = run_pipeline(*args, lambda: LowRelevanceEngine(conn), logger, "01RUN1")
     assert failures == []
-    assert not digest_held(conn, failures)
+    assert not failures.digest_held
     digest = conn.execute(
         "SELECT run_id, status, item_count, delivery_status, markdown FROM digests"
     ).fetchone()

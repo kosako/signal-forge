@@ -33,6 +33,17 @@ from app.jst import today_jst
 from app.purge import purge_expired
 
 
+class RunFailures(list[str]):
+    """run_pipeline の結果。失敗した段の名前の一覧(空 = 全段成功)。
+
+    digest_held: analyze 段の失敗で載せる記事が無く、当日の digest を確定しなかった(GH#191)。
+    digest 段が DigestHeldError を受けたときだけ立てる。当日の行の有無からは推し量らない
+    (実行の途中で JST の日付が変わると、作った digest を保留と取り違えるため)。
+    """
+
+    digest_held: bool = False
+
+
 def run_pipeline(
     conn: sqlite3.Connection,
     config: Config,
@@ -44,9 +55,9 @@ def run_pipeline(
     run_id: str,
     *,
     force_digest: bool = False,
-) -> list[str]:
-    """全段を直列実行し、失敗した段の名前リストを返す(空 = 全段成功)。"""
-    failures: list[str] = []
+) -> RunFailures:
+    """全段を直列実行し、失敗した段の名前リストを返す(空 = 全段成功。保留は digest_held)。"""
+    failures = RunFailures()
 
     def stage(name: str, action: Callable[[], object]) -> None:
         try:
@@ -66,24 +77,31 @@ def run_pipeline(
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
     stage("analyze", lambda: _analyze(conn, config, env, engine_factory, logger, run_id))
-    stage(
-        "digest",
-        lambda: _digest(
-            conn, config, env, engine_factory, logger, run_id, force_digest,
-            hold_if_empty="analyze" in failures,
-        ),
-    )
+
+    def digest() -> None:
+        try:
+            _digest(
+                conn, config, env, engine_factory, logger, run_id, force_digest,
+                hold_if_empty="analyze" in failures,
+            )
+        except DigestHeldError as e:
+            # 障害の空。段の失敗にはしない(原因の analyze 段の失敗として通知する。GH#191)
+            failures.digest_held = True
+            logger.warning(
+                f"{e}(復旧後に同じ日の intel run で作る)",
+                extra={"run_id": run_id, "stage": "digest"},
+            )
+
+    stage("digest", digest)
     # 障害で当日の digest を確定しなかった日は、export・deliver が当日分を扱わない(GH#191)
     stage(
         "export",
-        lambda: _export_today(conn, config, logger, run_id, held=digest_held(conn, failures)),
+        lambda: _export_today(conn, config, logger, run_id, held=failures.digest_held),
     )
     if is_telegram_configured(config, env):
         stage(
             "deliver",
-            lambda: _deliver_today(
-                conn, config, env, logger, run_id, held=digest_held(conn, failures)
-            ),
+            lambda: _deliver_today(conn, config, env, logger, run_id, held=failures.digest_held),
         )
     else:
         # 完全未設定 = M2a 前の未セットアップ。欠落検知は doctor #4 の責務(設計 05 §2)
@@ -116,7 +134,7 @@ def _digest(
 ) -> int | None:
     """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。
 
-    hold_if_empty: analyze 段が失敗した日。載せる記事が無ければ確定せず None(GH#191)。
+    hold_if_empty: analyze 段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
     """
     from app.analysis.trend import synthesize_trend
 
@@ -135,27 +153,10 @@ def _digest(
                 f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
                 extra={"run_id": run_id, "stage": "digest"},
             )
-    try:
-        return generate_digest(
-            conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend,
-            hold_if_empty=hold_if_empty,
-        )
-    except DigestHeldError as e:
-        # 障害の空。段の失敗にはしない(原因の analyze 段の失敗として通知される)
-        logger.warning(
-            f"{e}(復旧後に同じ日の intel run で作る)",
-            extra={"run_id": run_id, "stage": "digest"},
-        )
-        return None
-
-
-def digest_held(conn: sqlite3.Connection, failures: list[str]) -> bool:
-    """analyze 段の失敗で当日の digest を確定しなかったか(GH#191)。
-
-    digest 段は通ったのに当日の行が無い = 載せる記事が無く、障害の空として作らなかった。
-    export・deliver は当日分を扱わず、失敗通知は同じ日の再走で届くことを添える。
-    """
-    return "analyze" in failures and "digest" not in failures and not _digest_exists_today(conn)
+    return generate_digest(
+        conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend,
+        hold_if_empty=hold_if_empty,
+    )
 
 
 def _digest_exists_today(conn: sqlite3.Connection) -> bool:

@@ -241,33 +241,23 @@ def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     assert len(calls) == 1 and calls[0]
 
 
-@pytest.mark.parametrize("digest_exists", [False, True])
+@pytest.mark.parametrize("digest_held", [True, False])
 def test_run_failure_notice_tells_whether_digest_was_held(
-    tmp_path, monkeypatch, digest_exists
+    tmp_path, monkeypatch, digest_held
 ) -> None:
-    # analyze 段が失敗して当日の digest が無い = 障害の空として確定しなかった日だけ、
-    # 失敗通知に同じ日の再走で届くことを添える(GH#191)
+    # digest 段が保留した事実(run_pipeline の戻り値)を失敗通知へ渡す(GH#191)
     from app import delivery, logs, run
-    from app.db import apply_migrations, connect
-    from app.jst import today_jst
 
     monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
     _answer_config(tmp_path, telegram=True)
-    if digest_exists:
-        db = connect(tmp_path / "intel.db")
-        apply_migrations(db, tmp_path / "intel.db")
-        db.execute(
-            "INSERT INTO digests (digest_date, status, markdown, item_ids, item_count) "
-            "VALUES (?, 'ok', '', '[]', 0)",
-            (today_jst(),),
-        )
-        db.close()
-    held: list[bool] = []
-    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: ["analyze"])
+    failures = run.RunFailures(["analyze"])
+    failures.digest_held = digest_held
+    passed: list[bool] = []
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
     monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
     monkeypatch.setattr(
-        delivery, "notify_run_failure", lambda *args, digest_held: held.append(digest_held)
+        delivery, "notify_run_failure", lambda *args, digest_held: passed.append(digest_held)
     )
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 1
-    assert held == [not digest_exists]
+    assert passed == [digest_held]
