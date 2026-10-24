@@ -1181,9 +1181,42 @@ def test_requested_without_material_fails_loud(conn, config) -> None:
 
     with pytest.raises(DigError, match="リプライ指定だが本文の抽出材料がない"):
         run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
-    # キューには残る(ユーザーがパスするまで)
-    row = conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
-    assert row["status"] == "queued"
+    # 知らせるのは 1 回だけ。本文を取り直す経路は無いので指定を外し、自動キューの材料不足と
+    # 同じく静かに残す(観点・状態は保つ)。次の朝から同じ失敗を続けない(GH#197)
+    row = conn.execute(
+        "SELECT status, angle, requested_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()
+    assert (row["status"], row["angle"], row["requested_at"]) == ("queued", "観点", None)
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+
+def test_requested_without_material_keeps_respecification_after_selection(
+    conn, config, monkeypatch
+) -> None:
+    # 選定の後に本人が指定し直していたら(poller の更新)、指定を外さずに本人の操作を残す
+    from app import deepdive as deepdive_module
+
+    item = add_item(conn, "https://a.example/1", body=None)
+    enqueue(conn, item, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    real_select = deepdive_module._select_candidates
+
+    def select_then_respecify(*args, **kwargs):
+        selected = real_select(*args, **kwargs)
+        conn.execute(
+            "UPDATE dig_queue SET angle = '新しい観点', requested_at = '2026-07-21T21:00:00Z' "
+            "WHERE item_id = ?",
+            (item,),
+        )
+        return selected
+
+    monkeypatch.setattr(deepdive_module, "_select_candidates", select_then_respecify)
+
+    with pytest.raises(DigError, match="リプライ指定だが本文の抽出材料がない"):
+        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+    row = conn.execute(
+        "SELECT angle, requested_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()
+    assert (row["angle"], row["requested_at"]) == ("新しい観点", "2026-07-21T21:00:00Z")
 
 
 def test_item_failure_isolated_but_stage_fails(conn, config) -> None:
