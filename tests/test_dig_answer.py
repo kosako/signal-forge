@@ -675,12 +675,22 @@ def put_queue(conn: sqlite3.Connection, dig_id: int, status: str) -> int:
     return item_id
 
 
-def same_second(conn: sqlite3.Connection, question_id: int, item_id: int) -> None:
-    """質問の受付の時刻を、キューの最後の更新と同じ秒にする(時刻では先後が分からない)。"""
+# 受付と操作の時刻はどちらもこの秒に固定する(時刻では先後が分からない)。実際の時計に
+# 頼らないので、照合が時刻を > で比べても >= で比べても、下のどちらかのテストが必ず落ちる
+SAME_SECOND = "2026-10-18T12:00:00Z"
+
+
+def pin_question(conn: sqlite3.Connection, question_id: int) -> None:
+    """質問の受付の時刻を SAME_SECOND に固定する(返事を作る前に。取得済みの行にも効く)。"""
+    conn.execute("UPDATE dig_questions SET created_at = ? WHERE id = ?", (SAME_SECOND, question_id))
+
+
+def pin_queue(conn: sqlite3.Connection, item_id: int) -> None:
+    """キューの最後の更新の時刻と、指定の時刻(あれば)を SAME_SECOND に固定する。"""
     conn.execute(
-        "UPDATE dig_questions SET created_at = "
-        "(SELECT updated_at FROM dig_queue WHERE item_id = ?) WHERE id = ?",
-        (item_id, question_id),
+        "UPDATE dig_queue SET updated_at = ?, "
+        "requested_at = CASE WHEN requested_at IS NULL THEN NULL ELSE ? END WHERE item_id = ?",
+        (SAME_SECOND, SAME_SECOND, item_id),
     )
 
 
@@ -698,10 +708,11 @@ def test_redig_does_not_override_operation_during_answer(
     dig_id = add_dig(conn, config)
     item_id = put_queue(conn, dig_id, "done")
     question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    pin_question(conn, question_id)
 
     def operate() -> None:
         backlog_reply(tmp_path / "intel.db", reply.format(item_id), item_id)
-        same_second(conn, question_id, item_id)
+        pin_queue(conn, item_id)
 
     sender = Sender()
 
@@ -727,13 +738,14 @@ def test_redig_is_queued_without_operation_after_acceptance(conn, config, tmp_pa
     if before is not None:
         backlog_reply(tmp_path / "intel.db", before.format(item_id), item_id)
     question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
-    same_second(conn, question_id, item_id)
+    pin_queue(conn, item_id)
+    pin_question(conn, question_id)
 
     def dig_done() -> None:  # 調査段(deepdive)が 1 分後に掘り終えて done にする
         conn.execute(
             "UPDATE dig_queue SET status = 'done', "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+60 seconds') WHERE item_id = ?",
-            (item_id,),
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', ?, '+60 seconds') WHERE item_id = ?",
+            (SAME_SECOND, item_id),
         )
 
     engine = OperateDuringAnswer(
