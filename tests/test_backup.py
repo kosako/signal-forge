@@ -1,4 +1,6 @@
+import errno
 import logging
+import os
 import shutil
 import sqlite3
 import tarfile
@@ -293,3 +295,85 @@ def test_outside_profile_is_backed_up_when_config_dir_cannot_be_resolved(conn, t
         assert tar.extractfile("profile/my-profile.md").read().decode("utf-8") == PROFILE_TEXT
     assert "intel.db" in names
     assert not [n for n in names if n.split("/")[0] == "config"]
+
+
+# --- 同日の再実行での当日世代の置き換え(GH#254) ---
+
+TODAY = "2026-06-17"  # 当日の世代名は暦日で決まるので固定する(GH#210)
+
+
+def _restore(archive: Path, dest: Path) -> tuple[set[str], str]:
+    """アーカイブを展開し、戻した DB の rss ソースの名前と config.toml の中身を返す。"""
+    with tarfile.open(archive) as tar:
+        tar.extractall(path=dest, filter="data")
+    restored = sqlite3.connect(dest / "intel.db")
+    try:
+        # manual ソースは migration が入れる 1 行なので、テストで足した rss だけを見る
+        names = {row[0] for row in restored.execute("SELECT name FROM sources WHERE type = 'rss'")}
+    finally:
+        restored.close()
+    return names, (dest / "config" / "config.toml").read_text(encoding="utf-8")
+
+
+def test_same_day_rerun_archive_restores_updated_db_and_config(conn, tmp_path, monkeypatch) -> None:
+    # 収集や設定の修正のあとに同じ日に再実行したら、当日世代は新しい内容で置き換わり、
+    # 2 回目のアーカイブから更新した DB と設定を戻せる(古い世代を残したまま返す回帰を検出する)
+    monkeypatch.setattr("app.backup.today_jst", lambda: TODAY)
+    config = make_config(tmp_path)
+    prompts = make_prompts(tmp_path)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'before')")
+    first = backup_daily(conn, config, logger, prompts_dir=prompts)
+
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'after')")
+    (config.config_dir / "config.toml").write_text("# config v2\n", encoding="utf-8")
+    second = backup_daily(conn, config, logger, prompts_dir=prompts)
+
+    assert first == second == config.backup_dir / "intel-20260617.tar.gz"
+    assert sorted(p.name for p in config.backup_dir.iterdir()) == [second.name]
+    names, config_text = _restore(second, tmp_path / "restore")
+    assert names == {"before", "after"}
+    assert config_text == "# config v2\n"
+
+
+@pytest.mark.parametrize("stage", ["create", "replace"])
+def test_same_day_rerun_failure_keeps_previous_archive(conn, tmp_path, monkeypatch, stage) -> None:
+    # 同じ日の再実行でアーカイブの作成(容量不足など)や置き換えに失敗しても、当日の旧世代は
+    # 戻せるまま残り、一時ファイルは片付き、世代の削除には進まない(先に消してから作る形への
+    # 回帰を検出する)
+    monkeypatch.setattr("app.backup.today_jst", lambda: TODAY)
+    config = make_config(tmp_path)
+    prompts = make_prompts(tmp_path)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'before')")
+    archive = backup_daily(conn, config, logger, prompts_dir=prompts)
+    previous = archive.read_bytes()
+    # 世代の削除まで進めば最古の 06-03 が消える数(当日と合わせて GENERATIONS + 1)にしておく
+    for day in range(17 - GENERATIONS, 17):
+        (config.backup_dir / f"intel-202606{day:02d}.tar.gz").write_bytes(b"")
+    before = sorted(p.name for p in config.backup_dir.iterdir())
+    assert len(before) == GENERATIONS + 1
+
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'after')")
+    (config.config_dir / "config.toml").write_text("# config v2\n", encoding="utf-8")
+    injected = OSError(errno.ENOSPC if stage == "create" else errno.EIO, "injected")
+    seen: set[str] = set()  # 失敗の時点で置き場にあったファイル
+
+    def fail(*args, **kwargs):
+        seen.update(p.name for p in config.backup_dir.iterdir())
+        raise injected
+
+    with monkeypatch.context() as m:
+        if stage == "create":
+            m.setattr(tarfile.TarFile, "add", fail)  # 書いている途中で失敗する
+        else:
+            m.setattr(os, "replace", fail)  # 書き終えて置き換える時に失敗する
+        with pytest.raises(OSError) as excinfo:
+            backup_daily(conn, config, logger, prompts_dir=prompts)
+    assert excinfo.value is injected
+
+    assert seen - set(before)  # 一時ファイルはあった(片付けの確認が空振りしない)
+    # 一時ファイルは残らず、世代も消えない
+    assert sorted(p.name for p in config.backup_dir.iterdir()) == before
+    assert archive.read_bytes() == previous  # 当日の旧世代はそのまま
+    names, config_text = _restore(archive, tmp_path / "restore")
+    assert names == {"before"}
+    assert config_text == "# config\n"
