@@ -347,13 +347,14 @@ SELECT signal_date,
 FROM latest WHERE rn = 1 GROUP BY signal_date;
 ```
 
-### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009。GH#104 / 設計 06 §2〜3)
+### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009・022。GH#104 / 設計 06 §2〜3)
 
 夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。深掘りカードへのリプライが調べ直しの依頼なら、`intel answer` が同じ規則で upsert する(観点 = リプライの原文。GH#137)。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。
 
 - `item_id` UNIQUE(1 item 1 行。状態遷移で履歴を持たない — 観点は最新だけあれば調査に足りる)、items へ ON DELETE CASCADE
 - `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
-- `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)。調べ直しの依頼は、質問を受け付けた時刻を入れる(返事を作る間の本人のパス・指定し直しとの先後の照合に使う。GH#235・設計 06 §6)
+- `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)
+- `backlog_op_question_id`(migration 022)= 未消化一覧への本人の最後の操作(パス・指定)を反映した時点で、受け付け済みだった質問(`dig_questions.id`)の最大(質問がまだ無ければ 0)。受付の順序の印で、深掘りカードへの調べ直しの依頼は、自分の id がこれ以下なら(操作より前に受け付けた)積まない(GH#235・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、質問の id を目盛りにする。調べ直しの依頼と朝の深掘りの `done` は変えない。NULL = 未消化一覧での操作がまだない(migration 022 より前の操作を含む)
 - `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先の認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
 
 ### 深掘り実行結果(dig_results・migration 010・017。GH#105 / GH#153 / 設計 06 §4〜5)
