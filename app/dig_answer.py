@@ -9,6 +9,10 @@
 - write-ahead(migration 011): 答え(または失敗)を台帳に記帳してから送り、送れたら
   answer_message_id を記帳する。途中で止まっても、次の実行は未送信の行の送信から再開し、
   同じ質問の答えを作り直さない
+- 書き込みを伴う操作(take の記録 GH#106・調べ直しの依頼 GH#137)は、返事を作る呼び出しの
+  出力で決めない(GH#245)。本人の入力(リプライの本文と、返信先が失敗の知らせか)だけを渡す
+  別の呼び出し(prompts/dig-intent-v001)で決める。返事の材料(外部由来のノート・元記事)の中の
+  文が、本人の質問を take として記録させたり、調べ直しを積ませたりできないようにするため
 """
 
 from __future__ import annotations
@@ -30,7 +34,8 @@ from app.dig import DigInstruction, apply_instructions
 from app.prompting import fill_template, sanitize_body
 from app.vault_guard import VaultGuard, VaultStalled
 
-PROMPT_VERSION = "dig-answer-v002"
+PROMPT_VERSION = "dig-answer-v003"
+INTENT_PROMPT_VERSION = "dig-intent-v001"  # 本人のリプライの意図の判定(GH#245)
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # 返事の目安はプロンプトで 1,500 字。スキーマの上限は余裕を持たせる(少し超えただけで
@@ -41,6 +46,13 @@ EXPLAINER_MAX_CHARS = 20_000  # 解説ノート(平均 3,500 字。本人の追�
 HISTORY_TURNS = 5  # 材料に含めるそれまでのやり取り(直近から)
 
 FAILURE_TEXT = "⚠️ 答えを作れませんでした。時間をおいて、もう一度リプライしてください"
+# それまでのやり取りで、答えを作れなかった回に返事の代わりに置く文(GH#236)
+FAILED_TURN_TEXT = "(回答失敗: このときは答えを作れなかった)"
+# 失敗の知らせへのリプライに、答えられなかった元の質問を添えるときの前置き(GH#236)
+RETRY_LEAD = (
+    "(このリプライは「答えを作れなかった」という知らせへの返信。"
+    "答えられなかった私の前のリプライ(古い順):)"
+)
 
 # 調べ直しの依頼(GH#137)。観点は本人のリプライの原文(LLM の出力は使わない。材料の外部本文が
 # 翌朝の深掘りの指定観点 = プロンプトの信頼される側に入らないように)。上限は調査段が観点に使う長さ
@@ -71,26 +83,44 @@ SendReply = Callable[[int, str], int]
 
 
 class DigAnswer(BaseModel):
-    """返事の構造化出力(prompts/dig-answer-v002.md)。kind は take の記録(#106)が使う。
+    """返事の構造化出力(prompts/dig-answer-v003.md)。
 
-    redig = 本人が観点を足して調べ直してほしいと求めている(GH#137。翌朝の深掘りのキューに積む)。
-    既定値を持たせない(書き漏らしを「依頼でない」と黙って受け付けて依頼を失わない。欠ければ
-    検証の失敗として扱う)。
+    リプライの種類と調べ直しの依頼かは返させない(DigIntent で別に決める。GH#245)。
+    """
+
+    answer: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
+
+
+class DigIntent(BaseModel):
+    """本人のリプライの意図(prompts/dig-intent-v001.md。GH#245)。
+
+    kind は take の記録(#106)が使う。redig = 本人が観点を足して調べ直してほしいと求めている
+    (GH#137。翌朝の深掘りのキューに積む)。判定に渡すのは本人の入力だけで、外部由来の材料と
+    それから作った返事は渡さない。既定値を持たせない(書き漏らしを「依頼でない」と黙って受け付けて
+    依頼を失わない。欠ければ検証の失敗として扱う)。
     """
 
     kind: Literal["question", "take", "both"]
-    answer: str = Field(min_length=1, max_length=ANSWER_MAX_CHARS)
     redig: bool
 
 
 def enqueue_question(
-    conn: sqlite3.Connection, dig_result_id: int, question: str, question_message_id: int
+    conn: sqlite3.Connection,
+    dig_result_id: int,
+    question: str,
+    question_message_id: int,
+    replied_message_id: int,
 ) -> int:
-    """質問を台帳に積む(返事は answer_pending が作る)。トランザクションは呼び出し側が張る。"""
+    """質問を台帳に積む(返事は answer_pending が作る)。トランザクションは呼び出し側が張る。
+
+    replied_message_id = そのリプライの返信先(カード・返事・失敗の知らせ)。失敗の知らせへの
+    リプライなら、答えられなかった元の質問に結び付ける(retry_of。GH#236)。
+    """
     return conn.execute(
-        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
-        "VALUES (?, ?, ?)",
-        (dig_result_id, question, question_message_id),
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, retry_of) "
+        "VALUES (?, ?, ?, (SELECT id FROM dig_questions "
+        "WHERE dig_result_id = ? AND answer_message_id = ? AND status = 'failed'))",
+        (dig_result_id, question, question_message_id, dig_result_id, replied_message_id),
     ).lastrowid
 
 
@@ -165,7 +195,7 @@ def answer_pending(
 def _next_pending(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT q.id, q.dig_result_id, q.question, q.request,
+        SELECT q.id, q.dig_result_id, q.question, q.request, q.retry_of,
                r.item_id, r.note_name, r.source_note_name, r.card_text
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'pending'
@@ -186,6 +216,7 @@ def _answer_one(
     log_extra = {"stage": "answer", "extra": {"question_id": row["id"]}}
     try:
         engine = engine_factory(config.dig.answer_reasoning_effort)
+        intent = _intent(engine, config, row)
         prompt = build_answer_prompt(conn, config, row, vault)
         result = complete_with_retry(engine, prompt, DigAnswer, timeout_s=config.dig.timeout_s)
     except Exception as e:
@@ -198,16 +229,30 @@ def _answer_one(
         conn.commit()
         logger.error(f"返事を作れなかった: {type(e).__name__}: {e}", extra=log_extra)
         return
-    # ボタンからの依頼は本人の take でも調べ直しの依頼でもない(LLM の分類によらず question。
-    # GH#106 が記録しない)
-    kind = "question" if row["request"] is not None else result.kind
+    kind = intent.kind
     # 調べ直しは深掘りの段が動いているときだけ受ける(daily_cap = 0 では翌朝に掘られない)
-    redig = row["request"] is None and result.redig and config.dig.daily_cap > 0
+    redig = intent.redig and config.dig.daily_cap > 0
     if redig and not _record_answer_with_redig(conn, row, kind, result.answer, logger, log_extra):
         redig = False
     if not redig:
         _record_answer(conn, row["id"], kind, result.answer, redig=False)
     logger.info(f"返事を作った(kind={kind}・調べ直し={redig})", extra=log_extra)
+
+
+def _intent(engine: LLMEngine, config: Config, row: sqlite3.Row) -> DigIntent:
+    """take の記録・調べ直しの依頼を決める本人の意図(GH#245)。
+
+    返事を作る呼び出し(外部由来の材料を読む)とは別に、本人の入力だけで判定する。同じエンジン・
+    同じ effort で呼び、1 日の上限(answer_daily_cap は質問の数)と予備の台帳(段 answer)も
+    返事と共有する。判定に失敗したら返事も作らず失敗として知らせる(依頼を黙って落とさない)。
+    ボタンからの依頼は本人の take でも調べ直しの依頼でもないので、呼ばずに question にする
+    (GH#141。GH#106 が記録しない)。
+    """
+    if row["request"] is not None:
+        return DigIntent(kind="question", redig=False)
+    return complete_with_retry(
+        engine, build_intent_prompt(row), DigIntent, timeout_s=config.dig.timeout_s
+    )
 
 
 def _record_answer(
@@ -308,6 +353,12 @@ def build_answer_prompt(
     template = (_PROMPTS_DIR / f"{PROMPT_VERSION}.md").read_text(encoding="utf-8")
     profile = load_interest_profile(config.profile_path).body
     question = sanitize_body(row["question"], nonce)[:QUESTION_MAX_CHARS]
+    retried = _retried_questions(conn, row["retry_of"])
+    if retried:
+        question = "\n\n".join(
+            [question, RETRY_LEAD]
+            + [sanitize_body(q, nonce)[:QUESTION_MAX_CHARS] for q in retried]
+        )
     return fill_template(
         template,
         {
@@ -323,6 +374,49 @@ def build_answer_prompt(
             "nonce": nonce,
         },
     )
+
+
+_REPLIED_TO = {
+    False: "深掘りの概要カード、またはそのカードへのあなたの返事",
+    True: "「答えを作れなかった」という知らせ(私の前のリプライに答えられなかったときに送られる)",
+}
+
+
+def build_intent_prompt(row: sqlite3.Row) -> str:
+    """本人のリプライの意図を分けるプロンプト(GH#245)。
+
+    渡すのは本人の入力だけ: リプライの本文と、返信先が失敗の知らせか(本人の操作から分かること)。
+    外部由来の材料(カード・ノート・元記事)と、それから作った返事(それまでのやり取り)は渡さない。
+    失敗の知らせへのリプライでも元の質問は渡さない(take として書く原文・調べ直しの観点は今回の
+    リプライの本文なので、判定も今回の本文だけで行う。元の質問は返事の材料にだけ渡す)。
+    """
+    nonce = secrets.token_hex(4)
+    template = (_PROMPTS_DIR / f"{INTENT_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    return fill_template(
+        template,
+        {
+            "replied_to": _REPLIED_TO[row["retry_of"] is not None],
+            "reply": sanitize_body(row["question"], nonce)[:QUESTION_MAX_CHARS],
+            "schema": json.dumps(DigIntent.model_json_schema(), ensure_ascii=False),
+            "nonce": nonce,
+        },
+    )
+
+
+def _retried_questions(conn: sqlite3.Connection, retry_of: int | None) -> list[str]:
+    """失敗の知らせへのリプライが、やり直しを求めている元の質問(古い順。GH#236)。
+
+    やり直しも失敗し、その知らせにまたリプライしたときは、最初の質問まで辿る(retry_of は常に
+    前の行を指すので巡回しない。プロンプトを伸ばしすぎないよう HISTORY_TURNS 件まで)。
+    """
+    questions: list[str] = []
+    while retry_of is not None and len(questions) < HISTORY_TURNS:
+        row = conn.execute(
+            "SELECT question, retry_of FROM dig_questions WHERE id = ?", (retry_of,)
+        ).fetchone()
+        questions.append(row["question"])
+        retry_of = row["retry_of"]
+    return questions[::-1]
 
 
 def _materials(config: Config, row: sqlite3.Row, nonce: str, vault: VaultGuard) -> str:
@@ -378,11 +472,15 @@ def _request_materials(
 
 
 def _history(conn: sqlite3.Connection, dig_result_id: int, before_id: int, nonce: str) -> str:
-    """同じカードへのそれまでのやり取り(返事のあるものだけ。直近 HISTORY_TURNS 件を古い順)。"""
+    """同じカードへのそれまでのやり取り(直近 HISTORY_TURNS 件を古い順)。
+
+    答えを作れなかった質問も、返事の代わりに決まった文を付けて含める(GH#236。失敗の知らせへの
+    「もう一度」で、何をやり直すかが分かるように)。
+    """
     rows = conn.execute(
         """
-        SELECT question, answer FROM dig_questions
-        WHERE dig_result_id = ? AND id < ? AND status = 'answered'
+        SELECT question, status, answer FROM dig_questions
+        WHERE dig_result_id = ? AND id < ? AND status IN ('answered', 'failed')
         ORDER BY id DESC LIMIT ?
         """,
         (dig_result_id, before_id, HISTORY_TURNS),
@@ -392,7 +490,10 @@ def _history(conn: sqlite3.Connection, dig_result_id: int, before_id: int, nonce
     turns = []
     for r in reversed(rows):
         question = sanitize_body(r["question"], nonce)[:QUESTION_MAX_CHARS]
-        answer = sanitize_body(r["answer"], nonce)[:ANSWER_MAX_CHARS]
+        if r["status"] == "answered":
+            answer = sanitize_body(r["answer"], nonce)[:ANSWER_MAX_CHARS]
+        else:
+            answer = FAILED_TURN_TEXT
         turns.append(f"私: {question}\nあなた: {answer}")
     return "\n\n".join(turns)
 

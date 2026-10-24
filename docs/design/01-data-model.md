@@ -366,7 +366,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる)
 - `review_status` / `review_findings` / `review_cost_usd`(migration 017。GH#153)= 別系統の AI のレビューの結果。`review_status` NULL = レビューしていない(無効・017 より前の行)/ `clean` = 指摘なし / `revised` = 指摘あり → 書き手が 1 回直した / `revise_failed` = 直すのに失敗(本文は直す前のまま)/ `failed` = レビュー自体が失敗(未レビュー)/ `skipped` = 月の上限額に達して省いた。`review_findings` は指摘の JSON 配列(`clean` は空配列、`failed`・`skipped` は NULL)で、本文列と違い公開後も残す(続けるかを決める材料)。`review_cost_usd` はやり直しの分を含む API 費用の見積もりで、月の上限の判定と doctor #9 に使う(どちらも UTC の暦月)
 
-### 深掘りカードへの質問と返事(dig_questions・migration 011〜015。GH#126 / GH#141 / GH#137 / ADR 0005 / 設計 06 §6)
+### 深掘りカードへの質問と返事(dig_questions・migration 011〜015・020。GH#126 / GH#141 / GH#137 / GH#236 / ADR 0005 / 設計 06 §6)
 
 概要カードへのリプライ(質問・感想)と、それへの返事の台帳(1 リプライ = 1 行)。返事は
 **write-ahead** で作る: 答え(または失敗)を先に記帳し(`status` を `answered` / `failed` へ)、
@@ -376,10 +376,11 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `dig_result_id` = どのカードへの質問か(スレッド)。カードへのリプライも返事へのリプライも同じカードに帰属させ、同じカードのそれまでのやり取りを返事の材料に含める
 - `question_message_id` = 本人のリプライの message_id。返事はこれへのリプライとして送る(owner DM 限定)。UNIQUE(migration 012): poller が台帳に積んだ後、offset を保存する前に止まると同じ update が再配達されるため、同じリプライを 2 回受け付けない。カードのボタンからの依頼では NULL(返事はカード = `dig_results.message_id` へのリプライ。migration 014)
 - `request`(migration 014)= カードのボタンの種類(`summary` = 📝 要約 / `more` = 📖 詳しく。NULL = 本人のリプライ)。`question` には決まった依頼文が入る。`request` が NULL ⇔ `question_message_id` がある(CHECK)。同じカードの同じボタンは 1 行だけ(部分 UNIQUE。再配達・二重押しで 2 回作らない)。NOT NULL を外すため、migration 014 で表を作り直した
-- `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しで一緒に返させる(別の呼び出しを増やさない)。take の記録(GH#106)がこれを使う
+- `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しとは別の、本人の入力だけを渡す意図の判定の呼び出しが返す(外部由来の材料が判定を動かせないように。GH#245)。take の記録(GH#106)がこれを使う。ボタンからの依頼は判定を呼ばずに `question`
 - `take_recorded_at`(migration 013)= take(`take` / `both`)を解説ノートと `followup_dig` に記録した時刻。NULL = 未記録で、次の `intel answer` が記録し直す(設計 06 §6)
-- `redig`(migration 015)= 1 なら、返事を作る LLM が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった)
+- `redig`(migration 015)= 1 なら、意図の判定(GH#245)が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった)
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
+- `retry_of`(migration 020)= 失敗の知らせへのリプライなら、答えられなかった元の質問の id(GH#236)。poller が返信先の message_id(失敗の行の `answer_message_id`)から引いて積む。返事の材料に元の質問を添える(やり直しも失敗していれば最初の質問まで 5 件まで辿る)。NULL = カード・返事へのリプライ、ボタンからの依頼
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
 
 ## 8. digests

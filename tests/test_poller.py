@@ -897,6 +897,37 @@ def test_reply_to_answer_continues_the_same_card(conn, tmp_path) -> None:
     assert worker.kicks == 1
 
 
+def test_reply_to_failure_notice_is_linked_to_the_failed_question(conn, tmp_path) -> None:
+    # GH#236: 失敗の知らせへのリプライだけを、答えられなかった元の質問に結び付ける
+    # (返事・カードへのリプライは結び付けない)
+    _item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, "
+        "answer, answer_message_id) VALUES (?, '答えた質問', 80, 'answered', '返事', 950)",
+        (dig_id,),
+    )
+    failed_id = conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, status, "
+        "error, answer_message_id) VALUES (?, '元の質問', 81, 'failed', 'LLMError: x', 951)",
+        (dig_id,),
+    ).lastrowid
+    conn.commit()
+    api = FakeApi([[
+        card_reply("もう一度", 951, message_id=82, update_id=1),
+        card_reply("返事への質問", 950, message_id=83, update_id=2),
+        card_reply("カードへの質問", 700, message_id=84, update_id=3),
+    ]])
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=FakeWorker())
+
+    rows = conn.execute(
+        "SELECT question, retry_of FROM dig_questions WHERE question_message_id >= 82 ORDER BY id"
+    ).fetchall()
+    assert [(r["question"], r["retry_of"]) for r in rows] == [
+        ("もう一度", failed_id), ("返事への質問", None), ("カードへの質問", None)
+    ]
+
+
 def test_card_reply_over_daily_cap_is_recorded_only(conn, tmp_path) -> None:
     _item_id, dig_id = add_dig_card(conn)
     conn.execute(
