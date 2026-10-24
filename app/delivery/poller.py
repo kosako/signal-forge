@@ -9,8 +9,9 @@
   検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback
   1回のため記帳を先に行う。ローカル SQLite はミリ秒オーダーで10秒失効に間に合う)→
   ⑤editMessageReplyMarkup で ✓
-- message 処理(URL 投入。設計 02 §4 / 04 §5): owner の平文メッセージから http/https
-  URL を抽出し items(source=manual)へ投入して即 ACK。重複判定は canonical_url のみ
+- message 処理(URL 投入。設計 02 §4 / 04 §5): owner のメッセージから http/https
+  URL を抽出し(Telegram の entities を優先し、無ければ平文を補助的に解析。GH#227)、
+  items(source=manual)へ投入して即 ACK。重複判定は canonical_url のみ
   (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
@@ -66,6 +67,14 @@ _REACTION_VALUES = {"up": "useful", "dig": "dig", "knw": "known", "no": "noise"}
 _REACTION_EMOJI = {"up": "👍", "dig": "🔖", "knw": "✅", "no": "👎"}
 
 _URL_RE = re.compile(r"https?://\S+")
+# URL の抜き出し(設計 04 §5。GH#227)。URL を終える文字 = URL に生のまま現れない `<>"` と、
+# 全角の句読点・括弧・引用符。URL の直後に空白なしで続けた文(「（https://…）を読む」)を含めない
+_URL_STOP_CHARS = frozenset('<>"、。，．！？：；…（）［］｛｝「」『』【】〔〕〈〉《》“”‘’')
+# URL の末尾から外す ASCII の句読点(文の区切り。URL の途中にあるものは外さない)
+_URL_TRAILING_PUNCT = ".,;:!?'"
+# ASCII の閉じ括弧 → 開き括弧。対になっていない閉じ括弧の手前で URL を終える(Wikipedia の
+# `Foo_(bar)` のような URL の中の対になった括弧は残す)
+_URL_BRACKETS = {")": "(", "]": "[", "}": "{"}
 NO_URL_GUIDE = "URL を送ると翌朝のダイジェスト候補になります"
 
 
@@ -691,7 +700,7 @@ def _handle_message(
             _handle_dig_reply(conn, text.strip(), reply, logger)
             return
 
-    urls = _URL_RE.findall(text) if isinstance(text, str) else []
+    urls = _extract_urls(text, message.get("entities")) if isinstance(text, str) else []
     if not urls:
         reply(NO_URL_GUIDE)
         return
@@ -705,6 +714,78 @@ def _handle_message(
     else:
         # 抽出はされたが全件が正規化 reject(userinfo・不正ポート・host なし等)
         reply("有効な URL がありませんでした")
+
+
+def _extract_urls(text: str, entities: object) -> list[str]:
+    """メッセージから投入する http/https の URL を出現順に抜き出す(設計 04 §5。GH#227)。
+
+    Telegram の entities の url(本文中の URL の範囲)と text_link(文字列に付けたリンクの
+    url)を優先する。entities から http/https の URL が 1 つも得られないとき(entities が
+    無い・形が不正など)だけ、平文を正規表現で補助的に解析する。
+    """
+    urls = _entity_urls(text, entities)
+    if urls:
+        return urls
+    candidates = (_trim_url(match) for match in _URL_RE.findall(text))
+    return [url for url in candidates if _URL_RE.fullmatch(url)]
+
+
+def _entity_urls(text: str, entities: object) -> list[str]:
+    if not isinstance(entities, list):
+        return []
+    # entity の offset・length は UTF-16 の code unit で数える(Telegram Bot API)
+    encoded = text.encode("utf-16-le", "surrogatepass")
+    urls: list[str] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if entity.get("type") == "text_link":
+            url = entity.get("url")
+        elif entity.get("type") == "url":
+            span = _utf16_span(encoded, entity.get("offset"), entity.get("length"))
+            # Telegram の範囲が全角の句読点・括弧まで含む場合に備え、平文と同じ規則で整える
+            url = _trim_url(span) if span is not None else None
+        else:
+            continue
+        if isinstance(url, str) and _URL_RE.fullmatch(url):
+            urls.append(url)
+    return urls
+
+
+def _utf16_span(encoded: bytes, offset: object, length: object) -> str | None:
+    """UTF-16LE に直した本文から entity の範囲を取り出す。範囲が不正なら None。"""
+    if not isinstance(offset, int) or not isinstance(length, int):
+        return None
+    if offset < 0 or length <= 0 or (offset + length) * 2 > len(encoded):
+        return None
+    try:
+        return encoded[offset * 2 : (offset + length) * 2].decode("utf-16-le")
+    except UnicodeDecodeError:  # surrogate pair の途中で切れた範囲
+        return None
+
+
+def _trim_url(candidate: str) -> str:
+    """URL の候補から、URL の後ろに続けて書いた文字を外す(GH#227)。
+
+    URL を終える文字(_URL_STOP_CHARS)か、対になっていない ASCII の閉じ括弧の手前で切り、
+    末尾の ASCII の句読点を外す。URL の中の対になった括弧は残す。正規化(normalize_url)の
+    規則は変えない。
+    """
+    depth = dict.fromkeys(_URL_BRACKETS.values(), 0)
+    end = len(candidate)
+    for i, ch in enumerate(candidate):
+        if ch in _URL_STOP_CHARS:
+            end = i
+            break
+        if ch in depth:
+            depth[ch] += 1
+        elif ch in _URL_BRACKETS:
+            opener = _URL_BRACKETS[ch]
+            if depth[opener] == 0:
+                end = i
+                break
+            depth[opener] -= 1
+    return candidate[:end].rstrip(_URL_TRAILING_PUNCT)
 
 
 def _ingest_manual_urls(

@@ -313,12 +313,12 @@ def test_retap_appends_new_row(conn, tmp_path) -> None:
 
 
 def make_message_update(
-    text: object, *, update_id: int = 1, from_id: int = OWNER_ID
+    text: object, *, update_id: int = 1, from_id: int = OWNER_ID, entities: list | None = None
 ) -> dict:
-    return {
-        "update_id": update_id,
-        "message": {"text": text, "from": {"id": from_id}, "chat": {"id": CHAT_ID}},
-    }
+    message = {"text": text, "from": {"id": from_id}, "chat": {"id": CHAT_ID}}
+    if entities is not None:
+        message["entities"] = entities  # Telegram の message.entities(GH#227)
+    return {"update_id": update_id, "message": message}
 
 
 def manual_items(conn) -> list[sqlite3.Row]:
@@ -336,6 +336,74 @@ def test_url_message_ingested_and_acked(conn, tmp_path) -> None:
     assert len(rows) == 1
     assert rows[0]["status"] == "new"
     assert rows[0]["canonical_url"] == "https://example.com/article"  # u1 正規化済み
+    assert api.sent == [(CHAT_ID, "✅ 1件受け付けました。明朝のダイジェストで分析します")]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("（https://example.com/article）", "https://example.com/article"),  # 全角の括弧で囲んだ
+        ("「https://example.com/article」を読む", "https://example.com/article"),  # 括弧の後に文
+        ("あとで読む https://example.com/article。", "https://example.com/article"),  # 文末の句点
+        ("https://example.com/article、あとで読む", "https://example.com/article"),  # 読点の後に文
+        ("Read this (https://example.com/article).", "https://example.com/article"),
+        ("Is it https://example.com/article?", "https://example.com/article"),
+        # URL の中の対になった括弧は残し、対になっていない閉じ括弧と句点だけを外す
+        ("https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+        ("(https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+    ],
+)
+def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
+    conn, tmp_path, text, expected
+) -> None:
+    # entities の無いメッセージは平文を解析する。URL の直後の句読点・括弧を URL に含めない(GH#227)
+    api = FakeApi([[make_message_update(text)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    rows = manual_items(conn)
+    assert [(r["url"], r["canonical_url"]) for r in rows] == [(expected, expected)]
+    assert api.sent == [(CHAT_ID, "✅ 1件受け付けました。明朝のダイジェストで分析します")]
+
+
+@pytest.mark.parametrize(
+    ("text", "entities", "expected"),
+    [
+        # url entity の範囲を使う(平文の解析なら「あとで読む」まで URL に含める)。offset・length は
+        # UTF-16 の code unit で数える(絵文字は 2)
+        (
+            "😀 https://example.com/articleあとで読む",
+            [{"type": "url", "offset": 3, "length": 27}],
+            ["https://example.com/article"],
+        ),
+        # Telegram の範囲が全角の閉じ括弧まで含んでも、平文と同じ規則で外す
+        (
+            "（https://example.com/article）",
+            [{"type": "url", "offset": 1, "length": 28}],
+            ["https://example.com/article"],
+        ),
+        # 文字列に付けたリンク(text_link)は、その url を投入する
+        (
+            "この記事",
+            [{"type": "text_link", "offset": 0, "length": 4, "url": "https://example.com/linked"}],
+            ["https://example.com/linked"],
+        ),
+        # entities から http/https の URL を得られなければ平文を解析する
+        (
+            "太字 https://example.com/article。",
+            [
+                {"type": "bold", "offset": 0, "length": 2},
+                {"type": "text_link", "offset": 0, "length": 2, "url": "tg://user?id=1"},
+                {"type": "url", "offset": 99, "length": 5},  # 本文の外を指す
+            ],
+            ["https://example.com/article"],
+        ),
+    ],
+)
+def test_url_taken_from_message_entities(conn, tmp_path, text, entities, expected) -> None:
+    api = FakeApi([[make_message_update(text, entities=entities)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert [r["url"] for r in manual_items(conn)] == expected
     assert api.sent == [(CHAT_ID, "✅ 1件受け付けました。明朝のダイジェストで分析します")]
 
 
