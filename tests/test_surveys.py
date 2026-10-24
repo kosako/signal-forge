@@ -3,7 +3,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +18,7 @@ from app.delivery.surveys import (
     STATE_SOURCE_REPORT_SENT,
     STATE_SURVEY_SENT,
     STATE_WATCHDOG_NOTIFIED,
+    pending_dig_items,
 )
 from app.delivery.telegram import DeliveryError
 from app.jst import JST, today_jst
@@ -52,12 +53,22 @@ def jst_now(hhmm: str = "21:30") -> datetime:
     return datetime.now(JST).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
-def add_dig_reaction(conn, item_id: int, signal_date: str) -> None:
+def add_dig_reaction(
+    conn, item_id: int, signal_date: str, *, pressed_at: str | None = None
+) -> None:
+    """🔖 の reaction。signal_date は配信日。押した時刻 pressed_at(created_at の形)の既定は
+    配信日の 12:00 JST(追い掛けの対象は押した日で選ぶ。GH#226)。"""
     conn.execute(
-        "INSERT INTO signals (kind, item_id, value, signal_date) "
-        "VALUES ('reaction', ?, 'dig', ?)",
-        (item_id, signal_date),
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('reaction', ?, 'dig', ?, ?)",
+        (item_id, signal_date, pressed_at or jst_to_created_at(signal_date, "12:00:00")),
     )
+
+
+def jst_to_created_at(day: str, hms: str) -> str:
+    """JST の日時を signals.created_at の形(UTC の ISO)に直す。"""
+    moment = datetime.strptime(f"{day} {hms}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def silence_watchdog(conn) -> None:
@@ -180,6 +191,68 @@ def test_followup_links_to_canonical_url(conn, tmp_path) -> None:
     assert '<a href="https://a/dug?x=1&amp;y=2">対象記事</a>' in followup  # 属性エスケープ済み
 
 
+def test_followup_targets_chosen_by_jst_date_dig_was_pressed(conn, tmp_path) -> None:
+    # GH#226: 追い掛けの対象は 🔖 を押した日(created_at を JST に直した日付)で選ぶ。
+    # 配信日(signal_date)では選ばない。回答の帰属は配信日のまま(KPI の意味は変えない)
+    now = jst_now("21:30")
+    today = now.strftime("%Y-%m-%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    two_days_ago = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    older = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    # 過去の digest に昨日の 0:00 JST に付けた 🔖(UTC では前々日)→ 対象
+    late = add_item(conn, "https://a/late", title="過去の配信に昨日🔖")
+    add_dig_reaction(conn, late, older, pressed_at=jst_to_created_at(yesterday, "00:00:00"))
+    # 昨日の digest に昨日の 23:59:59 JST に付けた 🔖 → 対象
+    last = add_item(conn, "https://a/last", title="昨日の終わりに🔖")
+    add_dig_reaction(conn, last, yesterday, pressed_at=jst_to_created_at(yesterday, "23:59:59"))
+    # 昨日の digest に今日の 0:00 JST に付けた 🔖(UTC では昨日)→ 明日の夜の対象
+    today_mark = add_item(conn, "https://a/today", title="今日🔖")
+    add_dig_reaction(conn, today_mark, yesterday, pressed_at=jst_to_created_at(today, "00:00:00"))
+    # 前々日に付けた 🔖 → 昨日の夜の対象で、今夜は送らない
+    earlier = add_item(conn, "https://a/earlier", title="前々日🔖")
+    add_dig_reaction(conn, earlier, older, pressed_at=jst_to_created_at(two_days_ago, "23:59:59"))
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    followups = [t for _, t in api.sent if "深掘りした?" in t]
+    assert len(followups) == 2
+    assert "過去の配信に昨日🔖" in followups[0]
+    assert "昨日の終わりに🔖" in followups[1]
+
+    answer = FakeApi([[make_callback_update(0, data=f"f:{late}:y")]])
+    poll_once(conn, make_config(tmp_path), answer, logger)
+    row = conn.execute("SELECT * FROM signals WHERE kind = 'followup_dig'").fetchone()
+    assert (row["item_id"], row["value"], row["signal_date"]) == (late, "yes", older)
+
+
+def test_followup_judges_latest_reaction_per_item(conn, tmp_path) -> None:
+    # GH#226: 最新 reaction は配信日ごとでなく item ごとに決める(回答の記帳と同じ判定)。
+    # 2 つの配信日に 🔖 がある item も 1 通だけ送り、最新が 🔖 でない item は送らない
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    older = (now - timedelta(days=4)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    twice = add_item(conn, "https://a/twice", title="2つの配信で🔖")
+    add_dig_reaction(conn, twice, older, pressed_at=jst_to_created_at(yesterday, "09:00:00"))
+    add_dig_reaction(conn, twice, yesterday, pressed_at=jst_to_created_at(yesterday, "10:00:00"))
+    undone = add_item(conn, "https://a/undone", title="後の配信で👎")
+    add_dig_reaction(conn, undone, older, pressed_at=jst_to_created_at(yesterday, "09:00:00"))
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('reaction', ?, 'noise', ?, ?)",
+        (undone, yesterday, jst_to_created_at(yesterday, "10:00:00")),
+    )
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    followups = [t for _, t in api.sent if "深掘りした?" in t]
+    assert len(followups) == 1
+    assert "2つの配信で🔖" in followups[0]
+
+
 def test_dig_backlog_list_sent_before_followups(conn, tmp_path) -> None:
     # GH#88: 未消化 🔖 の累計一覧を追い掛けの前に1通。「いいえ」回答済みは残し、
     # 「はい」(深掘り済み)と reaction 訂正済みは載せない。新しい 🔖 が上
@@ -223,6 +296,61 @@ def test_dig_backlog_list_sent_before_followups(conn, tmp_path) -> None:
     assert "訂正済み" not in backlog
     followup_index = next(i for i, t in enumerate(texts) if "深掘りした?" in t)
     assert texts.index(backlog) < followup_index  # 一覧は追い掛けより前
+
+
+def test_dig_backlog_follows_latest_followup_answer(conn, tmp_path) -> None:
+    # GH#195: 一覧から外すのは最新の followup_dig が yes のときだけ。追い掛けのボタンで
+    # 「はい」→「いいえ」と訂正すると一覧に戻り、「いいえ」→「はい」で消える
+    now = jst_now("21:30")
+    older = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    back = add_item(conn, "https://a/back", title="はいからいいえへ")
+    add_dig_reaction(conn, back, older)
+    gone = add_item(conn, "https://a/gone", title="いいえからはいへ")
+    add_dig_reaction(conn, gone, older)
+    api = FakeApi([[
+        make_callback_update(0, update_id=1, data=f"f:{back}:y"),
+        make_callback_update(0, update_id=2, data=f"f:{back}:n"),
+        make_callback_update(0, update_id=3, data=f"f:{gone}:n"),
+        make_callback_update(0, update_id=4, data=f"f:{gone}:y"),
+    ]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert [a for a in api.answered if a[1] != "🔖 記録しました"] == []
+
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    assert "(1件)" in backlog
+    assert "はいからいいえへ" in backlog
+    assert "いいえからはいへ" not in backlog
+
+
+def test_dig_backlog_latest_followup_by_created_at_then_id(conn) -> None:
+    # GH#195: 最新の followup_dig は created_at の新しい行。同じ秒なら id の大きい行
+    # (id の順だけでも、created_at の順だけでも決めない)
+    def add_followups(item_id: int, rows: list[tuple[str, str]]) -> None:
+        for value, created_at in rows:  # この順に INSERT する(後ほど id が大きい)
+            conn.execute(
+                "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+                "VALUES ('followup_dig', ?, ?, '2026-10-15', ?)",
+                (item_id, value, created_at),
+            )
+
+    items = {}
+    for name, rows in {
+        "later_no": [("no", "2026-10-16T12:00:00Z"), ("yes", "2026-10-16T11:00:00Z")],
+        "later_yes": [("yes", "2026-10-16T12:00:00Z"), ("no", "2026-10-16T11:00:00Z")],
+        "same_sec_no": [("yes", "2026-10-16T12:00:00Z"), ("no", "2026-10-16T12:00:00Z")],
+        "same_sec_yes": [("no", "2026-10-16T12:00:00Z"), ("yes", "2026-10-16T12:00:00Z")],
+    }.items():
+        items[name] = add_item(conn, f"https://a/{name}")
+        add_dig_reaction(conn, items[name], "2026-10-15")
+        add_followups(items[name], rows)
+
+    pending = {row["item_id"] for row in pending_dig_items(conn)}
+
+    assert pending == {items["later_no"], items["same_sec_no"]}
 
 
 def test_dig_backlog_not_sent_when_empty(conn, tmp_path) -> None:
@@ -642,7 +770,7 @@ def test_followup_answer_attributed_to_dig_date(conn, tmp_path) -> None:
 
     row = conn.execute("SELECT * FROM signals WHERE kind = 'followup_dig'").fetchone()
     assert (row["item_id"], row["value"]) == (item, "yes")
-    assert row["signal_date"] == dig_date  # 🔖 を付けた日に帰属(設計 01 §7)
+    assert row["signal_date"] == dig_date  # 🔖 の reaction と同じ配信日に帰属(設計 01 §7)
     assert api.answered == [("cb1", "🔖 記録しました")]
     _, _, markup = api.edited[0]
     assert "はい ✓" in json.dumps(markup, ensure_ascii=False)
@@ -660,7 +788,7 @@ def test_followup_without_dig_rejected(conn, tmp_path) -> None:
 
 def test_followup_after_dig_corrected_to_noise_rejected(conn, tmp_path) -> None:
     # 追い掛け送信後に digest ボタンで dig → noise に訂正 → 古い追い掛けボタンの回答は
-    # 記帳しない(送信側と同じ「その日の最新 reaction が dig」判定。followup_dig 率の汚染防止)
+    # 記帳しない(送信側と同じ「item の最新 reaction が dig」判定。followup_dig 率の汚染防止)
     item = add_item(conn, "https://a/1")
     dig_date = (datetime.now(JST) - timedelta(days=1)).strftime("%Y-%m-%d")
     add_dig_reaction(conn, item, dig_date)
