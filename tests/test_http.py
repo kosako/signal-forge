@@ -133,9 +133,67 @@ def test_429_respects_retry_after() -> None:
     assert sleeps == [7]  # Retry-After 優先。追加バックオフを重ねない
 
 
-def test_dns_failure_is_retryable() -> None:
-    with pytest.raises(RetryableError, match="DNS"):
-        make_client(lambda request: httpx.Response(200)).get("https://nxdomain.example/")
+@pytest.mark.parametrize("empty_result", [False, True])
+def test_transient_dns_failure_then_success(empty_result: bool) -> None:
+    # 最初の名前解決だけが失敗し、次で回復する(スリープ復帰直後など。GH#188)
+    resolved: list[str] = []
+
+    def resolve(host: str) -> list[str]:
+        resolved.append(host)
+        if len(resolved) == 1:
+            if empty_result:
+                return []  # 解決結果が空
+            raise OSError("temporary failure in name resolution")
+        return PUBLIC[host]
+
+    sleeps: list[float] = []
+    client = HttpClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        resolve_host=resolve,
+        sleep=sleeps.append,
+    )
+    fetched = client.get("https://example.com/")
+    assert fetched.response.status_code == 200
+    assert resolved == ["example.com", "example.com"]
+    assert len(sleeps) == 1
+    assert 1.0 <= sleeps[0] < 2.0  # 他の一時失敗と同じバックオフ1回目 = 1s + jitter
+
+
+def test_persistent_dns_failure_exhausts_retries() -> None:
+    resolved: list[str] = []
+
+    def resolve(host: str) -> list[str]:
+        resolved.append(host)
+        raise OSError(f"unknown host {host}")
+
+    sleeps: list[float] = []
+    client = HttpClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        resolve_host=resolve,
+        sleep=sleeps.append,
+    )
+    with pytest.raises(RetryableError, match="リトライ上限") as excinfo:
+        client.get("https://nxdomain.example/")
+    assert len(resolved) == 3  # 初回 + 2回(他の一時失敗と同じ回数)
+    assert len(sleeps) == 2
+    assert 1.0 <= sleeps[0] < 2.0
+    assert 4.0 <= sleeps[1] < 5.0  # 1s→4s + jitter
+    # 呼び出し側は例外の型と文字列だけを記録するため、DNS の原因を文言に残す
+    assert "DNS 解決失敗: nxdomain.example" in str(excinfo.value)
+
+
+def test_dns_failure_on_redirect_hop_names_failed_host() -> None:
+    # 記録される文字列に元 URL しか無いと、どのホップのホストが引けなかったか分からない
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["host"])
+        return httpx.Response(302, headers={"location": "https://gone.example/a"})
+
+    with pytest.raises(RetryableError, match="リトライ上限") as excinfo:
+        make_client(handler, sleeps=[]).get("https://example.com/short")
+    assert calls == ["example.com"] * 3  # 試行ごとに元 URL からたどり直す
+    assert "DNS 解決失敗: gone.example" in str(excinfo.value)
 
 
 def test_resolve_short_url_returns_final() -> None:

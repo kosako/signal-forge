@@ -41,6 +41,10 @@ class SsrfBlockedError(FatalError):
     """接続先が global でないアドレス(is_global allowlist 方式。設計 05 §8)。"""
 
 
+class DnsResolutionError(RetryableError):
+    """名前解決の失敗(解決できない・結果が空)。一時的な失敗として再試行する(GH#188)。"""
+
+
 @dataclass(frozen=True)
 class FetchedResponse:
     response: httpx.Response
@@ -86,13 +90,15 @@ class HttpClient:
         """リトライ+リダイレクト追跡付き GET。
 
         2xx/3xx 以外もレスポンスとして返す(304 は正常系、4xx の業務分類は呼び出し側。
-        リトライ対象は transport エラー・5xx・429 のみ)。
+        リトライ対象は transport エラー・DNS 解決失敗・5xx・429 のみ)。
         """
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             try:
                 fetched = self._follow_redirects(url, headers)
-            except (httpx.TransportError, httpx.TimeoutException) as e:
+            except (httpx.TransportError, httpx.TimeoutException, DnsResolutionError) as e:
+                # スリープ復帰直後などの一時的な名前解決の失敗も、transport エラーと
+                # 同じ回数・バックオフで再試行する(GH#188)
                 last_error = e
                 self._backoff(attempt)
                 continue
@@ -112,7 +118,10 @@ class HttpClient:
                 self._backoff(attempt)
                 continue
             return fetched
-        raise RetryableError(f"リトライ上限({MAX_RETRIES}回)到達: {url}") from last_error
+        # DNS で尽きたときは失敗したホストを文言に残す。呼び出し側は例外の型と文字列だけを
+        # 記録し、リダイレクト先のホストは元 URL からは分からないため(GH#188)
+        detail = f"({last_error})" if isinstance(last_error, DnsResolutionError) else ""
+        raise RetryableError(f"リトライ上限({MAX_RETRIES}回)到達: {url}{detail}") from last_error
 
     def _backoff(self, attempt: int) -> None:
         if attempt < MAX_RETRIES:
@@ -187,9 +196,9 @@ class HttpClient:
         try:
             addresses = self._resolve_host(host)
         except OSError as e:
-            raise RetryableError(f"DNS 解決失敗: {host}") from e
+            raise DnsResolutionError(f"DNS 解決失敗: {host}") from e
         if not addresses:
-            raise RetryableError(f"DNS 解決結果が空: {host}")
+            raise DnsResolutionError(f"DNS 解決結果が空: {host}")
         for address in addresses:
             ip = ipaddress.ip_address(address)
             # ブラックリスト方式は shared address space(100.64.0.0/10)等が素通りするため、
