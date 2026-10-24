@@ -20,7 +20,9 @@
 照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
 レビューは品質の上乗せなので、失敗しても深掘りは止めない(未レビューのまま届け、ノートと
 カードに明示する)。費用は台帳に残し、月(UTC の暦月。doctor #9 の当月と同じ)の上限額に達したら
-その月はレビューを省く。
+その月はレビューを省く。Codex が失敗してドラフトを予備の Claude(app/analysis/fallback.py)が
+書いた回は、レビュー役と同じ系統で別の AI のレビューにならないので省き、ノートとカードに明示する
+(GH#180)。
 
 障害の局所化: item 単位で隔離し、1 件の失敗で他の件・他の段を止めない。失敗が
 あれば段としては失敗にする(#74 と同じ「進めるものは進め、止まったことは通知」)。
@@ -114,6 +116,8 @@ _REVIEW_KIND_LABELS = {
     "omission": "抜け",
 }
 _REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
+# ドラフトを予備の Claude が書いたので、レビューを省いた回の表示(GH#180。固定の文言)
+_SAME_FAMILY_NOTICE = "別の AI のレビューなし(下書きが予備の Claude のため)"
 
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
 _TWEET_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
@@ -177,6 +181,9 @@ class ReviewOutcome:
     model: str = ""
     findings: tuple[ReviewFinding, ...] = ()
     cost_usd: float = 0.0
+    # skipped のうち、ドラフトを書いたエンジンがレビュー役と同じ(予備の Claude)なので省いた回
+    # (GH#180)。台帳の状態は月の上限で省いた回と同じ skipped(migration 017 の CHECK のまま)
+    same_family: bool = False
 
 
 @dataclass(frozen=True)
@@ -393,7 +400,7 @@ def _dig_one(
                 config, engine_factory, candidate, note_name
             )
 
-    draft = _generate_draft(config, engine_factory, candidate, source_note_name)
+    draft, draft_engine = _generate_draft(config, engine_factory, candidate, source_note_name)
     review: ReviewOutcome | None = None
     if review_engine_factory is not None:
         draft, review = _review_and_revise(
@@ -404,6 +411,7 @@ def _dig_one(
             candidate,
             source_note_name,
             draft,
+            draft_engine,
             logger,
             run_id,
         )
@@ -706,10 +714,16 @@ def _generate_draft(
     engine_factory: Callable[[str], LLMEngine],
     candidate: DigCandidate,
     source_note_name: str | None,
-) -> DigDraft:
+) -> tuple[DigDraft, str]:
+    """解説のドラフトと、それを実際に書いたエンジンの name(GH#180)。
+
+    予備(FallbackEngine)の name は最後に答えたエンジンのもので、呼び出しの直後に読めば
+    このドラフトを書いたエンジンになる(Codex が失敗した回は予備の Claude。設計 00 §5)。
+    """
     engine = engine_factory(config.dig.reasoning_effort)
     prompt = build_dig_prompt(config, candidate, source_note_name)
-    return complete_with_retry(engine, prompt, DigDraft, timeout_s=config.dig.timeout_s)
+    draft = complete_with_retry(engine, prompt, DigDraft, timeout_s=config.dig.timeout_s)
+    return draft, engine.name
 
 
 def build_dig_prompt(
@@ -807,6 +821,7 @@ def _review_and_revise(
     candidate: DigCandidate,
     source_note_name: str | None,
     draft: DigDraft,
+    draft_engine: str,
     logger: logging.Logger,
     run_id: str | None,
 ) -> tuple[DigDraft, ReviewOutcome]:
@@ -814,6 +829,10 @@ def _review_and_revise(
 
     LLM の失敗(LLMError)はここで握り、直す前のドラフトで先へ進む(レビューは上乗せ)。
     それ以外の例外(実装の誤り)は握らず、item の失敗として段に伝える。
+
+    draft_engine はドラフトを実際に書いたエンジンの name。レビュー役と同じなら、同じ系統の
+    点検は別の AI のレビューにならないので、呼ばずに省く(GH#180。費用も掛けない)。主は Codex、
+    レビュー役は Claude API なので、同じになるのは Codex が失敗して予備の Claude が書いた回。
     """
     extra = {"run_id": run_id, "stage": "dig", "item_id": candidate.item_id}
     cap = config.dig.review_monthly_cap_usd
@@ -828,6 +847,14 @@ def _review_and_revise(
     meter: _CostMeter | None = None
     try:
         meter = _CostMeter(review_engine_factory())
+        if meter.name == draft_engine:
+            logger.warning(
+                f"レビューを省略: ドラフトを書いたエンジン({draft_engine})がレビュー役と同じ"
+                "(予備の Claude が書いたため、別の AI のレビューにならない)"
+                f" item={candidate.item_id}",
+                extra=extra,
+            )
+            return draft, ReviewOutcome("skipped", same_family=True)
         prompt = build_review_prompt(config, candidate, draft)
         review = complete_with_retry(meter, prompt, DigReview, timeout_s=config.dig.timeout_s)
     except LLMError as e:
@@ -956,6 +983,8 @@ def _review_callout(review: ReviewOutcome) -> str:
     if review.status == "failed":
         return f"> [!warning] {who}は失敗(未レビューのまま)\n"
     if review.status == "skipped":
+        if review.same_family:  # GH#180。失敗と同じ出し方
+            return f"> [!warning] {_SAME_FAMILY_NOTICE}\n"
         return "> [!info] 今月のレビュー費用が上限に達したため、レビューなし\n"
     if review.status == "revised":
         head = f"> [!note]- {who}: 指摘 {count} 件 → 書き手が確かめて 1 回直した"
@@ -983,6 +1012,8 @@ def _review_card_line(review: ReviewOutcome) -> str:
         return f"⚠️ 別 AI のレビュー: 指摘 {count} 件(直せていません。ノート末尾を参照)"
     if review.status == "failed":
         return "⚠️ 別 AI のレビューに失敗(未レビュー)"
+    if review.same_family:  # skipped(GH#180。失敗と同じ出し方)
+        return f"⚠️ {_SAME_FAMILY_NOTICE}"
     return "🧪 今月のレビュー費用が上限に達したため未レビュー"  # skipped
 
 

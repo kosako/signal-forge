@@ -14,8 +14,9 @@ import httpx
 import pytest
 import yaml
 
+from app.analysis.fallback import fallback_engine_factory
 from app.analysis.llm import LLMError, LLMUnavailableError, LLMUsage
-from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
+from app.config import Config, DigConfig, LLMFallbackConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.deepdive import (
     _TRANSLATE_CHUNK_CHARS,
@@ -1269,7 +1270,9 @@ class ReviewEngine:
         return DigReview(findings=self._findings)
 
 
-def run_with_review(conn, config, review_engine, *, engines=None, fail_for=None, api=None):
+def run_with_review(
+    conn, config, review_engine, *, engines=None, fail_for=None, api=None, factory=None
+):
     engines = {} if engines is None else engines
     api = FakeApi() if api is None else api
     item = add_item(conn, "https://blog.example/post", language="ja")  # 対訳の呼び出しを省く
@@ -1277,7 +1280,7 @@ def run_with_review(conn, config, review_engine, *, engines=None, fail_for=None,
     run_dig_stage(
         conn,
         config,
-        make_factory(engines, fail_for),
+        factory or make_factory(engines, fail_for),
         api,
         logger,
         today="2026-07-22",
@@ -1446,6 +1449,90 @@ def test_review_off_leaves_no_trace(conn, config) -> None:
     assert "review" not in yaml.safe_load(note.split("---")[1])
     assert "レビュー" not in note and "レビュー" not in card
     assert note.endswith("## 骨子\n\n1. …\n\n---\n\n(この下は手書きメモ・take 領域)\n")
+
+
+# --- 予備の Claude が書いたドラフトのレビュー(GH#180) ---
+
+
+class Codex(ScriptedEngine):
+    name = "codex-cli"
+
+
+class DownCodex:
+    """主(Codex)の偽物。起動できない(LLMUnavailableError)ので、予備が代わりに書く。"""
+
+    name = "codex-cli"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        self.calls += 1
+        raise LLMUnavailableError("codex 起動失敗")
+
+
+class ClaudeWriter(ScriptedEngine):
+    """予備(Claude API)の偽物。name はレビュー役(ReviewEngine)と同じ anthropic-api。"""
+
+    name = "anthropic-api"
+    model = "claude-sonnet-5-5"
+
+
+def fallback_factory(conn, config, monkeypatch, primary, fallback):
+    """本物の予備の入口(fallback_engine_factory)。主と予備のエンジンだけを偽物にする。"""
+    monkeypatch.setattr(
+        "app.analysis.fallback.create_anthropic_engine", lambda settings, env: fallback
+    )
+    on = replace(config, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
+    return fallback_engine_factory(
+        conn, on, {}, logger, stage="dig", primary=lambda effort: primary
+    )
+
+
+def test_draft_by_fallback_claude_skips_review(conn, config, monkeypatch) -> None:
+    # Codex が失敗して予備の Claude がドラフトを書いた回は、Claude のレビューは別の AI の
+    # レビューにならない。呼ばずに省き(費用も掛けない)、ノートとカードに出す
+    primary, writer = DownCodex(), ClaudeWriter()
+    review = ReviewEngine([finding()])
+    factory = fallback_factory(conn, config, monkeypatch, primary, writer)
+    row, note, card, _ = run_with_review(conn, config, review, factory=factory)
+
+    assert primary.calls == 1
+    assert [name for name, _ in writer.prompts] == ["DigDraft"]  # 書くだけ。直さない
+    assert review.prompts == []
+    assert (row["review_status"], row["review_findings"]) == ("skipped", None)
+    assert row["review_cost_usd"] == 0
+    assert yaml.safe_load(note.split("---")[1])["review"] == "skipped"
+    callout = note.index("> [!warning] 別の AI のレビューなし(下書きが予備の Claude のため)")
+    assert callout < note.index("take 領域")
+    assert "⚠️ 別の AI のレビューなし(下書きが予備の Claude のため)" in card
+    assert "日本語見出し" in card and "上限" not in card
+    # 予備で書いたことは予備の台帳にも残る(朝バッチの後の知らせ)
+    assert [tuple(r) for r in conn.execute("SELECT stage, ok FROM llm_fallback_calls")] == [
+        ("dig", 1)
+    ]
+
+
+@pytest.mark.parametrize("revise_by_fallback", [False, True])
+def test_draft_by_codex_is_reviewed_as_before(
+    conn, config, monkeypatch, revise_by_fallback
+) -> None:
+    # 予備を有効にしていても、Codex が書いたドラフトは今までどおりレビューする。指摘を受けた
+    # 直しを予備が書いても、レビューは Codex のドラフトに対する別の AI のもののまま
+    codex = Codex({"DigDraft-revise"} if revise_by_fallback else None)
+    writer = ClaudeWriter()
+    review = ReviewEngine([finding()], cost=0.12)
+    factory = fallback_factory(conn, config, monkeypatch, codex, writer)
+    row, note, card, _ = run_with_review(conn, config, review, factory=factory)
+
+    assert len(review.prompts) == 1
+    assert len(writer.prompts) == (1 if revise_by_fallback else 0)
+    assert row["review_status"] == "revised"
+    assert row["review_cost_usd"] == pytest.approx(0.12)
+    assert "> [!note]- 別 AI のレビュー(claude-opus-5-5): 指摘 1 件 → 書き手が確かめて" in note
+    assert "🧪 別 AI のレビュー: 指摘 1 件 → 直した版です" in card
+    assert "直した見出し" in card
+    assert "下書きが予備" not in note and "下書きが予備" not in card
 
 
 def test_review_findings_capped_and_one_line(conn, config) -> None:
