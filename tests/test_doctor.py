@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import tarfile
+import threading
 from pathlib import Path
 
 import httpx
@@ -17,6 +18,7 @@ from app.doctor import (
     month_cost_summary,
     run_doctor,
 )
+from app.vault_guard import VaultGuard
 
 
 @pytest.fixture
@@ -186,6 +188,65 @@ def test_check_exception_is_isolated_to_its_item(config_dir, tmp_path) -> None:
     assert result.status == "FAIL"
     assert "例外" in result.detail
     assert len(results) == 14  # 他の検査は巻き添えにならない
+    assert by_number(results, 4).status == "PASS"
+
+
+def test_undecodable_config_is_fail_but_all_checks_run(config_dir, tmp_path) -> None:
+    # 検証の前の読込で起きた例外(文字コード)も #1 の FAIL に留め、全体を止めない(GH#201)
+    (config_dir / "config.toml").write_bytes(b"[storage]\n# \xff\n")
+    results = doctor(config_dir, tmp_path)
+    assert len(results) == 14
+    result = by_number(results, 1)
+    assert result.status == "FAIL"
+    assert "UnicodeDecodeError" in result.detail
+    assert "検査不可" in by_number(results, 3).detail
+    assert by_number(results, 8).status == "PASS"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root は権限の検査を素通りする")
+def test_unreadable_config_dir_is_fail_but_all_checks_run(config_dir, tmp_path) -> None:
+    # 置き場を読めないと config.toml・.env の exists() 自体が PermissionError を上げる(GH#201)
+    config_dir.chmod(0o000)
+    try:
+        results = doctor(config_dir, tmp_path)
+    finally:
+        config_dir.chmod(0o700)
+    assert len(results) == 14
+    assert "PermissionError" in by_number(results, 1).detail
+    assert "PermissionError" in by_number(results, 2).detail
+    assert by_number(results, 8).status == "PASS"
+
+
+def test_undecodable_env_is_fail_without_its_content(config_dir, tmp_path) -> None:
+    # .env の読込の例外も #2 の FAIL に留める。例外の文(読めなかったバイト)は出さない(GH#201)
+    env_path = config_dir / ".env"
+    env_path.write_bytes(b"TELEGRAM_BOT_TOKEN=tok\xe9secret\n")
+    env_path.chmod(0o600)
+    results = doctor(config_dir, tmp_path)
+    assert len(results) == 14
+    result = by_number(results, 2)
+    assert result.status == "FAIL"
+    assert result.detail == "検査中に例外: UnicodeDecodeError"
+    assert by_number(results, 1).status == "PASS"
+    assert by_number(results, 3).status == "PASS"
+
+
+def test_db_dir_prepare_failure_is_fail_but_all_checks_run(config_dir, tmp_path) -> None:
+    # DB の置き場を作れない(親がファイル)mkdir の OSError も #3 の FAIL に留める(GH#201)
+    (tmp_path / "blocker").write_text("", encoding="utf-8")
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            f"{tmp_path}/intel.db", f"{tmp_path}/blocker/intel.db"
+        ),
+        encoding="utf-8",
+    )
+    results = doctor(config_dir, tmp_path)
+    assert len(results) == 14
+    result = by_number(results, 3)
+    assert result.status == "FAIL"
+    assert "接続失敗" in result.detail
+    assert by_number(results, 1).status == "PASS"
     assert by_number(results, 4).status == "PASS"
 
 
@@ -676,6 +737,33 @@ def test_vault_unset_fails(config_dir, tmp_path) -> None:
     assert "H4" in result.detail
 
 
+def test_vault_stall_is_fail_and_later_checks_run(config_dir, tmp_path, monkeypatch) -> None:
+    # 書込テストが応答待ちで止まっても、上限で #7 を FAIL にして残りの検査へ進む(GH#248)
+    import app.doctor as doctor_module
+
+    release, finished = threading.Event(), threading.Event()
+    real_probe = doctor_module._write_and_remove_probe
+
+    def stuck(target, probe):
+        release.wait(5)  # プライバシーの確認に応答するまで止まる open() の再現
+        real_probe(target, probe)
+        finished.set()
+
+    monkeypatch.setattr(doctor_module, "_write_and_remove_probe", stuck)
+    try:
+        results = doctor(config_dir, tmp_path, vault=VaultGuard(timeout_s=0.05))
+    finally:
+        release.set()
+    assert len(results) == 14
+    result = by_number(results, 7)
+    assert result.status == "FAIL"
+    assert "応答しない" in result.detail
+    assert by_number(results, 8).status == "PASS"
+    # 打ち切った後に書き込みが通っても、検査用のファイルは vault に残らない
+    assert finished.wait(5)
+    assert list((tmp_path / "vault").rglob(".doctor-write-test-*")) == []
+
+
 def test_launchd_not_loaded_is_warn(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path, launchctl=lambda job: False), 8)
     assert result.status == "WARN"
@@ -1007,6 +1095,31 @@ def test_x_oauth2_loose_permission_token_fails(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 13)
     assert result.status == "FAIL"
     assert "パーミッション" in result.detail
+
+
+def enable_x_signals(config_dir: Path) -> None:
+    with open(config_dir / "config.toml", "a", encoding="utf-8") as f:
+        f.write("\n[x_signals]\ndaily_read_cap = 15\n")
+
+
+def test_x_oauth2_missing_token_fails_when_signals_enabled(config_dir, tmp_path) -> None:
+    # 取込が有効なら未認可は SKIP でなく FAIL(朝の x_signals 段が失敗する。GH#249)
+    append_client_id(config_dir)
+    enable_x_signals(config_dir)
+    result = by_number(doctor(config_dir, tmp_path), 13)
+    assert result.status == "FAIL"
+    assert "未認可" in result.detail
+    assert "client_id" not in result.detail
+
+
+def test_x_oauth2_missing_token_and_client_id_fail_when_signals_enabled(
+    config_dir, tmp_path
+) -> None:
+    enable_x_signals(config_dir)
+    result = by_number(doctor(config_dir, tmp_path), 13)
+    assert result.status == "FAIL"
+    assert "client_id" in result.detail
+    assert "未認可" in result.detail
 
 
 def test_month_cost_summary_includes_x_signal_runs(config_dir, tmp_path) -> None:
