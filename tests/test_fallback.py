@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -159,6 +160,80 @@ def test_fallback_failure_raises_like_primary(conn, error_class) -> None:
     assert (row["ok"], row["cost_usd"]) == (0, 0.02)  # 失敗した応答の課金も残す
 
 
+_CLAUDE_REPLY = {
+    "content": [{"type": "text", "text": '{"score": 1}'}],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 10, "output_tokens": 5},
+}
+# 費用が分からない呼び出しの最大の額: 入力は prompt「記事」の UTF-8 のバイト数(6)、出力は
+# max_tokens(1000)。6 × $2/M + 1000 × $10/M
+_UNKNOWN_COST_BOUND = 0.010012
+
+
+def claude(handler) -> AnthropicApiEngine:
+    """予備の役の実物(出力の上限 1000・Sonnet 5.5 の単価)。応答は handler が返す。"""
+    return AnthropicApiEngine(
+        api_key="k",
+        model="claude-sonnet-5-5",
+        effort="low",
+        max_tokens=1000,
+        input_usd_per_mtok=2.0,
+        output_usd_per_mtok=10.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def raising(error_class):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_class("x", request=request)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("handler", "ok", "tokens", "cost"),
+    [
+        # 送った後に応答が来ない: 費用が分からないので、課金されうる最大の額で積む(GH#241)
+        (raising(httpx.ReadTimeout), 0, (None, None), _UNKNOWN_COST_BOUND),
+        (raising(httpx.RemoteProtocolError), 0, (None, None), _UNKNOWN_COST_BOUND),
+        # 応答は来たが usage を読めない: 同じく最大の額
+        (
+            lambda request: httpx.Response(200, json={**_CLAUDE_REPLY, "usage": None}),
+            1,
+            (None, None),
+            _UNKNOWN_COST_BOUND,
+        ),
+        # 接続を張れなかった(送っていない)・エラーの応答: 課金されないので 0 のまま
+        (raising(httpx.ConnectError), 0, (None, None), 0.0),
+        (raising(httpx.ConnectTimeout), 0, (None, None), 0.0),
+        (lambda request: httpx.Response(529, text="overloaded"), 0, (None, None), 0.0),
+        # 普通の応答: usage の実額のまま(10 × $2/M + 5 × $10/M)
+        (lambda request: httpx.Response(200, json=_CLAUDE_REPLY), 1, (10, 5), 0.00007),
+    ],
+    ids=[
+        "read-timeout",
+        "disconnect",
+        "no-usage",
+        "connect-error",
+        "connect-timeout",
+        "529",
+        "usage",
+    ],
+)
+def test_fallback_cost_when_usage_is_unknown(conn, handler, ok, tokens, cost) -> None:
+    engine = build(conn, Scripted("codex-cli", [LLMError("codex 非0終了(1)")]), claude(handler))
+    if ok:
+        assert engine.complete_structured("記事", Verdict) == Verdict(score=1)
+    else:
+        with pytest.raises(LLMError, match="予備も失敗"):
+            engine.complete_structured("記事", Verdict)
+    (row,) = ledger_rows(conn)
+    assert row["ok"] == ok
+    # トークン数が空 = usage を受け取れなかった呼び出し(額は実額でなく見積もり)
+    assert (row["input_tokens"], row["output_tokens"]) == tokens
+    assert row["cost_usd"] == pytest.approx(cost)
+
+
 def test_skipped_primary_then_fallback_failure_keeps_last_primary_class(conn) -> None:
     primary = Scripted("codex-cli", [LLMUnavailableError("codex 起動失敗")])
     fallback = Scripted("anthropic-api", [Verdict(score=1), LLMError("529")])
@@ -185,6 +260,25 @@ def test_fallback_not_used_over_monthly_cap(conn) -> None:
     # 上限の手前なら使う
     assert build(conn, primary, fallback, cap=4.01).complete_structured("p", Verdict)
     assert fallback.calls == 1
+
+
+def test_unknown_cost_counts_toward_monthly_cap(conn) -> None:
+    # 応答が来ずに費用が分からない呼び出しも、最大の額で上限の判定に効く(0 円で数えると、
+    # 上限に達しても予備を使い続ける。GH#241)
+    sent: list[httpx.Request] = []
+
+    def timeout(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    primary = Scripted("codex-cli", [LLMError("x"), LLMError("x")])
+    engine = build(conn, primary, claude(timeout), cap=0.01)
+    with pytest.raises(LLMError, match="予備も失敗"):
+        engine.complete_structured("記事", Verdict)
+    assert fallback_cost_this_month(conn) == pytest.approx(_UNKNOWN_COST_BOUND)
+    with pytest.raises(LLMError, match="上限"):
+        engine.complete_structured("記事", Verdict)
+    assert len(sent) == 1  # 上限に達したので、2 回目は予備を呼ばない
 
 
 def test_fallback_that_cannot_be_built_raises_like_primary(conn) -> None:

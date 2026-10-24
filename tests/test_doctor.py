@@ -1037,6 +1037,29 @@ def test_month_cost_summary_includes_fallback_cost(config_dir, tmp_path) -> None
     assert summary["llm_usd"] == 0.75
 
 
+def test_cost_shows_fallback_estimate(config_dir, tmp_path) -> None:
+    # 予備の費用不明分(トークン数が空の行。額は最大の額の見積もり)を含むことを #9 で分かるように
+    # する(GH#241)。実額だけの月は今の表示のまま
+    from app.config import load_config
+
+    conn = connect(tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO llm_fallback_calls (stage, model, primary_error, ok, input_tokens,"
+        " output_tokens, cost_usd) VALUES ('analyze', 'm', 'LLMError', 1, 100, 10, 0.5)"
+    )
+    assert month_cost_summary(conn, load_config(config_dir))["fallback_estimated_usd"] == 0
+    assert "見積もり" not in by_number(doctor(config_dir, tmp_path), 9).detail
+    conn.execute(
+        "INSERT INTO llm_fallback_calls (stage, model, primary_error, ok, cost_usd)"
+        " VALUES ('dig', 'm', 'LLMError', 0, 0.25)"
+    )
+    summary = month_cost_summary(conn, load_config(config_dir))
+    conn.close()
+    assert (summary["llm_usd"], summary["fallback_estimated_usd"]) == (0.75, 0.25)
+    detail = by_number(doctor(config_dir, tmp_path), 9).detail
+    assert "LLM $0.75(うち予備の費用不明分の見積もり $0.25)" in detail
+
+
 def test_month_cost_summary_without_fallback_table(config_dir, tmp_path) -> None:
     # migration を当てない doctor が 018 より前の DB で落ちない
     conn = connect(tmp_path / "intel.db")

@@ -476,19 +476,25 @@ config を読むので、poller の入れ直しは要らない。
    判定し、費用は呼び出しの後に記録するので、始めた呼び出しの分だけ上限を超えることがある(1 つだけ
    走っていれば 1 回分。朝バッチとカードへの返事は同時に走りうるので、そのときは同時に始めた分)。上限に達した月は予備を使わず、
    Codex が失敗した呼び出しは劣化・失敗に戻る(ログに「予備は今月の上限 … に達しているので使わない」)。
+   - 送った後に応答が来なかった呼び出し(時間切れ・応答の切断)と、応答の usage を読めなかった呼び出しは、費用が
+     分からないので、課金されうる最大の額(入力 = プロンプトの UTF-8 のバイト数、出力 = `max_tokens` を単価で掛けた額)
+     で積み、上限の判定と知らせ・doctor #9 の額に入れる(GH#241)。実際の額はふつうこれより少ない。予備は止めない。
+     doctor #9 と `--cost` は、その分を含む月に「LLM $…(うち予備の費用不明分の見積もり $…)」と出す。
+   - 接続を張れなかった呼び出し(送っていない)と、API がエラーの応答(200 以外)を返した呼び出しは、課金されない扱いで 0 円。
 
 予備の呼び出しの記録:
 
 ```sh
 db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
 sqlite3 -readonly -header -column "$db" <<'SQL'
-SELECT created_at, run_id, stage, primary_error, ok, round(cost_usd, 3) AS usd
+SELECT created_at, run_id, stage, primary_error, ok, input_tokens, round(cost_usd, 3) AS usd
 FROM llm_fallback_calls ORDER BY id DESC LIMIT 20;
 SQL
 ```
 
 - `primary_error` が `skipped` の行は、同じ実行で Codex が続けて失敗した後に、Codex を呼ばずに予備へ
   行った呼び出し(Codex に戻るのは次の実行から)。
+- `input_tokens` が空で `usd` がある行は、費用が分からなかった呼び出しの見積もり(最大の額。上の 3.)。
 - カードへの返事(朝バッチの外)で予備を使ったときは知らせない。`answer.log` の WARNING と、上の表の
   `run_id` が空の行で見る。
 

@@ -710,12 +710,17 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
             "WHERE created_at LIKE ? || '%'",
             (month_prefix,),
         ).fetchone()[0]
+    fallback_estimated = 0.0
     if _table_exists(conn, "llm_fallback_calls"):  # migration 018(GH#156)
-        llm_cost += conn.execute(
-            "SELECT coalesce(sum(cost_usd), 0) FROM llm_fallback_calls "
-            "WHERE created_at LIKE ? || '%'",
+        # トークン数が空の行は、応答の usage を受け取れず費用が分からなかった呼び出し。額は
+        # 課金されうる最大の額の見積もり(GH#241)
+        fallback_cost, fallback_estimated = conn.execute(
+            "SELECT coalesce(sum(cost_usd), 0), "
+            "coalesce(sum(CASE WHEN input_tokens IS NULL THEN cost_usd ELSE 0 END), 0) "
+            "FROM llm_fallback_calls WHERE created_at LIKE ? || '%'",
             (month_prefix,),
-        ).fetchone()[0]
+        ).fetchone()
+        llm_cost += fallback_cost
     if _table_exists(conn, "x_signal_runs"):  # migration 004 未適用の DB を落とさない
         x_cost += conn.execute(
             "SELECT coalesce(sum(estimated_cost_usd), 0) FROM x_signal_runs "
@@ -728,11 +733,23 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
     projected = spent / now.day * days_in_month
     return {
         "llm_usd": llm_cost,
+        "fallback_estimated_usd": fallback_estimated,  # llm_usd のうち予備の費用不明分の見積もり
         "x_usd": x_cost,
         "spent_usd": spent,
         "projected_usd": projected,
         "cap_usd": config.budget.monthly_cap_usd,
     }
+
+
+def llm_cost_text(summary: dict[str, float]) -> str:
+    """LLM の当月の額(doctor #9 / --cost で共用)。
+
+    予備の費用不明分の見積もり(最大の額)を含むなら、その額を添える(GH#241)。
+    """
+    text = f"LLM ${summary['llm_usd']:.2f}"
+    if summary["fallback_estimated_usd"] > 0:
+        text += f"(うち予備の費用不明分の見積もり ${summary['fallback_estimated_usd']:.2f})"
+    return text
 
 
 def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> CheckResult:
@@ -745,7 +762,7 @@ def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> Check
         return CheckResult(9, "当月コスト", "WARN", "config/DB 未初期化のため算出不可")
     summary = month_cost_summary(conn, config)
     detail = (
-        f"実績 ${summary['spent_usd']:.2f}(LLM ${summary['llm_usd']:.2f} / "
+        f"実績 ${summary['spent_usd']:.2f}({llm_cost_text(summary)} / "
         f"X ${summary['x_usd']:.2f})→ 着地見込み ${summary['projected_usd']:.2f} / "
         f"上限 ${summary['cap_usd']:.0f}"
     )
