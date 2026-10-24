@@ -9,7 +9,9 @@
   (c) rate limit 残 0(15分待ちはしない)。
 - 2 ページ目以降の失敗(HTTP の失敗・通信のリトライ尽き)は、取得ぶんを返しつつ理由を
   `FetchResult.partial_error` に載せ、since_id は据え置く(GH#182。検索と同じ形 = GH#183)。
-  取得ぶんを捨てると、その読み取りの費用も台帳に残らないため。
+  取得ぶんを捨てると、その読み取りの費用も台帳に残らないため。2 ページ目以降の 401/403 は
+  致命の失敗(FatalError)のまま送出し、それまでの読取数と費用を例外に添える(GH#178。collect が
+  失敗の記録に残す。取得ぶんは保存せず since_id も据え置く)。
 - RT は参照先(元ツイ)の id を URL に載せて dedup に乗せる(normalize_url が tweet URL を
   status id で `x.com/i/web/status/{id}` に統一するため、元ツイの直接ポストと重複排除される)。
   自分宛以外のリプライは除外(設計 02 §2)。
@@ -204,7 +206,15 @@ class XConnector:
                     raise
                 return tweets, users, reads, http_status, e
             http_status = response.status_code
-            raise_for_auth(response, "timeline")
+            # 2 ページ目以降の 401/403 も致命の失敗のまま送出するが、それまでの読取数と費用を
+            # 添えて collect に台帳へ残させる(GH#178。取得ぶんは保存せず since_id は据え置く。
+            # 読取が台帳から漏れると、同じ日の再実行が日次の上限を超えて読む)
+            raise_for_auth(
+                response,
+                "timeline",
+                api_reads=reads,
+                estimated_cost_usd=round(reads * self._unit_price, 6),
+            )
             if response.status_code != 200:
                 # 1ページ目から失敗(429/5xx/4xx)は「取得0件の成功」で隠さず失敗として返す
                 # (consecutive_failures を上げ doctor #14 / watchdog に拾わせる)。
@@ -230,9 +240,16 @@ class XConnector:
         return tweets, users, reads, http_status, None
 
 
-def raise_for_auth(response: httpx.Response, where: str) -> None:
+def raise_for_auth(
+    response: httpx.Response, where: str, *, api_reads: int = 0, estimated_cost_usd: float = 0.0
+) -> None:
+    """401/403 は FatalError(致命)。部分取得のあとなら、それまでの読取数と費用を添える(GH#178)。"""
     if response.status_code in (401, 403):
-        raise FatalError(f"X 認証失敗({where}): HTTP {response.status_code}(キー・権限を確認)")
+        raise FatalError(
+            f"X 認証失敗({where}): HTTP {response.status_code}(キー・権限を確認)",
+            api_reads=api_reads,
+            estimated_cost_usd=estimated_cost_usd,
+        )
 
 
 def status_error(response: httpx.Response, url: str) -> Exception:

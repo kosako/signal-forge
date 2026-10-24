@@ -574,6 +574,27 @@ def test_auth_error_is_fatal() -> None:
         connector_from({"a": [(401, {}, {})]}, slots=("a",)).fetch(make_source(), {})
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_error_after_partial_fetch_is_fatal_with_reads_and_cost(status) -> None:
+    # GH#178: 部分取得のあとの 401/403 は致命の失敗のまま送出し、先のスロットと同じスロットの
+    # 前のページで読んだぶんの読取数と費用を添える(collect が台帳に残す。ホームTL と同じ)
+    pages = {
+        "a": [
+            (200, page([tweet("900"), tweet("899")], next_token="ta"), {}),
+            (200, page([tweet("898")]), {}),
+        ],
+        "b": [(200, page([tweet("800")], next_token="tb"), {}), (status, {}, {})],
+    }
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from(pages, slots=("a", "b"), daily_read_cap=40).fetch(make_source(), {})
+    assert raised.value.api_reads == 4  # a の 2 + 1 件 + b の 1 ページ目の 1 件
+    assert raised.value.estimated_cost_usd == pytest.approx(0.016)
+    # 累計 0 件での 401/403 は読取なし
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from({"a": [(status, {}, {})]}, slots=("a",)).fetch(make_source(), {})
+    assert (raised.value.api_reads, raised.value.estimated_cost_usd) == (0, 0.0)
+
+
 def test_same_tweet_in_two_slots_returned_per_slot() -> None:
     # 重複返却は collect の UNIQUE(source_id, external_id)が吸収する(設計 02 §1)
     pages = {

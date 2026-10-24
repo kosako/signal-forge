@@ -162,7 +162,7 @@ def collect_x_signals(
             totals["new_signals"],
             " / ".join(errors) or None,
             run_id,
-            1 if backfill else 0,  # backfill は日次 cap の別枠(GH#178。migration 022)
+            1 if backfill else 0,  # backfill は日次 cap の別枠(GH#178。migration 023)
         ),
     )
     logger.info(

@@ -30,6 +30,8 @@
   失敗は取得ぶんを返しつつ理由を `FetchResult.partial_error` に載せ、collect にソースの失敗と
   して記録させる(GH#183。後ろのスロットの壊れたクエリの 400 などを正常扱いで隠さない)。
   通信のリトライ尽きも同じに扱う(GH#182。例外で取得ぶんを捨てると読み取りの費用も台帳に残らない)。
+  部分取得のあとの 401/403 は致命の失敗(FatalError)のまま送出し、それまでの読取数と費用を例外に
+  添える(GH#178。collect が失敗の記録に残す。ホームTL と同じ)。
   予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
@@ -134,7 +136,7 @@ class XSearchConnector:
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
             tweets, status, stopped, error = self._fetch_slot(
-                query, budget, start_time, end_time, users, have_prior=any(t for _q, t in fetched)
+                query, budget, start_time, end_time, users, prior_reads=reads
             )
             fetched.append((query, tweets))
             reads += len(tweets)
@@ -175,11 +177,12 @@ class XSearchConnector:
         end_time: str,
         users: dict[str, str],
         *,
-        have_prior: bool,
+        prior_reads: int,
     ) -> tuple[list[dict], int | None, bool, Exception | None]:
         """1スロット分のページング取得。returns (tweets, http_status, stop_all, error)。
 
         error = 部分取得のあとの HTTP・通信の失敗(GH#183・GH#182)。そのとき stop_all も真。
+        prior_reads = 先のスロットまでの読取数(0 = 累計 0 件。認証の失敗に添える。GH#178)。
         """
         tweets: list[dict] = []
         token: str | None = None
@@ -201,17 +204,25 @@ class XSearchConnector:
             except RetryableError as e:
                 # 通信のリトライ尽きも HTTP の失敗と同じに扱う(GH#182)。既取得分を例外で
                 # 捨てると、その読み取りの費用も台帳に残らない
-                if not have_prior and not tweets:
+                if not prior_reads and not tweets:
                     raise
                 return tweets, http_status, True, e
             http_status = response.status_code
-            raise_for_auth(response, "search/recent")
+            # 部分取得のあとの 401/403 も致命の失敗のまま送出し、先のスロットとこのスロットの
+            # 読取数と費用を添える(GH#178。ホームTL と同じ。collect が台帳に残す)
+            reads = prior_reads + len(tweets)
+            raise_for_auth(
+                response,
+                "search/recent",
+                api_reads=reads,
+                estimated_cost_usd=round(reads * self._unit_price, 6),
+            )
             if response.status_code != 200:
                 # 累計 0 件での失敗は「0件成功」で隠さず例外(ホームTL と同方針)。
                 # どこかのスロットが取得済みなら部分取得として全体打ち切り。取得ぶんは保存しつつ
                 # ソースの失敗として数えさせる(GH#183。400・402・429・5xx を正常扱いで隠さない)
                 error = status_error(response, SEARCH_URL)
-                if not have_prior and not tweets:
+                if not prior_reads and not tweets:
                     raise error
                 return tweets, http_status, True, error
             body = response.json()

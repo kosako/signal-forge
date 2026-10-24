@@ -301,6 +301,57 @@ def test_fatal_error_also_isolated(conn: sqlite3.Connection) -> None:
     assert "FatalError" in run["error"]
 
 
+class StoreFailingFakeConnector:
+    """読取の費用つきで返すが、保存で失敗する項目(解決に失敗する短縮 URL)を含む。"""
+
+    def fetch(self, source_row, cursor):
+        return FetchResult(
+            items=[item("https://bit.ly/abc")],
+            next_cursor={"since_id": "999"},
+            stats=FetchStats(
+                items_fetched=1, api_reads=50, estimated_cost_usd=0.2,
+                http_status=200, duration_ms=1,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("connector", "resolve_fails", "reads", "cost"),
+    [
+        # 部分取得のあとの認証の失敗: 読取数と費用は例外に添えて来る
+        (FakeConnector([], error=FatalError("401", api_reads=7, estimated_cost_usd=0.028)),
+         False, 7, 0.028),
+        # fetch は返したが保存で失敗した: 取得の統計の読取数と費用
+        (StoreFailingFakeConnector(), True, 50, 0.2),
+        # 読む前の失敗は 0(今までどおり)
+        (FakeConnector([], error=RetryableError("timeout")), False, 0, 0.0),
+    ],
+)
+def test_failure_keeps_reads_and_cost_already_spent(
+    conn: sqlite3.Connection, connector, resolve_fails: bool, reads: int, cost: float
+) -> None:
+    # GH#178: 失敗の行にも、それまでに読んだ件数と費用を残す(X の日次の読取上限の台帳と
+    # doctor #9 の当月の費用を過少にしない)。取得ぶんは保存せず、カーソルは据え置く
+    conn.execute("UPDATE sources SET cursor = '{\"etag\": \"old\"}' WHERE type = 'rss'")
+
+    def failing_resolver(url: str) -> str:
+        raise RetryableError("短縮 URL の解決に失敗")
+
+    collect_all(
+        conn, {"rss": connector}, logger, resolve_short=failing_resolver if resolve_fails else None
+    )
+
+    run = conn.execute("SELECT status, api_reads, estimated_cost_usd FROM collect_runs").fetchone()
+    assert (run["status"], run["api_reads"]) == ("error", reads)
+    assert run["estimated_cost_usd"] == pytest.approx(cost)
+    source = conn.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE type = 'rss'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"etag": "old"}
+    assert source["consecutive_failures"] == 1
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 0
+
+
 def test_invalid_scheme_item_recorded_as_error(conn: sqlite3.Connection) -> None:
     connector = FakeConnector([item("javascript:alert(1)"), item("https://example.com/ok")])
     collect_all(conn, {"rss": connector}, logger)
