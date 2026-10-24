@@ -35,6 +35,9 @@ class Verdict(BaseModel):
 
 VALID = '{"score": 80, "reason": "ok"}'
 
+# 秘密に見える文字列と、外部の記事の文に見える文字列(偽の codex が stderr・応答に再掲する。GH#202)
+LEAK_MARKER = "sk-live-SECRET0123456789 記事の本文そのものXYZ"
+
 
 @pytest.fixture(autouse=True)
 def fake_user_home(tmp_path_factory, monkeypatch):
@@ -201,6 +204,19 @@ def test_engine_timeout_raises_llmerror(tmp_path: Path) -> None:
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict, timeout_s=1)
 
 
+def test_engine_timeout_does_not_chain_captured_output(tmp_path: Path) -> None:
+    # GH#202: TimeoutExpired は読み取り済みの stdout・stderr を属性に持つ。原因の例外として
+    # つなぐと、本文を持つ例外が呼び出し側(ログ)へ渡るので、つながない
+    codex = fake_codex(
+        tmp_path, f"echo 'out {LEAK_MARKER}'\necho 'err {LEAK_MARKER}' >&2\nsleep 5\n"
+    )
+    with pytest.raises(LLMError) as excinfo:
+        CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict, timeout_s=1)
+    assert str(excinfo.value) == "タイムアウト(1s)"
+    assert excinfo.value.__cause__ is None
+    assert "SECRET" not in "".join(traceback.format_exception(excinfo.value))
+
+
 def _wait_until(cond, timeout_s: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -330,9 +346,6 @@ def test_engine_missing_output_raises(tmp_path: Path) -> None:
     with pytest.raises(LLMError, match="最終応答ファイル"):
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
 
-
-# 秘密に見える文字列と、外部の記事の文に見える文字列(偽の codex が stderr・応答に再掲する)
-LEAK_MARKER = "sk-live-SECRET0123456789 記事の本文そのものXYZ"
 
 # (偽の codex の本文, 例外の型, 例外の文言, 予備の側が読む主の失敗の種類)
 _CODEX_LEAK_CASES = {

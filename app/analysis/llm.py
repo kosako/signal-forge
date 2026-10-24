@@ -182,9 +182,11 @@ class CodexCliEngine:
                 raise LLMUnavailableError(f"codex 起動失敗: {e}") from e
             try:
                 _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
-            except subprocess.TimeoutExpired as e:
+            except subprocess.TimeoutExpired:
                 _kill_process_group(process)
-                raise LLMError(f"タイムアウト({timeout_s}s)") from e
+                # TimeoutExpired は読み取り済みの stdout・stderr(外部本文が混入しうる)を
+                # 属性に持つので、原因の例外としてつながない(GH#202)
+                raise LLMError(f"タイムアウト({timeout_s}s)") from None
             except BaseException:
                 # 手動実行の中断(Ctrl-C の KeyboardInterrupt)や想定外の例外でも子を残さない
                 # (GH#244)。子は別セッションなので端末の SIGINT が届かず、放っておくと推論を
