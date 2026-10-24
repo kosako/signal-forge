@@ -38,8 +38,8 @@ _CONNECTOR_WORDS = (
     "あとは", "あと", "それと", "それから", "それに", "そして", "で", "次に", "次は",
     "ついでに", "さらに", "加えて", "また", "やっぱり", "えっと", "えーと", "あ",
 )
-_TRAIL_CONNECTOR_RE = re.compile(
-    r"(?:、\s*(?:(?:" + "|".join(_CONNECTOR_WORDS) + r")\s*)*)+$"
+_CONNECTOR_ONLY_RE = re.compile(
+    r"\s*(?:(?:" + "|".join(_CONNECTOR_WORDS) + r")\s*)*"
 )
 
 
@@ -74,11 +74,15 @@ def parse_dig_reply(text: str, valid_ids: set[int]) -> list[DigInstruction]:
             # - 句点・改行は文の区切りなので、最後のものより後ろを切る。ASCII の「.」は
             #   切らない(「GPT-5.6」等の術語を壊さない)
             # - 読点は観点の中にも現れる(「コスト、運用の観点で」)ので、後ろが接続語
-            #   だけのときに限り切る
+            #   だけのときに限り切る。読点で分けて末尾の区間から 1 回ずつ判定する
+            #   (末尾に固定した正規表現の探索は長い入力で二乗になる)
             cut = max(segment.rfind("。"), segment.rfind("\n"))
             if cut != -1:
                 segment = segment[:cut]
-            segment = _TRAIL_CONNECTOR_RE.sub("", segment)
+            parts = segment.split("、")
+            while len(parts) > 1 and _CONNECTOR_ONLY_RE.fullmatch(parts[-1]):
+                parts.pop()
+            segment = "、".join(parts)
         core = _LEAD_PARTICLE_RE.sub("", segment, count=1)
         core = _TRAIL_PUNCT_RE.sub("", core)
         if not is_last:
