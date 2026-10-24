@@ -3,7 +3,7 @@ import pytest
 
 from app.connectors.base import FatalError, RetryableError
 from app.connectors.rss import RssConnector
-from app.http import HttpClient
+from app.http import MAX_RESPONSE_BYTES, HttpClient
 from app.models import Source
 
 FEED = """<?xml version="1.0" encoding="utf-8"?>
@@ -170,6 +170,16 @@ def test_404_is_fatal_not_retried() -> None:
 def test_garbage_body_is_retryable() -> None:
     connector = make_connector(lambda request: httpx.Response(200, content=b"\x00\x01 not xml"))
     with pytest.raises(RetryableError, match="パース失敗"):
+        connector.fetch(make_source(), {})
+
+
+def test_oversized_feed_is_fatal() -> None:
+    # 上限を超える応答は解析に渡さず、そのソースの失敗にする(collect がスキップして続ける。
+    # GH#203)
+    connector = make_connector(
+        lambda request: httpx.Response(200, content=b" " * (MAX_RESPONSE_BYTES + 1))
+    )
+    with pytest.raises(FatalError, match="上限"):
         connector.fetch(make_source(), {})
 
 

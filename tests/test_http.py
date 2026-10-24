@@ -1,13 +1,56 @@
+import gzip
+
 import httpx
 import pytest
 
 from app.connectors.base import FatalError, RetryableError
-from app.http import HttpClient, SsrfBlockedError
+from app.http import (
+    FETCH_DEADLINE_S,
+    MAX_RESPONSE_BYTES,
+    MAX_RETRY_AFTER_S,
+    READ_TIMEOUT_S,
+    FetchDeadlineError,
+    HttpClient,
+    ResponseTooLargeError,
+    SsrfBlockedError,
+)
 
 PUBLIC = {"example.com": ["93.184.216.34"], "cdn.example": ["93.184.216.35"]}
 
 
-def make_client(handler, hosts=None, sleeps=None):
+class FakeClock:
+    """取得の期限の検査用の時計。待ちと、テストが決めた応答の所要時間で進む(GH#203)。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class ChunkStream(httpx.SyncByteStream):
+    """本文を chunk ごとに返す応答。count が None なら終わらない。受信のたびに on_chunk を呼ぶ。"""
+
+    def __init__(self, chunk: bytes, count: int | None = None, on_chunk=None) -> None:
+        self.chunk = chunk
+        self.count = count
+        self.on_chunk = on_chunk
+        self.sent = 0
+
+    def __iter__(self):
+        while self.count is None or self.sent < self.count:
+            self.sent += 1
+            if self.on_chunk is not None:
+                self.on_chunk()
+            yield self.chunk
+
+
+def make_client(handler, hosts=None, sleeps=None, clock=None):
     hosts = {**PUBLIC, **(hosts or {})}
 
     def resolve(host: str) -> list[str]:
@@ -15,6 +58,13 @@ def make_client(handler, hosts=None, sleeps=None):
             raise OSError(f"unknown host {host}")
         return hosts[host]
 
+    if clock is not None:
+        return HttpClient(
+            transport=httpx.MockTransport(handler),
+            resolve_host=resolve,
+            sleep=clock.sleep,
+            clock=clock,
+        )
     return HttpClient(
         transport=httpx.MockTransport(handler),
         resolve_host=resolve,
@@ -131,6 +181,209 @@ def test_429_respects_retry_after() -> None:
     fetched = make_client(handler, sleeps=sleeps).get("https://example.com/")
     assert fetched.response.status_code == 200
     assert sleeps == [7]  # Retry-After 優先。追加バックオフを重ねない
+
+
+def test_429_retry_after_at_cap_is_waited() -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"retry-after": str(MAX_RETRY_AFTER_S)})
+        return httpx.Response(200)
+
+    clock = FakeClock()
+    fetched = make_client(handler, clock=clock).get("https://example.com/")
+    assert fetched.response.status_code == 200
+    assert clock.sleeps == [MAX_RETRY_AFTER_S]  # 上限ちょうどは待つ
+
+
+def test_429_long_retry_after_fails_without_waiting() -> None:
+    # 長い Retry-After をそのまま待つと朝バッチが止まる。待たずにそのソース・記事の失敗にする
+    # (GH#203)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(429, headers={"retry-after": str(MAX_RETRY_AFTER_S + 1)})
+
+    clock = FakeClock()
+    with pytest.raises(RetryableError, match="Retry-After") as excinfo:
+        make_client(handler, clock=clock).get("https://example.com/")
+    assert not isinstance(excinfo.value, FetchDeadlineError)
+    assert clock.sleeps == []
+    assert len(calls) == 1
+
+
+def test_429_retry_after_beyond_deadline_fails_without_waiting() -> None:
+    # 上限内の Retry-After でも、待つと期限までに試す時間が残らないなら待たない(GH#203)
+    calls = []
+    clock = FakeClock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        clock.now += FETCH_DEADLINE_S - MAX_RETRY_AFTER_S  # 応答に時間がかかった
+        return httpx.Response(429, headers={"retry-after": str(MAX_RETRY_AFTER_S)})
+
+    with pytest.raises(FetchDeadlineError, match="期限"):
+        make_client(handler, clock=clock).get("https://example.com/")
+    assert clock.sleeps == []
+    assert len(calls) == 1
+
+
+def test_backoff_beyond_deadline_is_not_slept() -> None:
+    # 試行ごとに 29s かかる 5xx。2 回目の後のバックオフ(4s+)で期限を越えるので待たない(GH#203)
+    calls = []
+    clock = FakeClock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        clock.now += 29
+        return httpx.Response(503)
+
+    with pytest.raises(FetchDeadlineError, match="期限"):
+        make_client(handler, clock=clock).get("https://example.com/")
+    assert len(calls) == 2
+    assert len(clock.sleeps) == 1
+    assert clock.now < FETCH_DEADLINE_S
+
+
+def test_request_timeout_shrinks_to_remaining_time() -> None:
+    # 1 回の接続・受信の待ちも期限の残りで縮める。read 30s を毎回待たせて期限を越えない(GH#203)
+    clock = FakeClock()
+    timeouts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        if request.headers["host"] == "example.com":
+            clock.now += FETCH_DEADLINE_S - 5
+            return httpx.Response(302, headers={"location": "https://cdn.example/new"})
+        return httpx.Response(200)
+
+    make_client(handler, clock=clock).get("https://example.com/old")
+    assert timeouts[0]["read"] == READ_TIMEOUT_S
+    assert timeouts[1] == {"connect": 5, "read": 5, "write": 5, "pool": 5}
+
+
+def test_deadline_stops_redirect_chain() -> None:
+    # リダイレクトの追跡も期限に含める。期限を過ぎたら次のホップへ接続しない(GH#203)
+    clock = FakeClock()
+    hosts: list[str] = []
+    resolved: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.headers["host"])
+        clock.now += FETCH_DEADLINE_S + 1
+        return httpx.Response(302, headers={"location": "https://cdn.example/new"})
+
+    def resolve(host: str) -> list[str]:
+        resolved.append(host)
+        return PUBLIC[host]
+
+    client = HttpClient(
+        transport=httpx.MockTransport(handler),
+        resolve_host=resolve,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    with pytest.raises(FetchDeadlineError, match="cdn.example"):
+        client.get("https://example.com/old")
+    assert hosts == ["example.com"]  # 期限の超過はリトライしない
+    assert resolved == ["example.com"]  # 次のホップの名前解決もしない
+
+
+def test_deadline_message_keeps_dns_failure_host() -> None:
+    # 期限で打ち切ったときも、DNS で失敗したホストを文言に残す(GH#188 の契約。GH#203)
+    clock = FakeClock()
+
+    def resolve(host: str) -> list[str]:
+        clock.now += FETCH_DEADLINE_S / 2  # 名前解決に時間がかかった
+        raise OSError("temporary failure in name resolution")
+
+    client = HttpClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        resolve_host=resolve,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+    with pytest.raises(FetchDeadlineError) as excinfo:
+        client.get("https://slow-dns.example/")
+    assert "DNS 解決失敗: slow-dns.example" in str(excinfo.value)
+
+
+def test_oversized_body_stops_reading_and_is_not_retried() -> None:
+    # 本文はストリーミングで受け、上限を超えた時点で読むのをやめる(GH#203)
+    calls = []
+    stream = ChunkStream(b"x" * (1024 * 1024))  # 終わらない応答
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, stream=stream)
+
+    with pytest.raises(ResponseTooLargeError, match="上限"):
+        make_client(handler, sleeps=[]).get("https://example.com/huge")
+    assert stream.sent == MAX_RESPONSE_BYTES // (1024 * 1024) + 1  # 超えた chunk で止まる
+    assert len(calls) == 1  # 読み直しても同じなのでリトライしない
+    assert issubclass(ResponseTooLargeError, FatalError)  # 呼び出し側の失敗の扱いに乗る
+
+
+def test_body_at_limit_is_returned() -> None:
+    body = b"x" * MAX_RESPONSE_BYTES
+    fetched = make_client(lambda request: httpx.Response(200, content=body)).get(
+        "https://example.com/big"
+    )
+    assert fetched.response.content == body
+
+
+def test_compressed_body_is_limited_after_decoding() -> None:
+    # 小さく圧縮した巨大な本文も、展開後のバイト数で止める(GH#203)
+    bomb = gzip.compress(b"\0" * (MAX_RESPONSE_BYTES + 1))
+    assert len(bomb) < MAX_RESPONSE_BYTES // 100
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-encoding": "gzip"}, stream=httpx.ByteStream(bomb)
+        )
+
+    with pytest.raises(ResponseTooLargeError):
+        make_client(handler).get("https://example.com/bomb")
+
+
+def test_compressed_body_within_limit_is_decoded() -> None:
+    # ストリーミングで読んだ本文も、従来どおり展開した content / text として返す
+    body = "本文".encode() * 1000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-type": "text/html; charset=utf-8"},
+            stream=httpx.ByteStream(gzip.compress(body)),
+        )
+
+    fetched = make_client(handler).get("https://example.com/gz")
+    assert fetched.response.content == body
+    assert fetched.response.text == "本文" * 1000
+
+
+def test_slow_body_stops_at_deadline() -> None:
+    # 少しずつ送り続ける応答は read timeout では切れない。受信のたびに期限を見る(GH#203)
+    clock = FakeClock()
+    calls = []
+
+    def advance() -> None:
+        clock.now += READ_TIMEOUT_S - 5  # read timeout の内側で 1 chunk ずつ届く
+
+    stream = ChunkStream(b"x", on_chunk=advance)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, stream=stream)
+
+    with pytest.raises(FetchDeadlineError, match="期限"):
+        make_client(handler, clock=clock).get("https://example.com/slow")
+    assert stream.sent == 3  # 25s・50s・75s。期限 60s を越えた chunk で止まる
+    assert len(calls) == 1  # 期限の超過はリトライしない
+    assert clock.sleeps == []
 
 
 @pytest.mark.parametrize("empty_result", [False, True])
