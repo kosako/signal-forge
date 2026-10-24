@@ -57,12 +57,20 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
     return body
 
 
+def mixes_id_and_time(query: dict[str, list[str]]) -> bool:
+    """search/recent は since_id・until_id を start_time・end_time と同じ要求に入れると 400 を返す
+    (実 API の応答で確認。GH#319)。テストの模型も同じ制約を持ち、併用の退行を捉える。"""
+    return bool({"since_id", "until_id"} & query.keys()) and bool(
+        {"start_time", "end_time"} & query.keys()
+    )
+
+
 def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
                    unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
     200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
-    そのページの要求で送出する(通信の失敗。GH#182)。"""
+    そのページの要求で送出する(通信の失敗。GH#182)。id と時刻の併用は 400(GH#319)。"""
     token_index: dict[str, int] = {}
     for series in pages.values():
         for i, (_s, body, _h) in enumerate(series):
@@ -78,6 +86,8 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         # 演算子の自動付加: スロットを括弧で囲んでから除外句を付ける(GH#230)
         assert raw_query.startswith("(") and raw_query.endswith(f") {X_SEARCH_QUERY_SUFFIX}")
         slot = raw_query.removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
+        if mixes_id_and_time(query):
+            return httpx.Response(400, json={})
         token = query.get("next_token", [None])[0]
         status, body, headers = pages[slot][0 if token is None else token_index[token]]
         if isinstance(status, Exception):
@@ -139,16 +149,22 @@ def test_or_slot_is_grouped_so_exclusions_cover_every_branch() -> None:
     assert result.items[0].meta == {"query": "ai OR llm"}  # meta は括弧を付けないスロットのまま
 
 
-def test_since_id_passed_and_kept_when_no_results() -> None:
+def test_since_id_sent_as_start_time_and_kept_when_no_results() -> None:
+    # GH#319: since_id は end_time(GH#184 の共通の上限)と同じ要求に入れると 400。watermark の
+    # snowflake の時刻を秒に切り捨てた start_time(含む)にして、end_time と一緒に送る
     seen: list[httpx.Request] = []
+    since_id = snowflake_at(datetime(2026, 10, 17, 12, 49, 0, 789000, tzinfo=UTC))
     pages = {"ai": [(200, page([]), {})]}
-    result = connector_from(pages, slots=("ai",), seen=seen).fetch(
-        make_source(), {"since_id": "900"}
+    result = connector_from(pages, slots=("ai",), seen=seen, now=NOW).fetch(
+        make_source(), {"since_id": since_id}
     )
     assert result.items == []
     assert result.stats.api_reads == 0
-    assert result.next_cursor == {"since_id": "900"}  # 取得ゼロなら据え置き
-    assert parse_qs(urlsplit(str(seen[0].url)).query)["since_id"] == ["900"]
+    assert result.next_cursor == {"since_id": since_id}  # 取得ゼロなら据え置き
+    query = parse_qs(urlsplit(str(seen[0].url)).query)
+    assert "since_id" not in query
+    assert query["start_time"] == ["2026-10-17T12:49:00Z"]  # 秒に切り捨て
+    assert query["end_time"] == ["2026-10-17T13:48:30Z"]
 
 
 def test_stale_since_id_is_dropped_and_cursor_advances(caplog) -> None:
@@ -162,7 +178,8 @@ def test_stale_since_id_is_dropped_and_cursor_advances(caplog) -> None:
         result = connector_from(pages, slots=("ai",), seen=seen, now=NOW).fetch(
             make_source(), {"since_id": stale}
         )
-    assert "since_id" not in parse_qs(urlsplit(str(seen[0].url)).query)
+    query = parse_qs(urlsplit(str(seen[0].url)).query)
+    assert "since_id" not in query and "start_time" not in query  # 下限なしで取る
     assert result.next_cursor == {"since_id": fresh}
     assert any("7 日窓" in r.getMessage() for r in caplog.records)
 
@@ -204,7 +221,8 @@ def test_stale_since_id_is_kept_in_cursor_when_not_advanced(pages) -> None:
     result = connector_from(pages, slots=("a", "b"), seen=seen, now=NOW).fetch(
         make_source(), {"since_id": stale}
     )
-    assert all("since_id" not in parse_qs(urlsplit(str(r.url)).query) for r in seen)
+    queries = [parse_qs(urlsplit(str(r.url)).query) for r in seen]
+    assert all("since_id" not in q and "start_time" not in q for q in queries)
     assert result.next_cursor == {"since_id": stale}
 
 
@@ -225,7 +243,9 @@ def test_since_id_age_boundary(age: timedelta, sent: bool) -> None:
         make_source(), {"since_id": since_id}
     )
     query = parse_qs(urlsplit(str(seen[0].url)).query)
-    assert (query.get("since_id") == [since_id]) is sent
+    assert "since_id" not in query  # 送るときも start_time に直す(GH#319)
+    expected = [(NOW - age).strftime("%Y-%m-%dT%H:%M:%SZ")] if sent else None
+    assert query.get("start_time") == expected
 
 
 def test_no_cursor_and_no_results_returns_empty_cursor() -> None:
@@ -406,6 +426,8 @@ class SearchServer:
     時計は start から始まり、要求に応えるたびに gap 進む(コネクタの時計も now で共有する)。
     end_time が無ければ要求の 30 秒前より前を返し(API の既定)、あれば end_time より前
     (end_time は含まない)を返す。end_time が要求の 10 秒前より新しければ 400(API の制約)。
+    start_time があればその時刻から(start_time は含む)を返す。since_id か until_id を
+    start_time か end_time と一緒に受けたら 400(API の制約。GH#319)。
     新しい順・since_id より新しいものだけ・max_results まで。
     """
 
@@ -422,6 +444,8 @@ class SearchServer:
         self._clock += self._gap  # 次の要求までに経つ時間
         query = parse_qs(urlsplit(str(request.url)).query)
         slot = query["query"][0].removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
+        if mixes_id_and_time(query):
+            return httpx.Response(400, json={})
         if "end_time" in query:
             until = datetime.strptime(query["end_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=UTC
@@ -430,9 +454,14 @@ class SearchServer:
                 return httpx.Response(400, json={})
         else:
             until = requested - timedelta(seconds=30)
+        start = SNOWFLAKE_EPOCH
+        if "start_time" in query:
+            start = datetime.strptime(query["start_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=UTC
+            )
         since = int(query.get("since_id", ["0"])[0])
         ids = sorted(
-            (int(snowflake_at(at)) for s, at in self._posts if s == slot and at < until),
+            (int(snowflake_at(at)) for s, at in self._posts if s == slot and start <= at < until),
             reverse=True,
         )
         data = [tweet(str(i)) for i in ids if i > since][: int(query["max_results"][0])]
@@ -467,6 +496,33 @@ def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
     assert first.partial_error is None
     second = run(NOW + timedelta(days=1), first.next_cursor)
     assert snowflake_at(a_new) in [i.external_id for i in second.items]
+
+
+def test_watermark_second_is_reread_and_cursor_advances() -> None:
+    # GH#319: watermark は since_id でなく、時刻を秒に切り捨てた start_time(含む)で送る。
+    # 同じ秒の投稿は読み直しになる(collect の UNIQUE で吸収)が、その前の秒は取らない。
+    # 模型は since_id と end_time の併用を 400 にするので、併用への退行もここで落ちる
+    mark = datetime(2026, 10, 17, 12, 49, 0, 500000, tzinfo=UTC)  # 前回の最大 id の時刻
+    same_second = mark - timedelta(milliseconds=400)
+    new = NOW - timedelta(minutes=1)
+    posts = [("a", mark - timedelta(seconds=1)), ("a", same_second), ("a", mark), ("a", new)]
+    server = SearchServer(posts, start=NOW, gap=timedelta(seconds=60))
+    result = XSearchConnector(
+        client=httpx.Client(transport=httpx.MockTransport(server.handle)),
+        credentials=CREDS,
+        slots=("a",),
+        daily_read_cap=20,
+        unit_price_usd=0.004,
+        sleep=lambda _s: None,
+        now=server.now,
+    ).fetch(make_source(), {"since_id": snowflake_at(mark)})
+    assert result.partial_error is None
+    assert [i.external_id for i in result.items] == [
+        snowflake_at(new),
+        snowflake_at(mark),
+        snowflake_at(same_second),
+    ]
+    assert result.next_cursor == {"since_id": snowflake_at(new)}
 
 
 def test_auth_error_is_fatal() -> None:

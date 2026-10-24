@@ -14,9 +14,14 @@
   恒久欠落する。**全スロットが完走したときだけ進める**: 途中打ち切りで進めると未実行スロットの
   その日ぶんが watermark の背後に隠れて恒久欠落するため、打ち切り時は据え置き(翌日、旧
   watermark から再取得して UNIQUE で吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。
-- search/recent は直近 7 日より古い since_id を 400 で拒否する。停止明けで watermark が窓の外に
-  出ると毎日 400 で永久に進まないため、窓の端に近い(SINCE_ID_MAX_AGE より古い)since_id は
-  外して取得する(GH#121。窓の外の欠落は API 上取り戻せない)。
+- search/recent は since_id・until_id を start_time・end_time と同じ要求で受け付けない(400。
+  GH#319)。上の end_time を全要求に送るので、watermark は since_id として送らず、その snowflake
+  の時刻を秒に切り捨てた start_time(その時刻を含む)にして送る。watermark と同じ秒の投稿は
+  読み直しになり、collect の UNIQUE で吸収される(読み直しは同じ秒の数件で、その課金は許容)。
+- search/recent は直近 7 日より古い since_id を 400 で拒否する(start_time も同じ 7 日窓に
+  限られる)。停止明けで watermark が窓の外に出ると毎日 400 で永久に進まないため、窓の端に近い
+  (SINCE_ID_MAX_AGE より古い)watermark は外して、start_time なしで取得する(GH#121。窓の外の
+  欠落は API 上取り戻せない)。
 - 打ち切り・失敗はホームTL と同じ方針: rate limit 残 0 で全体打ち切り / 累計 0 件での
   HTTP・通信の失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。部分取得後の
   失敗は取得ぶんを返しつつ理由を `FetchResult.partial_error` に載せ、collect にソースの失敗と
@@ -58,7 +63,8 @@ SEARCH_URL = f"{API_BASE}/tweets/search/recent"
 # note_tweet = 長文ポストの全文(GH#94。ホームTL と同じ理由)
 TWEET_FIELDS = "created_at,author_id,note_tweet"
 EXPANSIONS = "author_id"
-# search/recent が受け付ける since_id は直近 7 日(実測の 400 応答で確認・GH#121)。
+# search/recent が受け付ける since_id は直近 7 日(実測の 400 応答で確認・GH#121)。watermark を
+# 時刻にして送る start_time も同じ窓に限られる(GH#319)。
 # run の所要時間と時計のずれに 1 日の余裕を取る(この古さなら予算はどのみち新しい側で埋まる)
 SINCE_ID_MAX_AGE = timedelta(days=6)
 # 全スロット共通の取得の上限(end_time)を実行の開始からどれだけ前に置くか(GH#184)。
@@ -102,10 +108,15 @@ class XSearchConnector:
         if since_id and _snowflake_time(since_id) < now - SINCE_ID_MAX_AGE:
             # 送ると毎日 400 で watermark が永久に進まない(GH#121)。外して新しい側から取り直す
             logging.getLogger("intel").warning(
-                "検索の since_id が 7 日窓の端より古い。since_id なしで取得する",
+                "検索の since_id が 7 日窓の端より古い。start_time なしで取得する",
                 extra={"source_id": source_row.id, "extra": {"since_id": since_id}},
             )
             since_id = None
+        # since_id は end_time と同じ要求に入れると 400 になる(GH#319)。watermark の時刻を
+        # 秒に切り捨てた start_time(含む)で送る。同じ秒の投稿の読み直しは UNIQUE で吸収される
+        start_time = (
+            _snowflake_time(since_id).strftime("%Y-%m-%dT%H:%M:%SZ") if since_id else None
+        )
         users: dict[str, str] = {}
         fetched: list[tuple[str, list[dict]]] = []  # (スロットのクエリ, tweets)
         reads = 0
@@ -115,7 +126,7 @@ class XSearchConnector:
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
             tweets, status, stopped, error = self._fetch_slot(
-                query, budget, since_id, end_time, users, have_prior=any(t for _q, t in fetched)
+                query, budget, start_time, end_time, users, have_prior=any(t for _q, t in fetched)
             )
             fetched.append((query, tweets))
             reads += len(tweets)
@@ -150,7 +161,7 @@ class XSearchConnector:
         self,
         query: str,
         budget: int,
-        since_id: str | None,
+        start_time: str | None,
         end_time: str,
         users: dict[str, str],
         *,
@@ -171,8 +182,8 @@ class XSearchConnector:
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
             }
-            if since_id:
-                params["since_id"] = since_id
+            if start_time:
+                params["start_time"] = start_time  # watermark の時刻(GH#319。since_id は送らない)
             if token:
                 params["next_token"] = token  # search/recent は pagination_token でなく next_token
             try:
@@ -204,7 +215,7 @@ class XSearchConnector:
                 return tweets, http_status, True, None  # 残 0 → 全体打ち切り(15分待ちはしない)
             token = body.get("meta", {}).get("next_token")
             if not token:
-                break  # since_id 到達 / 7日窓の末尾
+                break  # start_time 到達 / 7日窓の末尾
         return tweets, http_status, False, None
 
 
