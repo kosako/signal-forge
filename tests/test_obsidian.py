@@ -473,25 +473,102 @@ def test_relisted_in_later_bookmark_section_reuses_first_note(conn, tmp_path) ->
     assert f"[[{first_note.stem}]]" in later_text  # 追いパスの再計算でも最初のノートへ
 
 
-def test_pending_notes_use_same_note_date_as_export(conn, tmp_path) -> None:
-    # GH#242: 追いパスの投影先は export_digest と同じ規則(最初に載った digest の日付)で決める。
-    # 記事メッセージの台帳が後の digest の行でも、export が書いたノートへ投影する
-    item = add_digested(conn, "https://a/1")
+def test_item_dropped_by_force_and_delivered_later_reuses_first_note(conn, tmp_path) -> None:
+    # GH#242: --force の置換で外れた item が後日また配信されても、初日に export したノートを使う。
+    # 後日の Daily のリンクと、後日の配信へのリプライの感想の投影も最初のノートへ
+    item = add_digested(conn, "https://a/1", title="外れた記事")
     first_id = add_digest(conn, [item], date="2026-07-06")
     config = make_config(tmp_path)
     export_digest(conn, config, first_id, logger)
-    later_id = add_digest(conn, [], date="2026-07-08", bookmark_item_ids=[item])
+    # 同じ日の --force の置換で台帳(item_ids)から外れ、候補(analyzed)に戻った状態(builder と同じ)
+    other = add_digested(conn, "https://a/2", title="差し替えた記事")
+    conn.execute("UPDATE digests SET item_ids = ? WHERE id = ?", (json.dumps([other]), first_id))
+    conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (item,))
+
+    later_id = add_digest(conn, [item], date="2026-07-08")
+    export_digest(conn, config, later_id, logger)
     conn.execute(
         "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 501)",
         (later_id, item),
     )
-    add_note(conn, item, "後の台帳から届いた感想")
+    add_note(conn, item, "後日の配信へのリプライ")
+    export_pending_notes(conn, config, logger)
+
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    notes = list((base / "Items").glob(f"*-{item}-*.md"))
+    assert [p.name[:8] for p in notes] == ["20260706"]  # 別日付を作らない
+    assert f"[[{notes[0].stem}]]" in (base / "Daily" / "2026-07-08.md").read_text()
+    assert "後日の配信へのリプライ" in notes[0].read_text()
+
+
+def test_existing_duplicate_notes_are_left_in_place(conn, tmp_path) -> None:
+    # GH#242: 修正前に再掲で作られた別日付のノート(重複)は動かさず統合もしない。その日を
+    # export し直すと従来どおり重複のノートを書き直し、感想の追いパスは最初のノートへ
+    item = add_digested(conn, "https://a/1", title="重複の記事")
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, first_id, logger)
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (first_id, item),
+    )
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    first_note = next((base / "Items").glob(f"20260706-{item}-*.md"))
+    duplicate = first_note.with_name(first_note.name.replace("20260706", "20260710", 1))
+    duplicate.write_text(first_note.read_text() + "\n重複の側の手書き\n")
+    first_note.write_text(first_note.read_text() + "\n最初の側の手書き\n")
+    later_id = add_digest(conn, [], date="2026-07-10", bookmark_item_ids=[item])
+
+    export_digest(conn, config, later_id, logger)  # 再掲の日を export し直す
+    add_note(conn, item, "後で書いた感想")
+    export_pending_notes(conn, config, logger)
+
+    names = sorted(p.name for p in (base / "Items").glob(f"*-{item}-*.md"))
+    assert names == sorted([first_note.name, duplicate.name])
+    assert f"[[{duplicate.stem}]]" in (base / "Daily" / "2026-07-10.md").read_text()
+    assert "重複の側の手書き" in duplicate.read_text()
+    assert "最初の側の手書き" in first_note.read_text()
+    assert "後で書いた感想" in first_note.read_text()
+
+
+def test_conflict_file_is_not_reused_as_item_note(conn, tmp_path) -> None:
+    # GH#242: 既存のノートを探すとき、退避した .conflict は出力先にしない
+    item = add_digested(conn, "https://a/1", title="退避の記事")
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, first_id, logger)
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    first_note = next((base / "Items").glob(f"20260706-{item}-*.md"))
+    conflict = first_note.with_suffix(".conflict.md")
+    first_note.rename(conflict)  # 本人が元のノートを片付け、退避だけが残った
+    conflict_text = conflict.read_text()
+
+    later_id = add_digest(conn, [], date="2026-07-10", bookmark_item_ids=[item])
+    export_digest(conn, config, later_id, logger)
+
+    assert conflict.read_text() == conflict_text  # 退避には書かない
+    assert list((base / "Items").glob(f"20260710-{item}-*.md"))  # 従来の規則で作る
+
+
+def test_pending_pass_links_daily_to_note_it_just_created(conn, tmp_path) -> None:
+    # GH#242: Items ノートがまだ無い item(export が失敗した日など)を追いパスが作ったとき、
+    # 同じ追いパスで書き直す再掲の日の Daily も、そのノートへリンクする
+    item = add_digested(conn, "https://a/1", title="未出力の記事")
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (first_id, item),
+    )
+    later_id = add_digest(conn, [], date="2026-07-10", bookmark_item_ids=[item])
+    add_note(conn, item, "記事への感想")
+    add_digest_note(conn, later_id, "再掲の日の日次感想")
+    config = make_config(tmp_path)
 
     export_pending_notes(conn, config, logger)
-    items_dir = Path(config.obsidian.vault_path) / config.obsidian.folder / "Items"
-    notes = list(items_dir.glob(f"*-{item}-*.md"))
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    notes = list((base / "Items").glob(f"*-{item}-*.md"))
     assert [p.name[:8] for p in notes] == ["20260706"]
-    assert "後の台帳から届いた感想" in notes[0].read_text()
+    assert f"[[{notes[0].stem}]]" in (base / "Daily" / "2026-07-10.md").read_text()
 
 
 # --- 読み取り後の変更の検出(GH#189)---

@@ -34,6 +34,9 @@ EXCERPT_MAX_CHARS = 300  # RSS/manual の抜粋の長さ(恒久保存は要約�
 
 FORBIDDEN_IN_SLUG = re.compile(r'[/\\:*?"<>|#^\[\]\s]+')
 _FRONT_MATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+# Items ノートのファイル名(`YYYYMMDD-{item_id}-{slug}.md`)と、退避した .conflict の名前
+_ITEM_NOTE_FILE = re.compile(r"(\d{8})-(\d+)-.*\.md")
+_CONFLICT_FILE = re.compile(r"\.conflict(-\d+)?\.md\Z")
 
 # ユーザー所有キー: 生成側は初期値を置くだけで、再生成時に上書きしない(設計 04 §7)
 _USER_OWNED_KEYS = ("reaction",)
@@ -65,14 +68,13 @@ def export_digest(
     # 🔖 保存節の item(GH#99)も配信 item と同様に Items ノート化する(=「保存」の実体)
     item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
-    # ノートの日付は item が最初に載った digest の日付(後日の保存節への再掲でも同じノート。GH#242)
-    note_dates = _first_listed_dates(conn, [row["item_id"] for row in rows])
+    # 既にある Items ノートを item ごとに使う(後日の保存節への再掲で別日付を作らない。GH#242)
+    existing_notes = _existing_item_notes(items_dir)
 
     wikilinks = []
     conflicts = 0
     for row in rows:
-        note_date = note_dates.get(row["item_id"], digest["digest_date"])
-        note_name = _item_note_name(note_date, row["item_id"], row["title"])
+        note_name, note_date = _item_note_target(existing_notes, row, digest["digest_date"])
         wikilinks.append(f"[[{note_name}]]")
         if not _write_note(
             items_dir / f"{note_name}.md",
@@ -114,10 +116,10 @@ def export_pending_notes(
 ) -> None:
     """未反映の感想を該当ノートへ投影する(item = GH#92 / digest = GH#96)。
 
-    感想は配信済みメッセージへのリプライでしか生まれないため、対象の item は
-    digest_messages → digests で絞れる(export は deliver より前段だが、感想が付く時点で
-    その item は配信済み)。ノート名の日付は export_digest と同じく、item が最初に載った
-    digest の日付(GH#242)。digest 感想は digests.digest_date で直接 Daily を特定する。
+    感想は配信済みメッセージへのリプライでしか生まれないため、item ノート名の digest_date は
+    digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
+    その item は配信済み)。その名前のノートが無ければ、export_digest と同じく item の既存の
+    ノートへ投影する(GH#242)。digest 感想は digests.digest_date で直接 Daily を特定する。
     再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
     """
     if config.obsidian.vault_path is None:
@@ -148,7 +150,7 @@ def export_pending_notes(
     base = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
     items_dir = base / "Items"
     items_dir.mkdir(parents=True, exist_ok=True)
-    note_dates = _first_listed_dates(conn, [entry["item_id"] for entry in pending])
+    existing_notes = _existing_item_notes(items_dir)
     conflicts = 0
     for entry in pending:
         rows = _load_items(conn, [entry["item_id"]])
@@ -160,8 +162,9 @@ def export_pending_notes(
             )
             continue
         row = rows[0]
-        note_date = note_dates.get(row["item_id"], entry["digest_date"])
-        note_name = _item_note_name(note_date, row["item_id"], row["title"])
+        note_name, note_date = _item_note_target(existing_notes, row, entry["digest_date"])
+        # 新しく作るノートも、下の Daily の wikilink の再計算で同じ出力先として扱う
+        existing_notes.setdefault(row["item_id"], [note_name])
         if not _write_note(
             items_dir / f"{note_name}.md",
             _item_frontmatter(row, note_date),
@@ -183,7 +186,9 @@ def export_pending_notes(
     daily_dir = base / "Daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
     for digest in pending_digests:
-        front, body = _daily_note_content(conn, digest, _daily_wikilinks(conn, digest))
+        front, body = _daily_note_content(
+            conn, digest, _daily_wikilinks(conn, digest, existing_notes)
+        )
         if not _write_note(
             daily_dir / f"{digest['digest_date']}.md",
             front,
@@ -287,16 +292,16 @@ def _daily_note_content(
     return front, digest["markdown"] + links_section + notes_section
 
 
-def _daily_wikilinks(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[str]:
+def _daily_wikilinks(
+    conn: sqlite3.Connection, digest: sqlite3.Row, existing_notes: dict[int, list[str]]
+) -> list[str]:
     """digest の item_ids から wikilink 一覧を再計算する(追いパス用。配信順を維持)。"""
     item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
-    note_dates = _first_listed_dates(conn, [row["item_id"] for row in rows])
-    wikilinks = []
-    for row in rows:
-        note_date = note_dates.get(row["item_id"], digest["digest_date"])
-        wikilinks.append(f"[[{_item_note_name(note_date, row['item_id'], row['title'])}]]")
-    return wikilinks
+    return [
+        f"[[{_item_note_target(existing_notes, row, digest['digest_date'])[0]}]]"
+        for row in rows
+    ]
 
 
 def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
@@ -304,33 +309,38 @@ def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
     return json.loads(digest["item_ids"]) + json.loads(digest["bookmark_item_ids"] or "[]")
 
 
-def _first_listed_dates(conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, str]:
-    """item ごとに、最初に載った digest の日付(Items ノート名の日付。GH#242)。
+def _existing_item_notes(items_dir: Path) -> dict[int, list[str]]:
+    """Items/ に既にあるノート名(拡張子なし)を item ごとに、名前順(= 日付の古い順)で返す。
 
-    配信 item(item_ids)と 🔖 保存節(bookmark_item_ids)の両方を見る。配信済みの記事が
-    後日の保存節に再掲されても、ノートの出力先は最初のノートのまま(別日付のノートを
-    作らない)。export_digest・Daily の wikilink・感想の追いパスで同じ規則を使う。
+    .conflict の退避は出力先ではないので除く(GH#242)。
     """
-    if not item_ids:
-        return {}
-    placeholders = ",".join("?" * len(item_ids))
-    rows = conn.execute(
-        f"""
-        SELECT item_id, MIN(digest_date) AS digest_date
-        FROM (
-            SELECT listed.value AS item_id, digests.digest_date
-            FROM digests, json_each(digests.item_ids) AS listed
-            UNION ALL
-            SELECT listed.value AS item_id, digests.digest_date
-            FROM digests, json_each(digests.bookmark_item_ids) AS listed
-            WHERE digests.bookmark_item_ids IS NOT NULL
-        )
-        WHERE item_id IN ({placeholders})
-        GROUP BY item_id
-        """,
-        item_ids,
-    ).fetchall()
-    return {row["item_id"]: row["digest_date"] for row in rows}
+    notes: dict[int, list[str]] = {}
+    for path in items_dir.glob("*.md"):
+        m = _ITEM_NOTE_FILE.fullmatch(path.name)
+        if m is None or _CONFLICT_FILE.search(path.name):
+            continue
+        notes.setdefault(int(m.group(2)), []).append(path.stem)
+    for names in notes.values():
+        names.sort()
+    return notes
+
+
+def _item_note_target(
+    existing_notes: dict[int, list[str]], row: sqlite3.Row, digest_date: str
+) -> tuple[str, str]:
+    """item のノートの出力先(ノート名と frontmatter の digest_date)を決める(GH#242)。
+
+    従来の規則(digest_date)の名前のノートがあればそれを使う(GH#242 より前の重複は動かさない)。
+    無ければ、その item の既存のノートのうち最も早いものを使う。配信済みの記事が後日の
+    🔖 保存節に再掲されたときや、--force の置換で外れた item が後日また載ったときに、別の
+    日付のノートを作らないため。どちらも無いときだけ従来の規則で新しく作る。
+    """
+    note_name = _item_note_name(digest_date, row["item_id"], row["title"])
+    names = existing_notes.get(row["item_id"], [])
+    if not names or note_name in names:
+        return note_name, digest_date
+    first = names[0]
+    return first, f"{first[:4]}-{first[4:6]}-{first[6:8]}"
 
 
 def _jst_date(created_at: str) -> str:
