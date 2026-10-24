@@ -211,10 +211,12 @@ chmod 600 "${HOME}/.config/intel/.env"
 #     GH#199)、そのファイルを、展開した config.toml の [analysis].profile_path が指す場所
 #     (未設定なら設定ディレクトリの interest-profile.md)へ置く。その場所が symlink なら、
 #     リンクの先へ置くか、リンクをこのファイルで置き換える。置かないと分析・深掘り・返事が
-#     止まる(設計 05 §5)。ls で何も出なければこの手順は飛ばす
+#     止まる(設計 05 §5)。ls で何も出なければこの手順は飛ばす。profile_path が相対パスなら、
+#     intel を動かすディレクトリ(launchd の WorkingDirectory = repo)からのパスなので、
+#     絶対パスに直して PROFILE_PATH に書く
 ls "${RESTORE_DIR}/profile/" 2>/dev/null
 PROFILE_PATH="${HOME}/.config/intel/interest-profile.md"   # ← [analysis].profile_path 設定時は書き換える
-mkdir -p "${PROFILE_PATH%/*}"
+mkdir -p "$(dirname -- "${PROFILE_PATH}")"
 cp -p "${RESTORE_DIR}/profile/<ファイル名>" "${PROFILE_PATH}"
 
 # 2. 復旧先 DB パスを確認する。config.toml の [storage].db_path を設定していれば
