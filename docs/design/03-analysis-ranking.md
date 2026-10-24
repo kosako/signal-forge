@@ -201,7 +201,7 @@ negativeペナルティ: negative ラベル 1 個につき −15
 ```
 
 - 算出した score は digest 直前に `analyses.total_score` へ UPDATE で書き戻す(生産者は app/ranking/ のみ。01 §3)。
-- digest へは score 降順で最大 `digest.max_items` 件(config、**既定 10**)。**閾値(config `ranking.min_score`、既定 40)未満は件数が余っていても載せない**(その日は少件数または「該当なし」)。理由: 10 件埋め合わせが「未読の置き換え化」リスクを直接悪化させる。
+- digest へは score 降順で最大 `digest.max_items` 件(config、**既定 10**)。**閾値(config `ranking.min_score`、既定 40)未満は件数が余っていても載せない**(その日は少件数または「該当なし」。朝バッチの analyze 段が失敗した日の 0 件は「該当なし」として確定しない。設計 00 §6・GH#191)。理由: 10 件埋め合わせが「未読の置き換え化」リスクを直接悪化させる。
 - PROPOSAL の「無効日3日連続なら配信5件に削減」は、この `digest.max_items` を 5 に変更して発動する(コード変更なしの運用ノブ。発動判定は週次手動レビュー)。
 - 上位 10 件中の同一ソース上限 4 件(超過は次点繰上げ)。係数・ペナルティはすべて config.toml で調整可(コード変更なしのチューニング)。
 - **🔖 保存アイテムはランキング不参加**(GH#99): `x_signals.item_id` に bookmark 紐付けのある item は候補クエリから除外し、digest の「🔖 保存」節(`digests.bookmark_item_ids`)に **must-include の別枠**として全件載せる(未掲載 = analyzed のものを保存順に。掲載で digested)。degraded 配信でも節は付ける(リンク列で分析に依存しない)。トレンド synthesis の対象からも除外(過去の任意時点の内容のため)。

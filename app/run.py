@@ -8,6 +8,8 @@ X 由来 documents の TTL 失効前に本文を材料として使うため。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
 段の失敗はその段で捕捉して記録し、後続の段は実行する。失敗が1つでもあれば
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
+analyze 段が失敗して載せる記事が無い日は、空の digest を確定しない(障害の空。GH#191)。
+export・deliver は当日分を扱わず、同じ日の再走で作って配信する。
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from app.collect import collect_all
 from app.config import Config
 from app.connectors.base import Connector
 from app.delivery import create_api, deliver_digest, is_telegram_configured
-from app.digest.builder import generate_digest
+from app.digest.builder import DigestHeldError, generate_digest
 from app.export import export_digest, export_pending_notes
 from app.extraction import extract_pending
 from app.http import HttpClient
@@ -66,11 +68,23 @@ def run_pipeline(
     stage("analyze", lambda: _analyze(conn, config, env, engine_factory, logger, run_id))
     stage(
         "digest",
-        lambda: _digest(conn, config, env, engine_factory, logger, run_id, force_digest),
+        lambda: _digest(
+            conn, config, env, engine_factory, logger, run_id, force_digest,
+            hold_if_empty="analyze" in failures,
+        ),
     )
-    stage("export", lambda: _export_today(conn, config, logger, run_id))
+    # 障害で当日の digest を確定しなかった日は、export・deliver が当日分を扱わない(GH#191)
+    stage(
+        "export",
+        lambda: _export_today(conn, config, logger, run_id, held=digest_held(conn, failures)),
+    )
     if is_telegram_configured(config, env):
-        stage("deliver", lambda: _deliver_today(conn, config, env, logger, run_id))
+        stage(
+            "deliver",
+            lambda: _deliver_today(
+                conn, config, env, logger, run_id, held=digest_held(conn, failures)
+            ),
+        )
     else:
         # 完全未設定 = M2a 前の未セットアップ。欠落検知は doctor #4 の責務(設計 05 §2)
         logger.warning(
@@ -97,8 +111,13 @@ def _digest(
     logger: logging.Logger,
     run_id: str,
     force_digest: bool,
+    *,
+    hold_if_empty: bool = False,
 ) -> int | None:
-    """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。"""
+    """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。
+
+    hold_if_empty: analyze 段が失敗した日。載せる記事が無ければ確定せず None(GH#191)。
+    """
     from app.analysis.trend import synthesize_trend
 
     trend = None
@@ -116,9 +135,27 @@ def _digest(
                 f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
                 extra={"run_id": run_id, "stage": "digest"},
             )
-    return generate_digest(
-        conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend
-    )
+    try:
+        return generate_digest(
+            conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend,
+            hold_if_empty=hold_if_empty,
+        )
+    except DigestHeldError as e:
+        # 障害の空。段の失敗にはしない(原因の analyze 段の失敗として通知される)
+        logger.warning(
+            f"{e}(復旧後に同じ日の intel run で作る)",
+            extra={"run_id": run_id, "stage": "digest"},
+        )
+        return None
+
+
+def digest_held(conn: sqlite3.Connection, failures: list[str]) -> bool:
+    """analyze 段の失敗で当日の digest を確定しなかったか(GH#191)。
+
+    digest 段は通ったのに当日の行が無い = 載せる記事が無く、障害の空として作らなかった。
+    export・deliver は当日分を扱わず、失敗通知は同じ日の再走で届くことを添える。
+    """
+    return "analyze" in failures and "digest" not in failures and not _digest_exists_today(conn)
 
 
 def _digest_exists_today(conn: sqlite3.Connection) -> bool:
@@ -216,10 +253,17 @@ def _dig(
 
 
 def _export_today(
-    conn: sqlite3.Connection, config: Config, logger: logging.Logger, run_id: str
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    run_id: str,
+    *,
+    held: bool = False,
 ) -> None:
-    # digest 段が skip(生成済み)でも当日分を export する(再実行の冪等性)
-    export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id)
+    # digest 段が skip(生成済み)でも当日分を export する(再実行の冪等性)。
+    # 障害で当日の digest を確定しなかった日(GH#191)は当日分が無いので書かない
+    if not held:
+        export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id)
     # 既配信 item に付いた感想(Telegram リプライ)を該当ノートへ投影(GH#92)
     export_pending_notes(conn, config, logger, run_id=run_id)
 
@@ -230,8 +274,13 @@ def _deliver_today(
     env: dict[str, str],
     logger: logging.Logger,
     run_id: str,
+    *,
+    held: bool = False,
 ) -> None:
-    # 配信済みは deliver_digest 側で skip(再実行の冪等性)
+    # 配信済みは deliver_digest 側で skip(再実行の冪等性)。障害で当日の digest を
+    # 確定しなかった日(GH#191)は送るものが無い(同じ日の再走で作って送る)
+    if held:
+        return
     deliver_digest(conn, config, create_api(env), _today_digest_id(conn), logger, run_id=run_id)
 
 

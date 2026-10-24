@@ -453,7 +453,7 @@ def run(
     from app.db import apply_migrations, connect
     from app.http import HttpClient
     from app.logs import DEFAULT_LOG_DIR, setup_logging
-    from app.run import notify_llm_fallback, run_pipeline
+    from app.run import digest_held, notify_llm_fallback, run_pipeline
 
     config = load_config(config_dir)
     env = load_env(config_dir)
@@ -481,7 +481,10 @@ def run(
 
         if is_telegram_configured(config, env):
             try:
-                notify_run_failure(conn, config, create_api(env), failures, run_id, logger)
+                notify_run_failure(
+                    conn, config, create_api(env), failures, run_id, logger,
+                    digest_held=digest_held(conn, failures),  # GH#191
+                )
             except Exception as e:  # create_api の設定不備等でも終了コードを汚さない
                 logger.error(f"失敗通知を送れない: {e}", extra={"run_id": run_id, "stage": "run"})
         typer.echo(f"失敗した段: {', '.join(failures)}(run_id={run_id})", err=True)

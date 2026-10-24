@@ -159,13 +159,13 @@ class LLMEngine(Protocol):
 | 単一ソースの collect 失敗 | sources に失敗時刻を記録し他ソースは続行。連続失敗は doctor #14 が警告し、X は watchdog も通知(設計 02 §2・§3) |
 | 本文抽出失敗 | extraction_status=failed のままタイトル+メタで degraded 分析に回す(黙って脱落させない) |
 | LLM 失敗(transient: 検証失敗・タイムアウト) | §5 のリトライ→degraded ダイジェスト |
-| LLM 環境障害(起動不能・認証不在)・分析全滅(analyzed=0) | degraded で握らず analyze 段の失敗として raise → 失敗通知(設計 05 §4)。全滅時は degraded 行が書き込み済みのため劣化配信は併走する(GH#74)。digest は当日(JST)に分析された候補だけで全滅を判定し、劣化配信にも当日の分だけを載せる(閾値に届かず analyzed のまま残る過去の記事に当日の全滅を隠させない。過去の記事は候補のまま残す。GH#175) |
+| LLM 環境障害(起動不能・認証不在)・分析全滅(analyzed=0) | degraded で握らず analyze 段の失敗として raise → 失敗通知(設計 05 §4)。全滅時は degraded 行が書き込み済みのため劣化配信は併走する(GH#74)。digest は当日(JST)に分析された候補だけで全滅を判定し、劣化配信にも当日の分だけを載せる(閾値に届かず analyzed のまま残る過去の記事に当日の全滅を隠させない。過去の記事は候補のまま残す。GH#175)。analyze 段が失敗し、載せる記事が無い日(ランキングも劣化配信も 0 件)は、障害の空として digest を確定しない(行を作らない。「該当なし」として確定すると、復旧後の同じ日の再走が skip して回復した分析の結果が届かないため)。export・deliver はその日の digest を扱わず(段の失敗にしない)、失敗通知の 1 通に「復旧したら同じ日に `intel run` で再走すれば届く」を添える(設計 05 §4)。分析が通って載せる記事が無い日は従来どおり「該当なし」で確定する(GH#191) |
 | Telegram 送信失敗 | 指数バックオフで3回。export は deliver より前段(§2 の順序)なので Obsidian への蓄積は完了済み。全滅時は `delivery_status='failed'` のまま終了し、再走時に digest_messages 台帳で未送信のみ再送(SQLite が正本なので再送可能) |
 | Telegram 完全未設定 | deliver 段を skip(WARN ログ)。M2a 前の未セットアップ状態を段失敗にしない。欠落検知は doctor #4 の責務(設計 05 §2) |
 | 朝バッチ全体の異常終了 | watchdog(受信デーモン `intel poll` の内蔵タイマー。7:15 JST に digests の当日行を確認)が未生成を検知し Telegram に通知 |
 | 受信デーモン死亡 | launchd KeepAlive が再起動。getUpdates は offset カーソルで再開(取りこぼしなし) |
 
-冪等性: collect はソース別カーソル+content_hash 重複排除で再実行安全。`intel run` の再実行は当日 digest を再生成せず、**未配信(`delivery_status ≠ 'sent'`)の場合のみ送信し、配信済みなら skip する**(理由: 二重配信で KPI 分母を汚さない)。送信途中失敗時の「未送信アイテムのみ再送」は設計 04 §2(digest_messages 台帳)に従う。
+冪等性: collect はソース別カーソル+content_hash 重複排除で再実行安全。`intel run` の再実行は当日 digest を再生成せず、**未配信(`delivery_status ≠ 'sent'`)の場合のみ送信し、配信済みなら skip する**(理由: 二重配信で KPI 分母を汚さない)。障害の空で当日 digest を確定しなかった日(上の表。GH#191)は、再実行がその日の digest を初めて作って配信する。確定して配信済みの digest の作り直しは `--force` だけ(訂正版の仕組みは持たない)。送信途中失敗時の「未送信アイテムのみ再送」は設計 04 §2(digest_messages 台帳)に従う。
 
 ## 7. 拡張点(設計はしない、口だけ確保)
 

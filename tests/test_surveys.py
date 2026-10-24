@@ -442,6 +442,21 @@ def test_notify_run_failure_once_per_day(conn, tmp_path) -> None:
     assert "collect, digest" in api.sent[0][1]
     assert "intel run" in api.sent[0][1]
     assert get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today_jst()
+    assert "ダイジェストを作れませんでした" not in api.sent[0][1]
+
+
+def test_notify_run_failure_tells_same_day_rerun_when_digest_held(conn, tmp_path) -> None:
+    # 分析の障害で当日の digest を確定しなかった日は、同じ 1 通で同じ日の再走で届くことを知らせる
+    # (GH#191)。別の通知は足さず、同一種別 1 日 1 通の枠も同じ
+    api = FakeApi()
+    config = make_config(tmp_path)
+    notify_run_failure(conn, config, api, ["analyze"], "01RUN", logger, digest_held=True)
+    notify_run_failure(conn, config, api, ["analyze"], "01RUN2", logger, digest_held=True)
+
+    ((_, text),) = api.sent
+    assert "段: analyze / run_id=01RUN" in text
+    assert "分析の障害で今日のダイジェストを作れませんでした" in text
+    assert "今日のうちに `intel run` で再走すれば届きます" in text
 
 
 def test_notify_run_failure_swallows_send_error(conn, tmp_path) -> None:

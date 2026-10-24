@@ -183,7 +183,7 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
 
 
 def test_stage_failure_is_isolated_and_reported(conn, tmp_path, ttl_documents) -> None:
-    # プロファイル欠落 → analyze 段は失敗するが、digest(空)・purge まで進む
+    # プロファイル欠落 → analyze 段は失敗するが、digest・purge まで進む
     config = Config(
         config_dir=tmp_path,
         obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault")),
@@ -199,8 +199,9 @@ def test_stage_failure_is_isolated_and_reported(conn, tmp_path, ttl_documents) -
         "SELECT count(*) FROM items WHERE url = 'https://example.com/article'"
     ).fetchone()[0]
     assert collected == 1  # collect は成功(ttl_documents が用意した 2 件は数えない)
-    digest = conn.execute("SELECT item_count FROM digests").fetchone()
-    assert digest["item_count"] == 0  # 分析なしでも digest 段は空で完走
+    # 分析なしの空は障害の空。digest 段は確定せずに完走し、export も当日分を書かずに通る(GH#191)
+    assert "digest" not in failures and "export" not in failures
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
     assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
@@ -225,9 +226,102 @@ def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path, ttl_do
     assert "purge" not in failures and "backup" not in failures  # 後続の段は継続
     # degraded を1件も書かない(修復後の再実行がそのまま再分析になる)
     assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
-    # digest 段は空で完走(トレンドは付加機能として節省略・本体は止めない)
-    assert conn.execute("SELECT item_count FROM digests").fetchone()["item_count"] == 0
+    # 空の digest は確定しない(修復後の同じ日の再実行で作る。GH#191)。トレンドは付加機能として
+    # 節省略・本体は止めない
+    assert "digest" not in failures
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
     assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
+
+
+def use_fake_telegram(monkeypatch) -> list[httpx.Request]:
+    """朝バッチの Telegram を MockTransport に差し替え、送った request の一覧を返す。"""
+    from app import run as run_module
+    from app.delivery import TelegramApi
+
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(sent)}})
+
+    monkeypatch.setattr(
+        run_module, "create_api",
+        lambda env: TelegramApi("tok", transport=httpx.MockTransport(handler)),
+    )
+    return sent
+
+
+def with_telegram(config: Config) -> Config:
+    from dataclasses import replace
+
+    from app.config import TelegramConfig
+
+    return replace(config, telegram=TelegramConfig(owner_user_id=1, owner_chat_id=42))
+
+
+def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # 分析の障害で載せる記事が無い日は、空の digest を確定せず送らない。復旧後の同じ日の
+    # 再実行で、回復した分析の結果を作って配信する(GH#191)
+    from app.analysis.llm import LLMUnavailableError
+    from app.run import digest_held
+
+    class UnavailableEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 起動失敗")
+
+    sent = use_fake_telegram(monkeypatch)
+    args = (
+        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        {"rss": StaticConnector()}, make_http(),
+    )
+    failures = run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN1")
+    assert failures == ["analyze"]  # export・deliver は当日分を扱わず、失敗にしない
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
+    assert sent == []  # 空のダイジェストを送らない
+    assert digest_held(conn, failures)  # 失敗通知は同じ日の再走を案内する
+
+    assert run_pipeline(*args, lambda: ScriptedEngine(conn), logger, "01RUN2") == []
+    digest = conn.execute("SELECT run_id, item_count, delivery_status FROM digests").fetchone()
+    assert tuple(digest) == ("01RUN2", 1, "sent")
+    assert sent  # 回復した分析の結果が同じ日に届く
+
+
+def test_no_qualified_items_digest_is_finalized_as_before(conn, tmp_path, monkeypatch) -> None:
+    # 分析が通って載せる記事が無い日は、今までどおり「該当なし」で確定して配信し、
+    # 同じ日の再実行でも作り直さない(障害の空とは区別する。GH#191)
+    from app.run import digest_held
+
+    class LowRelevanceEngine(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            batch = super().complete_structured(prompt, schema, timeout_s)
+            return AnalysisBatch(
+                results=[result.model_copy(update={"relevance": 0}) for result in batch.results]
+            )
+
+    sent = use_fake_telegram(monkeypatch)
+    args = (
+        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        {"rss": StaticConnector()}, make_http(),
+    )
+    failures = run_pipeline(*args, lambda: LowRelevanceEngine(conn), logger, "01RUN1")
+    assert failures == []
+    assert not digest_held(conn, failures)
+    digest = conn.execute(
+        "SELECT run_id, status, item_count, delivery_status, markdown FROM digests"
+    ).fetchone()
+    assert tuple(digest)[:4] == ("01RUN1", "ok", 0, "sent")
+    assert "基準(min_score)を満たすアイテムがありませんでした" in digest["markdown"]
+    delivered = len(sent)
+
+    assert run_pipeline(*args, lambda: ScriptedEngine(conn), logger, "01RUN2") == []
+    rows = conn.execute("SELECT run_id, item_count FROM digests").fetchall()
+    assert [tuple(row) for row in rows] == [("01RUN1", 0)]  # 作り直さない
+    assert len(sent) == delivered  # 送り直さない
 
 
 def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(

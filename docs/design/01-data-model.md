@@ -385,7 +385,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 ## 8. digests
 
-- 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。
+- 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。朝バッチで analyze 段が失敗し、載せる記事が無い日は行を作らない(障害の空を「該当なし」として確定すると、同じ日の再実行が skip するため。設計 00 §6・GH#191)。
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
 - `trend_markdown`(migration 003。GH#75)= その日の「今日のトレンド」節のプレーンテキスト。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。

@@ -150,6 +150,52 @@ def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
     assert conn.execute("SELECT status FROM items").fetchone()["status"] == "analyzed"
 
 
+def test_hold_if_empty_does_not_finalize_empty_digest(conn, tmp_path) -> None:
+    # 分析の段が失敗した日の空は「該当なし」として確定しない(行を作らない。GH#191)
+    from app.digest.builder import DigestHeldError
+
+    add_analyzed(conn, "https://a/1", relevance=10)  # min_score 未満
+    config = make_config(tmp_path)
+    with pytest.raises(DigestHeldError):
+        generate_digest(conn, config, logger, hold_if_empty=True)
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM items").fetchone()["status"] == "analyzed"
+    # 載せる記事があれば、分析の段が失敗した日でも作る(先の実行で分析を済ませた候補など)
+    ok = add_analyzed(conn, "https://a/2", relevance=90)
+    digest_id = generate_digest(conn, config, logger, hold_if_empty=True)
+    row = conn.execute("SELECT item_ids FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert json.loads(row["item_ids"]) == [ok]
+
+
+def test_hold_if_empty_on_force_keeps_existing_digest(conn, tmp_path) -> None:
+    # --force の置換でも障害の空なら、旧採用 item の復帰と台帳の作り直しごと戻し、
+    # 既存の digest をそのまま残す(GH#191)
+    from dataclasses import replace
+
+    from app.config import RankingConfig
+    from app.digest.builder import DigestHeldError
+
+    item = add_analyzed(conn, "https://a/1", relevance=90)
+    config = make_config(tmp_path)
+    digest_id = generate_digest(conn, config, logger)
+    conn.execute(
+        "UPDATE digests SET delivery_status = 'sent', sent_at = 'x' WHERE id = ?", (digest_id,)
+    )
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 1)",
+        (digest_id, item),
+    )
+    strict = replace(config, ranking=RankingConfig(min_score=101))  # 旧採用 item も載らない
+    with pytest.raises(DigestHeldError):
+        generate_digest(conn, strict, logger, force=True, hold_if_empty=True)
+    row = conn.execute("SELECT id, item_ids, delivery_status FROM digests").fetchone()
+    assert (row["id"], json.loads(row["item_ids"]), row["delivery_status"]) == (
+        digest_id, [item], "sent",
+    )
+    assert conn.execute("SELECT status FROM items").fetchone()["status"] == "digested"
+    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 1
+
+
 def test_all_degraded_produces_title_only_digest(conn, tmp_path, fixed_today) -> None:
     a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
     b = add_analyzed(conn, "https://a/2", relevance=0, degraded=1)

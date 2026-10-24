@@ -214,16 +214,27 @@ def notify_run_failure(
     failures: list[str],
     run_id: str,
     logger: logging.Logger,
+    *,
+    digest_held: bool = False,
 ) -> None:
-    """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。"""
+    """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。
+
+    digest_held: 分析の障害で当日の digest を確定しなかった(GH#191)。同じ 1 通で、
+    復旧したら同じ日の再走で届くことを知らせる。
+    """
     today = today_jst()
     if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
         return
+    guide = (
+        "分析の障害で今日のダイジェストを作れませんでした。"
+        "復旧したら今日のうちに `intel run` で再走すれば届きます"
+        if digest_held
+        else "`intel run` で再走してください"
+    )
     try:
         api.send_message(
             _require_chat_id(config),
-            f"⚠️ 朝バッチ失敗(段: {', '.join(failures)} / run_id={run_id})。"
-            "`intel run` で再走してください",
+            f"⚠️ 朝バッチ失敗(段: {', '.join(failures)} / run_id={run_id})。{guide}",
         )
         # 送信成功後に記録(失敗した日は次の再走で再通知できる)
         set_state(conn, STATE_RUN_FAILURE_NOTIFIED, today)
