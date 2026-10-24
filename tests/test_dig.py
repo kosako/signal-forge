@@ -107,6 +107,40 @@ def test_parse_filler_before_next_number_not_mixed_into_previous() -> None:
     ]
 
 
+def test_parse_comma_inside_angle_kept_when_next_number_follows() -> None:
+    # 観点の中の読点より後ろを次の番号の前置きと誤認して捨てない(GH#238)。
+    # 接続語で始まっても後ろに自由文が続くなら観点の一部
+    for text, angle in (
+        ("3664 をコスト、運用の観点で 3773 はパス", "コスト、運用の観点で"),
+        ("3664 をコスト、それと運用の観点で 3773 はパス", "コスト、それと運用の観点で"),
+        ("3664 をコスト、運用の観点で\n3773 はパス", "コスト、運用の観点で"),
+        ("3664 をコスト、運用の観点で。あと 3773 はパス", "コスト、運用の観点で"),
+    ):
+        assert parse_dig_reply(text, {3664, 3773}) == [
+            DigInstruction(3664, "request", angle=angle),
+            DigInstruction(3773, "pass"),
+        ], text
+
+
+def test_parse_connector_after_comma_still_dropped() -> None:
+    # 読点の後ろが接続語だけなら次の番号の前置きとして切る(GH#238 で保つ挙動)
+    for preface in ("、あと", "、それと", "、それから", "、で", "、えっと、あと", "、"):
+        text = f"3664 をコスト、運用の観点で{preface} 3773 はパス"
+        assert parse_dig_reply(text, {3664, 3773}) == [
+            DigInstruction(3664, "request", angle="コスト、運用の観点で"),
+            DigInstruction(3773, "pass"),
+        ], text
+
+
+def test_parse_pass_followed_by_comma_and_free_text() -> None:
+    # パスは観点をとらないので、パス語の直後の読点で命令が終わる(GH#238)
+    text = "3773 はパス、気になるのは 3660 を検証の観点で"
+    assert parse_dig_reply(text, {3773, 3660}) == [
+        DigInstruction(3773, "pass"),
+        DigInstruction(3660, "request", angle="検証の観点で"),
+    ]
+
+
 # --- queue 操作 ---
 
 
