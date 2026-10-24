@@ -1281,6 +1281,45 @@ def test_reply_to_header_records_digest_note(conn, tmp_path) -> None:
     )]
 
 
+def test_reply_to_message_replaced_by_force_records_note(conn, tmp_path) -> None:
+    # GH#190: --force の置換と送り直しの後も、Telegram に残る前のメッセージへのリプライを
+    # 感想として記録する。再選抜で外れた記事(dropped)も、その記事の感想になる
+    from app.config import DigestConfig
+    from app.delivery import deliver_digest
+    from app.digest import generate_digest
+    from tests.test_delivery import ApiRecorder
+    from tests.test_ranking import add_analyzed
+
+    kept = add_analyzed(conn, "https://a/kept", relevance=90)
+    dropped = add_analyzed(conn, "https://a/dropped", relevance=80)
+    config = replace(make_config(tmp_path), digest=DigestConfig(max_items=2))
+    digest_id = generate_digest(conn, config, logger)
+    recorder = ApiRecorder()  # message_id はヘッダ 101・kept 102・dropped 103 の順
+    deliver_digest(conn, config, recorder.api(), digest_id, logger)
+
+    narrowed = replace(config, digest=DigestConfig(max_items=1))
+    assert generate_digest(conn, narrowed, logger, force=True) == digest_id
+    row = conn.execute("SELECT item_ids FROM digests").fetchone()
+    assert json.loads(row["item_ids"]) == [kept]  # dropped は再選抜で外れた
+    deliver_digest(conn, narrowed, recorder.api(), digest_id, logger)  # 104・105 を送り直す
+
+    api = FakeApi([[
+        make_reply_update("外れた記事への感想", 103, update_id=1),
+        make_reply_update("置換の前のヘッダへの感想", 101, update_id=2),
+        make_reply_update("送り直した記事への感想", 105, update_id=3),
+    ]])
+    poll_once(conn, config, api, logger)
+
+    notes = conn.execute("SELECT item_id, note FROM item_notes ORDER BY id").fetchall()
+    assert [tuple(r) for r in notes] == [
+        (dropped, "外れた記事への感想"), (kept, "送り直した記事への感想"),
+    ]
+    digest_notes = conn.execute("SELECT digest_id, note FROM digest_notes").fetchall()
+    assert [tuple(r) for r in digest_notes] == [(digest_id, "置換の前のヘッダへの感想")]
+    assert all(text != NO_URL_GUIDE for _, text in api.sent)  # URL 投入へ落ちない
+    assert manual_items(conn) == []
+
+
 @pytest.mark.parametrize("table", ["item_notes", "digest_notes"])  # 記事への感想 / 日次感想
 def test_redelivered_note_is_recorded_once(conn, tmp_path, monkeypatch, table) -> None:
     # GH#193: 感想を記帳した後、offset を保存する前に止まると同じ update が再配達される。

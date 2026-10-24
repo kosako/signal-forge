@@ -118,23 +118,31 @@ def test_force_replace_preserves_digest_notes_and_resets_delivery(conn, tmp_path
 
 
 def test_force_replace_then_deliver_resends_all(conn, tmp_path) -> None:
-    # Codex should(PR #97): --force + deliver の契約(台帳作り直し・全通再送)を直接保護
+    # Codex should(PR #97): --force + deliver の契約(今の世代の台帳を空にして全通再送)を直接保護。
+    # 前の世代の行は消さず、置換の印を付けて残す(リプライの帰属と感想の投影に使う。GH#190)
     from app.config import TelegramConfig
     from app.delivery import deliver_digest
     from tests.test_delivery import ApiRecorder
 
-    add_analyzed(conn, "https://a/1", relevance=90)
+    item = add_analyzed(conn, "https://a/1", relevance=90)
     config = make_config(tmp_path)
     tg_config = Config(config_dir=tmp_path, telegram=TelegramConfig(owner_chat_id=777))
     digest_id = generate_digest(conn, config, logger)
-    deliver_digest(conn, tg_config, ApiRecorder().api(), digest_id, logger)
+    recorder = ApiRecorder()  # 2 回の配信で同じものを使う(message_id は chat の中で重ならない)
+    deliver_digest(conn, tg_config, recorder.api(), digest_id, logger)
     assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 2  # ヘッダ+1件
 
     assert generate_digest(conn, config, logger, force=True) == digest_id
-    second = ApiRecorder()
-    deliver_digest(conn, tg_config, second.api(), digest_id, logger)
-    assert len(second.requests) == 2  # ヘッダ + 全 item が再送される(skip しない)
-    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 2  # 台帳作り直し
+    deliver_digest(conn, tg_config, recorder.api(), digest_id, logger)
+    assert len(recorder.requests) == 4  # ヘッダ + 全 item が再送される(skip しない)
+    ledger = conn.execute(
+        "SELECT item_id, message_id, superseded_at IS NOT NULL AS superseded "
+        "FROM digest_messages ORDER BY id"
+    ).fetchall()
+    assert [tuple(r) for r in ledger] == [
+        (None, 101, 1), (item, 102, 1),  # 前の世代(置換の印つきで残る)
+        (None, 103, 0), (item, 104, 0),  # 今の世代
+    ]
     row = conn.execute("SELECT delivery_status FROM digests").fetchone()
     assert row["delivery_status"] == "sent"
 
@@ -168,7 +176,7 @@ def test_hold_if_empty_does_not_finalize_empty_digest(conn, tmp_path) -> None:
 
 
 def test_hold_if_empty_on_force_keeps_existing_digest(conn, tmp_path) -> None:
-    # --force の置換でも障害の空なら、旧採用 item の復帰と台帳の作り直しごと戻し、
+    # --force の置換でも障害の空なら、旧採用 item の復帰と台帳の置換の印(GH#190)ごと戻し、
     # 既存の digest をそのまま残す(GH#191)
     from dataclasses import replace
 
@@ -193,7 +201,8 @@ def test_hold_if_empty_on_force_keeps_existing_digest(conn, tmp_path) -> None:
         digest_id, [item], "sent",
     )
     assert conn.execute("SELECT status FROM items").fetchone()["status"] == "digested"
-    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 1
+    ledger = conn.execute("SELECT superseded_at FROM digest_messages").fetchall()
+    assert [r["superseded_at"] for r in ledger] == [None]  # 今の世代のまま
 
 
 def test_all_degraded_produces_title_only_digest(conn, tmp_path, fixed_today) -> None:

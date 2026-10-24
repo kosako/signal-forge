@@ -407,6 +407,39 @@ def test_partial_resend_sends_only_missing_messages(conn, tmp_path) -> None:
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
 
 
+def test_partial_resend_ignores_superseded_generation(conn, tmp_path) -> None:
+    # GH#190: --force の置換で印を付けた前の世代の行は、送り直しの判定に使わない。
+    # 今の世代はヘッダ + item a まで送信済みで失敗した状態。前の世代には b の行もあるが、
+    # 今の世代では未送信なので b だけを送る(ヘッダと a は今の世代の行で送信済み)
+    a = add_item(conn, "https://a/1")
+    b = add_item(conn, "https://a/2", title="未送信タイトル")
+    digest_id = add_digest(conn, [a, b])
+    for item_id, message_id, superseded_at in (
+        (None, 1, "2026-07-06T00:00:00Z"),
+        (a, 2, "2026-07-06T00:00:00Z"),
+        (b, 3, "2026-07-06T00:00:00Z"),
+        (None, 4, None),
+        (a, 5, None),
+    ):
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id, superseded_at) "
+            "VALUES (?, ?, ?, ?)",
+            (digest_id, item_id, message_id, superseded_at),
+        )
+    conn.execute("UPDATE digests SET delivery_status = 'failed' WHERE id = ?", (digest_id,))
+    recorder = ApiRecorder()
+
+    sent = deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert sent == 1  # item b のみ
+    assert "未送信タイトル" in recorder.texts()[0]
+    current = conn.execute(
+        "SELECT item_id, message_id FROM digest_messages WHERE superseded_at IS NULL ORDER BY id"
+    ).fetchall()
+    assert [tuple(r) for r in current] == [(None, 4), (a, 5), (b, 101)]
+    assert conn.execute("SELECT count(*) FROM digest_messages").fetchone()[0] == 6  # 前の世代も残る
+
+
 def test_midway_failure_marks_failed_and_keeps_ledger(conn, tmp_path) -> None:
     a = add_item(conn, "https://a/1")
     b = add_item(conn, "https://a/2")
