@@ -503,7 +503,7 @@ def doctor(
 ) -> None:
     """構成不備・故障・コスト超過の検査(14項目)。終了コード: FAIL あり=1。"""
     from app.config import load_config
-    from app.doctor import has_failure, month_cost_summary, run_doctor
+    from app.doctor import has_failure, llm_cost_text, month_cost_summary, run_doctor
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
     if purge or cost:
@@ -525,7 +525,7 @@ def doctor(
             summary = month_cost_summary(conn, config)
             typer.echo(
                 f"当月実績 ${summary['spent_usd']:.2f}"
-                f"(LLM ${summary['llm_usd']:.2f} / X ${summary['x_usd']:.2f})\n"
+                f"({llm_cost_text(summary)} / X ${summary['x_usd']:.2f})\n"
                 f"着地見込み ${summary['projected_usd']:.2f} / 上限 ${summary['cap_usd']:.0f}"
             )
         return

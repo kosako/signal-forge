@@ -10,7 +10,8 @@
 - 予備も失敗したら、主の失敗と同じ種類のエラーにする(LLMUnavailableError なら段の失敗、
   LLMError なら劣化、という各段の今の扱いを変えない)
 - 予備の呼び出しは台帳(llm_fallback_calls。migration 018)に残し、月(UTC の暦月。doctor #9 の
-  当月と同じ)の上限額に達したら予備を使わない
+  当月と同じ)の上限額に達したら予備を使わない。応答の usage を受け取れず費用が分からない呼び出しは、
+  課金されうる最大の額で積む(無料として数えない。GH#241)
 - LLM の失敗(LLMError)以外の例外(実装の誤り)は予備に回さず、そのまま伝える
 """
 
@@ -101,7 +102,23 @@ class FallbackLedger:
     def cap_usd(self) -> float:
         return self._cap
 
-    def record(self, *, model: str, primary_error: str, ok: bool, usage: LLMUsage | None) -> None:
+    def record(
+        self,
+        *,
+        model: str,
+        primary_error: str,
+        ok: bool,
+        usage: LLMUsage | None,
+        cost_bound_usd: float | None,
+    ) -> None:
+        """1 呼び出しを残す。額は usage の実額。usage を受け取れず費用が分からない呼び出しは
+        トークン数を空にし、課金されうる最大の額(cost_bound_usd)を積む(上限の判定に効かせる。
+        GH#241)。どちらも無い(送っていない・エラーの応答)なら 0。
+        """
+        if usage is not None:
+            cost = usage.cost_usd
+        else:
+            cost = cost_bound_usd if cost_bound_usd is not None else 0.0
         self._conn.execute(
             "INSERT INTO llm_fallback_calls (run_id, stage, model, primary_error, ok,"
             " input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -113,7 +130,7 @@ class FallbackLedger:
                 int(ok),
                 usage.input_tokens if usage else None,
                 usage.output_tokens if usage else None,
-                usage.cost_usd if usage else 0.0,
+                cost,
             ),
         )
 
@@ -218,6 +235,7 @@ class FallbackEngine:
                 primary_error=reason,
                 ok=False,
                 usage=getattr(fallback, "last_usage", None),
+                cost_bound_usd=getattr(fallback, "last_cost_bound_usd", None),
             )
             self._logger.warning(
                 f"主のエンジンも予備も失敗(主: {primary} / 予備: {type(e).__name__}: {e})",
@@ -231,6 +249,7 @@ class FallbackEngine:
             primary_error=reason,
             ok=True,
             usage=getattr(fallback, "last_usage", None),
+            cost_bound_usd=getattr(fallback, "last_cost_bound_usd", None),
         )
         self._logger.warning(
             f"主のエンジンが失敗したため予備({self._fallback_model})で代行(主: {primary})",

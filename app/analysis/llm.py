@@ -384,6 +384,8 @@ _ANTHROPIC_UNAVAILABLE_STATUSES = frozenset({401, 403, 404})
 # 正常終了の stop_reason。max_tokens(打ち切り)・refusal(拒否)などは出力が
 # スキーマを満たす保証がないので失敗にする
 _ANTHROPIC_OK_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
+# 接続を張れなかった通信の失敗(リクエストを送っていないので課金されない。GH#241)
+_ANTHROPIC_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
 @dataclass(frozen=True)
@@ -403,7 +405,9 @@ class AnthropicApiEngine:
     URL に固定し、プロキシの環境変数は読まない(trust_env=False)。
 
     課金は応答ごとに発生するので、成功・失敗にかかわらず応答の usage を
-    `last_usage` に残す(呼び出し側が費用を記録する)。
+    `last_usage` に残す(呼び出し側が費用を記録する)。送った後に応答の usage を
+    受け取れなかった呼び出し(時間切れ・応答の切断など)は費用が分からないので、
+    課金されうる最大の額を `last_cost_bound_usd` に残す(GH#241)。
     """
 
     name = "anthropic-api"
@@ -431,11 +435,16 @@ class AnthropicApiEngine:
         self._output_price = output_usd_per_mtok
         self._transport = transport
         self.last_usage: LLMUsage | None = None
+        # 費用が分からない呼び出しの、課金されうる最大の額(分かった・送っていないときは None)
+        self.last_cost_bound_usd: float | None = None
 
     def complete_structured(
         self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
     ) -> M:
         self.last_usage = None
+        # 送った後は、応答の usage を受け取るまで費用が分からない。それまでは課金されうる
+        # 最大の額を持ち、費用が分かったら(実額・課金されない失敗)消す(GH#241)
+        self.last_cost_bound_usd = self._max_cost_usd(prompt)
         body = {
             "model": self.model,
             "max_tokens": self._max_tokens,
@@ -455,12 +464,16 @@ class AnthropicApiEngine:
                 response = client.post(_ANTHROPIC_MESSAGES_URL, headers=headers, json=body)
         # 元の例外はつながない(from None)。通信の例外のメッセージはヘッダの値(= キー)を
         # 含みうり、つなぐと traceback 経由でログに出る(logs は原因の例外も書き出す)
-        except httpx.TimeoutException as e:
-            raise LLMError(f"タイムアウト({timeout_s}s)・{type(e).__name__}") from None
         except httpx.HTTPError as e:
+            if isinstance(e, _ANTHROPIC_NOT_SENT_ERRORS):
+                self.last_cost_bound_usd = None
+            if isinstance(e, httpx.TimeoutException):
+                raise LLMError(f"タイムアウト({timeout_s}s)・{type(e).__name__}") from None
             raise LLMError(f"Anthropic API への通信失敗: {type(e).__name__}") from None
 
         if response.status_code != 200:
+            # エラーの応答は usage を返さず、完了した応答でもないので課金されない扱い(今までどおり)
+            self.last_cost_bound_usd = None
             # 応答本文のメッセージは載せない(種別だけ)。ログに残る文字列を有界に保つ
             detail = f"Anthropic API {response.status_code}({_anthropic_error_type(response)})"
             if response.status_code in _ANTHROPIC_UNAVAILABLE_STATUSES:
@@ -474,6 +487,8 @@ class AnthropicApiEngine:
             raise LLMError("Anthropic API の応答の形が不正")
 
         self.last_usage = self._usage(data.get("usage"))
+        if self.last_usage is not None:  # 実額が分かった。usage が読めなければ最大の額のまま
+            self.last_cost_bound_usd = None
         stop_reason = data.get("stop_reason")
         if stop_reason not in _ANTHROPIC_OK_STOP_REASONS:
             reason = re.sub(r"[^\w-]", "", str(stop_reason))[:40]
@@ -496,6 +511,18 @@ class AnthropicApiEngine:
             # (parse_structured は応答の先頭・入力値を載せ、原因の例外にも本文が残るため
             # つながない。GH#156 のレビュー)
             raise LLMError(_content_free_parse_error(e, _ANTHROPIC_PARSE_LABELS)) from None
+
+    def _max_cost_usd(self, prompt: str) -> float:
+        """この prompt の呼び出しで課金されうる最大の額(費用が分からないときの見積もり。GH#241)。
+
+        出力は上限の max_tokens(思考 + 本文)。入力は多めに見るため、トークン数を prompt の
+        UTF-8 のバイト数とみなす(実際のトークン数はふつうこれより少ない)。
+        """
+        input_tokens = len(prompt.encode("utf-8"))
+        cost = (
+            input_tokens * self._input_price + self._max_tokens * self._output_price
+        ) / 1_000_000
+        return round(cost, 6)
 
     def _usage(self, usage: object) -> LLMUsage | None:
         if not isinstance(usage, dict):

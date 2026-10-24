@@ -655,6 +655,31 @@ def test_anthropic_usage_reset_per_call() -> None:
     assert engine.last_usage is None  # 前回の usage を持ち越さない
 
 
+def test_anthropic_cost_bound_only_while_cost_is_unknown() -> None:
+    # 送った後に usage を受け取れなければ、課金されうる最大の額を残す(GH#241)。実額が
+    # 分かった・送っていない呼び出しでは残さず、前回の値も持ち越さない
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    def answered(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=anthropic_reply())
+
+    outcomes = iter([timeout, answered, refused])
+    engine = anthropic_engine(lambda request: next(outcomes)(request))
+    with pytest.raises(LLMError):
+        engine.complete_structured("p", Verdict)
+    # 入力は prompt の UTF-8 のバイト数(1)、出力は max_tokens: 1 × $4/M + 16k × $20/M
+    assert engine.last_cost_bound_usd == pytest.approx(0.320004)
+    engine.complete_structured("p", Verdict)
+    assert engine.last_cost_bound_usd is None
+    with pytest.raises(LLMError):
+        engine.complete_structured("p", Verdict)
+    assert engine.last_cost_bound_usd is None
+
+
 def test_create_anthropic_engine_reads_alias_key_only() -> None:
     settings = AnthropicApiConfig(model="claude-sonnet-5-5", effort="high")
     engine = create_anthropic_engine(settings, {ANTHROPIC_API_KEY_ENV: " k "})
