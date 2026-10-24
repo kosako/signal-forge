@@ -509,11 +509,12 @@ def _publish_pending_notes(
         return failures
 
     def publish(row: sqlite3.Row) -> None:
+        if not lock.begin_write():  # 見切られた後に動き出した。ロックは放されたので書かない
+            return
         try:
             _publish_row_notes(config, row, logger, run_id)
         finally:
-            if vault.stalled:  # 見切られた後に終わった。握っていたロックをここで放す
-                lock.release()
+            lock.end_write()  # 見切られた後に終わったなら、ここで放す
 
     try:
         for index, row in enumerate(rows):
@@ -546,9 +547,8 @@ def _publish_pending_notes(
                 (row["id"],),
             )
     finally:
-        # 見切ったときは、止まったスレッドが終わるまで(またはプロセスの終了まで)握る
-        if not vault.stalled:
-            lock.release()
+        # 見切ったスレッドがまだ書いているなら、それが終わるまで(またはプロセスの終了まで)握る
+        lock.leave()
     return failures
 
 
@@ -580,11 +580,17 @@ class _PublishLock:
     同じノートを公開し、本人が take を足したあとで、遅れた書き込みがノートを置き換えないよう、
     見切ったときはそのスレッドが終わるまで握る。flock なのでプロセスが終われば外れる
     (止まったスレッドもプロセスと一緒に消える)。answer.lock(GH#145)と同じ考え方。
+
+    放す役は 1 つの mutex の下で決める: 書き出しのスレッドの終わり(end_write)と呼び出し側の
+    離脱(leave)のうち、後になった側が放す。見切りの判定の直後にスレッドが書き終えても、
+    どちらも放さずに残ることはない。
     """
 
     def __init__(self, fd: int | None) -> None:
         self._fd = fd
         self._mutex = threading.Lock()
+        self._writing = False  # 書き出しのスレッドが動いている
+        self._left = False  # 呼び出し側が公開を終えた(見切った場合を含む)
 
     @classmethod
     def acquire(cls, conn: sqlite3.Connection) -> _PublishLock | None:
@@ -609,13 +615,33 @@ class _PublishLock:
         os.close(fd)
         return None
 
-    def release(self) -> None:
-        """放す(fd を閉じると flock も外れる)。呼び出し側のスレッドと止まったスレッドの
-        どちらが先に呼んでもよく、2 回目は何もしない。"""
+    def begin_write(self) -> bool:
+        """書き出しのスレッドの始まり。呼び出し側が既に離れていれば False(書かない)。"""
         with self._mutex:
-            if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
+            if self._left:
+                return False
+            self._writing = True
+            return True
+
+    def end_write(self) -> None:
+        """書き出しのスレッドの終わり。呼び出し側が先に離れていれば、ここで放す。"""
+        with self._mutex:
+            self._writing = False
+            if self._left:
+                self._close()
+
+    def leave(self) -> None:
+        """呼び出し側の離脱。書き出し中のスレッドがあれば、放すのはその終わり(end_write)に任せる。"""
+        with self._mutex:
+            self._left = True
+            if not self._writing:
+                self._close()
+
+    def _close(self) -> None:
+        """放す(fd を閉じると flock も外れる。2 回目は何もしない)。mutex の中で呼ぶ。"""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
 
 def _publish_lock_path(conn: sqlite3.Connection) -> Path | None:
