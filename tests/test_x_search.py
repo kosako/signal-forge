@@ -61,7 +61,8 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
                    unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
-    200 応答は max_results で data を切り詰めて実 API の挙動を模す。"""
+    200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
+    そのページの要求で送出する(通信の失敗。GH#182)。"""
     token_index: dict[str, int] = {}
     for series in pages.values():
         for i, (_s, body, _h) in enumerate(series):
@@ -79,6 +80,8 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         slot = raw_query.removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
         token = query.get("next_token", [None])[0]
         status, body, headers = pages[slot][0 if token is None else token_index[token]]
+        if isinstance(status, Exception):
+            raise status
         if status == 200:
             limit = int(query["max_results"][0])
             body = {**body, "data": body.get("data", [])[:limit]}
@@ -314,6 +317,53 @@ def test_later_slot_failure_carries_error_with_partial_items(status, error_type)
     assert isinstance(result.partial_error, error_type)
     assert str(status) in str(result.partial_error)
     assert result.next_cursor == {"since_id": "100"}  # watermark は据え置き(既存の契約)
+
+
+def test_transport_error_after_prior_slot_returns_partial_with_cost() -> None:
+    # GH#182: 後ろのスロットで通信のリトライが尽きても、先のスロットの取得ぶんと読み取りの
+    # 件数・費用を返す(例外で捨てると費用が台帳に残らない)。HTTP の失敗と同じく理由を載せ、
+    # 残りのスロットは取らず、watermark は据え置く
+    seen: list[httpx.Request] = []
+    pages = {
+        "a": [(200, page([tweet("500")]), {})],
+        "b": [(httpx.ConnectError("boom"), {}, {})],
+        "c": [(200, page([tweet("600")]), {})],
+    }
+    result = connector_from(pages, slots=("a", "b", "c"), seen=seen).fetch(
+        make_source(), {"since_id": "100"}
+    )
+    assert [i.external_id for i in result.items] == ["500"]
+    assert result.stats.api_reads == 1
+    assert result.stats.estimated_cost_usd == pytest.approx(0.004)
+    assert isinstance(result.partial_error, RetryableError)
+    assert "接続失敗" in str(result.partial_error)
+    assert result.next_cursor == {"since_id": "100"}
+    sent = [parse_qs(urlsplit(str(r.url)).query)["query"][0] for r in seen]
+    assert sent.count(f"(b) {X_SEARCH_QUERY_SUFFIX}") == 3  # 初回 + 2 回リトライしてから諦める
+    assert f"(c) {X_SEARCH_QUERY_SUFFIX}" not in sent
+
+
+def test_transport_error_on_later_page_of_first_slot_returns_partial() -> None:
+    # 同じスロットの 2 ページ目で尽きた場合も、そのスロットの 1 ページ目は部分取得として返す(GH#182)
+    pages = {
+        "a": [
+            (200, page([tweet(str(500 - i)) for i in range(10)], next_token="tok1"), {}),
+            (httpx.ConnectError("boom"), {}, {}),
+        ],
+    }
+    result = connector_from(pages, slots=("a",), daily_read_cap=35).fetch(
+        make_source(), {"since_id": "100"}
+    )
+    assert result.stats.api_reads == 10
+    assert isinstance(result.partial_error, RetryableError)
+    assert result.next_cursor == {"since_id": "100"}
+
+
+def test_transport_error_with_zero_total_raises() -> None:
+    # 累計 0 件での通信の失敗は、HTTP の失敗と同じく「0件成功」で隠さず例外
+    pages = {"a": [(httpx.ConnectError("boom"), {}, {})], "b": [(200, page([tweet("1")]), {})]}
+    with pytest.raises(RetryableError, match="接続失敗"):
+        connector_from(pages, slots=("a", "b")).fetch(make_source(), {})
 
 
 def test_budget_cut_is_normal_and_advances_cursor() -> None:

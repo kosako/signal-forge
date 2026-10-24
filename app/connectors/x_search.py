@@ -18,9 +18,10 @@
   出ると毎日 400 で永久に進まないため、窓の端に近い(SINCE_ID_MAX_AGE より古い)since_id は
   外して取得する(GH#121。窓の外の欠落は API 上取り戻せない)。
 - 打ち切り・失敗はホームTL と同じ方針: rate limit 残 0 で全体打ち切り / 累計 0 件での
-  HTTP 失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。部分取得後の
+  HTTP・通信の失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。部分取得後の
   失敗は取得ぶんを返しつつ理由を `FetchResult.partial_error` に載せ、collect にソースの失敗と
   して記録させる(GH#183。後ろのスロットの壊れたクエリの 400 などを正常扱いで隠さない)。
+  通信のリトライ尽きも同じに扱う(GH#182。例外で取得ぶんを捨てると読み取りの費用も台帳に残らない)。
   予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
@@ -36,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 from app.config import X_SEARCH_MIN_PAGE, x_search_query
-from app.connectors.base import FetchResult, FetchStats, RawItem
+from app.connectors.base import FetchResult, FetchStats, RawItem, RetryableError
 from app.connectors.x import (
     API_BASE,
     MAX_RESULTS,
@@ -157,7 +158,7 @@ class XSearchConnector:
     ) -> tuple[list[dict], int | None, bool, Exception | None]:
         """1スロット分のページング取得。returns (tweets, http_status, stop_all, error)。
 
-        error = 部分取得のあとの HTTP の失敗(GH#183)。そのとき stop_all も真。
+        error = 部分取得のあとの HTTP・通信の失敗(GH#183・GH#182)。そのとき stop_all も真。
         """
         tweets: list[dict] = []
         token: str | None = None
@@ -174,7 +175,14 @@ class XSearchConnector:
                 params["since_id"] = since_id
             if token:
                 params["next_token"] = token  # search/recent は pagination_token でなく next_token
-            response = self._session.get(SEARCH_URL, params)
+            try:
+                response = self._session.get(SEARCH_URL, params)
+            except RetryableError as e:
+                # 通信のリトライ尽きも HTTP の失敗と同じに扱う(GH#182)。既取得分を例外で
+                # 捨てると、その読み取りの費用も台帳に残らない
+                if not have_prior and not tweets:
+                    raise
+                return tweets, http_status, True, e
             http_status = response.status_code
             raise_for_auth(response, "search/recent")
             if response.status_code != 200:
