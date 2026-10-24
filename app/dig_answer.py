@@ -278,12 +278,25 @@ def _record_answer_with_redig(
     キューに積めたときだけ知らせを付ける(積めなかったのに「調べ直します」と送らない)。
     キューへの積み方は未消化一覧へのリプライ指定と同じ(dig.apply_instructions: queued へ戻し、
     requested_at を更新して優先し、観点を上書きする。source は変えない)。
+    質問を受け付けた後に本人がそのアイテムをパス・指定し直していたら(返事を作る数分の間の
+    未消化一覧への操作)、古い依頼で上書きせず、積まずに False を返す(GH#235)。
     """
     angle = row["question"].strip()[:REDIG_ANGLE_MAX_CHARS] or None
     try:
         conn.execute("BEGIN IMMEDIATE")  # 接続は autocommit
+        if _operated_after(conn, row["item_id"], row["id"]):
+            conn.execute("ROLLBACK")
+            logger.info(
+                "受け付けた後にパス・指定し直しがあったため、調べ直しを積まない(返事だけ送る)",
+                extra=log_extra,
+            )
+            return False
         _record_answer(conn, row["id"], kind, answer + REDIG_NOTICE, redig=True)
-        apply_instructions(conn, [DigInstruction(row["item_id"], "request", angle=angle)])
+        apply_instructions(
+            conn,
+            [DigInstruction(row["item_id"], "request", angle=angle)],
+            from_backlog=False,
+        )
         conn.execute("COMMIT")
     except sqlite3.Error as e:
         if conn.in_transaction:
@@ -294,6 +307,21 @@ def _record_answer_with_redig(
         )
         return False
     return True
+
+
+def _operated_after(conn: sqlite3.Connection, item_id: int, question_id: int) -> bool:
+    """質問を受け付けた後に、本人が未消化一覧でそのアイテムをパス・指定し直したか(GH#235)。
+
+    未消化一覧への操作は、反映した時点で受け付け済みだった質問の id の最大を印に残す
+    (dig_queue.backlog_op_question_id。migration 022)。質問の id がそれ以下なら、質問は
+    その操作より前に受け付けている。時刻は秒の単位で同じ秒の先後が分からないので使わない。
+    先の調べ直しの依頼と朝の深掘りの done は印を変えない(本人の未消化一覧への操作ではない。
+    続けて送った調べ直しや、掘った後の調べ直しは今どおり積む)。
+    """
+    queue = conn.execute(
+        "SELECT backlog_op_question_id AS mark FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    return queue is not None and queue["mark"] is not None and queue["mark"] >= question_id
 
 
 class _Sender:

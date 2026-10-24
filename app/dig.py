@@ -114,8 +114,17 @@ def enqueue_bookmark(conn: sqlite3.Connection, item_id: int) -> bool:
     return inserted == 1
 
 
+# 受付の順序の印(GH#235)。未消化一覧への操作なら受け付け済みの質問の id の最大(質問が
+# まだ無ければ 0)、そうでなければ NULL にして、既存の行では前の印を残す
+_BACKLOG_MARK = "CASE WHEN ? THEN (SELECT coalesce(max(id), 0) FROM dig_questions) END"
+_KEEP_MARK = "COALESCE(excluded.backlog_op_question_id, dig_queue.backlog_op_question_id)"
+
+
 def apply_instructions(
-    conn: sqlite3.Connection, instructions: list[DigInstruction]
+    conn: sqlite3.Connection,
+    instructions: list[DigInstruction],
+    *,
+    from_backlog: bool = True,
 ) -> None:
     """命令列をキューへ反映する(commit は呼び出し側)。
 
@@ -126,31 +135,39 @@ def apply_instructions(
       とき前回の観点が生きる)
     - source は初回投入の経路のまま変えない(migration 009 の契約。明示指定の有無は
       requested_at / status が担う)
+    - from_backlog = 未消化一覧への本人の操作か(既定)。そうなら受付の順序の印として、
+      反映した時点で受け付け済みの質問(dig_questions.id)の最大を残す(migration 022)。
+      深掘りカードへの調べ直しの依頼(dig_answer)は False で、印を変えない。返事を作る間の
+      未消化一覧への操作を、作り終えた古い依頼で上書きしないための照合に使う(GH#235)
     """
     for instruction in instructions:
         if instruction.action == "pass":
             conn.execute(
-                """
-                INSERT INTO dig_queue (item_id, status, source)
-                VALUES (?, 'passed', 'request')
+                f"""
+                INSERT INTO dig_queue (item_id, status, source, backlog_op_question_id)
+                VALUES (?, 'passed', 'request', {_BACKLOG_MARK})
                 ON CONFLICT(item_id) DO UPDATE SET
                   status = 'passed',
+                  backlog_op_question_id = {_KEEP_MARK},
                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 """,
-                (instruction.item_id,),
+                (instruction.item_id, int(from_backlog)),
             )
         else:
             conn.execute(
-                """
-                INSERT INTO dig_queue (item_id, status, source, angle, requested_at)
-                VALUES (?, 'queued', 'request', ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                f"""
+                INSERT INTO dig_queue
+                  (item_id, status, source, angle, requested_at, backlog_op_question_id)
+                VALUES (?, 'queued', 'request', ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                        {_BACKLOG_MARK})
                 ON CONFLICT(item_id) DO UPDATE SET
                   status = 'queued',
                   angle = COALESCE(excluded.angle, dig_queue.angle),
                   requested_at = excluded.requested_at,
+                  backlog_op_question_id = {_KEEP_MARK},
                   updated_at = excluded.updated_at
                 """,
-                (instruction.item_id, instruction.angle),
+                (instruction.item_id, instruction.angle, int(from_backlog)),
             )
 
 
