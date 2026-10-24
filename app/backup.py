@@ -58,7 +58,7 @@ def backup_daily(
             with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
                 tar.add(snapshot, arcname="intel.db")
                 _add_dir_if_exists(tar, config.config_dir, "config", logger, run_id=run_id)
-                _add_profile_if_outside(tar, config)
+                _add_profile_if_outside(tar, config, logger, run_id=run_id)
                 _add_dir_if_exists(tar, prompts_dir, "prompts", logger, run_id=run_id)
             os.replace(partial_path, archive_path)  # 当日再実行は置換(冪等)
         except BaseException:
@@ -104,18 +104,41 @@ def _add_dir_if_exists(
         tar.add(directory, arcname=arcname)
 
 
-def _add_profile_if_outside(tar: tarfile.TarFile, config: Config) -> None:
+def _add_profile_if_outside(
+    tar: tarfile.TarFile,
+    config: Config,
+    logger: logging.Logger,
+    *,
+    run_id: str | None,
+) -> None:
     # 関心プロファイルは分析・深掘り・返事が読む正本で、欠落すると止まる(設計 03 §4)。
     # [analysis].profile_path で設定ディレクトリの外に置くと config/ に入らないので、
     # 実際に読むファイルを profile/<読む名前> に別に入れる(GH#199)。中にあれば config/ に
-    # 入っているので二重に入れない。中の symlink が外を指す場合は config/ にリンクしか
-    # 残らないので、解決した先で中か外かを決め、中身を入れる。
-    # 無い・壊れた symlink(循環を含む)は入れない。解決より先に確かめるのは、Python 3.12 の
-    # resolve() が循環 symlink で RuntimeError を出し、DB を含む世代ごと作れなくなるため
-    if not config.profile_path.is_file():
+    # 入っているので二重に入れない(設定ディレクトリ自体が symlink でも config/ には実体の
+    # 中身が入るので、実体の側を指す profile_path も中として扱う。GH#279)。中の symlink が
+    # 外を指す場合は config/ にリンクしか残らないので、解決した先で中か外かを決め、中身を入れる。
+    # 無ければ入れない
+    profile = config.profile_path
+    if profile.is_symlink():
+        # 循環・リンク切れで解決できなければ入れずに WARN を残し、DB を含む世代は作る
+        # (_add_dir_if_exists と同じ扱い。resolve() は循環で Python 3.12 は RuntimeError を出す)
+        try:
+            profile = profile.resolve(strict=True)
+        except (OSError, RuntimeError) as e:
+            logger.warning(
+                f"symlink を解決できず関心プロファイルを profile/ に入れない: {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "backup"},
+            )
+            return
+    if not profile.is_file():
         return
-    profile = config.profile_path.resolve()
-    if profile.is_relative_to(config.config_dir.resolve()):
+    profile = profile.resolve()  # 親の dir の symlink も解決してから設定ディレクトリと比べる
+    try:
+        config_dir = config.config_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
+        # 解決できない設定ディレクトリは config/ に入らない(GH#279)ので、外として扱う
+        config_dir = None
+    if config_dir is not None and profile.is_relative_to(config_dir):
         return
     tar.add(profile, arcname=f"profile/{config.profile_path.name}")
 

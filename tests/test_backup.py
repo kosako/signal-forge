@@ -8,7 +8,7 @@ import pytest
 
 from app.analysis.profile import load_interest_profile
 from app.backup import GENERATIONS, backup_daily
-from app.config import Config, StorageConfig, load_config
+from app.config import AnalysisConfig, Config, StorageConfig, load_config
 from app.db import apply_migrations, connect
 
 logger = logging.getLogger("test-backup")
@@ -221,16 +221,75 @@ def test_symlinked_profile_in_config_dir_backs_up_its_content(conn, tmp_path) ->
     assert load_interest_profile(restored.profile_path).updated == "2026-10-01"
 
 
-def test_profile_symlink_loop_does_not_break_backup(conn, tmp_path) -> None:
-    # 循環 symlink のプロファイルは入れず、DB を含む世代は作る(Python 3.12 の resolve() は
-    # 循環で RuntimeError を出すため、解決より先に確かめる)
-    config = make_config(tmp_path)
-    loop = config.config_dir / "interest-profile.md"
-    loop.symlink_to(loop)
+def test_profile_on_real_side_of_symlinked_config_dir_goes_into_config(conn, tmp_path) -> None:
+    # 設定ディレクトリ自体が symlink で、profile_path がリンクの先(実体の側)を指していても、
+    # 中身は config/ に入る(GH#279 で config/ に実体の中身が入る)。中として扱い、
+    # profile/ に二重に入れない(GH#199)
+    real = tmp_path / "conf-real"
+    real.mkdir()
+    (real / "interest-profile.md").write_text(PROFILE_TEXT, encoding="utf-8")
+    (real / "config.toml").write_text(
+        f'[analysis]\nprofile_path = "{real / "interest-profile.md"}"\n\n'
+        f'[storage]\nbackup_dir = "{tmp_path / "backups"}"\n',
+        encoding="utf-8",
+    )
+    link = tmp_path / "conf-link"
+    link.symlink_to(real, target_is_directory=True)
+    config = load_config(link)
 
     archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
 
     with tarfile.open(archive) as tar:
         names = tar.getnames()
+        member = tar.getmember("config/interest-profile.md")
+        assert member.isfile()
+        assert tar.extractfile(member).read().decode("utf-8") == PROFILE_TEXT
+    assert not [n for n in names if n.split("/")[0] == "profile"]
+
+
+@pytest.mark.parametrize("kind", ["loop", "dangling"])
+def test_unresolvable_profile_symlink_is_skipped_with_warning(
+    conn, tmp_path, caplog, kind
+) -> None:
+    # 循環・リンク切れの symlink のプロファイルは入れずに WARN を残し、DB を含む世代は作る
+    # (設定ディレクトリの symlink と同じ扱い。GH#279)。Python 3.12 の resolve() は循環で
+    # RuntimeError を出す
+    config = make_config(tmp_path)
+    link = config.config_dir / "interest-profile.md"
+    link.symlink_to(link if kind == "loop" else tmp_path / "missing.md")
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
     assert "intel.db" in names
     assert not [n for n in names if n.split("/")[0] == "profile"]
+    assert any(
+        r.levelno == logging.WARNING and "profile/" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_outside_profile_is_backed_up_when_config_dir_cannot_be_resolved(conn, tmp_path) -> None:
+    # 設定ディレクトリが循環する symlink だと config/ は入らない(WARN。GH#279)。外の
+    # プロファイルを比べる先が解決できなくても止めずに profile/ に入れ、DB を含む世代は作る
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    profile = tmp_path / "vault" / "my-profile.md"
+    profile.parent.mkdir()
+    profile.write_text(PROFILE_TEXT, encoding="utf-8")
+    config = Config(
+        config_dir=loop_a,
+        analysis=AnalysisConfig(profile_path=str(profile)),
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
+    )
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        assert tar.extractfile("profile/my-profile.md").read().decode("utf-8") == PROFILE_TEXT
+    assert "intel.db" in names
+    assert not [n for n in names if n.split("/")[0] == "config"]
