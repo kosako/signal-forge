@@ -148,7 +148,8 @@ def save_token(config_dir: Path, token: XOAuth2Token) -> None:
 @contextlib.contextmanager
 def _token_lock(config_dir: Path) -> Iterator[None]:
     """refresh のプロセス間直列化(朝バッチ + doctor の同時 refresh でローテーション競合
-    = 片方が invalid_grant で認可チェーンを失うのを防ぐ)。"""
+    = 片方が invalid_grant で認可チェーンを失うのを防ぐ)。再認可(intel x-auth)の
+    交換・保存も同じロックに入る(refresh の保存で再認可の token を上書きさせない。GH#233)。"""
     lock_path = config_dir / LOCK_FILENAME
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
@@ -405,15 +406,19 @@ def run_authorization_flow(
     echo(url)
     open_browser(url)
     code = server.wait_for_code(timeout_s)
-    token = exchange_code(
-        client,
-        client_id=client_id,
-        client_secret=client_secret,
-        code=code,
-        redirect_uri=redirect_uri,
-        code_verifier=verifier,
-    )
-    save_token(config_dir, token)
+    # 交換から保存までを refresh と同じロックで直列化する(GH#233)。朝バッチ・doctor の
+    # refresh の往復中に再認可すると、後から保存される refresh の結果が再認可の token を
+    # 上書きしうるため。ブラウザ待ちの間はロックを持たない(その間の refresh を止めない)
+    with _token_lock(config_dir):
+        token = exchange_code(
+            client,
+            client_id=client_id,
+            client_secret=client_secret,
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=verifier,
+        )
+        save_token(config_dir, token)
     return token
 
 

@@ -78,7 +78,7 @@ class Connector(Protocol):
 
 - **前提事実(API 実確認 2026-07-13)**: access token は **offline.access を付けても 2h で失効**する。無人朝バッチには refresh token(**offline.access scope 必須** — Issue #58 記載の 4 scope に追加)が要る。refresh token は**ローテーションされる**(使用のたびに新 refresh token が発行される)前提で設計する。
 - **scope**: `tweet.read users.read bookmark.read like.read offline.access`(S1b の取込に必要な最小集合)。
-- **認可フロー(`intel x-auth`)**: PKCE(S256)+ loopback redirect(`http://127.0.0.1:<port>/callback`。port は config `[x_oauth2].callback_port`、既定 8791。**portal 登録の redirect URI と完全一致必須**)。state 照合(不一致は中断)。public client(Native App 型)は body の client_id、confidential client(Web App 型)は .env `X_OAUTH2_CLIENT_SECRET` の Basic 認証。
+- **認可フロー(`intel x-auth`)**: PKCE(S256)+ loopback redirect(`http://127.0.0.1:<port>/callback`。port は config `[x_oauth2].callback_port`、既定 8791。**portal 登録の redirect URI と完全一致必須**)。state 照合(不一致は中断)。public client(Native App 型)は body の client_id、confidential client(Web App 型)は .env `X_OAUTH2_CLIENT_SECRET` の Basic 認証。callback を受けたあとの code の交換から token の保存までは、refresh と同じプロセス間のファイルロック(config_dir の `x-oauth2-token.lock`)の中で行う。朝バッチ・doctor の refresh の往復中に再認可しても、後から保存される refresh の結果で再認可の token を上書きさせないため。ブラウザ待ちの間はロックを持たない(GH#233)。
 - **token 保存**: `~/.config/intel/x-oauth2-token.json`(chmod 600・.env と同じ扱い = 設計 05 §6)。**0600 一時ファイル → rename の原子的更新**(ローテーションされた refresh token の取りこぼし = 認可チェーン切断を防ぐ)。壊れたファイルは fail fast(黙って再認可に倒さない)。
 - **セッション(`XOAuth2Session`)**: Bearer つき GET。共通リトライ規約(設計 05 §8)は `XApiSession` と同形(429 は待たず即返す)。失効 5 分前の先回り refresh + 401 時の1回 refresh。**新 token は使用前に永続化**(保存失敗時に旧 token で続行しない)。refresh 失敗は再認可(`intel x-auth`)の案内つきエラー。
 - **検証**: `/2/users/me`(読取課金なし)。x-auth の完了確認と doctor #13 が使う。

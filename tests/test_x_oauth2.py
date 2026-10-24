@@ -1,8 +1,10 @@
 import base64
+import contextlib
 import hashlib
 import os
 import stat
 import threading
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
@@ -559,3 +561,150 @@ def test_run_authorization_flow_end_to_end(tmp_path: Path) -> None:
     form = dict(parse_qsl(captured[0].content.decode()))
     assert form["code"] == "ok"
     assert len(form["code_verifier"]) >= 43  # PKCE verifier が交換に使われている
+
+
+# --- 再認可と並行する refresh(GH#233) ---
+
+
+def approve_in_browser(before_redirect: Callable[[], None] = lambda: None):
+    """open_browser の代わり。別スレッドで before_redirect のあと、認可完了の redirect を模す。"""
+
+    def fake_browser(url: str) -> None:
+        params = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+
+        def user_approves() -> None:
+            before_redirect()
+            hit(f"{params['redirect_uri']}?code=ok&state={params['state']}")
+
+        threading.Thread(target=user_approves).start()
+
+    return fake_browser
+
+
+def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 朝バッチ・doctor の refresh が token エンドポイントとの往復中(ロック保持中)に x-auth の
+    # callback が届いても、再認可の交換・保存は refresh の保存の後に行う。最後に残る token は
+    # 再認可のもの(古い認可の refresh の結果で上書きされない)
+    from app.connectors import x_oauth2
+
+    save_token(tmp_path, make_token())  # 古い認可の token(rt-1)
+    order: list[str] = []  # token エンドポイントが応答した順
+    errors: list[BaseException] = []
+    refresh_in_flight = threading.Event()
+    release_refresh = threading.Event()
+    reauth_reached = threading.Event()  # 再認可がロックを求めた(求めずに進めば完了した)
+
+    def batch_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            refresh_in_flight.set()
+            # 往復の途中で止める。待ちが切れたら refresh を失敗させ、errors でテストを落とす
+            # (切れたまま進むと、再認可が始まる前に refresh の保存が終わり順序を確かめられない)
+            assert release_refresh.wait(timeout=10), "refresh の解放待ちが切れた"
+            order.append("refresh")
+            return httpx.Response(200, json=token_response(2))
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    def reauth_handler(request: httpx.Request) -> httpx.Response:
+        order.append("reauth")
+        return httpx.Response(200, json=token_response(9))  # 再認可の token(rt-9)
+
+    real_lock = x_oauth2._token_lock
+
+    @contextlib.contextmanager
+    def observed_lock(config_dir: Path) -> Iterator[None]:
+        if threading.current_thread().name == "reauth":
+            reauth_reached.set()  # ここから先は refresh の保存を待つ
+        with real_lock(config_dir):
+            yield
+
+    monkeypatch.setattr(x_oauth2, "_token_lock", observed_lock)
+    expired = make_token(expires_at="2026-07-13T11:00:00Z")
+    session = make_session(tmp_path, httpx.MockTransport(batch_handler), expired)
+
+    def batch() -> None:
+        try:
+            fetch_me(session)  # 失効済み → refresh
+        except BaseException as e:
+            errors.append(e)
+
+    def reauth() -> None:
+        try:
+            with httpx.Client(transport=httpx.MockTransport(reauth_handler)) as client:
+                run_authorization_flow(
+                    client,
+                    config_dir=tmp_path,
+                    client_id="cid",
+                    client_secret=None,
+                    callback_port=0,
+                    echo=lambda _s: None,
+                    open_browser=approve_in_browser(),
+                    timeout_s=10,
+                )
+        except BaseException as e:
+            errors.append(e)
+        finally:
+            reauth_reached.set()
+
+    batch_thread = threading.Thread(target=batch)
+    reauth_thread = threading.Thread(target=reauth, name="reauth")
+    batch_thread.start()
+    try:
+        assert refresh_in_flight.wait(timeout=10)
+        reauth_thread.start()
+        assert reauth_reached.wait(timeout=10)
+    finally:
+        release_refresh.set()
+    batch_thread.join(timeout=10)
+    reauth_thread.join(timeout=10)
+    assert errors == []
+    assert order == ["refresh", "reauth"]  # 交換は refresh の往復と保存が終わってから
+    assert load_token(tmp_path).refresh_token == "rt-9"  # 再認可の token が残る
+
+
+def test_reauth_does_not_hold_lock_while_waiting_for_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 本人がブラウザで認可している間はロックを持たない(その間の refresh を止めない)
+    import fcntl
+
+    from app.connectors.x_oauth2 import LOCK_FILENAME
+
+    waiting = threading.Event()  # 認可側が callback 待ちに入った
+    real_wait = CallbackServer.wait_for_code
+
+    def observed_wait(self: CallbackServer, timeout_s: int) -> str:
+        waiting.set()
+        return real_wait(self, timeout_s)
+
+    monkeypatch.setattr(CallbackServer, "wait_for_code", observed_wait)
+    lock_state: list[str] = []
+
+    def try_lock() -> None:
+        # callback 待ちに入ってから確かめる(待ちに入る前にロックを取る回帰も見逃さない)
+        if not waiting.wait(timeout=10):
+            lock_state.append("unsynced")
+            return
+        fd = os.open(tmp_path / LOCK_FILENAME, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_state.append("free")
+        except BlockingIOError:
+            lock_state.append("held")
+        finally:
+            os.close(fd)
+
+    with httpx.Client(transport=capture_transport([], token_response(1))) as client:
+        token = run_authorization_flow(
+            client,
+            config_dir=tmp_path,
+            client_id="cid",
+            client_secret=None,
+            callback_port=0,
+            echo=lambda _s: None,
+            open_browser=approve_in_browser(before_redirect=try_lock),
+            timeout_s=10,
+        )
+    assert lock_state == ["free"]
+    assert load_token(tmp_path) == token
