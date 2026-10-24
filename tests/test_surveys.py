@@ -414,6 +414,17 @@ def test_watchdog_notifies_when_digest_unsent(conn, tmp_path) -> None:
     assert any("未配信" in t for _, t in api.sent)
 
 
+def test_watchdog_unsent_tells_resend_by_date(conn, tmp_path) -> None:
+    # 翌日の配信は当日分しか送らないので、日をまたいだときの送り直し方をその日の日付で添える
+    # (GH#247)
+    add_undelivered_digest(conn, [], WATCHDOG_DUE)
+    api = FakeApi()
+    run_due_timers(conn, make_config(tmp_path), api, logger, WATCHDOG_DUE)
+    ((_, text),) = api.sent
+    assert "未配信" in text
+    assert "`intel deliver --date 2026-10-20`" in text
+
+
 def test_watchdog_silent_when_digest_sent(conn, tmp_path) -> None:
     digest_id = add_digest(conn, [])
     conn.execute("UPDATE digests SET delivery_status = 'sent' WHERE id = ?", (digest_id,))
@@ -443,6 +454,28 @@ def test_notify_run_failure_once_per_day(conn, tmp_path) -> None:
     assert "intel run" in api.sent[0][1]
     assert get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today_jst()
     assert "ダイジェストを作れませんでした" not in api.sent[0][1]
+
+
+def test_notify_run_failure_tells_resend_by_date_when_deliver_failed(conn, tmp_path) -> None:
+    # 配信だけが失敗した日は、日をまたいだら日付を指定して送り直せることを添える(GH#247)
+    api = FakeApi()
+    notify_run_failure(conn, make_config(tmp_path), api, ["deliver"], "01RUN", logger)
+
+    ((_, text),) = api.sent
+    assert "`intel run` で再走してください" in text
+    assert f"`intel deliver --date {today_jst()}`" in text
+
+
+def test_notify_run_failure_omits_resend_by_date_without_digest(conn, tmp_path) -> None:
+    # digest を作れなかった日は日付を指定しても送るものが無いので、送り直し方を添えない
+    api = FakeApi()
+    notify_run_failure(
+        conn, make_config(tmp_path), api, ["digest", "export", "deliver"], "01RUN", logger
+    )
+
+    ((_, text),) = api.sent
+    assert "`intel run` で再走してください" in text
+    assert "intel deliver" not in text
 
 
 def test_notify_run_failure_tells_same_day_rerun_when_digest_held(conn, tmp_path) -> None:

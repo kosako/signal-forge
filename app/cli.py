@@ -149,22 +149,43 @@ def digest(
 @app.command()
 def deliver(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    digest_date: str | None = typer.Option(
+        None,
+        "--date",
+        help="送る digest の日付(YYYY-MM-DD・JST。既定 = 当日)。日をまたいで届かなかった"
+        "過去の分を送り直す。台帳にある分は送らない(GH#247)",
+    ),
 ) -> None:
-    """当日ダイジェストを Telegram に配信する。"""
+    """当日ダイジェストを Telegram に配信する(--date で過去の未配信の分を送り直す)。"""
+    from datetime import datetime
+
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.delivery import create_api, deliver_digest
     from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
 
+    if digest_date is not None:
+        # 過去の分は自動で繰り越さず、本人が日付で指定して送る(日次配信の契約と通知の量を
+        # 変えない。GH#247)。DB の digest_date と同じ 0 埋めの形に揃えてから引く
+        try:
+            digest_date = datetime.strptime(digest_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            typer.echo(f"--date が不正: {digest_date}(YYYY-MM-DD で指定)", err=True)
+            raise typer.Exit(code=1) from None
     config = load_config(config_dir)
     env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
-    row = conn.execute("SELECT id FROM digests WHERE digest_date = ?", (today_jst(),)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM digests WHERE digest_date = ?", (digest_date or today_jst(),)
+    ).fetchone()
     if row is None:
-        typer.echo("当日の digest が存在しない(先に intel digest を実行)", err=True)
+        if digest_date is None:
+            typer.echo("当日の digest が存在しない(先に intel digest を実行)", err=True)
+        else:
+            typer.echo(f"{digest_date} の digest が存在しない", err=True)
         raise typer.Exit(code=1)
     sent = deliver_digest(conn, config, create_api(env), row["id"], logger)
     typer.echo("配信済み(skip)" if sent == 0 else f"配信完了({sent}通)")

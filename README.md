@@ -145,7 +145,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 | `extract` | items から本文を抜き出し documents を作る | |
 | `analyze` | 事前選別と LLM の本分析で analyses を作る | 関心プロファイルが必要 |
 | `digest` | ランキングして日本語ダイジェストを作る | `--force` 生成済みでも当日分を作り直す。配信状態も未配信に戻るので、次の deliver で送り直す |
-| `deliver` | 当日のダイジェストを Telegram に配信する | 当日分が無ければ exit 1 |
+| `deliver` | 当日のダイジェストを Telegram に配信する | 当日分が無ければ exit 1 / `--date YYYY-MM-DD` 日をまたいで届かなかった日の分を送る(届いた分は送らない。runbook §16) |
 | `dig` | 深掘りキューの本日分を調べ、DeepDive ノートと概要カードを出す | `[dig].daily_cap = 0` なら何もしない。関心プロファイルが必要 |
 | `answer` | 深掘りカードへの質問に答え、Telegram で返す | 通常は poller が起動する。同時に 1 つだけ動く。関心プロファイルが必要 |
 | `x-auth` | X OAuth 2.0(PKCE)の認可を行い token を保存する | `[x_oauth2].client_id` が必要(runbook §9) |

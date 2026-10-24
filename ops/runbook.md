@@ -15,6 +15,7 @@
 - §13: 深掘りノートのレビュー(別系統の AI が見る。既定は off)
 - §14: Codex が失敗したときの予備(Claude API でやり直す。既定は off)
 - §15: 配信の記帳に失敗したとき(届いた 1 通を台帳に入れてから再走する)
+- §16: 配信が日をまたいで届かなかったとき(日付を指定して送り直す)
 
 ## 前提
 
@@ -158,7 +159,7 @@ FDA を付与する:
 2. 受信デーモン: Telegram でボタン付きメッセージに反応し、`✓` が付くこと。
 3. **翌朝の無人配信**: 朝バッチ後にダイジェストが Telegram に届き、
    `~/.local/state/intel/logs/morning.log` に当日 run の JSON 行があること
-   (これが plan #22 の完了判定。届かない場合は watchdog 通知 → 手動 `intel run`)。
+   (これが plan #22 の完了判定。届かない場合は watchdog 通知 → 手動 `intel run`。日をまたいだら §16)。
    分析の障害(codex が起動できない・ログイン切れ、関心プロファイルが読めないなど)で載せる記事が無かった日は、
    空のダイジェストを送らず、朝バッチ失敗通知に「分析の障害で今日のダイジェストを作れませんでした」と出る。
    原因を直してから今日のうちに `uv run intel run` で再走すれば届く(日をまたいだら、その記事は翌朝の
@@ -533,8 +534,32 @@ digest の配信で、Telegram には送れたのに台帳(`digest_messages`)に
    db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
    sqlite3 "$db" "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (<digest_id>, <item_id>, <message_id>);"
    ```
-4. `uv run intel deliver` で残りを送る(台帳にある分は送らない)。`intel deliver` は当日の digest だけを
-   送るので、日をまたいだら残りは送らない(届かなかった記事は Obsidian の Daily ノートで見る)。
+4. `uv run intel deliver` で残りを送る(台帳にある分は送らない)。`intel deliver` は既定では当日の digest
+   だけを送るので、日をまたいだら `uv run intel deliver --date <その digest の日付>` で送る(§16。日付は
+   `sqlite3 -readonly "$db" "SELECT digest_date FROM digests WHERE id = <digest_id>;"` で引く)。
 
 - 配信は同じ DB に対して 1 つずつ走る(DB の隣の `intel.db.deliver.lock`。GH#192)。朝バッチの配信中に手で
   `intel deliver` を打つと、先の配信が終わるまで待ってから、未送信の分だけを送る。
+
+## 16. 配信が日をまたいで届かなかったとき(GH#247・設計 04 §2)
+
+朝の配信が失敗し(Telegram の障害、不在で再走できなかったなど)、その日のうちに `intel run` で再走しなかったときは、
+翌日以降の `intel run` と日付を指定しない `intel deliver` はその日の digest を送らない(どちらも当日分だけを送る)。
+載せた記事も翌日以降のダイジェストの候補には戻らない(記事は Obsidian の Daily ノートには書き出し済み)。
+過去の分は自動では繰り越さない(日次の配信と通知の量を変えないため)ので、送りたい日を指定して送る。
+
+1. 送れていない digest の日付を確かめる。朝バッチ失敗通知(配信の段が失敗した日)と watchdog の「未配信」の通知に
+   `intel deliver --date <日付>` として出る。通知が届かなかったときは DB で引く:
+   ```sh
+   db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+   sqlite3 -readonly "$db" "SELECT digest_date, delivery_status FROM digests WHERE delivery_status <> 'sent' ORDER BY digest_date;"
+   ```
+2. 配信が失敗した原因(Telegram の障害、token・`owner_chat_id` の設定など)が直っていることを確かめる。
+3. `uv run intel deliver --date <日付>`(例: `--date 2026-10-23`)で送る。台帳(`digest_messages`)にある分は
+   送らないので、途中まで届いた日は残りだけが届く。送り終えた日をもう一度指定しても何も送らない
+   (「配信済み(skip)」)。ヘッダにはその digest の日付が出る。
+   - 残っている日が複数あれば、古い日から 1 日ずつ指定する。
+   - 送れなかったら、原因を直してから同じコマンドをもう一度打つ。
+   - ERROR「送信済みの message を台帳に記帳できない」が出たときは、先に §15 の 1〜3 を済ませる。
+
+- 遅れて届いた記事へのボタン(👍・🔖 など)の記録は、送った日ではなく digest の日付に帰属する(設計 01 §7)。
