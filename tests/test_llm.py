@@ -331,6 +331,65 @@ def test_engine_missing_output_raises(tmp_path: Path) -> None:
         CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
 
 
+# 秘密に見える文字列と、外部の記事の文に見える文字列(偽の codex が stderr・応答に再掲する)
+LEAK_MARKER = "sk-live-SECRET0123456789 記事の本文そのものXYZ"
+
+# (偽の codex の本文, 例外の型, 例外の文言, 予備の側が読む主の失敗の種類)
+_CODEX_LEAK_CASES = {
+    "nonzero_exit": (
+        f"echo 'boom {LEAK_MARKER}' >&2\nexit 3\n",
+        LLMError,
+        "codex 非0終了(3)",
+        "codex 非0終了(3)",
+    ),
+    "config_error": (
+        f"echo 'Error: Unknown feature flag: {LEAK_MARKER}' >&2\nexit 1\n",
+        LLMUnavailableError,
+        "codex の起動設定エラー(Error: Unknown feature flag)",
+        "codex の起動設定エラー",
+    ),
+    "not_json": (
+        OUT_FILE_SNIPPET + f"echo '{LEAK_MARKER} は JSON ではない' > \"$out\"\n",
+        LLMError,
+        "JSON パース失敗(Expecting value・位置 0)",
+        "JSON パース失敗",
+    ),
+    "schema_type": (
+        OUT_FILE_SNIPPET
+        + f'echo \'{{"score": "{LEAK_MARKER}", "reason": "{LEAK_MARKER}"}}\' > "$out"\n',
+        LLMError,
+        "スキーマ検証失敗(score: int_parsing)",
+        "スキーマ検証失敗",
+    ),
+    "schema_missing": (
+        OUT_FILE_SNIPPET + f'echo \'{{"reason": "{LEAK_MARKER}"}}\' > "$out"\n',
+        LLMError,
+        "スキーマ検証失敗(score: missing)",
+        "スキーマ検証失敗",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_CODEX_LEAK_CASES))
+def test_engine_failure_does_not_echo_stderr_or_reply(tmp_path: Path, case: str) -> None:
+    # GH#202: stderr・応答の本文(外部の記事の文・本人の質問を含みうる)を例外に載せない。
+    # 呼び出し側は例外の文言をログ(traceback を含む)と DB に書くため。種類・場所・終了コードは残す
+    from app.analysis.fallback import _primary_failure_kind
+
+    script, error_type, message, kind = _CODEX_LEAK_CASES[case]
+    codex = fake_codex(tmp_path, script)
+    with pytest.raises(LLMError) as excinfo:
+        CodexCliEngine(codex_bin=codex).complete_structured("p", Verdict)
+    assert type(excinfo.value) is error_type
+    assert str(excinfo.value) == message
+    assert excinfo.value.__cause__ is None  # 本文を持つ原因の例外もつながない
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SECRET" not in rendered
+    assert "記事の本文" not in rendered
+    # 予備の側(GH#156)が書き出しで主の失敗の種類を見分けられること(文言の契約)
+    assert _primary_failure_kind(excinfo.value) == kind
+
+
 def test_env_is_isolated_no_anthropic_key(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
     monkeypatch.setenv("SOME_OTHER_SECRET", "x")

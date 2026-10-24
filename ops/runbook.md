@@ -90,7 +90,9 @@ rm -rf "${TMP_DIR}"
   (設計 00 §5)。これを受け付けない版(古い版や、feature 名を変えた新しい版)では codex が起動の時点で
   エラーで止まり、doctor #6 が FAIL する(起動引数が黙って無視されることはない)。例外の型は codex の stderr の
   書き出しで決まり、決まった書き出し(`Error: Unknown feature flag` など)なら `LLMUnavailableError`、
-  それ以外は `LLMError` になる。確かめたのは上の版だけなので、ほかの版は下の手順で doctor #6 を通してから使う。
+  それ以外は `LLMError` になる。例外とログには stderr の中身を載せず、当たった書き出しか終了コードだけが出る
+  (`codex の起動設定エラー(Error: Unknown feature flag)`・`codex 非0終了(1)`。GH#202)。
+  確かめたのは上の版だけなので、ほかの版は下の手順で doctor #6 を通してから使う。
 - npm 版は node の版ごとの global に入る。node を別の版に替えると、PATH の上の `codex` が無くなるか
   別の版になる。新しい node の側にも上の版を入れ、この節の手順をやり直す(plist の PATH が変わったら
   morning と poller の両方を入れ直す。§11 の 2)。

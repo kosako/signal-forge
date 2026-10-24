@@ -14,7 +14,7 @@ from app.analysis.analyzer import (
     analyze_selected,
     build_prompt,
 )
-from app.analysis.llm import LLMError, LLMUnavailableError, parse_structured
+from app.analysis.llm import CodexCliEngine, LLMError, LLMUnavailableError, parse_structured
 from app.config import AnalysisConfig, Config
 from app.db import apply_migrations, connect
 from app.jst import JST
@@ -251,6 +251,30 @@ def test_engine_unavailable_propagates_without_degraded(conn, tmp_path) -> None:
     assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
     statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
     assert statuses == {"new"}
+
+
+@pytest.mark.parametrize("case", ["nonzero_exit", "not_json", "schema_type"])
+def test_codex_failure_text_stays_out_of_log_and_analyses(
+    conn, tmp_path, monkeypatch, caplog, case
+) -> None:
+    # GH#202: 偽の codex が stderr・応答に再掲した文字列(秘密に見える文字列・記事の文)は、
+    # チャンクの失敗のログにも analyses(degraded の行)にも残らない
+    from tests.test_llm import _CODEX_LEAK_CASES, fake_codex
+
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "auth.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))  # 使い捨て CODEX_HOME が実ユーザーの ~/.codex に触れない
+    a = add_item(conn, "https://a.example/1")
+    engine = CodexCliEngine(codex_bin=fake_codex(tmp_path, _CODEX_LEAK_CASES[case][0]))
+    with caplog.at_level(logging.WARNING), pytest.raises(FullDegradationError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a], logger)
+    assert "チャンク分析失敗" in caplog.text
+    assert "SECRET" not in caplog.text
+    assert "記事の本文" not in caplog.text
+    (row,) = conn.execute("SELECT * FROM analyses").fetchall()
+    assert row["degraded"] == 1
+    assert not any("SECRET" in str(value) for value in row)
 
 
 def test_single_unavailable_saves_obtained_results_and_leaves_rest_new(conn, tmp_path) -> None:
