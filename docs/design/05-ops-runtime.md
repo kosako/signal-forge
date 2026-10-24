@@ -102,7 +102,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 | LLM `complete_structured`(深掘りのレビュー = `anthropic-api` と、指摘を受けた直し) | `[dig].timeout_s`(既定 600s)/呼 | 同一エンジン1回(401/403/404 = キー・権限・モデル ID の誤りはやり直さない) | 失敗しても段の失敗にしない。未レビュー(直しの失敗なら直す前)のまま届け、ノートとカードに明示する(設計 06 §4。GH#153) |
 | Telegram 送信 | 30s | 3回、429 は retry_after 秒待ち | 全滅時は §4 の失敗系へ。transport error(read timeout 後等)のリトライで稀に二重送信しうるが、個人用途で実害小のため許容する |
 | Telegram long polling | long poll 50s | 即時再接続(連続失敗は30s間隔) | プロセスは KeepAlive が面倒を見る |
-| 受信した update の処理(GH#181) | DB の busy_timeout 5s | DB の一時的な失敗(ロック競合)で保存できなかった update は offset を進めず、30s 後に再配達された同じ update をやり直す。同じ update で 3 回まで(初回 + 3 回。Telegram 送信と揃える) | 上限を超えたら poller.log に WARN(update_id・update の種別・エラーの種類だけ。本文は残さない)を残して隔離し、offset を進める。それ以外の失敗はやり直さずにログに残して進める(設計 04 §1) |
+| 受信した update の処理(GH#181) | DB の busy_timeout 5s | DB の一時的な失敗(ロック競合)で保存できなかった update は offset を進めず、30s 後に再配達された同じ update をやり直す。同じ update で 3 回まで(初回 + 3 回。Telegram 送信と揃える)。callback の書き込みの失敗は対象外で、やり直さない(設計 04 §3 の警告 answer で本人に知らせて処理を終える) | 上限を超えたら poller.log に WARN(update_id・update の種別・エラーの種類だけ。本文は残さない)を残して隔離し、offset を進める。それ以外の失敗はやり直さずにログに残して進める(設計 04 §1) |
 
 - **SSRF ガード(外部 URL を fetch する全経路の共通 HTTP クライアント規約)**: 本文抽出・短縮 URL 展開・RSS 取得を含むすべての外向き HTTP は、**DNS 解決後の接続先 IP が global でなければ接続を拒否する(`is_global` を基本にした allowlist 方式。private / loopback / link-local に加え shared address space 100.64.0.0/10 等のブラックリスト漏れも遮断)**。**リダイレクト追跡の各ホップで再検査**し(悪意ある RSS entry・短縮 URL のリダイレクト先から、常時稼働機の LAN 内・localhost へのプローブを遮断)、接続は**検証済み IP にピン留め**する(URL ホストを IP に書き換え、Host ヘッダ+SNI で元ホスト名を維持。検証と接続で DNS を別々に引くと、1回目 public・2回目 private を返す DNS rebinding で検査を回避できるため)。
 - 原則: **リトライはステージ内で完結**させ、ステージをまたぐ再実行は冪等な `intel run` 全体の手動再走に一本化する(部分再開の状態管理を持たない)。
