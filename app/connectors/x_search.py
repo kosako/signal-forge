@@ -6,7 +6,9 @@
   括弧で囲むのは OR を含むスロットでも除外を全体に掛けるため(GH#230)。
 - 予算(daily_read_cap)はスロット数で均等割(端数は先頭から)。スロット間の再配分はしない
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
-  そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。
+  そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。cap は JST の暦日の上限で、
+  同じ日の実行が読んだぶん(合成点が台帳から出す。connectors/x.py の x_reads_today)を引いた
+  残りを均等割する(GH#178)。
 - カーソルは全スロット横断の最大 tweet id を `{"since_id": ...}` に(snowflake id は時刻単調
   のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。そのために全スロットの
   取得の上限(end_time)を実行の開始で 1 つに固定する(GH#184): スロットは順に取るので、上限が
@@ -89,12 +91,14 @@ class XSearchConnector:
         slots: tuple[str, ...],
         daily_read_cap: int,
         unit_price_usd: float,
+        reads_used_today: int = 0,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._session = XApiSession(client=client, credentials=credentials, sleep=sleep)
         self._slots = slots
-        self._daily_read_cap = daily_read_cap
+        # 今回読める上限 = 日次の上限 − 同じ日(JST)の実行が読んだぶん(GH#178)
+        self._read_budget = max(0, daily_read_cap - reads_used_today)
         self._unit_price = unit_price_usd
         self._now = now
 
@@ -121,7 +125,7 @@ class XSearchConnector:
         fetched: list[tuple[str, list[dict]]] = []  # (スロットのクエリ, tweets)
         reads = 0
         http_status: int | None = None
-        budgets = _split_budget(self._daily_read_cap, len(self._slots))
+        budgets = _split_budget(self._read_budget, len(self._slots))
         stopped = False
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
@@ -220,15 +224,24 @@ class XSearchConnector:
 
 
 def build_x_search_connector(
-    slots: tuple[str, ...], daily_read_cap: int, unit_price_usd: float, env: dict[str, str]
+    slots: tuple[str, ...],
+    daily_read_cap: int,
+    unit_price_usd: float,
+    env: dict[str, str],
+    *,
+    reads_used_today: int = 0,
 ) -> XSearchConnector:
-    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真・slots 非空)。"""
+    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真・slots 非空)。
+
+    reads_used_today = 同じ日の検索の読取数(`x_reads_today` の search。GH#178)。
+    """
     return XSearchConnector(
         client=build_x_client(),
         credentials=credentials_from_env(env),
         slots=slots,
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price_usd,
+        reads_used_today=reads_used_today,
     )
 
 

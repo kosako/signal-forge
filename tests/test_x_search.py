@@ -66,7 +66,8 @@ def mixes_id_and_time(query: dict[str, list[str]]) -> bool:
 
 
 def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
-                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH) -> XSearchConnector:
+                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH,
+                   reads_used_today=0) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
     200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
@@ -103,6 +104,7 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         slots=tuple(slots),
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price,
+        reads_used_today=reads_used_today,
         sleep=lambda _s: None,
         now=lambda: now,
     )
@@ -398,6 +400,28 @@ def test_budget_cut_is_normal_and_advances_cursor() -> None:
     assert result.stats.api_reads == 20  # 10/10 で両スロットとも予算に届いた
     assert result.partial_error is None
     assert result.next_cursor == {"since_id": "700"}
+
+
+def test_reads_used_today_splits_only_remaining_budget() -> None:
+    # GH#178: cap は暦日の上限。同じ日の実行が読んだぶんを引いた残りをスロットで均等割する
+    seen: list[httpx.Request] = []
+    pages = {
+        slot: [(200, page([tweet(str(base - i)) for i in range(100)]), {})]
+        for slot, base in (("a", 500), ("b", 700), ("c", 900))
+    }
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=5, seen=seen
+    ).fetch(make_source(), {})
+    assert result.stats.api_reads == 30  # 残り 30 → 10/10/10
+    assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in seen] == [["10"]] * 3
+    # 残り 25 → 9/8/8 はどれも下限 10 未満。読まずに据え置く(cap はハード上限)
+    seen.clear()
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=10, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 0
+    assert seen == []
+    assert result.next_cursor == {"since_id": "100"}
 
 
 def test_all_requests_share_end_time_before_run_start() -> None:

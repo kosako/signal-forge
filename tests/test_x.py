@@ -1,3 +1,5 @@
+import logging
+import sqlite3
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -5,6 +7,7 @@ import httpx
 import pytest
 
 from app.cli import _build_connectors
+from app.collect import collect_all
 from app.config import Config, XConfig, XSearchConfig
 from app.connectors.base import FatalError, FetchResult, FetchStats, RetryableError
 from app.connectors.x import (
@@ -13,8 +16,10 @@ from app.connectors.x import (
     XRouter,
     build_x_connector,
     has_x_credentials,
+    x_reads_today,
 )
 from app.connectors.x_search import XSearchConnector
+from app.db import apply_migrations, connect
 from app.http import HttpClient
 from app.models import Source
 
@@ -64,7 +69,7 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
 
 
 def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
-                   unit_price=0.004, seen=None) -> XConnector:
+                   unit_price=0.004, seen=None, reads_used_today=0) -> XConnector:
     """pages[i] = (status, body_dict, headers)。timeline リクエストは pagination_token で
     index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。200 応答は
     max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、その
@@ -96,6 +101,7 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
         credentials=CREDS,
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price,
+        reads_used_today=reads_used_today,
         sleep=lambda _s: None,
     )
 
@@ -131,6 +137,26 @@ def test_pagination_hard_caps_at_daily_read_cap() -> None:
     assert result.stats.api_reads == 130  # ちょうど cap。超過しない
     timeline = [r for r in seen if "timelines" in str(r.url)]
     assert parse_qs(urlsplit(str(timeline[-1].url)).query)["max_results"] == ["30"]  # 残枠
+
+
+def test_reads_used_today_leaves_only_remaining_budget() -> None:
+    # GH#178: cap は暦日の上限。同じ日の実行が読んだぶんを引いた残りだけを読む
+    seen: list[httpx.Request] = []
+    p1 = page([tweet(str(500 - i), "t") for i in range(100)], next_token="tok1")
+    result = connector_from(
+        [(200, p1, {})], daily_read_cap=130, reads_used_today=100, seen=seen
+    ).fetch(make_source(), {})
+    assert result.stats.api_reads == 30
+    timeline = [r for r in seen if "timelines" in str(r.url)]
+    assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in timeline] == [["30"]]
+    # 使い切った日は読まず、since_id も据え置く(翌日に新しい側から取る)
+    seen.clear()
+    result = connector_from(
+        [(200, p1, {})], daily_read_cap=130, reads_used_today=130, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 0
+    assert [r for r in seen if "timelines" in str(r.url)] == []
+    assert result.next_cursor == {"since_id": "100"}
 
 
 def test_rate_limit_remaining_zero_stops() -> None:
@@ -363,22 +389,104 @@ def _config(x_enabled: bool, slots: tuple[str, ...] = ()) -> Config:
     )
 
 
-def test_build_connectors_wires_x_only_when_enabled_and_keyed() -> None:
+@pytest.fixture
+def db(tmp_path: Path) -> sqlite3.Connection:
+    db_path = tmp_path / "intel.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    yield conn
+    conn.close()
+
+
+def test_build_connectors_wires_x_only_when_enabled_and_keyed(db) -> None:
     http = HttpClient()
-    assert set(_build_connectors(_config(False), FULL_ENV, http)) == {"rss"}  # X 無効
-    assert set(_build_connectors(_config(True), FULL_ENV, http)) == {"rss", "x"}  # 有効+キー
+    assert set(_build_connectors(_config(False), FULL_ENV, http, db)) == {"rss"}  # X 無効
+    assert set(_build_connectors(_config(True), FULL_ENV, http, db)) == {"rss", "x"}  # 有効+キー
     # 有効だがキー欠落 → X は載せず RSS は残る(縮退。欠落は doctor #5)
-    assert set(_build_connectors(_config(True), {}, http)) == {"rss"}
+    assert set(_build_connectors(_config(True), {}, http, db)) == {"rss"}
 
 
-def test_build_connectors_wires_search_only_with_slots() -> None:
+def test_build_connectors_wires_search_only_with_slots(db) -> None:
     http = HttpClient()
-    router = _build_connectors(_config(True), FULL_ENV, http)["x"]
+    router = _build_connectors(_config(True), FULL_ENV, http, db)["x"]
     assert isinstance(router, XRouter)
     assert router._search is None  # slots 空 = 検索無効
-    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, http)["x"]
+    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, http, db)["x"]
     assert isinstance(router._home, XConnector)
     assert isinstance(router._search, XSearchConnector)
+
+
+def add_x_source(db, name: str, config: str | None = None) -> int:
+    return db.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('x', ?, ?)", (name, config)
+    ).lastrowid
+
+
+def add_collect_run(db, source_id: int, started_at: str, reads: int, status="ok") -> None:
+    db.execute(
+        "INSERT INTO collect_runs (source_id, started_at, status, api_reads) VALUES (?, ?, ?, ?)",
+        (source_id, started_at, status, reads),
+    )
+
+
+def test_x_reads_today_sums_jst_calendar_day_per_mode(db) -> None:
+    # GH#178: 当日 = JST の暦日(UTC 15:00 が日付の境界)。部分取得のあとの失敗の読取も数える
+    home = add_x_source(db, "home")  # config NULL = home
+    explicit_home = add_x_source(db, "x:home", '{"mode": "home"}')
+    search = add_x_source(db, "x:search", '{"mode": "search"}')
+    rss = db.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')").lastrowid
+    add_collect_run(db, home, "2026-10-23T14:59:59Z", 7)  # JST 10/23 23:59:59 = 前日
+    add_collect_run(db, home, "2026-10-23T15:00:00Z", 10)  # JST 10/24 0:00 = 当日の始まり
+    add_collect_run(db, explicit_home, "2026-10-24T03:00:00Z", 2)
+    add_collect_run(db, home, "2026-10-24T05:00:00Z", 3, status="error")  # 部分取得のあとの失敗
+    add_collect_run(db, home, "2026-10-24T14:59:59Z", 20)  # JST 10/24 23:59:59 = 当日の終わり
+    add_collect_run(db, home, "2026-10-24T15:00:00Z", 40)  # JST 10/25 0:00 = 翌日
+    add_collect_run(db, search, "2026-10-24T01:00:00Z", 5)
+    add_collect_run(db, rss, "2026-10-24T01:00:00Z", 99)  # X 以外は数えない
+    assert x_reads_today(db, "2026-10-24") == {"home": 35, "search": 5}
+    assert x_reads_today(db, "2026-10-23") == {"home": 7, "search": 0}
+    assert x_reads_today(db, "2026-10-26") == {"home": 0, "search": 0}
+
+
+def test_build_connectors_passes_same_day_reads_from_ledger(db) -> None:
+    # GH#178: 合成点が台帳の当日の合計を mode ごとにコネクタへ渡す(前日の読取は数えない)
+    home = add_x_source(db, "home")
+    search = add_x_source(db, "x:search", '{"mode": "search"}')
+    add_collect_run(db, home, "2000-01-01T00:00:00Z", 130)  # 前日以前
+    db.execute("INSERT INTO collect_runs (source_id, api_reads) VALUES (?, 100)", (home,))
+    db.execute("INSERT INTO collect_runs (source_id, api_reads) VALUES (?, 20)", (search,))
+    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, HttpClient(), db)["x"]
+    assert router._home._read_budget == 30  # 130 - 100
+    assert router._search._read_budget == 15  # 35 - 20
+
+
+def test_second_collect_same_day_reads_only_remaining_budget(db) -> None:
+    # GH#178: 同じ日に普通に再実行しても(手動の intel run・intel collect)、日次の上限を超えて
+    # 読まない。1 回目に読んだぶんが台帳(collect_runs)に残り、2 回目はその残りだけを読む
+    add_x_source(db, "home")
+    next_id = iter(range(10_000, 0, -1))
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/users/me"):
+            return httpx.Response(200, json={"data": {"id": "me"}})
+        limit = parse_qs(urlsplit(str(request.url)).query)["max_results"][0]
+        seen.append(limit)
+        count = min(int(limit), 100)  # 毎回 100 件の新着(next_token なし = 1 ページで終わり)
+        return httpx.Response(
+            200, json=page([tweet(str(next(next_id)), "新着の投稿") for _ in range(count)])
+        )
+
+    def run_once() -> None:
+        router = _build_connectors(_config(True), FULL_ENV, HttpClient(), db)["x"]
+        router._home._session._client = httpx.Client(transport=httpx.MockTransport(handler))
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+
+    for _ in range(3):
+        run_once()
+    reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
+    assert reads == [100, 30, 0]  # 合計は cap(130)ちょうど。3 回目は読まない
+    assert seen == ["100", "30"]
 
 
 def test_build_x_connector_signs_requests() -> None:

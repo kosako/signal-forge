@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 from app.config import Config
+from app.jst import jst_day_bounds_utc, today_jst
 
 # 規則3: X の低情報量判定(正規化テキストがこの字数未満かつリンク無し)
 X_NOISE_MIN_CHARS = 20
@@ -76,8 +77,11 @@ def preselect(
             survivors.append(row)
 
     # ブックマークは daily_cap の外で必ず採用(件数は x_signals の日次 cap /
-    # backfill --limit で既に有界)。cap は従来どおり他ソースにのみ適用する
-    selected = bookmarks + _rule_daily_cap(survivors, config.analysis.daily_llm_limit)
+    # backfill --limit で既に有界)。cap は従来どおり他ソースにのみ適用する。
+    # cap は JST の暦日の上限で、同じ日の実行がすでに分析したぶんを引いた残りだけを
+    # 採用する(GH#178。再走や単独の intel analyze で上限を超えない)
+    limit = max(0, config.analysis.daily_llm_limit - analyzed_on(conn, today_jst()))
+    selected = bookmarks + _rule_daily_cap(survivors, limit)
     selected_ids = [row["id"] for row in selected]
     selected_id_set = set(selected_ids)
     for row in survivors:
@@ -88,6 +92,27 @@ def preselect(
 
     logger.info("事前選別 完了", extra={"run_id": run_id, "stage": "analyze", "extra": counts})
     return PreselectResult(counts=counts, selected_ids=selected_ids)
+
+
+def analyzed_on(conn: sqlite3.Connection, day: str) -> int:
+    """JST の暦日 day に分析した件数(日次上限の使用量。GH#178)。
+
+    台帳は analyses(analyzed_at は UTC。暦日の境界はトレンド・digest と同じ)。degraded の
+    行も数える(LLM には渡している)。ブックマークに紐付く item は日次上限の外なので数えない
+    (判定は事前選別と同じ x_signals の紐付け)。
+    """
+    start, end = jst_day_bounds_utc(day)
+    return conn.execute(
+        """
+        SELECT count(*) AS n FROM analyses
+        WHERE analyzed_at >= ? AND analyzed_at < ?
+          AND NOT EXISTS (
+            SELECT 1 FROM x_signals
+            WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = analyses.item_id
+          )
+        """,
+        (start, end),
+    ).fetchone()["n"]
 
 
 def _skip(conn: sqlite3.Connection, item_id: int, reason: str) -> None:
@@ -149,6 +174,8 @@ def _rule_x_noise(row: sqlite3.Row) -> str | None:
 
 def _rule_daily_cap(rows: list[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
     """規則4: 日次上限。published_at 降順・ソース間ラウンドロビンで多様性を保って採用。
+
+    limit は当日の残り(日次上限 − 同じ日にすでに分析した件数。GH#178)。
 
     まず全体を published_at 降順(NULL は最後)に並べ、その順でソース列とソースの
     巡回順を作る(新しい item を持つソースから先に採用され、境界件数でも降順が保たれる)。
