@@ -162,23 +162,40 @@ def test_all_degraded_produces_title_only_digest(conn, tmp_path, fixed_today) ->
     assert "推薦理由" not in row["markdown"]  # タイトルのみ
 
 
-def test_extraction_failed_items_are_not_full_degradation(conn, tmp_path, fixed_today) -> None:
-    # GH#240: 当日の全件が本文の抽出に失敗していても、LLM が答えていれば全滅(degraded 配信)
-    # ではない。通常の digest にし、本文を読めていない記事にだけ印を付ける
-    failed = add_analyzed(conn, "https://a/failed", relevance=90)
-    normal = add_analyzed(conn, "https://a/normal", relevance=80)
-    conn.execute("UPDATE analyses SET extraction_failed = 1 WHERE item_id = ?", (failed,))
-    set_analyzed_at(conn, TODAY_AT, failed, normal)
+def test_all_extraction_failed_today_is_not_full_degradation(conn, tmp_path, fixed_today) -> None:
+    # GH#240: 当日の候補がすべて本文の抽出に失敗していても、LLM が答えていれば全滅(degraded
+    # 配信)ではない。通常の digest にし、どの記事にも要約・推薦理由と印を残す
+    a = add_analyzed(conn, "https://a/1", relevance=90)
+    b = add_analyzed(conn, "https://a/2", relevance=80)
+    conn.execute("UPDATE analyses SET extraction_failed = 1")
+    set_analyzed_at(conn, TODAY_AT, a, b)
 
     digest_id = generate_digest(conn, make_config(tmp_path), logger)
 
     row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert row["status"] == "ok"
+    assert json.loads(row["item_ids"]) == [a, b]
+    md = row["markdown"]
+    assert "degraded" not in md  # 全滅の注記は付かない
+    assert md.count("- ⚠️ 本文を読めていない(見出しだけで分析)") == 2
+    assert md.count("\n要約\n") == 2  # 要約はそのまま
+    assert md.count("**推薦理由**: 理由") == 2  # 理由・示唆もそのまま
+
+
+def test_extraction_note_only_on_failed_item(conn, tmp_path) -> None:
+    # 本文を読めた通常の記事の項目は変わらない(印は抽出に失敗した記事だけ。GH#240)
+    failed = add_analyzed(conn, "https://a/failed", relevance=90)
+    normal = add_analyzed(conn, "https://a/normal", relevance=80)
+    conn.execute("UPDATE analyses SET extraction_failed = 1 WHERE item_id = ?", (failed,))
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     assert json.loads(row["item_ids"]) == [failed, normal]
     first, second = row["markdown"].split("## 2. ")
     assert "- ⚠️ 本文を読めていない(見出しだけで分析)" in first
-    assert "**推薦理由**: 理由" in first  # 理由・示唆はそのまま
-    assert "本文を読めていない" not in second  # 通常の項目は変わらない
+    assert "本文を読めていない" not in second
+    assert "- カテゴリ: 課題直結\n\n要約\n" in second
 
 
 def test_mixed_degraded_and_ok_is_normal_digest(conn, tmp_path) -> None:
