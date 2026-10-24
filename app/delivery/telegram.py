@@ -5,21 +5,28 @@
 - 構成: ヘッダ1通+アイテム最大 `digest.max_items` 通(1アイテム=1メッセージ。
   ボタンをアイテム単位に付けるため)
 - 冪等性: `digest_messages` 台帳にある message は再送しない(部分再送)。全通完了で
-  `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を記録して例外
+  `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を記録して例外。
+  同じ DB への配信は DB の隣の `<DB>.deliver.lock`(flock)で直列化する(GH#192)。送信できた
+  message の記帳に失敗したら記帳だけをやり直し、それでも駄目なら message_id をログに残して
+  止める(GH#225)
 - token は `.env` の TELEGRAM_BOT_TOKEN。URL に token が入るため、httpx の例外を
   そのまま伝播させない(sanitize して再送出)
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -34,6 +41,11 @@ TIMEOUT_S = 30  # 設計 05 §8
 MAX_RETRIES = 3  # 初回 + リトライ3回(同上)
 BACKOFF_S = (1.0, 2.0, 4.0)
 LONG_POLL_S = 50  # getUpdates の long polling 秒(設計 05 §8)
+
+# 配信の直列化のロック(GH#192)。DB の隣の `<DB>.deliver.lock`(migrate.lock と同じ名付け)
+DELIVER_LOCK_SUFFIX = ".deliver.lock"
+# 送信できた message の記帳だけのやり直し(GH#225)。待ちは BACKOFF_S
+RECORD_RETRIES = 3
 
 ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸収(設計 04 §2)
 # タイトルは RSS 由来で長さ未検証。異常に長い1件で Telegram の 4096 字上限を超えて
@@ -208,16 +220,33 @@ def deliver_digest(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """digest を配信し、送信した message 数を返す(送信済みは 0)。
 
     台帳(digest_messages)に無い message のみ送る部分再送。1通送るごとに台帳へ
-    コミットし、途中失敗しても送信済み分を二重送信しない。
+    コミットし、途中失敗しても送信済み分を二重送信しない。台帳の確認から送信・記帳までは
+    同じ DB への配信どうしで直列化し、朝バッチと手動の `intel deliver` が重なっても、後の側は
+    先の側の記帳を読んでから判断する(GH#192)。sleep は記帳のやり直しの待ち(GH#225)。
     """
     if config.telegram.owner_chat_id is None:
         raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
-    chat_id = config.telegram.owner_chat_id
+    with _delivery_lock(conn, logger, run_id):
+        return _deliver_locked(
+            conn, config.telegram.owner_chat_id, api, digest_id, logger, run_id, sleep
+        )
 
+
+def _deliver_locked(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    api: TelegramApi,
+    digest_id: int,
+    logger: logging.Logger,
+    run_id: str | None,
+    sleep: Callable[[float], None],
+) -> int:
+    """deliver_digest の本体(_delivery_lock の中で呼ぶ)。"""
     digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     if digest is None:
         raise DeliveryError(f"digest id={digest_id} が存在しない")
@@ -238,7 +267,7 @@ def deliver_digest(
             message_id = api.send_message(
                 chat_id, _header_text(digest, _load_bookmark_rows(conn, digest))
             )
-            _record_message(conn, digest_id, None, message_id)
+            _record_message(conn, digest_id, None, message_id, logger, run_id, sleep)
             sent += 1
         for position, row in enumerate(items, start=1):
             if row["item_id"] in sent_item_ids:
@@ -248,14 +277,14 @@ def deliver_digest(
                 _item_text(position, row),
                 reply_markup=reaction_keyboard(row["item_id"]),
             )
-            _record_message(conn, digest_id, row["item_id"], message_id)
+            _record_message(conn, digest_id, row["item_id"], message_id, logger, run_id, sleep)
             sent += 1
     except DeliveryError:
         conn.execute(
             "UPDATE digests SET delivery_status = 'failed' WHERE id = ?", (digest_id,)
         )
         logger.error(
-            "配信が途中失敗(送信済み分は台帳に記録済み。再走で未送信のみ再送)",
+            "配信が途中失敗(台帳にある分は再走で送らない。未送信のみ再送)",
             extra={"run_id": run_id, "stage": "deliver", "extra": {"sent": sent}},
         )
         raise
@@ -493,11 +522,82 @@ def _load_ledger(conn: sqlite3.Connection, digest_id: int) -> tuple[set[int], bo
 
 
 def _record_message(
-    conn: sqlite3.Connection, digest_id: int, item_id: int | None, message_id: int
+    conn: sqlite3.Connection,
+    digest_id: int,
+    item_id: int | None,
+    message_id: int,
+    logger: logging.Logger,
+    run_id: str | None,
+    sleep: Callable[[float], None],
 ) -> None:
     # 接続は autocommit(app/db.py)。1通ごとに即確定し、途中クラッシュでも
-    # 台帳と送信実績がずれない
-    conn.execute(
-        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
-        (digest_id, item_id, message_id),
+    # 台帳と送信実績がずれない。
+    # 送信は済んでいるので、記帳に失敗しても送り直さず記帳だけをやり直す(GH#225。ディスクの
+    # 一時的な異常など)。台帳に無い message は再走で未送信として送り直され、リプライの帰属も
+    # 引けない。やり直しても記帳できなければ message_id をログに残して止める(runbook §15)
+    error: sqlite3.Error | None = None
+    for attempt in range(RECORD_RETRIES + 1):
+        if attempt > 0:
+            sleep(BACKOFF_S[attempt - 1])
+        try:
+            conn.execute(
+                "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+                (digest_id, item_id, message_id),
+            )
+            return
+        except sqlite3.OperationalError as e:  # ディスク満杯・I/O エラーなど。やり直す
+            error = e
+        except sqlite3.Error as e:  # 制約違反などはやり直しても通らない
+            error = e
+            break
+    logger.error(
+        "送信済みの message を台帳に記帳できない(この 1 通は台帳に無い。"
+        "再走の前に runbook §15 で台帳に入れる)",
+        extra={
+            "run_id": run_id,
+            "stage": "deliver",
+            "item_id": item_id,  # null = ヘッダ
+            "extra": {
+                "digest_id": digest_id,
+                "message_id": message_id,
+                "error": f"{type(error).__name__}: {error}",
+            },
+        },
     )
+    raise DeliveryError(
+        f"送信済みの message_id={message_id} を台帳に記帳できない"
+        f"(digest_id={digest_id}, item_id={item_id}): {type(error).__name__}"
+    ) from error
+
+
+@contextlib.contextmanager
+def _delivery_lock(
+    conn: sqlite3.Connection, logger: logging.Logger, run_id: str | None
+) -> Iterator[None]:
+    """同じ DB への配信をプロセス間で直列化する(GH#192)。
+
+    ロックファイルは接続が開いている DB の隣に置く(config の db_path ではなく接続から引き、
+    同じ DB を開いた配信どうしを確実に揃える)。先の配信が終わるまで待つ。メモリ上の DB は
+    他のプロセスと共有されないので直列化しない。
+    """
+    db_file = next(
+        (row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), ""
+    )
+    if not db_file:
+        yield
+        return
+    db_path = Path(db_file)
+    lock_path = db_path.with_name(db_path.name + DELIVER_LOCK_SUFFIX)
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info(
+                "別の配信が実行中のため、終わるのを待つ",
+                extra={"run_id": run_id, "stage": "deliver"},
+            )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # close で flock は解放される

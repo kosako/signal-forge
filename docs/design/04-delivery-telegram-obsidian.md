@@ -38,6 +38,8 @@
 > 💡 「ログが取れないから」と見送った AI ツールの導入を、もう一度検討する材料になる。
 
 - **配信の冪等性**: 送信完了時に `digests.delivery_status='sent'` + `sent_at` を記録し(語彙は 01 §3 に統一。delivered_at という別名は使わない)、`intel deliver` は既配信の digest を再送しない(再実行安全)。送信途中失敗時は未送信アイテムのみ再送できるよう、送信済み message_id をアイテムごとに `digest_messages`(01 §3)へ記録する。
+  - **配信の直列化**(GH#192): 台帳の確認から送信・記帳までを、同じ DB への配信どうしでプロセス間に直列化する(DB の隣の `<DB>.deliver.lock`(既定 `intel.db.deliver.lock`)を flock。migration の `<DB>.migrate.lock` と同じ名付け。01 §10)。朝バッチの deliver 段と手動の `intel deliver` / `intel run` が重なっても、後の側は先の側が終わるまで待ち、その記帳を読んでから未送信だけを送る(先の側が送り終えていれば配信済みとして skip)。
+  - **送信後の記帳の失敗**(GH#225): 送信が成功して message_id を受け取った後に台帳の INSERT が失敗したら(ディスクの一時的な異常など)、送り直さず記帳だけを 3 回までやり直す(待ちは 1s→2s→4s。制約違反などはやり直さない)。それでも記帳できなければ、その message_id を ERROR のログ(朝バッチは `morning.log`)に残して配信を止める(先のアイテムは送らない。書ければ `delivery_status='failed'`)。台帳に無い message は再走で未送信として送り直され、感想のリプライの帰属(§5)も引けないため、再走の前にログの message_id を台帳へ入れて復旧する(手順は runbook §15)。送信と記帳の間でプロセスが止まったときは message_id が残らず、再走で送り直しうる(この対処の外)。
 
 ## 3. callback_query 処理(受信デーモン)
 
