@@ -332,6 +332,11 @@ def _build_section(path: Path, name: str, cls: type, values: dict) -> object:
     for key, value in values.items():
         if not _type_ok(fields[key], value):
             raise ConfigError(f"{path}: [{name}].{key} の型が不正: {value!r}")
+        # nan/inf は TOML として合法だが、nan は大小比較が常に偽、inf は「0 以上」「正」を満たすので
+        # 値域の検証(_validate)をすり抜ける。浮動小数点の設定はすべて先に有限値だけを受ける
+        # (GH#198)。int の値は常に有限で、巨大な int を math.isfinite に渡すと OverflowError
+        if fields[key] == "float" and isinstance(value, float) and not math.isfinite(value):
+            raise ConfigError(f"{path}: [{name}].{key} は有限値であること(nan/inf は不可): {value}")
     # TOML の配列は list で来るが、frozen dataclass の既定は不変の tuple に揃える
     coerced = {
         key: tuple(value) if isinstance(value, list) else value for key, value in values.items()
@@ -389,6 +394,10 @@ def _validate(path: Path, config: Config) -> None:
         )
     if config.x_oauth2.client_id is not None and not config.x_oauth2.client_id.strip():
         raise ConfigError(f"{path}: [x_oauth2].client_id が空文字(未使用なら行ごと削除)")
+    # 空文字の vault_path は Path("") = 実行ディレクトリに解決され、ノートが Vault に届かない
+    # (doctor・export は None だけを未設定として扱う)。未設定はキーの省略で表す(GH#251)
+    if config.obsidian.vault_path is not None and not config.obsidian.vault_path.strip():
+        raise ConfigError(f"{path}: [obsidian].vault_path が空文字(未設定なら行ごと削除)")
     cap = config.dig.review_monthly_cap_usd
     if not (math.isfinite(cap) and cap > 0):
         raise ConfigError(f"{path}: [dig].review_monthly_cap_usd は正の有限値: {cap}")
@@ -558,7 +567,9 @@ def load_env(config_dir: Path) -> dict[str, str]:
         if not stripped or stripped.startswith("#"):
             continue
         if "=" not in stripped:
-            raise ConfigError(f"{path}:{lineno}: KEY=VALUE 形式でない行: {stripped[:20]}…")
+            # 行の内容は出さない(token の途中の改行や値だけの貼り付けでは secret の一部になり、
+            # doctor・CLI の出力や launchd のログに残るため。行番号と種別だけを返す。GH#205)
+            raise ConfigError(f"{path}:{lineno}: KEY=VALUE 形式でない行(= が無い)")
         key, _, value = stripped.partition("=")
         value = value.strip()
         # 囲みクォートは「対になっている場合のみ」1組だけ剥がす(str.strip だと

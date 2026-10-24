@@ -1,8 +1,9 @@
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
-from app.config import Config, ConfigError, load_config, load_env
+from app.config import _SECTIONS, Config, ConfigError, load_config, load_env
 
 
 def write_config(tmp_path: Path, body: str) -> Path:
@@ -230,6 +231,15 @@ def test_load_env_rejects_malformed_line(tmp_path: Path) -> None:
         load_env(tmp_path)
 
 
+def test_load_env_malformed_line_does_not_echo_content(tmp_path: Path) -> None:
+    # 区切りの無い行は secret の一部(token の途中の改行・値だけの貼り付け)でありうるので、
+    # 行番号と種別だけを出し、行の内容は先頭も含めて出さない(GH#205)
+    write_env(tmp_path, "X_API_KEY=abc\nQz7Wk3Rv9Lm2Xp5Tn8Hd4Fj6\n")
+    with pytest.raises(ConfigError, match=r"\.env:2: KEY=VALUE") as excinfo:
+        load_env(tmp_path)
+    assert "Qz7W" not in str(excinfo.value)
+
+
 def test_telegram_timer_times_validated(tmp_path: Path) -> None:
     write_config(tmp_path, '[telegram]\nsurvey_time = "21:30"\nwatchdog_time = "07:15"\n')
     config = load_config(tmp_path)
@@ -283,6 +293,17 @@ def test_x_oauth2_validation(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, '[x_oauth2]\nclient_id = " "\n'))
 
 
+def test_obsidian_vault_path_rejects_blank(tmp_path: Path) -> None:
+    # 空文字は Path("") = 実行ディレクトリに解決され、ノートが Vault に届かない。
+    # 未設定はキーの省略で表す(GH#251)
+    for blank in ("", "  "):
+        with pytest.raises(ConfigError, match=r"\[obsidian\].vault_path"):
+            load_config(write_config(tmp_path, f'[obsidian]\nvault_path = "{blank}"\n'))
+    config = load_config(write_config(tmp_path, '[obsidian]\nvault_path = "~/vault"\n'))
+    assert config.obsidian.vault_path == "~/vault"
+    assert load_config(write_config(tmp_path, "[obsidian]\n")).obsidian.vault_path is None
+
+
 def test_x_signals_cap_counts_toward_combined_budget(tmp_path: Path) -> None:
     # S1b 取込も合算予算の単一ノブの内側(ADR 0001)。既定 0 は挙動不変
     assert load_config(tmp_path / "nowhere").x_signals.daily_read_cap == 0
@@ -316,6 +337,24 @@ def test_x_signals_weights_reject_non_finite(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[x_signals]\nhalf_life_days = nan\n"))
     with pytest.raises(ConfigError, match="weight_like"):
         load_config(write_config(tmp_path, "[x_signals]\nweight_like = inf\n"))
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_float_settings_reject_non_finite(tmp_path: Path, bad: str) -> None:
+    # nan は大小比較が常に偽、inf は「0 以上」「正」を満たすので、値域の検証より先に
+    # 有限値だけを受ける。ランキングの閾値・係数と予算に限らず、浮動小数点の設定すべてに
+    # 掛かる(GH#198)
+    float_settings = [
+        (section, f.name)
+        for section, cls in _SECTIONS.items()
+        for f in fields(cls)
+        if f.type == "float"
+    ]
+    assert {("ranking", "min_score"), ("budget", "monthly_cap_usd")} <= set(float_settings)
+    for section, key in float_settings:
+        write_config(tmp_path, f"[{section}]\n{key} = {bad}\n")
+        with pytest.raises(ConfigError, match=rf"\[{section}\]\.{key} は有限値"):
+            load_config(tmp_path)
 
 
 def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
