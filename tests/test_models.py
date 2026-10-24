@@ -1,3 +1,4 @@
+import ast
 import sqlite3
 from pathlib import Path
 
@@ -65,3 +66,23 @@ def test_analysis_from_row_covers_all_columns(conn: sqlite3.Connection) -> None:
     assert analysis.total_score is None
     assert analysis.degraded == 0
     assert analysis.estimated_cost_usd == 0
+    assert analysis.extraction_failed == 0  # migration 021 の既定(GH#240)
+
+
+def test_extraction_failed_note_is_read_from_common_layer() -> None:
+    # 本文を読めていない印(GH#240)は digest・Telegram・Items ノートの 3 つの段が使う。特定の段の
+    # module に置かず共通の層(models.py)から読む(設計 00 §3)。Items ノートの書き出しが文言のため
+    # だけに digest と ranking を読み込む依存を作らない
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    for rel in ("digest/builder.py", "delivery/telegram.py", "export/obsidian.py"):
+        tree = ast.parse((app_dir / rel).read_text(encoding="utf-8"))
+        sources = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and any(alias.name == "EXTRACTION_FAILED_NOTE" for alias in node.names)
+        }
+        assert sources == {"app.models"}, rel
+    obsidian = ast.parse((app_dir / "export/obsidian.py").read_text(encoding="utf-8"))
+    imported = {node.module for node in ast.walk(obsidian) if isinstance(node, ast.ImportFrom)}
+    assert not {m for m in imported if m and m.startswith(("app.digest", "app.ranking"))}

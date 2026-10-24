@@ -138,6 +138,30 @@ def test_x_items_have_no_excerpt_rss_do(conn, tmp_path) -> None:
     assert "抽出済み本文" not in x_note.read_text()
 
 
+def test_item_note_marks_summary_made_without_body(conn, tmp_path) -> None:
+    # GH#240: 本文を読めず見出しだけで作った要約には、要約の頭に印を出す。本文を読めた通常の
+    # 記事と、分析の無い degraded の記事のノートには出さない
+    failed = add_digested(conn, "https://a/failed", body=None)
+    normal = add_digested(conn, "https://a/normal")
+    degraded = add_digested(conn, "https://a/degraded", body=None)
+    conn.execute(
+        "UPDATE analyses SET extraction_failed = 1 WHERE item_id IN (?, ?)", (failed, degraded)
+    )
+    conn.execute("UPDATE analyses SET degraded = 1 WHERE item_id = ?", (degraded,))
+    digest_id = add_digest(conn, [failed, normal, degraded])
+    export_digest(conn, make_config(tmp_path), digest_id, logger)
+
+    items_dir = tmp_path / "vault" / "SignalForge" / "Items"
+
+    def note_text(item_id: int) -> str:
+        return next(p for p in items_dir.glob("*.md") if f"-{item_id}-" in p.name).read_text()
+
+    assert "## 要約\n> ⚠️ 本文を読めていない(見出しだけで分析)\n\n要約文\n" in note_text(failed)
+    assert "## 要約\n要約文\n" in note_text(normal)
+    assert "本文を読めていない" not in note_text(normal)
+    assert "本文を読めていない" not in note_text(degraded)
+
+
 def test_regeneration_preserves_handwritten_and_user_frontmatter(conn, tmp_path) -> None:
     item = add_digested(conn, "https://a/1")
     digest_id = add_digest(conn, [item])

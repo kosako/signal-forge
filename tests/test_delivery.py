@@ -43,6 +43,7 @@ def add_item(
     reason="理由",
     implication="示唆テキスト。",
     degraded=0,
+    extraction_failed=0,
 ) -> int:
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, published_at, content_hash, "
@@ -52,9 +53,12 @@ def add_item(
     conn.execute(
         "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
         "recommendation_reason, implication, degraded, engine, model, prompt_version, "
-        "input_hash) "
-        "VALUES (?, ?, ?, '課題直結', 80, 'new', ?, ?, ?, 'codex-cli', 'm', 'analyze-v001', ?)",
-        (item_id, title_ja, summary, reason, implication, degraded, f"sha256:{url}"),
+        "input_hash, extraction_failed) "
+        "VALUES (?, ?, ?, '課題直結', 80, 'new', ?, ?, ?, 'codex-cli', 'm', 'analyze-v001', ?, ?)",
+        (
+            item_id, title_ja, summary, reason, implication, degraded, f"sha256:{url}",
+            extraction_failed,
+        ),
     )
     return item_id
 
@@ -230,6 +234,71 @@ def test_long_summary_truncated_but_title_url_implication_kept(conn, tmp_path) -
     assert '<a href="https://a/1">' in text  # URL も削らない
 
 
+def test_extraction_failed_item_shows_note_and_keeps_reason(conn, tmp_path) -> None:
+    # GH#240: 本文を読めず見出しだけで作った分析は、ソース行の次に印を出す。LLM は正常に
+    # 答えているので degraded ではなく、🎯 の行(GH#90)はそのまま出す。ヘッダは通常のまま
+    a = add_item(
+        conn, "https://a/1",
+        summary="見出しからの要約。", reason="理由。", implication="示唆。", extraction_failed=1,
+    )
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert "⚠️" not in recorder.texts()[0]
+    lines = recorder.texts()[1].splitlines()
+    assert lines[2:] == [
+        "⚠️ 本文を読めていない(見出しだけで分析)",
+        "見出しからの要約。",
+        "🎯 理由。",
+        "💡 示唆。",
+    ]
+
+
+def test_normal_item_has_no_extraction_note(conn, tmp_path) -> None:
+    # 本文を読めた通常の項目は従来どおり(印の行は出ない。GH#240)
+    a = add_item(conn, "https://a/1", summary="要約。", reason="理由。", implication="示唆。")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert "本文を読めていない" not in text
+    assert text.splitlines()[2:] == ["要約。", "🎯 理由。", "💡 示唆。"]
+
+
+def test_extraction_note_not_on_degraded_item(conn, tmp_path) -> None:
+    # degraded(LLM の失敗でタイトルのみ)は分析が無いので、本文の印も 🎯 も出さない(GH#240)
+    a = add_item(
+        conn, "https://a/1",
+        summary="タイトル", reason="LLM 分析失敗のため degraded 記録",
+        implication="分析なし(タイトルのみ)", degraded=1, extraction_failed=1,
+    )
+    digest_id = add_digest(conn, [a], status="degraded")
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert recorder.texts()[1].splitlines()[2:] == ["タイトル", "💡 分析なし(タイトルのみ)"]
+
+
+def test_long_summary_with_extraction_note_stays_within_limit(conn, tmp_path) -> None:
+    # 印の行も削らない行として予算に入れ、超過は要約で吸収する(1 通 1000 字。設計 04 §2)
+    a = add_item(
+        conn, "https://a/1",
+        summary="あ" * 3000, reason="理由は残る。", implication="示唆は残る。",
+        extraction_failed=1,
+    )
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    text = recorder.texts()[1]
+    assert len(text) == ITEM_TEXT_MAX_CHARS  # 上限ちょうどまで要約で埋まる
+    assert "…" in text
+    assert text.splitlines()[2] == "⚠️ 本文を読めていない(見出しだけで分析)"
+    assert text.endswith("🎯 理由は残る。\n💡 示唆は残る。")
+
+
 def test_truncation_never_splits_html_entity(conn, tmp_path) -> None:
     # 切り詰め境界に & が来るよう、エスケープで膨らむ文字を敷き詰める
     # (エスケープ後 slice だと末尾が「&am…」等の壊れた entity になる)
@@ -271,7 +340,9 @@ def test_degraded_digest_header_has_warning(conn, tmp_path) -> None:
     recorder = ApiRecorder()
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
 
-    assert "⚠️ 本文抽出失敗/分析縮退あり" in recorder.texts()[0]
+    # 全滅(LLM の失敗)の劣化配信。本文の抽出の失敗は記事ごとに出すので、ここでは言わない(GH#240)
+    assert "⚠️ 分析縮退あり(LLM の失敗でタイトルのみ)" in recorder.texts()[0]
+    assert "本文" not in recorder.texts()[0]
     # summary/implication 空でもタイトル+ソース行のメッセージは成立する
     assert "1. <b>" in recorder.texts()[1]
     assert "💡" not in recorder.texts()[1]

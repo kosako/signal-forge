@@ -15,6 +15,7 @@ import sqlite3
 
 from app.config import Config
 from app.jst import jst_day_bounds_utc, today_jst
+from app.models import EXTRACTION_FAILED_NOTE
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
 
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
@@ -280,6 +281,8 @@ def _render_markdown(
         lines.append(f"- URL: {item.canonical_url}")  # DB 正規 URL のみ(LLM 出力 URL 不使用)
         if not degraded:
             lines.append(f"- カテゴリ: {item.category}")
+            if item.extraction_failed and not item.degraded:
+                lines.append(f"- {EXTRACTION_FAILED_NOTE}")
             lines.append("")
             lines.append(item.summary)
             lines.append("")

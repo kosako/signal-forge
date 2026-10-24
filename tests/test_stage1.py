@@ -195,7 +195,7 @@ def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
         (item_id,),
     )
     result = preselect(conn, make_config(tmp_path), logger)
-    assert result.counts["selected"] == 1  # degraded 分析に回る(除外しない)
+    assert result.counts["selected"] == 1  # 本文なしの分析に回る(除外しない)
     assert result.selected_ids == [item_id]
 
 

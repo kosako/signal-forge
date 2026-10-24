@@ -328,6 +328,50 @@ def test_single_unavailable_does_not_degrade_earlier_single_failure(conn, tmp_pa
     assert statuses == {a: "analyzed", b: "new", c: "new"}
 
 
+def test_extraction_failure_recorded_without_degrading_normal_answer(conn, tmp_path) -> None:
+    # GH#240: 本文の抽出に失敗した記事(documents 行が無い記事も同じ)は本文なしで LLM に渡す。
+    # LLM が正常に答えれば degraded にせず(全滅の判定・🎯 の省略に混ぜない)、本文を読めて
+    # いないことだけを extraction_failed で残す。読めた記事(ok / partial)は 0 のまま
+    ok = add_item(conn, "https://a.example/ok")
+    partial = add_item(conn, "https://a.example/partial", body="短い本文", extraction="partial")
+    failed = add_item(conn, "https://a.example/failed", body=None, extraction="failed")
+    no_doc = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
+        "VALUES (2, 'https://a.example/nodoc', 'https://a.example/nodoc', 'T', 'sha256:x')"
+    ).lastrowid
+    ids = [ok, partial, failed, no_doc]
+    engine = FakeEngine([AnalysisBatch(results=[analysis_for(i) for i in ids])])
+
+    counts = analyze_selected(conn, make_config(tmp_path), engine, "p", ids, logger)
+
+    assert counts == {"analyzed": 4, "degraded": 0}
+    rows = {
+        r["item_id"]: r
+        for r in conn.execute("SELECT item_id, degraded, extraction_failed FROM analyses")
+    }
+    assert {i: rows[i]["extraction_failed"] for i in ids} == {
+        ok: 0, partial: 0, failed: 1, no_doc: 1
+    }
+    assert all(rows[i]["degraded"] == 0 for i in ids)
+    # プロンプトの extraction と同じ判定(無い documents も failed として渡している)
+    assert engine.prompts[0].count("extraction: failed") == 2
+
+
+def test_extraction_failure_recorded_on_degraded_row_too(conn, tmp_path) -> None:
+    # LLM の失敗で degraded 記録になっても、入力が本文なしだったことは同じ印で残す(GH#240)
+    a = add_item(conn, "https://a.example/1", body=None, extraction="failed")
+    b = add_item(conn, "https://a.example/2")
+    engine = FakeEngine([LLMError("落ちた")] * 2)
+    with pytest.raises(FullDegradationError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
+    rows = {
+        r["item_id"]: r
+        for r in conn.execute("SELECT item_id, degraded, extraction_failed FROM analyses")
+    }
+    assert (rows[a]["degraded"], rows[a]["extraction_failed"]) == (1, 1)
+    assert (rows[b]["degraded"], rows[b]["extraction_failed"]) == (1, 0)
+
+
 def test_batching_respects_batch_size(conn, tmp_path) -> None:
     ids = [add_item(conn, f"https://a.example/{i}") for i in range(5)]
     engine = FakeEngine(

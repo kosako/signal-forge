@@ -26,6 +26,7 @@ import yaml
 
 from app.config import Config
 from app.jst import JST
+from app.models import EXTRACTION_FAILED_NOTE
 
 GENERATED_BEGIN = "<!-- GENERATED:BEGIN -->"
 GENERATED_END = "<!-- GENERATED:END -->"
@@ -246,7 +247,11 @@ def _item_frontmatter(row: sqlite3.Row, digest_date: str) -> dict:
 
 
 def _item_generated_body(row: sqlite3.Row, notes: list[sqlite3.Row]) -> str:
-    lines = ["## 要約", row["summary"] or "(なし)"]
+    lines = ["## 要約"]
+    # 本文を読めず見出しだけで作った要約であることを示す(GH#240)。degraded は分析が無いので出さない
+    if row["extraction_failed"] and not row["degraded"]:
+        lines += [f"> {EXTRACTION_FAILED_NOTE}", ""]
+    lines.append(row["summary"] or "(なし)")
     # X 由来は本文・抜粋を恒久保存層に置かない(Issue #2 確定)
     if row["source_type"] in ("rss", "manual") and row["extracted_text"]:
         lines += ["", "## 抜粋", row["extracted_text"][:EXCERPT_MAX_CHARS]]
@@ -355,7 +360,7 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
                sources.name AS source_name, sources.type AS source_type,
                analyses.title_ja, analyses.summary, analyses.recommendation_reason,
                analyses.implication,
-               analyses.total_score,
+               analyses.total_score, analyses.degraded, analyses.extraction_failed,
                documents.extracted_text
         FROM items
         JOIN sources ON sources.id = items.source_id

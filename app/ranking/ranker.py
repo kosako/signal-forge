@@ -33,6 +33,8 @@ class RankedItem:
     degraded: bool
     # 日本語見出し(analyze-v002)。None = v001 世代 / degraded(表示は原文 title に fallback)
     title_ja: str | None = None
+    # 本文の抽出に失敗し、見出しだけで分析した(analyses.extraction_failed。GH#240)。表示用
+    extraction_failed: bool = False
 
 
 def rank_for_digest(conn: sqlite3.Connection, config: Config) -> list[RankedItem]:
@@ -71,7 +73,7 @@ def digest_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                analyses.id AS analysis_id, analyses.relevance_score, analyses.novelty,
                analyses.negative_labels, analyses.topic, analyses.title_ja, analyses.summary,
                analyses.category, analyses.recommendation_reason, analyses.implication,
-               analyses.degraded, analyses.analyzed_at
+               analyses.degraded, analyses.extraction_failed, analyses.analyzed_at
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (
@@ -175,6 +177,7 @@ def _select(scored: list[tuple[sqlite3.Row, float]], config: Config) -> list[Ran
                 implication=row["implication"],
                 degraded=bool(row["degraded"]),
                 title_ja=row["title_ja"],
+                extraction_failed=bool(row["extraction_failed"]),
             )
         )
     return selected
