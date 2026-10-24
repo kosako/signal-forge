@@ -8,15 +8,20 @@
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
   そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。
 - カーソルは全スロット横断の最大 tweet id を `{"since_id": ...}` に(snowflake id は時刻単調
-  のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。**全スロットが完走した
-  ときだけ進める**: 途中打ち切りで進めると未実行スロットのその日ぶんが watermark の背後に
-  隠れて恒久欠落するため、打ち切り時は据え置き(翌日、旧 watermark から再取得して UNIQUE で
-  吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。
+  のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。そのために全スロットの
+  取得の上限(end_time)を実行の開始で 1 つに固定する(GH#184): スロットは順に取るので、上限が
+  要求ごとに違うと、先のスロットに実行中に入った新着が後のスロットの最大 id の背後に隠れて
+  恒久欠落する。**全スロットが完走したときだけ進める**: 途中打ち切りで進めると未実行スロットの
+  その日ぶんが watermark の背後に隠れて恒久欠落するため、打ち切り時は据え置き(翌日、旧
+  watermark から再取得して UNIQUE で吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。
 - search/recent は直近 7 日より古い since_id を 400 で拒否する。停止明けで watermark が窓の外に
   出ると毎日 400 で永久に進まないため、窓の端に近い(SINCE_ID_MAX_AGE より古い)since_id は
   外して取得する(GH#121。窓の外の欠落は API 上取り戻せない)。
 - 打ち切り・失敗はホームTL と同じ方針: rate limit 残 0 で全体打ち切り / 累計 0 件での
-  HTTP 失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。
+  HTTP 失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗は打ち切り返却。部分取得後の
+  失敗は取得ぶんを返しつつ理由を `FetchResult.partial_error` に載せ、collect にソースの失敗と
+  して記録させる(GH#183。後ろのスロットの壊れたクエリの 400 などを正常扱いで隠さない)。
+  予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
 """
@@ -55,6 +60,10 @@ EXPANSIONS = "author_id"
 # search/recent が受け付ける since_id は直近 7 日(実測の 400 応答で確認・GH#121)。
 # run の所要時間と時計のずれに 1 日の余裕を取る(この古さなら予算はどのみち新しい側で埋まる)
 SINCE_ID_MAX_AGE = timedelta(days=6)
+# 全スロット共通の取得の上限(end_time)を実行の開始からどれだけ前に置くか(GH#184)。
+# search/recent は end_time を要求の時刻より 10 秒以上前に限り、指定しなければ要求の 30 秒前を
+# 上限にする。既定と同じ 30 秒にして索引の遅れへの余裕を今までと変えない(時計のずれは 20 秒まで)
+END_TIME_LAG = timedelta(seconds=30)
 _SNOWFLAKE_EPOCH_MS = 1288834974657  # tweet id(snowflake)の時刻の基準 = 2010-11-04T01:42:54.657Z
 
 
@@ -84,9 +93,12 @@ class XSearchConnector:
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
+        now = self._now()
+        # 全スロットをこの時刻までで取る(GH#184。秒の単位で、この時刻は含まない)
+        end_time = (now - END_TIME_LAG).strftime("%Y-%m-%dT%H:%M:%SZ")
         stored_since = cursor.get("since_id")
         since_id = stored_since  # 送る値。外しても保存値は据え置き用に残す(次回も同じ判定で外れる)
-        if since_id and _snowflake_time(since_id) < self._now() - SINCE_ID_MAX_AGE:
+        if since_id and _snowflake_time(since_id) < now - SINCE_ID_MAX_AGE:
             # 送ると毎日 400 で watermark が永久に進まない(GH#121)。外して新しい側から取り直す
             logging.getLogger("intel").warning(
                 "検索の since_id が 7 日窓の端より古い。since_id なしで取得する",
@@ -99,9 +111,10 @@ class XSearchConnector:
         http_status: int | None = None
         budgets = _split_budget(self._daily_read_cap, len(self._slots))
         stopped = False
+        error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
-            tweets, status, stopped = self._fetch_slot(
-                query, budget, since_id, users, have_prior=any(t for _q, t in fetched)
+            tweets, status, stopped, error = self._fetch_slot(
+                query, budget, since_id, end_time, users, have_prior=any(t for _q, t in fetched)
             )
             fetched.append((query, tweets))
             reads += len(tweets)
@@ -116,7 +129,8 @@ class XSearchConnector:
         # 次回 since_id は「全スロット完走」時のみ今回の最大 tweet id に進める。
         # 途中打ち切りで進めると未実行スロットのその日ぶんが恒久欠落する(据え置きなら
         # 翌日再取得され UNIQUE で吸収)。スロット内の予算打ち切りで捨てる古い側は
-        # ホームTL と同じく追わない(設計 02 §2)
+        # ホームTL と同じく追わない(設計 02 §2)。全スロットを同じ end_time で取るので、
+        # あるスロットを取ったあとに入った新着が、後のスロットの最大 id の背後に隠れない(GH#184)
         next_since = str(max(all_ids)) if all_ids and not stopped else stored_since
         return FetchResult(
             items=items,
@@ -128,6 +142,7 @@ class XSearchConnector:
                 http_status=http_status,
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
+            partial_error=error,
         )
 
     def _fetch_slot(
@@ -135,11 +150,15 @@ class XSearchConnector:
         query: str,
         budget: int,
         since_id: str | None,
+        end_time: str,
         users: dict[str, str],
         *,
         have_prior: bool,
-    ) -> tuple[list[dict], int | None, bool]:
-        """1スロット分のページング取得。returns (tweets, http_status, stop_all)。"""
+    ) -> tuple[list[dict], int | None, bool, Exception | None]:
+        """1スロット分のページング取得。returns (tweets, http_status, stop_all, error)。
+
+        error = 部分取得のあとの HTTP の失敗(GH#183)。そのとき stop_all も真。
+        """
         tweets: list[dict] = []
         token: str | None = None
         http_status: int | None = None
@@ -147,6 +166,7 @@ class XSearchConnector:
             params: dict[str, str | int] = {
                 "query": x_search_query(query),  # (スロット) + 除外句(GH#230)
                 "max_results": min(MAX_RESULTS, budget - len(tweets)),
+                "end_time": end_time,  # 全スロット共通の上限(GH#184)
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
             }
@@ -159,10 +179,12 @@ class XSearchConnector:
             raise_for_auth(response, "search/recent")
             if response.status_code != 200:
                 # 累計 0 件での失敗は「0件成功」で隠さず例外(ホームTL と同方針)。
-                # どこかのスロットが取得済みなら部分取得として全体打ち切り
+                # どこかのスロットが取得済みなら部分取得として全体打ち切り。取得ぶんは保存しつつ
+                # ソースの失敗として数えさせる(GH#183。400・402・429・5xx を正常扱いで隠さない)
+                error = status_error(response, SEARCH_URL)
                 if not have_prior and not tweets:
-                    raise status_error(response, SEARCH_URL)
-                return tweets, http_status, True
+                    raise error
+                return tweets, http_status, True, error
             body = response.json()
             page = body.get("data", [])
             for user in body.get("includes", {}).get("users", []):
@@ -171,11 +193,11 @@ class XSearchConnector:
             if not page:
                 break  # 空ページ = 新規なし。next_token 循環によるループも塞ぐ
             if rate_limit_exhausted(response):
-                return tweets, http_status, True  # 残 0 → 全体打ち切り(15分待ちはしない)
+                return tweets, http_status, True, None  # 残 0 → 全体打ち切り(15分待ちはしない)
             token = body.get("meta", {}).get("next_token")
             if not token:
                 break  # since_id 到達 / 7日窓の末尾
-        return tweets, http_status, False
+        return tweets, http_status, False, None
 
 
 def build_x_search_connector(

@@ -27,6 +27,8 @@ class FetchResult:
     next_cursor: dict         # sources.cursor に JSON 保存する不透明な辞書
     stats: FetchStats         # items_fetched, api_reads, estimated_cost_usd(collect_runs へ記録)
                               #   + http_status, duration_ms(ログのみ)
+    partial_error: Exception | None = None   # 部分取得のあとの失敗(GH#183)。collect は items と
+                              #   next_cursor を保存しつつ、ソースの失敗として記録する(下の「記録」)
 
 class Connector(Protocol):
     source_type: str          # "x" | "rss"
@@ -40,7 +42,7 @@ class Connector(Protocol):
   - `RetryableError`(接続失敗・timeout・5xx・429): リトライは**設計 05 §8 の共通規約に従う**(2回・指数バックオフ 1s→4s + jitter。429 は Retry-After 優先)。リトライ尽きでそのソースを当日スキップ。
   - `FatalError`(401/403・設定不備): リトライせずスキップ、doctor 警告対象。
   - いずれもソース単位で握りつぶし、**他ソースの collect は必ず継続**(縮退の基本形。X が死んでも RSS+手動URLでダイジェストは出る)。
-- **記録**: fetch 1回ごとに `collect_runs`(source_id, started_at, finished_at, status, items_fetched, api_reads, estimated_cost_usd, error)へ1行。テーブル定義の正本は 01(語彙も 01 に従う)。http_status・duration_ms はログ(JSON Lines)のみで DB には持たない(1人運用のデバッグはログで足りる)。`sources` には last_success_at / last_error_at / consecutive_failures を反映する(成功で 0 リセット・失敗で +1。01 §3)。
+- **記録**: fetch 1回ごとに `collect_runs`(source_id, started_at, finished_at, status, items_fetched, api_reads, estimated_cost_usd, error)へ1行。テーブル定義の正本は 01(語彙も 01 に従う)。http_status・duration_ms はログ(JSON Lines)のみで DB には持たない(1人運用のデバッグはログで足りる)。`sources` には last_success_at / last_error_at / consecutive_failures を反映する(成功で 0 リセット・失敗で +1。01 §3)。部分取得のあとの失敗(`partial_error`。X 検索の後ろのスロットの失敗。§2)は、items とカーソルを保存しつつ失敗として記録する(collect_runs は件数・費用つきの `status='error'`。sources は失敗で +1 し、last_success_at は変えない。GH#183)。
 - **SSRF ガード**: 短縮 URL 展開・本文抽出を含む外部 URL fetch の全経路は、設計 05 §8 の共通 HTTP クライアント規約(global でないアドレスへの接続拒否 = is_global allowlist 方式、リダイレクト各ホップで再検査、検証済み IP へのピン留め)に従う。
 - 拡張点: 新ソースは Connector 実装+sources 1行の追加のみ。スケジューリング分岐(ソース別頻度)は現時点で作らない(朝バッチ1回で十分)。
 
@@ -58,11 +60,11 @@ class Connector(Protocol):
 
 ### AI 検索(`connectors/x_search.py`・Issue #57)
 
-- **エンドポイント**: `GET /2/tweets/search/recent`。パラメータ: `query`(括弧で囲んだスロット + 自動付加演算子), `max_results`(10〜100。**下限 10 は API 仕様**), `since_id`, `next_token`(検索は `pagination_token` でなく `next_token`), `tweet.fields=created_at,author_id,note_tweet`(note_tweet はホームTL と同じ理由 = GH#94), `expansions=author_id`(RT/リプライはクエリ演算子で除外済みのため referenced_tweets は要らない)。認証はホームTL と同じ OAuth 1.0a(既存4キー。Bearer は使わず認証経路を1本に保つ)。署名・リトライは共有トランスポート(`XApiSession`)。
+- **エンドポイント**: `GET /2/tweets/search/recent`。パラメータ: `query`(括弧で囲んだスロット + 自動付加演算子), `max_results`(10〜100。**下限 10 は API 仕様**), `since_id`, `end_time`(全スロット共通の取得の上限。下の「カーソル」), `next_token`(検索は `pagination_token` でなく `next_token`), `tweet.fields=created_at,author_id,note_tweet`(note_tweet はホームTL と同じ理由 = GH#94), `expansions=author_id`(RT/リプライはクエリ演算子で除外済みのため referenced_tweets は要らない)。認証はホームTL と同じ OAuth 1.0a(既存4キー。Bearer は使わず認証経路を1本に保つ)。署名・リトライは共有トランスポート(`XApiSession`)。
 - **スロット**: config `[x_search].slots`(**最大3・入れ替え式**。ADR 0001)。4本以上・重複・空文字・括弧と自動付加分込み512字超(Basic tier のクエリ長上限)・括弧(引用符の外)や引用符が対応していないもの(囲んだ括弧が途中で閉じて除外句が全体に掛からない。GH#230)は ConfigError で fail fast。**slots 空 = 検索無効**(コネクタを配線しない)。スロット自動更新は作らない(更新提案は S2 = #59 の人間承認ゲート)。
 - **クエリの自動付加**: 各スロットを括弧で囲んで `-is:retweet -is:reply` を付加し(`(スロット) -is:retweet -is:reply`)、RT・リプライを**課金前にサーバ側で除外**する。ホームTL の「RT は元ツイへ正規化・他人宛リプライ除外」と方針整合で、取ってから捨てると読取課金が無駄になるため。括弧で囲むのは、X の検索が AND を OR より先に結び付けるため: 括弧なしの `a OR b -is:retweet -is:reply` では除外が `b` の枝にしか掛からない(GH#230)。`lang:` 等の演算子や OR はスロット側に書いてよい(スロット内の結合はスロットに書いたとおりで、除外だけが全体に掛かる)。スレッド(著者の自己リプライ)も落ちるが MVP はノイズ削減を優先(RawItem.meta に `{"query": スロット}` を記録し、週次の再配分材料にする)。
 - **予算**: `[x_search].daily_read_cap`(既定35)をスロット数で均等割(端数は先頭から。35 → 12/12/11)。スロット間の再配分はしない(多産クエリが他スロットを飢えさせない)。残枠が 10(max_results 下限)を切ったらそのスロットは打ち切り(**cap はハード上限**。超過方向に丸めない)。**ホームTL との合算は `[x].combined_daily_read_cap`(既定165)が単一ノブ**で、内訳合計が超えると起動時 ConfigError(ADR 0001 予算配分)。
-- **カーソル**: `cursor = {"since_id": 全スロット横断の最大 tweet id}`。tweet id(snowflake)は時刻単調なので単一 watermark で足り、スロット入れ替え後もそのまま有効(新スロットは前回実行以降ぶんから取れる)。**watermark は全スロット完走時のみ進める**: 途中打ち切り(失敗・rate limit 残0)で進めると未実行スロットのその日ぶんが watermark の背後に隠れて恒久欠落するため、打ち切り時は据え置く(翌日、旧 watermark から再取得して UNIQUE で吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。スロット内の予算打ち切りで捨てる古い側はホームTL 同様に追わない。**search/recent は直近 7 日より古い since_id を 400 で拒否する**(ホームTL には無い制約): 停止明けで watermark が窓の外に出ると毎日 400 で永久に進まないため、**6 日(7 日に 1 日の余裕)より古い since_id は外して取得し WARNING を出す**(GH#121。窓の外の欠落は API 上取り戻せない)。外すのは送信だけで、打ち切り・0 件のときは上の規約どおり元の値を据え置く(次回も同じ判定で外れる)。失敗の扱いもホームTL と同方針: 累計0件での失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗・rate limit 残0は打ち切り返却(残りスロットも当日分は諦める)。
+- **カーソル**: `cursor = {"since_id": 全スロット横断の最大 tweet id}`。tweet id(snowflake)は時刻単調なので単一 watermark で足り、スロット入れ替え後もそのまま有効(新スロットは前回実行以降ぶんから取れる)。ただしスロットは順に取るので、取得の上限の時刻がスロットごとに違うと、先のスロットを取ったあと・後のスロットを取る前に先のスロットに入った新着が、後のスロットの最大 id(= 次回の since_id)の背後に隠れて恒久欠落する。そこで**全スロットの取得の上限を共通にする**(GH#184): 実行の開始の 30 秒前を `end_time` にして全スロット・全ページに送り、その境界までだけを取って watermark を進める(境界より後の新着は次回、どのスロットからも取れる)。search/recent は `end_time` を要求の時刻より 10 秒以上前に限り、指定しなければ要求の 30 秒前を上限にする。既定と同じ 30 秒にして、索引の遅れへの余裕を今までと変えない(手元の時計が X より 20 秒以上進むと 400 になり、失敗として記録される)。**watermark は全スロット完走時のみ進める**: 途中打ち切り(失敗・rate limit 残0)で進めると未実行スロットのその日ぶんが watermark の背後に隠れて恒久欠落するため、打ち切り時は据え置く(翌日、旧 watermark から再取得して UNIQUE で吸収。取得済みぶんの再読課金は検索 cap 上限までで許容)。スロット内の予算打ち切りで捨てる古い側はホームTL 同様に追わない。**search/recent は直近 7 日より古い since_id を 400 で拒否する**(ホームTL には無い制約): 停止明けで watermark が窓の外に出ると毎日 400 で永久に進まないため、**6 日(7 日に 1 日の余裕)より古い since_id は外して取得し WARNING を出す**(GH#121。窓の外の欠落は API 上取り戻せない)。外すのは送信だけで、打ち切り・0 件のときは上の規約どおり元の値を据え置く(次回も同じ判定で外れる)。失敗の扱いもホームTL と同方針: 累計0件での失敗は例外(0件成功で障害を隠さない)/ 部分取得後の失敗・rate limit 残0は打ち切り返却(残りスロットも当日分は諦める)。**部分取得後の失敗(400・402・429・5xx)は、取得ぶんを保存しつつソースの失敗として記録する**(GH#183。`FetchResult.partial_error`。consecutive_failures が上がり、上の「縮退」の連続失敗の警告に載る)。後ろのスロットのクエリの誤りによる 400 が毎日続いても、先のスロットが取れているからと正常扱いで隠さないため。予算・rate limit 残0による打ち切りは失敗にしない(応答は正常)。
 - **sources 行と識別**: **type='x' のまま2行運用**(purge の `x_cache_ttl_days`・Obsidian 抜粋なし・KPI 集計が無変更で検索アイテムにも効く)。識別は sources.config の JSON `{"mode": "search"}`。**config NULL = home**(既存ホームTL 行の互換)。mode 不正・不明キーは FatalError(タイポで home に化けてホームTL を二重取得・二重課金する事故を防ぐ)。collect の「type → Connector 1:1」契約(§1)は `XRouter`(connectors/x.py)が吸収する。検索ソースの登録 SQL:
   ```sql
   INSERT INTO sources (type, name, config) VALUES ('x', 'x:search', '{"mode": "search"}');
