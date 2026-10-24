@@ -34,9 +34,8 @@ EXCERPT_MAX_CHARS = 300  # RSS/manual の抜粋の長さ(恒久保存は要約�
 
 FORBIDDEN_IN_SLUG = re.compile(r'[/\\:*?"<>|#^\[\]\s]+')
 _FRONT_MATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-# Items ノートのファイル名(`YYYYMMDD-{item_id}-{slug}.md`)と、退避した .conflict の名前
-_ITEM_NOTE_FILE = re.compile(r"(\d{8})-(\d+)-.*\.md")
-_CONFLICT_FILE = re.compile(r"\.conflict(-\d+)?\.md\Z")
+# Items ノートのファイル名の形(`YYYYMMDD-{item_id}-{slug}.md`)
+_ITEM_NOTE_FILE = re.compile(r"\d{8}-\d+-.*\.md")
 
 # ユーザー所有キー: 生成側は初期値を置くだけで、再生成時に上書きしない(設計 04 §7)
 _USER_OWNED_KEYS = ("reaction",)
@@ -164,7 +163,7 @@ def export_pending_notes(
         row = rows[0]
         note_name, note_date = _item_note_target(existing_notes, row, entry["digest_date"])
         # 新しく作るノートも、下の Daily の wikilink の再計算で同じ出力先として扱う
-        existing_notes.setdefault(row["item_id"], [note_name])
+        existing_notes.setdefault(note_name[8:], [note_name])
         if not _write_note(
             items_dir / f"{note_name}.md",
             _item_frontmatter(row, note_date),
@@ -293,7 +292,7 @@ def _daily_note_content(
 
 
 def _daily_wikilinks(
-    conn: sqlite3.Connection, digest: sqlite3.Row, existing_notes: dict[int, list[str]]
+    conn: sqlite3.Connection, digest: sqlite3.Row, existing_notes: dict[str, list[str]]
 ) -> list[str]:
     """digest の item_ids から wikilink 一覧を再計算する(追いパス用。配信順を維持)。"""
     item_ids = _digest_item_ids(digest)
@@ -309,34 +308,33 @@ def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
     return json.loads(digest["item_ids"]) + json.loads(digest["bookmark_item_ids"] or "[]")
 
 
-def _existing_item_notes(items_dir: Path) -> dict[int, list[str]]:
-    """Items/ に既にあるノート名(拡張子なし)を item ごとに、名前順(= 日付の古い順)で返す。
-
-    .conflict の退避は出力先ではないので除く(GH#242)。
-    """
-    notes: dict[int, list[str]] = {}
+def _existing_item_notes(items_dir: Path) -> dict[str, list[str]]:
+    """Items/ に既にあるノート名(拡張子なし)を、日付より後ろ(`-{item_id}-{slug}`)ごとに
+    名前順(= 日付の古い順)で返す(GH#242)。"""
+    notes: dict[str, list[str]] = {}
     for path in items_dir.glob("*.md"):
-        m = _ITEM_NOTE_FILE.fullmatch(path.name)
-        if m is None or _CONFLICT_FILE.search(path.name):
-            continue
-        notes.setdefault(int(m.group(2)), []).append(path.stem)
+        if _ITEM_NOTE_FILE.fullmatch(path.name):
+            notes.setdefault(path.stem[8:], []).append(path.stem)
     for names in notes.values():
         names.sort()
     return notes
 
 
 def _item_note_target(
-    existing_notes: dict[int, list[str]], row: sqlite3.Row, digest_date: str
+    existing_notes: dict[str, list[str]], row: sqlite3.Row, digest_date: str
 ) -> tuple[str, str]:
     """item のノートの出力先(ノート名と frontmatter の digest_date)を決める(GH#242)。
 
     従来の規則(digest_date)の名前のノートがあればそれを使う(GH#242 より前の重複は動かさない)。
-    無ければ、その item の既存のノートのうち最も早いものを使う。配信済みの記事が後日の
-    🔖 保存節に再掲されたときや、--force の置換で外れた item が後日また載ったときに、別の
-    日付のノートを作らないため。どちらも無いときだけ従来の規則で新しく作る。
+    無ければ、日付の部分だけが違う同じ item のノートのうち最も早いものを使う。配信済みの記事が
+    後日の 🔖 保存節に再掲されたときや、--force の置換で外れた item が後日また載ったときに、
+    別の日付のノートを作らないため。どちらも無いときだけ従来の規則で新しく作る。
+    slug は原文タイトルから決まり変わらないので、日付より後ろが一致するものだけを同じ item の
+    ノートとみなす。退避した .conflict(`{ノート名}.conflict.md`)は名前が違うので選ばない
+    (タイトル自体が `.conflict` で終わるノートは正しく選ぶ)。
     """
     note_name = _item_note_name(digest_date, row["item_id"], row["title"])
-    names = existing_notes.get(row["item_id"], [])
+    names = existing_notes.get(note_name[8:], [])
     if not names or note_name in names:
         return note_name, digest_date
     first = names[0]

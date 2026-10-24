@@ -550,6 +550,22 @@ def test_conflict_file_is_not_reused_as_item_note(conn, tmp_path) -> None:
     assert list((base / "Items").glob(f"20260710-{item}-*.md"))  # 従来の規則で作る
 
 
+@pytest.mark.parametrize("title", ["sync.conflict", "sync.conflict-2"])
+def test_title_ending_with_conflict_still_reuses_first_note(conn, tmp_path, title) -> None:
+    # GH#242(Codex must): タイトル自体が .conflict で終わるノートも、退避と取り違えずに使う
+    item = add_digested(conn, "https://a/1", title=title)
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, first_id, logger)
+    later_id = add_digest(conn, [], date="2026-07-10", bookmark_item_ids=[item])
+    export_digest(conn, config, later_id, logger)
+
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    notes = list((base / "Items").glob(f"*-{item}-*.md"))
+    assert [p.name for p in notes] == [f"20260706-{item}-{title}.md"]
+    assert f"[[20260706-{item}-{title}]]" in (base / "Daily" / "2026-07-10.md").read_text()
+
+
 def test_pending_pass_links_daily_to_note_it_just_created(conn, tmp_path) -> None:
     # GH#242: Items ノートがまだ無い item(export が失敗した日など)を追いパスが作ったとき、
     # 同じ追いパスで書き直す再掲の日の Daily も、そのノートへリンクする
