@@ -8,6 +8,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -599,28 +600,50 @@ def test_existing_note_not_overwritten_on_publish_retry(conn, config) -> None:
     ] is not None
 
 
-def block_first_note_write(monkeypatch) -> tuple[threading.Event, list[str]]:
-    """最初のノートの書き出しだけを release まで止める(vault の応答待ちの代わり。GH#234)。"""
+def block_first_note_write(monkeypatch, *, after_check: bool = False) -> SimpleNamespace:
+    """最初のノートの書き出しを、解除まで止める(vault の応答待ちの代わり。GH#234)。
+
+    after_check なら、置き換えの直前の存在確認を通った後で止める。止まった位置に着いたら
+    reached が立つ。解除(release)を忘れたときは 30 秒で進め、timed_out に残す(テストの誤り)。
+    """
     from app import deepdive as deepdive_module
 
-    release = threading.Event()
-    calls: list[str] = []
+    blocker = SimpleNamespace(
+        reached=threading.Event(), release=threading.Event(), calls=[], timed_out=[]
+    )
     original = deepdive_module.atomic_write
 
-    def blocking(path, content, **kwargs):
-        calls.append(path.name)
-        if len(calls) == 1:
-            release.wait(5)
-        return original(path, content, **kwargs)
+    def hold() -> None:
+        blocker.reached.set()
+        if not blocker.release.wait(30):
+            blocker.timed_out.append(True)
+
+    def blocking(path, content, *, precondition=None):
+        blocker.calls.append(path.name)
+        if len(blocker.calls) > 1:
+            return original(path, content, precondition=precondition)
+        if not after_check:
+            hold()
+            return original(path, content, precondition=precondition)
+
+        def check_then_hold() -> bool:
+            unchanged = precondition() if precondition is not None else True
+            hold()
+            return unchanged
+
+        return original(path, content, precondition=check_then_hold)
 
     monkeypatch.setattr(deepdive_module, "atomic_write", blocking)
-    return release, calls
+    return blocker
 
 
-def join_vault_threads() -> None:
-    for thread in threading.enumerate():
-        if thread.name == "vault-io":
-            thread.join(5)
+def finish_blocked_write(blocker: SimpleNamespace) -> list[threading.Thread]:
+    """止めた書き出しを解除し、vault-io のスレッドの終わりを待つ(終わらなかったものを返す)。"""
+    blocker.release.set()
+    threads = [t for t in threading.enumerate() if t.name == "vault-io"]
+    for thread in threads:
+        thread.join(5)
+    return [thread for thread in threads if thread.is_alive()]
 
 
 def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypatch) -> None:
@@ -640,7 +663,7 @@ def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypat
             (item, f"{name}-深掘り", f"{name} のカード", f"{name} の本文"),
         )
     conn.commit()
-    release, calls = block_first_note_write(monkeypatch)
+    blocker = block_first_note_write(monkeypatch)
     api = FakeApi()
     try:
         with pytest.raises(DigError, match="VaultStalled"):
@@ -648,7 +671,8 @@ def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypat
                 conn, config, make_factory({}), api, logger, today="2026-07-23",
                 vault=VaultGuard(timeout_s=0.05),
             )
-        assert calls == ["s-深掘り.md"]  # 止まった後は、残りの件で vault に触れない
+        assert blocker.reached.is_set()
+        assert blocker.calls == ["s-深掘り.md"]  # 止まった後は、残りの件で vault に触れない
         rows = conn.execute(
             "SELECT published_at, note_markdown FROM dig_results WHERE note_name != 'p-深掘り'"
         ).fetchall()
@@ -656,8 +680,8 @@ def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypat
         assert [row["note_markdown"] for row in rows] == ["s の本文", "l の本文"]
         assert [text for _, text in api.sent] == ["p のカード"]
     finally:
-        release.set()
-        join_vault_threads()
+        alive = finish_blocked_write(blocker)
+    assert alive == [] and blocker.timed_out == []
 
     # 次の実行は、遅れて書き終えたノートを公開済みとして記帳し、残りを公開してカードを送る
     run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
@@ -670,11 +694,12 @@ def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypat
     assert [text for _, text in api.sent] == ["p のカード", "s のカード", "l のカード"]
 
 
-def test_late_publish_does_not_replace_note_published_meanwhile(
-    conn, config, monkeypatch
-) -> None:
-    # 見切ったスレッドが後から書き終えても、その間に次の実行が公開し、take が足された
-    # ノートを置き換えない(既存かどうかは置き換えの直前に確かめる。GH#234)
+def test_next_run_does_not_publish_while_late_write_pending(conn, config, monkeypatch) -> None:
+    # 存在の確認を通った後で止まったスレッドは、後からノートを置き換えうる。それが終わるまで
+    # 別の実行は公開しない(公開して本人が take を足したノートを置き換えさせない。GH#234)
+    from app import deepdive as deepdive_module
+
+    monkeypatch.setattr(deepdive_module, "_PUBLISH_LOCK_WAIT_S", 0.05)
     item = add_item(conn, "https://blog.example/post")
     conn.execute(
         "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
@@ -682,7 +707,47 @@ def test_late_publish_does_not_replace_note_published_meanwhile(
         (item,),
     )
     conn.commit()
-    release, _calls = block_first_note_write(monkeypatch)
+    blocker = block_first_note_write(monkeypatch, after_check=True)
+    note = deepdive_dir(config) / "n-深掘り.md"
+    api = FakeApi()
+    try:
+        with pytest.raises(DigError, match="VaultStalled"):
+            run_dig_stage(
+                conn, config, make_factory({}), api, logger, today="2026-07-23",
+                vault=VaultGuard(timeout_s=0.05),
+            )
+        assert blocker.reached.is_set()
+        with pytest.raises(DigError, match="別の実行の公開が終わっていない"):
+            run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+        assert not note.exists()
+        assert conn.execute("SELECT published_at FROM dig_results").fetchone()[
+            "published_at"
+        ] is None
+        assert api.sent == []
+    finally:
+        alive = finish_blocked_write(blocker)
+    assert alive == [] and blocker.timed_out == []
+
+    # 止まったスレッドが書き終えたら、次の実行はそのノートを公開済みとして扱いカードを送る
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+    with note.open("a", encoding="utf-8") as f:  # 本人の take
+        f.write("\n手書きの take\n")
+
+    assert note.read_text(encoding="utf-8") == "公開の本文\n手書きの take\n"
+    assert api.sent == [(10, "カード")]
+
+
+def test_late_publish_keeps_note_created_meanwhile(conn, config, monkeypatch) -> None:
+    # 見切ったスレッドが後から書き終えるとき、その間にできたノートは置き換えない(既存かどうかは
+    # 置き換えの直前に確かめる。GH#234)
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+        " VALUES (?, 'n-深掘り', 'カード', '遅れた書き込みの本文')",
+        (item,),
+    )
+    conn.commit()
+    blocker = block_first_note_write(monkeypatch)
     note = deepdive_dir(config) / "n-深掘り.md"
     try:
         with pytest.raises(DigError, match="VaultStalled"):
@@ -690,14 +755,13 @@ def test_late_publish_does_not_replace_note_published_meanwhile(
                 conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23",
                 vault=VaultGuard(timeout_s=0.05),
             )
-        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
-        with note.open("a", encoding="utf-8") as f:  # 本人の take
-            f.write("\n手書きの take\n")
+        assert blocker.reached.is_set()
+        note.write_text("公開済みの本文\n手書きの take\n", encoding="utf-8")
     finally:
-        release.set()
-        join_vault_threads()
+        alive = finish_blocked_write(blocker)
+    assert alive == [] and blocker.timed_out == []
 
-    assert note.read_text(encoding="utf-8") == "公開の本文\n手書きの take\n"
+    assert note.read_text(encoding="utf-8") == "公開済みの本文\n手書きの take\n"
     assert not list(deepdive_dir(config).glob(".*.tmp"))  # 一時ファイルを残さない
 
 

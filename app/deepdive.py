@@ -33,11 +33,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,7 +63,7 @@ from app.delivery.telegram import (
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import JST
 from app.prompting import fill_template, sanitize, sanitize_body
-from app.vault_guard import VaultGuard, VaultStalled
+from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-v001"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
@@ -68,6 +72,11 @@ REVISE_PROMPT_VERSION = "dig-revise-v001"  # 指摘を受けて書き手が 1 �
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限定。ADR 0004)
+
+# ノートの公開を実行どうしで 1 つに絞るロック(台帳の DB と同じ置き場。GH#234)。
+# 別の実行が握っていたら、この時間だけ待って諦める(ふだんの公開は数ミリ秒で終わる)
+_PUBLISH_LOCK_NAME = "dig-publish.lock"
+_PUBLISH_LOCK_WAIT_S = VAULT_TIMEOUT_S
 
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
@@ -479,42 +488,67 @@ def _publish_pending_notes(
     macOS のプライバシーの確認待ちなどで止まると、カードの送信と朝バッチの後続の段・失敗通知
     まで止まるため。上限を超えたら、その件と残りの件は本文を台帳に持ったまま未公開にして
     先へ進む(公開済みの件のカードは送り、未公開の件は次の実行で公開し直す)。止まった
-    スレッドが後から書き終えても、_publish_note は既存のノートを上書きしない。
+    スレッドは後から書き終えうるので、それが終わるまで公開のロック(_PublishLock)を握り、
+    別の実行に同じノートを公開させない。
     """
     failures: list[str] = []
     rows = conn.execute(
         "SELECT id, item_id, note_name, source_note_name, note_markdown,"
         " source_note_markdown FROM dig_results WHERE published_at IS NULL ORDER BY id"
     ).fetchall()
-    for index, row in enumerate(rows):
-        try:
-            vault.call(lambda row=row: _publish_row_notes(config, row, logger, run_id))
-        except VaultStalled as e:
-            unpublished = len(rows) - index
-            logger.error(
-                "vault が応答しないので、ノートの公開をこの実行では止める"
-                f"(未公開の {unpublished} 件は本文を台帳に残し、次の実行で公開する。"
-                f"runbook §11): {e}",
-                extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
-            )
-            failures.append(
-                f"item {row['item_id']}: ノート公開 VaultStalled"
-                f"(未公開 {unpublished} 件は次の実行へ)"
-            )
-            break
-        except Exception as e:
-            logger.error(
-                f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
-                extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
-                exc_info=True,
-            )
-            failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
-            continue
-        conn.execute(
-            "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
-            " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
-            (row["id"],),
+    if not rows:
+        return failures
+    lock = _PublishLock.acquire(conn)
+    if lock is None:
+        logger.error(
+            "別の実行のノートの公開が終わっていない(vault が応答しないまま止まっている可能性)"
+            f"ので、この実行では公開しない(未公開の {len(rows)} 件は次の実行へ。runbook §11)",
+            extra={"run_id": run_id, "stage": "dig"},
         )
+        failures.append(f"ノート公開: 別の実行の公開が終わっていない(未公開 {len(rows)} 件)")
+        return failures
+
+    def publish(row: sqlite3.Row) -> None:
+        try:
+            _publish_row_notes(config, row, logger, run_id)
+        finally:
+            if vault.stalled:  # 見切られた後に終わった。握っていたロックをここで放す
+                lock.release()
+
+    try:
+        for index, row in enumerate(rows):
+            try:
+                vault.call(lambda row=row: publish(row))
+            except VaultStalled as e:
+                unpublished = len(rows) - index
+                logger.error(
+                    "vault が応答しないので、ノートの公開をこの実行では止める"
+                    f"(未公開の {unpublished} 件は本文を台帳に残し、次の実行で公開する。"
+                    f"runbook §11): {e}",
+                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                )
+                failures.append(
+                    f"item {row['item_id']}: ノート公開 VaultStalled"
+                    f"(未公開 {unpublished} 件は次の実行へ)"
+                )
+                break
+            except Exception as e:
+                logger.error(
+                    f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
+                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                    exc_info=True,
+                )
+                failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
+                continue
+            conn.execute(
+                "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+                " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
+                (row["id"],),
+            )
+    finally:
+        # 見切ったときは、止まったスレッドが終わるまで(またはプロセスの終了まで)握る
+        if not vault.stalled:
+            lock.release()
     return failures
 
 
@@ -537,6 +571,59 @@ def _publish_row_notes(
             logger,
             run_id,
         )
+
+
+class _PublishLock:
+    """ノートの公開を、同じ台帳を使う実行どうし(朝バッチと `intel dig`)で 1 つに絞る(GH#234)。
+
+    vault が応答せず見切ったスレッドは中断できず、後から書き終えうる。その間に別の実行が
+    同じノートを公開し、本人が take を足したあとで、遅れた書き込みがノートを置き換えないよう、
+    見切ったときはそのスレッドが終わるまで握る。flock なのでプロセスが終われば外れる
+    (止まったスレッドもプロセスと一緒に消える)。answer.lock(GH#145)と同じ考え方。
+    """
+
+    def __init__(self, fd: int | None) -> None:
+        self._fd = fd
+        self._mutex = threading.Lock()
+
+    @classmethod
+    def acquire(cls, conn: sqlite3.Connection) -> _PublishLock | None:
+        """取れなければ None(別の実行が _PUBLISH_LOCK_WAIT_S を過ぎても握っている)。"""
+        path = _publish_lock_path(conn)
+        if path is None:  # ファイルでない DB は、別の実行と台帳を共有しない
+            return cls(None)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            deadline = time.monotonic() + _PUBLISH_LOCK_WAIT_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return cls(fd)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.1)
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+        return None
+
+    def release(self) -> None:
+        """放す(fd を閉じると flock も外れる)。呼び出し側のスレッドと止まったスレッドの
+        どちらが先に呼んでもよく、2 回目は何もしない。"""
+        with self._mutex:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+
+
+def _publish_lock_path(conn: sqlite3.Connection) -> Path | None:
+    """この接続の DB と同じ置き場のロックファイル(設定の値でなく、開いている台帳から決める)。"""
+    for _seq, name, file in conn.execute("PRAGMA database_list").fetchall():
+        if name == "main":
+            return Path(file).with_name(_PUBLISH_LOCK_NAME) if file else None
+    return None
 
 
 def _send_pending_cards(
@@ -977,8 +1064,8 @@ def _publish_note(
     (write-ahead により内容は同一生成物なので、失われるのは何もない)。
 
     既存かどうかは置き換え(rename)の直前に確かめる(GH#234)。vault が応答せず上限の時間で
-    見切ったスレッドは後から書き終えうる。その間に次の実行が公開し、本人が take を書いた
-    ノートを、遅れた書き込みで置き換えないため。
+    見切ったスレッドは後から書き終えうるので、その間にできたノートを置き換えないため。
+    別の実行の公開との競合は、公開のロック(_PublishLock)で防ぐ。
     """
     if not atomic_write(path, content, precondition=lambda: not path.exists()):
         logger.warning(
