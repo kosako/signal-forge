@@ -67,7 +67,8 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
                    unit_price=0.004, seen=None) -> XConnector:
     """pages[i] = (status, body_dict, headers)。timeline リクエストは pagination_token で
     index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。200 応答は
-    max_results で data を切り詰めて実 API の挙動を模す。"""
+    max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、その
+    ページの要求で送出する(通信の失敗。GH#182)。"""
     token_index = {
         body.get("meta", {}).get("next_token"): i + 1
         for i, (_s, body, _h) in enumerate(pages)
@@ -83,6 +84,8 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
         query = parse_qs(split.query)
         token = query.get("pagination_token", [None])[0]
         status, body, headers = pages[0 if token is None else token_index[token]]
+        if isinstance(status, Exception):
+            raise status
         if status == 200:
             limit = int(query.get("max_results", ["100"])[0])
             body = {**body, "data": body.get("data", [])[:limit]}
@@ -134,6 +137,9 @@ def test_rate_limit_remaining_zero_stops() -> None:
     p1 = page([tweet("500", "t")], next_token="tok1")
     result = connector_from([(200, p1, {"x-rate-limit-remaining": "0"})]).fetch(make_source(), {})
     assert result.stats.api_reads == 1  # 残0で打ち切り。next_token があっても2ページ目は取らない
+    # 打ち切りは失敗ではない(応答は正常)。古い側の穴は追わず since_id を進める(設計 02 §2)
+    assert result.partial_error is None
+    assert result.next_cursor == {"since_id": "500"}
 
 
 def test_no_next_token_stops() -> None:
@@ -228,10 +234,13 @@ def test_5xx_retries_then_recovers_and_resigns() -> None:
 def test_429_after_first_page_returns_partial() -> None:
     p1 = page([tweet("500", "t")], next_token="tok1")
     result = connector_from([(200, p1, {}), (429, {}, {})], daily_read_cap=500).fetch(
-        make_source(), {}
+        make_source(), {"since_id": "100"}
     )
     assert result.stats.api_reads == 1  # 1ページ取得後の 429 → 既取得分を返す
-    assert result.next_cursor == {"since_id": "500"}
+    # 正常扱いで隠さずソースの失敗にさせ、since_id は据え置く(GH#182。検索と同じ形 = GH#183)
+    assert isinstance(result.partial_error, RetryableError)
+    assert "429" in str(result.partial_error)
+    assert result.next_cursor == {"since_id": "100"}
 
 
 def test_auth_error_is_fatal() -> None:
@@ -257,6 +266,29 @@ def test_5xx_after_first_page_returns_partial() -> None:
         make_source(), {}
     )
     assert result.stats.api_reads == 1  # 途中の 5xx はリトライ尽き後に既取得分で打ち切り
+    assert isinstance(result.partial_error, RetryableError)
+    assert "503" in str(result.partial_error)
+    assert result.next_cursor == {}  # 据え置き(元の cursor が空なら空のまま。GH#182)
+
+
+def test_transport_error_after_first_page_returns_partial_with_cost() -> None:
+    # GH#182: 2 ページ目で通信のリトライが尽きても、1 ページ目の項目と読み取りの件数・費用を
+    # 返す(例外で捨てると費用が台帳に残らない)。理由を載せてソースの失敗にさせ、since_id は
+    # 据え置く(翌日に旧 since_id から取り直し、取得済みぶんは UNIQUE で吸収)
+    seen: list[httpx.Request] = []
+    p1 = page([tweet("500", "一つめ"), tweet("499", "二つめ")], next_token="tok1")
+    result = connector_from(
+        [(200, p1, {}), (httpx.ConnectError("boom"), {}, {})], daily_read_cap=500, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert [i.external_id for i in result.items] == ["500", "499"]
+    assert result.stats.items_fetched == 2
+    assert result.stats.api_reads == 2
+    assert result.stats.estimated_cost_usd == pytest.approx(2 * 0.004)
+    assert isinstance(result.partial_error, RetryableError)
+    assert "接続失敗" in str(result.partial_error)
+    assert result.next_cursor == {"since_id": "100"}
+    second = [r for r in seen if "pagination_token=tok1" in str(r.url)]
+    assert len(second) == 3  # 2 ページ目は初回 + 2 回リトライしてから諦める
 
 
 def test_transport_error_is_retryable() -> None:

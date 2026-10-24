@@ -7,6 +7,9 @@
 - 打ち切りは3条件(いずれも「古い側を捨てる」。見逃し防止は非目標。設計 02 §2):
   (a) next_token なし = since_id 到達 / TL 末尾、(b) daily_read_cap 到達、
   (c) rate limit 残 0(15分待ちはしない)。
+- 2 ページ目以降の失敗(HTTP の失敗・通信のリトライ尽き)は、取得ぶんを返しつつ理由を
+  `FetchResult.partial_error` に載せ、since_id は据え置く(GH#182。検索と同じ形 = GH#183)。
+  取得ぶんを捨てると、その読み取りの費用も台帳に残らないため。
 - RT は参照先(元ツイ)の id を URL に載せて dedup に乗せる(normalize_url が tweet URL を
   status id で `x.com/i/web/status/{id}` に統一するため、元ツイの直接ポストと重複排除される)。
   自分宛以外のリプライは除外(設計 02 §2)。
@@ -122,13 +125,19 @@ class XConnector:
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
         me_id = self._get_me_id()
-        tweets, users, reads, http_status = self._fetch_timeline(me_id, cursor.get("since_id"))
+        tweets, users, reads, http_status, error = self._fetch_timeline(
+            me_id, cursor.get("since_id")
+        )
         items = _merge_same_original([
             item for tweet in tweets if (item := _to_raw_item(tweet, users, me_id)) is not None
         ])
-        # 次回 since_id は今回取得した最大 tweet id(打ち切っても古い側の穴は追わない。設計 02 §2)
+        # 次回 since_id は今回取得した最大 tweet id(予算・rate limit で打ち切っても古い側の穴は
+        # 追わない。設計 02 §2)。部分取得のあとの失敗では据え置く(GH#182。失敗で取れなかった
+        # 古い側は方針で捨てたものではないので、翌日に旧 since_id から取り直して UNIQUE で吸収する)
         next_since = (
-            str(max(int(t["id"]) for t in tweets)) if tweets else cursor.get("since_id")
+            str(max(int(t["id"]) for t in tweets))
+            if tweets and error is None
+            else cursor.get("since_id")
         )
         next_cursor = {"since_id": next_since} if next_since else {}
         return FetchResult(
@@ -141,6 +150,7 @@ class XConnector:
                 http_status=http_status,
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
+            partial_error=error,
         )
 
     def _get_me_id(self) -> str:
@@ -156,7 +166,11 @@ class XConnector:
 
     def _fetch_timeline(
         self, me_id: str, since_id: str | None
-    ) -> tuple[list[dict], dict[str, str], int, int | None]:
+    ) -> tuple[list[dict], dict[str, str], int, int | None, Exception | None]:
+        """returns (tweets, users, reads, http_status, error)。
+
+        error = 2 ページ目以降の HTTP の失敗・通信のリトライ尽き(GH#182)。1 ページ目の失敗は例外。
+        """
         url = f"{API_BASE}/users/{me_id}/timelines/reverse_chronological"
         tweets: list[dict] = []
         users: dict[str, str] = {}
@@ -174,16 +188,25 @@ class XConnector:
                 params["since_id"] = since_id
             if token:
                 params["pagination_token"] = token
-            response = self._session.get(url, params)
+            try:
+                response = self._session.get(url, params)
+            except RetryableError as e:
+                # 通信のリトライ尽きも HTTP の失敗と同じに扱う(GH#182)。既取得分を例外で
+                # 捨てると、その読み取りの費用も台帳に残らない
+                if not tweets:
+                    raise
+                return tweets, users, reads, http_status, e
             http_status = response.status_code
             raise_for_auth(response, "timeline")
             if response.status_code != 200:
                 # 1ページ目から失敗(429/5xx/4xx)は「取得0件の成功」で隠さず失敗として返す
                 # (consecutive_failures を上げ doctor #14 / watchdog に拾わせる)。
-                # 既取得分があれば部分取得で打ち切り(古い側の欠落は許容。設計 02 §2)
+                # 既取得分があれば部分取得で打ち切り、取得ぶんは保存しつつソースの失敗として
+                # 数えさせる(GH#182。検索と同じ形 = GH#183)
+                error = status_error(response, url)
                 if not tweets:
-                    raise status_error(response, url)
-                break
+                    raise error
+                return tweets, users, reads, http_status, error
             body = response.json()
             page = body.get("data", [])
             for user in body.get("includes", {}).get("users", []):
@@ -197,7 +220,7 @@ class XConnector:
             token = body.get("meta", {}).get("next_token")
             if not token:
                 break  # since_id 到達 / TL 末尾
-        return tweets, users, reads, http_status
+        return tweets, users, reads, http_status, None
 
 
 def raise_for_auth(response: httpx.Response, where: str) -> None:

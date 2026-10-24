@@ -9,6 +9,7 @@ import pytest
 
 from app.collect import collect_all
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
+from app.connectors.x import XConnector, XCredentials
 from app.db import apply_migrations, connect
 from app.http import HttpClient
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
@@ -151,6 +152,65 @@ def test_partial_failure_saves_items_and_counts_as_source_failure(
         "「x:search」が 3 回連続で失敗(直近: FatalError: X が HTTP 402: "
         "https://api.twitter.com/2/tweets/search/recent)"
     ]
+
+
+def test_x_home_transport_failure_on_second_page_keeps_first_page_and_cost(
+    conn: sqlite3.Connection,
+) -> None:
+    # GH#182: ホームTL の 2 ページ目で通信のリトライが尽きても、1 ページ目の項目を保存し、
+    # 読み取りの件数・費用を台帳に残す(doctor #9 の当月の集計に入れる)。ソースは失敗として
+    # 数え、カーソル(since_id)は進めない
+    conn.execute(
+        "INSERT INTO sources (type, name, cursor, last_success_at) "
+        "VALUES ('x', 'home', '{\"since_id\": \"100\"}', '2026-10-20T21:30:00Z')"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/users/me"):
+            return httpx.Response(200, json={"data": {"id": "me"}})
+        if "pagination_token" in request.url.params:
+            raise httpx.ConnectError("boom")
+        return httpx.Response(200, json={
+            "data": [
+                {"id": "300", "text": "一つめの投稿", "author_id": "a1",
+                 "created_at": "2026-10-21T09:00:00.000Z"},
+                {"id": "299", "text": "二つめの投稿", "author_id": "a1",
+                 "created_at": "2026-10-21T08:00:00.000Z"},
+            ],
+            "meta": {"next_token": "tok1"},
+        })
+
+    connector = XConnector(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=XCredentials(
+            api_key="ck", api_secret="cs", access_token="at", access_token_secret="ats"
+        ),
+        daily_read_cap=130,
+        unit_price_usd=0.004,
+        sleep=lambda _s: None,
+    )
+    collect_all(conn, {"rss": FakeConnector([]), "x": connector}, logger)
+
+    stored = conn.execute(
+        "SELECT external_id FROM items WHERE source_id = "
+        "(SELECT id FROM sources WHERE type='x') ORDER BY external_id"
+    ).fetchall()
+    assert [r["external_id"] for r in stored] == ["299", "300"]
+    run = conn.execute(
+        "SELECT status, error, items_fetched, api_reads, estimated_cost_usd FROM collect_runs "
+        "WHERE source_id = (SELECT id FROM sources WHERE type='x')"
+    ).fetchone()
+    assert (run["status"], run["items_fetched"], run["api_reads"]) == ("error", 2, 2)
+    assert run["estimated_cost_usd"] == pytest.approx(2 * 0.004)
+    assert "接続失敗" in run["error"]
+    source = conn.execute(
+        "SELECT cursor, last_success_at, last_error, consecutive_failures "
+        "FROM sources WHERE type='x'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"since_id": "100"}
+    assert source["last_success_at"] == "2026-10-20T21:30:00Z"
+    assert "RetryableError" in source["last_error"]
+    assert source["consecutive_failures"] == 1
 
 
 def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:
