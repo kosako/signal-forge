@@ -599,7 +599,9 @@ def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
     def batch_handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == TOKEN_URL:
             refresh_in_flight.set()
-            release_refresh.wait(timeout=10)  # 往復の途中で止める
+            # 往復の途中で止める。待ちが切れたら refresh を失敗させ、errors でテストを落とす
+            # (切れたまま進むと、再認可が始まる前に refresh の保存が終わり順序を確かめられない)
+            assert release_refresh.wait(timeout=10), "refresh の解放待ちが切れた"
             order.append("refresh")
             return httpx.Response(200, json=token_response(2))
         return httpx.Response(200, json={"data": {"username": "kosako"}})
@@ -661,21 +663,35 @@ def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
     assert load_token(tmp_path).refresh_token == "rt-9"  # 再認可の token が残る
 
 
-def test_reauth_does_not_hold_lock_while_waiting_for_browser(tmp_path: Path) -> None:
+def test_reauth_does_not_hold_lock_while_waiting_for_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # 本人がブラウザで認可している間はロックを持たない(その間の refresh を止めない)
     import fcntl
 
     from app.connectors.x_oauth2 import LOCK_FILENAME
 
-    lock_free: list[bool] = []
+    waiting = threading.Event()  # 認可側が callback 待ちに入った
+    real_wait = CallbackServer.wait_for_code
+
+    def observed_wait(self: CallbackServer, timeout_s: int) -> str:
+        waiting.set()
+        return real_wait(self, timeout_s)
+
+    monkeypatch.setattr(CallbackServer, "wait_for_code", observed_wait)
+    lock_state: list[str] = []
 
     def try_lock() -> None:
+        # callback 待ちに入ってから確かめる(待ちに入る前にロックを取る回帰も見逃さない)
+        if not waiting.wait(timeout=10):
+            lock_state.append("unsynced")
+            return
         fd = os.open(tmp_path / LOCK_FILENAME, os.O_WRONLY | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_free.append(True)
+            lock_state.append("free")
         except BlockingIOError:
-            lock_free.append(False)
+            lock_state.append("held")
         finally:
             os.close(fd)
 
@@ -690,5 +706,5 @@ def test_reauth_does_not_hold_lock_while_waiting_for_browser(tmp_path: Path) -> 
             open_browser=approve_in_browser(before_redirect=try_lock),
             timeout_s=10,
         )
-    assert lock_free == [True]
+    assert lock_state == ["free"]
     assert load_token(tmp_path) == token
