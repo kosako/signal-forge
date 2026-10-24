@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import tarfile
 import threading
@@ -112,7 +113,8 @@ def doctor(config_dir: Path, tmp_path: Path, **overrides) -> list[CheckResult]:
         "api_factory": FakeBotApi,
         "engine_factory": lambda name: SafeEngine(),
         # 既定は偽物(実 codex 起動・実 HTTP サーバを避けて高速化)。
-        # 実サーバ経路は test_llm_network_probe_uses_real_local_server が明示的に検証
+        # 実サーバ経路は test_llm_network_probe_uses_real_local_server(到達なし → PASS)と
+        # test_llm_network_probe_detects_real_local_hit(到達あり → FAIL)が明示的に検証
         "codex_home_engine_factory": lambda codex_home: SafeEngine(),
         "server_factory": FakeServer,
         "launchctl": lambda job: True,
@@ -642,6 +644,37 @@ def test_llm_network_probe_uses_real_local_server(config_dir, tmp_path) -> None:
         doctor(config_dir, tmp_path, server_factory=None), 6  # None → 実サーバ
     )
     assert result.status == "PASS"
+
+
+def test_llm_network_probe_detects_real_local_hit(config_dir, tmp_path) -> None:
+    # 陽性対照(GH#209): 既定の server_factory(127.0.0.1 の空きポートの実ローカルサーバ)へ
+    # 実際に HTTP GET するエンジン → ハンドラの到達記録から was_hit() までの観測経路で FAIL。
+    # 上の「到達しなければ PASS」と組で、到達の判定が実サーバで働くことを示す
+    fetched: list[int] = []
+
+    class FetchingEngine:
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            # 接続先はプロンプト中のローカル canary サーバだけに限る(外部へは出ない)
+            match = re.search(r"http://127\.0\.0\.1:\d+/\S+", prompt)
+            if match is None:
+                return CanaryProbe(content="unreadable")  # HOME プローブ
+            # 環境の proxy 設定を使わず、ローカルサーバへ直接つなぐ
+            response = httpx.get(match.group(0), timeout=5, trust_env=False)
+            fetched.append(response.status_code)
+            return CanaryProbe(content=response.text)
+
+    result = by_number(
+        doctor(
+            config_dir, tmp_path,
+            server_factory=None,  # None → 実サーバ
+            engine_factory=lambda name: FetchingEngine(),
+        ),
+        6,
+    )
+    assert fetched == [200]  # 実サーバへ届き、ハンドラが応答した
+    assert result.status == "FAIL"
+    # 接続の例外による FAIL ではなく、到達の観測による FAIL であること
+    assert "到達を観測" in result.detail
 
 
 def test_llm_probe_exception_does_not_leak_output(config_dir, tmp_path) -> None:
