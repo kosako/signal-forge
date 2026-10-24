@@ -9,11 +9,16 @@
   (c) rate limit 残 0(15分待ちはしない)。
 - 2 ページ目以降の失敗(HTTP の失敗・通信のリトライ尽き)は、取得ぶんを返しつつ理由を
   `FetchResult.partial_error` に載せ、since_id は据え置く(GH#182。検索と同じ形 = GH#183)。
-  取得ぶんを捨てると、その読み取りの費用も台帳に残らないため。
+  取得ぶんを捨てると、その読み取りの費用も台帳に残らないため。2 ページ目以降の 401/403 は
+  致命の失敗(FatalError)のまま送出し、それまでの読取数と費用を例外に添える(GH#178。collect が
+  失敗の記録に残す。取得ぶんは保存せず since_id も据え置く)。
 - RT は参照先(元ツイ)の id を URL に載せて dedup に乗せる(normalize_url が tweet URL を
   status id で `x.com/i/web/status/{id}` に統一するため、元ツイの直接ポストと重複排除される)。
   自分宛以外のリプライは除外(設計 02 §2)。
 - api_reads(課金対象の読取件数)× 単価を FetchStats.estimated_cost_usd に載せる。
+- daily_read_cap は JST の暦日の上限で、同じ日の実行で共有する(GH#178)。合成点が台帳
+  (collect_runs.api_reads)の当日の合計を `x_reads_today` で引き、コネクタは上限から
+  それを引いた残りだけを読む(fetch は DB に触らない契約のまま。設計 02 §1)。
 - type='x' の sources 行はホームTL と検索の2種があり、sources.config の mode で識別する
   (NULL = home。設計 02 §2)。collect の「type → Connector 1:1」契約は XRouter が保つ。
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import json
 import random
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -40,6 +46,7 @@ from app.connectors.base import (
     RetryableError,
 )
 from app.http import BACKOFF_S, MAX_RETRIES  # 共通リトライ規約(設計 05 §8)
+from app.jst import jst_day_bounds_utc, today_jst
 from app.models import Source
 
 API_BASE = "https://api.twitter.com/2"
@@ -116,10 +123,12 @@ class XConnector:
         credentials: XCredentials,
         daily_read_cap: int,
         unit_price_usd: float,
+        reads_used_today: int = 0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._session = XApiSession(client=client, credentials=credentials, sleep=sleep)
-        self._daily_read_cap = daily_read_cap
+        # 今回読める上限 = 日次の上限 − 同じ日(JST)の実行が読んだぶん(GH#178)
+        self._read_budget = max(0, daily_read_cap - reads_used_today)
         self._unit_price = unit_price_usd
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
@@ -151,6 +160,9 @@ class XConnector:
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
             partial_error=error,
+            # 当日の枠が残っておらずタイムラインを読まなかった(GH#178)。復旧を確かめていないので
+            # collect にソースの成否の状態を変えさせない(失敗の続きを成功で消さない)
+            budget_exhausted=self._read_budget == 0,
         )
 
     def _get_me_id(self) -> str:
@@ -177,10 +189,10 @@ class XConnector:
         reads = 0
         token: str | None = None
         http_status: int | None = None
-        while reads < self._daily_read_cap:
+        while reads < self._read_budget:
             params: dict[str, str | int] = {
                 # cap を1件も超えないよう残枠を上限に(設計 02 §2 / ADR 0001 予算配分)
-                "max_results": min(MAX_RESULTS, self._daily_read_cap - reads),
+                "max_results": min(MAX_RESULTS, self._read_budget - reads),
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
             }
@@ -197,7 +209,15 @@ class XConnector:
                     raise
                 return tweets, users, reads, http_status, e
             http_status = response.status_code
-            raise_for_auth(response, "timeline")
+            # 2 ページ目以降の 401/403 も致命の失敗のまま送出するが、それまでの読取数と費用を
+            # 添えて collect に台帳へ残させる(GH#178。取得ぶんは保存せず since_id は据え置く。
+            # 読取が台帳から漏れると、同じ日の再実行が日次の上限を超えて読む)
+            raise_for_auth(
+                response,
+                "timeline",
+                api_reads=reads,
+                estimated_cost_usd=round(reads * self._unit_price, 6),
+            )
             if response.status_code != 200:
                 # 1ページ目から失敗(429/5xx/4xx)は「取得0件の成功」で隠さず失敗として返す
                 # (consecutive_failures を上げ doctor #14 / watchdog に拾わせる)。
@@ -223,9 +243,16 @@ class XConnector:
         return tweets, users, reads, http_status, None
 
 
-def raise_for_auth(response: httpx.Response, where: str) -> None:
+def raise_for_auth(
+    response: httpx.Response, where: str, *, api_reads: int = 0, estimated_cost_usd: float = 0.0
+) -> None:
+    """401/403 は FatalError(致命)。部分取得のあとなら、それまでの読取数と費用を添える(GH#178)。"""
     if response.status_code in (401, 403):
-        raise FatalError(f"X 認証失敗({where}): HTTP {response.status_code}(キー・権限を確認)")
+        raise FatalError(
+            f"X 認証失敗({where}): HTTP {response.status_code}(キー・権限を確認)",
+            api_reads=api_reads,
+            estimated_cost_usd=estimated_cost_usd,
+        )
 
 
 def status_error(response: httpx.Response, url: str) -> Exception:
@@ -242,15 +269,53 @@ def has_x_credentials(env: dict[str, str]) -> bool:
 
 
 def build_x_connector(
-    daily_read_cap: int, unit_price_usd: float, env: dict[str, str]
+    daily_read_cap: int,
+    unit_price_usd: float,
+    env: dict[str, str],
+    *,
+    reads_used_today: int = 0,
 ) -> XConnector:
-    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真)。"""
+    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真)。
+
+    reads_used_today = 同じ日のホームTL の読取数(`x_reads_today` の home。GH#178)。
+    """
     return XConnector(
         client=build_x_client(),
         credentials=credentials_from_env(env),
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price_usd,
+        reads_used_today=reads_used_today,
     )
+
+
+def x_reads_today(conn: sqlite3.Connection, day: str | None = None) -> dict[str, int]:
+    """JST の暦日 day(既定 = 今日)に collect が台帳へ記録した X の読取数を mode ごとに返す。
+
+    日次の読取上限は 1 回の実行の上限でなく暦日の上限(ADR 0001 の合算日次ハード上限)。
+    同じ日の再実行(失敗のあとの手動の `intel run`・単独の `intel collect`)が上限を超えて
+    読まないよう、合成点がここで当日の合計を出し、コネクタに残りだけを読ませる(GH#178)。
+    日付は collect_runs.started_at(UTC)を JST の暦日に直して決める(dig の日次上限と同じ
+    暦日)。部分取得のあとの失敗(status='error')の読取も数える(費用は掛かっている)。
+    mode の判定は x_source_mode と同じ(config NULL = home)。mode が不正な行・bookmark 行は
+    fetch の前に失敗するので読取は常に 0 で、どちらに数えても合計は変わらない。
+    """
+    start, end = jst_day_bounds_utc(day or today_jst())
+    rows = conn.execute(
+        """
+        SELECT CASE WHEN json_extract(sources.config, '$.mode') = 'search'
+                    THEN 'search' ELSE 'home' END AS mode,
+               sum(collect_runs.api_reads) AS reads
+        FROM collect_runs
+        JOIN sources ON sources.id = collect_runs.source_id
+        WHERE sources.type = 'x'
+          AND collect_runs.started_at >= ? AND collect_runs.started_at < ?
+        GROUP BY mode
+        """,
+        (start, end),
+    ).fetchall()
+    reads = {"home": 0, "search": 0}
+    reads.update({row["mode"]: row["reads"] for row in rows})
+    return reads
 
 
 def build_x_client() -> httpx.Client:

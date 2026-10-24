@@ -6,7 +6,10 @@
   括弧で囲むのは OR を含むスロットでも除外を全体に掛けるため(GH#230)。
 - 予算(daily_read_cap)はスロット数で均等割(端数は先頭から)。スロット間の再配分はしない
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
-  そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。
+  そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。cap は JST の暦日の上限で、
+  同じ日の実行が読んだぶん(合成点が台帳から出す。connectors/x.py の x_reads_today)を引いた
+  残りを均等割する(GH#178)。残りの割り当てが下限に届かず要求しなかったスロットがある実行は
+  完走でないので、下の watermark は据え置く。
 - カーソルは全スロット横断の最大 tweet id を `{"since_id": ...}` に(snowflake id は時刻単調
   のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。そのために全スロットの
   取得の上限(end_time)を実行の開始で 1 つに固定する(GH#184): スロットは順に取るので、上限が
@@ -22,6 +25,8 @@
   失敗は取得ぶんを返しつつ理由を `FetchResult.partial_error` に載せ、collect にソースの失敗と
   して記録させる(GH#183。後ろのスロットの壊れたクエリの 400 などを正常扱いで隠さない)。
   通信のリトライ尽きも同じに扱う(GH#182。例外で取得ぶんを捨てると読み取りの費用も台帳に残らない)。
+  部分取得のあとの 401/403 は致命の失敗(FatalError)のまま送出し、それまでの読取数と費用を例外に
+  添える(GH#178。collect が失敗の記録に残す。ホームTL と同じ)。
   予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
@@ -83,12 +88,14 @@ class XSearchConnector:
         slots: tuple[str, ...],
         daily_read_cap: int,
         unit_price_usd: float,
+        reads_used_today: int = 0,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._session = XApiSession(client=client, credentials=credentials, sleep=sleep)
         self._slots = slots
-        self._daily_read_cap = daily_read_cap
+        # 今回読める上限 = 日次の上限 − 同じ日(JST)の実行が読んだぶん(GH#178)
+        self._read_budget = max(0, daily_read_cap - reads_used_today)
         self._unit_price = unit_price_usd
         self._now = now
 
@@ -110,12 +117,15 @@ class XSearchConnector:
         fetched: list[tuple[str, list[dict]]] = []  # (スロットのクエリ, tweets)
         reads = 0
         http_status: int | None = None
-        budgets = _split_budget(self._daily_read_cap, len(self._slots))
+        budgets = _split_budget(self._read_budget, len(self._slots))
+        # 当日の残り枠の均等割で下限に届かず、1 回も要求しないスロット(GH#178)。そのスロットの
+        # その日ぶんを watermark の背後に隠さないよう、ほかのスロットが取れても完走扱いにしない
+        unrun_slot = any(budget < X_SEARCH_MIN_PAGE for budget in budgets)
         stopped = False
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
             tweets, status, stopped, error = self._fetch_slot(
-                query, budget, since_id, end_time, users, have_prior=any(t for _q, t in fetched)
+                query, budget, since_id, end_time, users, prior_reads=reads
             )
             fetched.append((query, tweets))
             reads += len(tweets)
@@ -131,8 +141,10 @@ class XSearchConnector:
         # 途中打ち切りで進めると未実行スロットのその日ぶんが恒久欠落する(据え置きなら
         # 翌日再取得され UNIQUE で吸収)。スロット内の予算打ち切りで捨てる古い側は
         # ホームTL と同じく追わない(設計 02 §2)。全スロットを同じ end_time で取るので、
-        # あるスロットを取ったあとに入った新着が、後のスロットの最大 id の背後に隠れない(GH#184)
-        next_since = str(max(all_ids)) if all_ids and not stopped else stored_since
+        # あるスロットを取ったあとに入った新着が、後のスロットの最大 id の背後に隠れない(GH#184)。
+        # 残り枠が足りず要求しなかったスロットがある実行も完走でない(GH#178)
+        advance = bool(all_ids) and not stopped and not unrun_slot
+        next_since = str(max(all_ids)) if advance else stored_since
         return FetchResult(
             items=items,
             next_cursor={"since_id": next_since} if next_since else {},
@@ -144,6 +156,9 @@ class XSearchConnector:
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
             partial_error=error,
+            # 当日の残り枠でどのスロットも要求しなかった(GH#178)。復旧を確かめていないので
+            # collect にソースの成否の状態を変えさせない(失敗の続きを成功で消さない)
+            budget_exhausted=all(budget < X_SEARCH_MIN_PAGE for budget in budgets),
         )
 
     def _fetch_slot(
@@ -154,11 +169,12 @@ class XSearchConnector:
         end_time: str,
         users: dict[str, str],
         *,
-        have_prior: bool,
+        prior_reads: int,
     ) -> tuple[list[dict], int | None, bool, Exception | None]:
         """1スロット分のページング取得。returns (tweets, http_status, stop_all, error)。
 
         error = 部分取得のあとの HTTP・通信の失敗(GH#183・GH#182)。そのとき stop_all も真。
+        prior_reads = 先のスロットまでの読取数(0 = 累計 0 件。認証の失敗に添える。GH#178)。
         """
         tweets: list[dict] = []
         token: str | None = None
@@ -180,17 +196,25 @@ class XSearchConnector:
             except RetryableError as e:
                 # 通信のリトライ尽きも HTTP の失敗と同じに扱う(GH#182)。既取得分を例外で
                 # 捨てると、その読み取りの費用も台帳に残らない
-                if not have_prior and not tweets:
+                if not prior_reads and not tweets:
                     raise
                 return tweets, http_status, True, e
             http_status = response.status_code
-            raise_for_auth(response, "search/recent")
+            # 部分取得のあとの 401/403 も致命の失敗のまま送出し、先のスロットとこのスロットの
+            # 読取数と費用を添える(GH#178。ホームTL と同じ。collect が台帳に残す)
+            reads = prior_reads + len(tweets)
+            raise_for_auth(
+                response,
+                "search/recent",
+                api_reads=reads,
+                estimated_cost_usd=round(reads * self._unit_price, 6),
+            )
             if response.status_code != 200:
                 # 累計 0 件での失敗は「0件成功」で隠さず例外(ホームTL と同方針)。
                 # どこかのスロットが取得済みなら部分取得として全体打ち切り。取得ぶんは保存しつつ
                 # ソースの失敗として数えさせる(GH#183。400・402・429・5xx を正常扱いで隠さない)
                 error = status_error(response, SEARCH_URL)
-                if not have_prior and not tweets:
+                if not prior_reads and not tweets:
                     raise error
                 return tweets, http_status, True, error
             body = response.json()
@@ -209,15 +233,24 @@ class XSearchConnector:
 
 
 def build_x_search_connector(
-    slots: tuple[str, ...], daily_read_cap: int, unit_price_usd: float, env: dict[str, str]
+    slots: tuple[str, ...],
+    daily_read_cap: int,
+    unit_price_usd: float,
+    env: dict[str, str],
+    *,
+    reads_used_today: int = 0,
 ) -> XSearchConnector:
-    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真・slots 非空)。"""
+    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真・slots 非空)。
+
+    reads_used_today = 同じ日の検索の読取数(`x_reads_today` の search。GH#178)。
+    """
     return XSearchConnector(
         client=build_x_client(),
         credentials=credentials_from_env(env),
         slots=slots,
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price_usd,
+        reads_used_today=reads_used_today,
     )
 
 

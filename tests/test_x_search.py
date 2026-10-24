@@ -58,7 +58,8 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
 
 
 def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
-                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH) -> XSearchConnector:
+                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH,
+                   reads_used_today=0) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
     200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
@@ -93,6 +94,7 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         slots=tuple(slots),
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price,
+        reads_used_today=reads_used_today,
         sleep=lambda _s: None,
         now=lambda: now,
     )
@@ -380,6 +382,52 @@ def test_budget_cut_is_normal_and_advances_cursor() -> None:
     assert result.next_cursor == {"since_id": "700"}
 
 
+def test_reads_used_today_splits_only_remaining_budget() -> None:
+    # GH#178: cap は暦日の上限。同じ日の実行が読んだぶんを引いた残りをスロットで均等割する
+    seen: list[httpx.Request] = []
+    pages = {
+        slot: [(200, page([tweet(str(base - i)) for i in range(100)]), {})]
+        for slot, base in (("a", 500), ("b", 700), ("c", 900))
+    }
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=5, seen=seen
+    ).fetch(make_source(), {})
+    assert result.stats.api_reads == 30  # 残り 30 → 10/10/10
+    assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in seen] == [["10"]] * 3
+    assert not result.budget_exhausted
+    # 残り 25 → 9/8/8 はどれも下限 10 未満。読まずに据え置く(cap はハード上限)。読まなかった
+    # 印を立て、collect にソースの成否の状態を変えさせない
+    seen.clear()
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=10, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 0
+    assert seen == []
+    assert result.next_cursor == {"since_id": "100"}
+    assert result.budget_exhausted
+
+
+def test_slot_left_below_min_page_by_remaining_budget_keeps_cursor() -> None:
+    # GH#178: 残り 29 → 10/10/9。最後のスロットは下限 10 に届かず要求しない。先の 2 スロットが
+    # 取れても完走ではないので watermark は据え置く(進めると、要求しなかったスロットのその日
+    # ぶんが watermark の背後に隠れて恒久欠落する)
+    seen: list[httpx.Request] = []
+    pages = {
+        "a": [(200, page([tweet(str(500 - i)) for i in range(10)]), {})],
+        "b": [(200, page([tweet(str(700 - i)) for i in range(10)]), {})],
+        "c": [(200, page([tweet(str(900 - i)) for i in range(10)]), {})],
+    }
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=6, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 20
+    queries = [parse_qs(urlsplit(str(r.url)).query)["query"][0] for r in seen]
+    assert queries == [f"(a) {X_SEARCH_QUERY_SUFFIX}", f"(b) {X_SEARCH_QUERY_SUFFIX}"]
+    assert result.partial_error is None  # 予算による打ち切りは失敗にしない
+    assert result.next_cursor == {"since_id": "100"}
+    assert not result.budget_exhausted  # 要求したスロットがある(成否はその応答で決まる)
+
+
 def test_all_requests_share_end_time_before_run_start() -> None:
     # GH#184: 全スロット・全ページで同じ end_time(実行の開始の 30 秒前。API は要求の時刻より
     # 10 秒以上前に限る。値は実装の定数とは独立に書く)
@@ -472,6 +520,27 @@ def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
 def test_auth_error_is_fatal() -> None:
     with pytest.raises(FatalError, match="認証失敗"):
         connector_from({"a": [(401, {}, {})]}, slots=("a",)).fetch(make_source(), {})
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_error_after_partial_fetch_is_fatal_with_reads_and_cost(status) -> None:
+    # GH#178: 部分取得のあとの 401/403 は致命の失敗のまま送出し、先のスロットと同じスロットの
+    # 前のページで読んだぶんの読取数と費用を添える(collect が台帳に残す。ホームTL と同じ)
+    pages = {
+        "a": [
+            (200, page([tweet("900"), tweet("899")], next_token="ta"), {}),
+            (200, page([tweet("898")]), {}),
+        ],
+        "b": [(200, page([tweet("800")], next_token="tb"), {}), (status, {}, {})],
+    }
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from(pages, slots=("a", "b"), daily_read_cap=40).fetch(make_source(), {})
+    assert raised.value.api_reads == 4  # a の 2 + 1 件 + b の 1 ページ目の 1 件
+    assert raised.value.estimated_cost_usd == pytest.approx(0.016)
+    # 累計 0 件での 401/403 は読取なし
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from({"a": [(status, {}, {})]}, slots=("a",)).fetch(make_source(), {})
+    assert (raised.value.api_reads, raised.value.estimated_cost_usd) == (0, 0.0)
 
 
 def test_same_tweet_in_two_slots_returned_per_slot() -> None:

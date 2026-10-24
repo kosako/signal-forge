@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.stage1 import preselect
+from app.analysis.stage1 import analyzed_on, preselect
 from app.collect import _raw_payload, collect_all
 from app.config import AnalysisConfig, Config
 from app.connectors.x import _to_raw_item
@@ -184,6 +184,71 @@ def test_daily_cap_limit_one_takes_globally_freshest(conn, tmp_path) -> None:
     # ソースの登録順でなく published_at 降順が優先される(境界件数でも降順維持)
     assert survivor["canonical_url"] == "https://b.example/newest"
     assert result.counts["selected"] == 1
+
+
+DAY = "2026-10-24"  # 日次上限の判定に使う当日(JST)。実時計に依存させない(GH#178)
+DAY_UTC = "2026-10-23T21:30:00Z"  # DAY の JST 6:30(朝バッチ)
+
+
+def add_analysis(conn, item_id: int, analyzed_at: str = DAY_UTC, degraded: int = 0) -> None:
+    conn.execute(
+        "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
+        "recommendation_reason, implication, degraded, engine, model, prompt_version, "
+        "input_hash, analyzed_at) VALUES (?, 's', 'その他', 50, 'new', 'r', 'i', ?, "
+        "'codex-cli', 'm', 'v', ?, ?)",
+        (item_id, degraded, f"h{item_id}", analyzed_at),
+    )
+    conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (item_id,))
+
+
+def test_daily_cap_shared_with_same_day_runs(conn, tmp_path, monkeypatch) -> None:
+    # GH#178: 日次上限は暦日の上限。同じ日の 2 回目の実行(再走・単独の intel analyze)は、
+    # その日すでに分析した件数を引いた残りだけを採用する
+    monkeypatch.setattr("app.analysis.stage1.today_jst", lambda: DAY)
+    base = datetime.now(UTC)
+    for i in range(3):  # 1 回目の実行で分析ずみ(degraded も LLM に渡したぶんとして数える)
+        add_analysis(conn, add_item(conn, f"https://a.example/done{i}", published=iso(base)),
+                     degraded=1 if i == 0 else 0)
+    # ブックマークの分析は上限の外なので数えない
+    bookmarked = add_item(conn, "https://a.example/bookmarked", published=iso(base))
+    conn.execute("INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', 't1', ?)",
+                 (bookmarked,))
+    add_analysis(conn, bookmarked)
+    # 前日(JST)の分析も数えない
+    add_analysis(conn, add_item(conn, "https://a.example/yesterday", published=iso(base)),
+                 analyzed_at="2026-10-23T14:59:59Z")
+    for i in range(3):
+        add_item(conn, f"https://b.example/{i}", source_id=3,
+                 published=iso(base - timedelta(hours=i)))
+
+    result = preselect(conn, make_config(tmp_path, daily_llm_limit=4), logger)
+    assert result.counts["selected"] == 1  # 4 - 3 = 残り 1
+    assert result.counts["daily_cap"] == 2
+    selected = conn.execute(
+        "SELECT canonical_url FROM items WHERE id = ?", (result.selected_ids[0],)
+    ).fetchone()
+    assert selected["canonical_url"] == "https://b.example/0"  # 残り枠でも published_at 降順
+    # 上限に達したあとの実行は採用しない(新着は daily_cap で skipped に記録)
+    add_analysis(conn, result.selected_ids[0], analyzed_at="2026-10-24T14:59:59Z")
+    late = add_item(conn, "https://b.example/late", source_id=3, published=iso(base))
+    result = preselect(conn, make_config(tmp_path, daily_llm_limit=4), logger)
+    assert result.selected_ids == []
+    assert skip_reasons(conn)["https://b.example/late"] == ("skipped", "daily_cap")
+    assert late not in result.selected_ids
+
+
+def test_analyzed_on_counts_jst_calendar_day(conn) -> None:
+    # GH#178: 当日 = JST の暦日(UTC 15:00 が日付の境界。トレンド・digest と同じ境界)
+    for i, analyzed_at in enumerate((
+        "2026-10-23T14:59:59Z",  # JST 10/23 23:59:59 = 前日
+        "2026-10-23T15:00:00Z",  # JST 10/24 0:00 = 当日の始まり
+        "2026-10-24T14:59:59Z",  # JST 10/24 23:59:59 = 当日の終わり
+        "2026-10-24T15:00:00Z",  # JST 10/25 0:00 = 翌日
+    )):
+        add_analysis(conn, add_item(conn, f"https://a.example/{i}"), analyzed_at=analyzed_at)
+    assert analyzed_on(conn, "2026-10-24") == 2
+    assert analyzed_on(conn, "2026-10-23") == 1
+    assert analyzed_on(conn, "2026-10-26") == 0
 
 
 def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:

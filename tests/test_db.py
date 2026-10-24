@@ -52,6 +52,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (19, "019_notes_received_message.sql"),
         (20, "020_dig_questions_retry.sql"),
         (21, "021_analyses_extraction_failed.sql"),
+        (23, "023_x_signal_runs_backfill.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -317,6 +318,26 @@ def test_card_requests_migration_keeps_questions_and_enforces_rules(tmp_path: Pa
         )
     conn.close()
 
+
+
+def test_x_signal_runs_backfill_migration_defaults_existing_runs_to_daily(tmp_path: Path) -> None:
+    # GH#178(migration 023): 既存の取込の行は通常の取込(backfill = 0)になり、0 / 1 以外は入らない
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 22:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO x_signal_runs (status, api_reads) VALUES ('ok', 7)")
+
+    apply_migrations(conn, db)
+
+    assert conn.execute("SELECT backfill FROM x_signal_runs").fetchone()["backfill"] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE x_signal_runs SET backfill = 2")
+    conn.close()
 
 
 def test_redig_migration_defaults_existing_questions_to_zero(tmp_path: Path) -> None:
