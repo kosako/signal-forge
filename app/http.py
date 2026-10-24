@@ -5,8 +5,8 @@
   リトライ・待機を含む)に期限 60s を付ける(GH#203)
 - リトライ: 2回・指数バックオフ(1s→4s)+ jitter。429 は Retry-After 尊重(30s まで。より長い
   待ちを求められたら待たずに失敗)。恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)
-- 本文はストリーミングで受け、展開後 10 MiB を超えたら読むのをやめて失敗にする。展開は少しずつ
-  行い、上限の検査の前に巨大に展開しない(GH#203)
+- 本文はストリーミングで受け、受信量(展開前)か展開後が 10 MiB を超えたら読むのをやめて失敗に
+  する。展開は少しずつ行い、上限の検査の前に巨大に展開しない(GH#203)
 - SSRF ガード: DNS 解決後の接続先 IP が global でなければ拒否(is_global を基本にした
   allowlist 方式。private/loopback/link-local に加え shared address space 100.64.0.0/10 等
   のブラックリスト漏れも遮断)。リダイレクトは自動追跡せず各ホップで再検査する。
@@ -50,6 +50,10 @@ _RAW_SLICE_BYTES = 1024
 # 符号化に加えるため、明示して固定する(GH#203)
 _ACCEPT_ENCODING = "gzip, deflate"
 _EXPANDING_CODINGS = frozenset({"gzip", "deflate", "br", "zstd"})  # httpx が展開しうる符号化
+# 期限で見捨てた名前解決のスレッドは止められないので、同時に走る数に上限を付ける。収集と本文
+# 抽出は直列に取得するので、ふだん走るのは 1 本。埋まっていれば新しく作らずに失敗にする(GH#203)
+_MAX_RESOLVER_THREADS = 4
+_resolver_slots = threading.BoundedSemaphore(_MAX_RESOLVER_THREADS)
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _PERMANENT_REDIRECTS = frozenset({301, 308})
@@ -90,17 +94,26 @@ def _failure_detail(last_error: Exception | None) -> str:
 
 
 class _SlicedStream(httpx.SyncByteStream):
-    """受信したデータを小さく分けて展開器へ渡す(GH#203)。
+    """受信したデータを小さく分けて展開器へ渡し、受信量(展開前)も上限で止める(GH#203)。
 
     httpx は受信の 1 回分(最大 64 KiB)を出力の上限なしで展開するため、そのままでは小さく
-    圧縮した巨大な本文が上限の検査の前にメモリを使い切りうる。
+    圧縮した巨大な本文が上限の検査の前にメモリを使い切りうる。また展開器は圧縮データの終わりの
+    後ろに届いたデータを、出力なしで内部にためる。展開後のバイト数だけでは止められないので、
+    展開器へ渡す前の受信量も数える。
     """
 
-    def __init__(self, inner: httpx.SyncByteStream) -> None:
+    def __init__(self, inner: httpx.SyncByteStream, url: str) -> None:
         self._inner = inner
+        self._url = url
 
     def __iter__(self) -> Iterator[bytes]:
+        received = 0
         for data in self._inner:
+            received += len(data)
+            if received > MAX_RESPONSE_BYTES:
+                raise ResponseTooLargeError(
+                    f"応答の受信量(展開前)が上限({MAX_RESPONSE_BYTES} バイト)を超える: {self._url}"
+                )
             for start in range(0, len(data), _RAW_SLICE_BYTES):
                 yield data[start : start + _RAW_SLICE_BYTES]
 
@@ -344,8 +357,9 @@ class HttpClient:
         """本文を上限と期限を検査しながら読み、response.content で読めるようにする(GH#203)。
 
         上限は content-encoding(gzip 等)を展開した後のバイト数で数える(小さく圧縮した
-        巨大な本文も止める)。展開器には受信データを小さく分けて渡し、上限の検査の前に巨大に
-        展開しない。展開比を抑えられない符号化(重ねた符号化・br・zstd)は受けない。
+        巨大な本文も止める)。展開の前の受信量も同じ上限で止める(_SlicedStream)。展開器には
+        受信データを小さく分けて渡し、上限の検査の前に巨大に展開しない。展開比を抑えられない
+        符号化(重ねた符号化・br・zstd)は受けない。
         受信のたびに期限も見る(止まっている受信は _DeadlineGuard が終わらせる)。
         """
         codings = [
@@ -357,7 +371,7 @@ class HttpClient:
             raise FatalError(
                 f"展開後の大きさを抑えられない Content-Encoding({', '.join(expanding)}): {url}"
             )
-        response.stream = _SlicedStream(response.stream)
+        response.stream = _SlicedStream(response.stream, url)
         chunks: list[bytes] = []
         size = 0
         for chunk in response.iter_bytes():
@@ -398,18 +412,29 @@ class HttpClient:
 
         getaddrinfo は途中で止められないため別のスレッドで引き、期限が来たら待つのをやめる。
         残ったスレッドは OS の resolver の timeout で終わる(daemon なので終了も妨げない)。
+        止まった名前解決が積み上がらないよう、同時に走るスレッドが上限まで埋まっていれば
+        新しく作らずに名前解決の失敗にする(GH#188 と同じく再試行するが、スレッドは増えない)。
         """
         outcome: list[list[str] | BaseException] = []
+        slots = _resolver_slots
 
         def resolve() -> None:
             try:
                 outcome.append(self._resolve_host(host))
             except BaseException as e:  # 呼び出し元のスレッドで送出し直す
                 outcome.append(e)
+            finally:
+                slots.release()
 
         remaining = self._remaining(deadline, url)
+        if not slots.acquire(blocking=False):
+            raise DnsResolutionError(f"DNS 解決失敗: {host}(止まった名前解決が上限まで残っている)")
         worker = threading.Thread(target=resolve, name="resolve-host", daemon=True)
-        worker.start()
+        try:
+            worker.start()
+        except BaseException:
+            slots.release()
+            raise
         worker.join(remaining)
         if not outcome:
             raise FetchDeadlineError(

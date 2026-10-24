@@ -366,6 +366,26 @@ def test_compressed_body_is_limited_while_decoding() -> None:
     assert peak < MAX_RESPONSE_BYTES * 3
 
 
+def test_data_after_compressed_end_is_limited() -> None:
+    # 展開器は gzip の終わりの後ろに届いたデータを、出力なしで内部にためる。展開後のバイト数は
+    # 増えないので、展開の前の受信量も上限で止める(GH#203)
+    head = gzip.compress(b"<rss/>")
+    trailing = ChunkStream(bytes(1024 * 1024), count=2 * MAX_RESPONSE_BYTES // (1024 * 1024))
+
+    class GzipThenTrailing(httpx.SyncByteStream):
+        def __iter__(self):
+            yield head
+            yield from trailing
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=GzipThenTrailing())
+
+    with pytest.raises(ResponseTooLargeError, match="上限"):
+        make_client(handler).get("https://example.com/trailing")
+    # gzip の分があるので、後ろのデータの 10 MiB 目で上限を超えて読むのをやめる
+    assert trailing.sent == MAX_RESPONSE_BYTES // (1024 * 1024)
+
+
 @pytest.mark.parametrize("encoding", ["gzip, gzip", "deflate, gzip", "br", "zstd"])
 def test_unboundable_content_encoding_is_rejected(encoding: str) -> None:
     # 重ねた符号化は 1 段目の展開分をまとめて次の段で展開し、br / zstd は展開比が大きい。
@@ -521,6 +541,61 @@ def test_slow_name_resolution_is_abandoned_at_deadline(monkeypatch) -> None:
         assert time.monotonic() - started < 2.0
     finally:
         release.set()
+
+
+def test_stalled_name_resolutions_do_not_pile_up(monkeypatch) -> None:
+    # 期限で見捨てた名前解決のスレッドは止められない。返らない名前解決が続いても、スレッドを
+    # 上限より増やさず、埋まっている間は待たずに名前解決の失敗にする(GH#188・GH#203)
+    monkeypatch.setattr(app.http, "FETCH_DEADLINE_S", 0.2)
+    monkeypatch.setattr(app.http, "_resolver_slots", threading.BoundedSemaphore(2))
+    release = threading.Event()
+    stalled: list[str] = []
+
+    def resolve(host: str) -> list[str]:
+        if host in PUBLIC:
+            return PUBLIC[host]
+        stalled.append(host)
+        release.wait(10)  # 応答しない resolver
+        raise OSError("timed out")
+
+    client = HttpClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        resolve_host=resolve,
+        sleep=lambda _s: None,
+    )
+    try:
+        for _ in range(2):  # 期限で見捨てたスレッドが上限の 2 本まで残る
+            with pytest.raises(FetchDeadlineError, match="名前解決が終わらない"):
+                client.get("https://slow-dns.example/")
+        monkeypatch.setattr(app.http, "FETCH_DEADLINE_S", 60)
+        started = time.monotonic()
+        with pytest.raises(RetryableError, match="リトライ上限") as excinfo:
+            client.get("https://slow-dns.example/")
+        assert time.monotonic() - started < 2.0  # 名前解決を待たない
+        assert "DNS 解決失敗: slow-dns.example" in str(excinfo.value)  # GH#188 の文言
+        assert len(stalled) == 2  # GH#188 の再試行でもスレッドは増えない
+    finally:
+        release.set()
+    for worker in threading.enumerate():
+        if worker.name == "resolve-host":
+            worker.join(10)
+    # 止まっていた名前解決が終われば、また引ける
+    assert client.get("https://example.com/").response.status_code == 200
+
+
+def test_resolver_slot_is_returned_when_thread_cannot_start(monkeypatch) -> None:
+    # 名前解決のスレッドを作れなかったときも枠を返す。返さないと枠が尽き、以後ずっと引けない
+    monkeypatch.setattr(app.http, "_resolver_slots", threading.BoundedSemaphore(1))
+    client = make_client(lambda request: httpx.Response(200))
+
+    def cannot_start(self) -> None:
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", cannot_start)
+        with pytest.raises(RuntimeError):
+            client.get("https://example.com/")
+    assert client.get("https://example.com/").response.status_code == 200
 
 
 @pytest.mark.parametrize("empty_result", [False, True])
