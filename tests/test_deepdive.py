@@ -601,6 +601,124 @@ def test_existing_note_not_overwritten_on_publish_retry(conn, config) -> None:
     ] is not None
 
 
+def test_queue_update_failure_rolls_back_ledger_insert(conn, config, tmp_path) -> None:
+    # 生成物の記帳(結果の INSERT)とキューの done 化は 1 つのトランザクション。INSERT の後で
+    # キューの更新が失敗したら両方を戻す。結果だけ残ってキューが queued のままだと、次の実行が
+    # LLM で作り直し、同じ item の結果が 2 行になる(GH#255)
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    conn.execute(  # この接続のキューの done 化だけを失敗させる(DB の書き込みの失敗の代わり)
+        "CREATE TEMP TRIGGER fail_queue_done BEFORE UPDATE OF status ON dig_queue"
+        " WHEN NEW.status = 'done' BEGIN SELECT RAISE(ABORT, 'キューの更新の失敗'); END"
+    )
+    engines: dict[str, ScriptedEngine] = {}
+    api = FakeApi()
+
+    with pytest.raises(DigError, match=f"item {item}: IntegrityError"):
+        run_dig_stage(conn, config, make_factory(engines), api, logger, today="2026-07-22")
+
+    assert engines["medium"].prompts  # 前提: 生成は済み、記帳の途中で失敗した
+    assert not conn.in_transaction  # 書き込みのトランザクションを開いたまま残さない
+    assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 0
+    assert conn.execute(
+        "SELECT status FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()["status"] == "queued"
+    assert list(deepdive_dir(config).glob("*.md")) == [] and api.sent == []
+
+    # 接続を開き直した次の実行(障害は無い)は実行のロックを取り、作り直した 1 行だけを
+    # 記帳して届ける
+    conn.close()
+    reopened = connect(tmp_path / "intel.db")
+    try:
+        assert run_dig_stage(
+            reopened, config, make_factory({}), api, logger, today="2026-07-22"
+        ) is True
+        rows = reopened.execute("SELECT item_id, message_id FROM dig_results").fetchall()
+        status = reopened.execute(
+            "SELECT status FROM dig_queue WHERE item_id = ?", (item,)
+        ).fetchone()["status"]
+    finally:
+        reopened.close()
+    assert [(row["item_id"], row["message_id"]) for row in rows] == [(item, 901)]
+    assert status == "done"
+    assert len(api.sent) == 1
+
+
+def test_second_note_failure_resumes_after_reconnect_without_llm(
+    conn, config, tmp_path, monkeypatch
+) -> None:
+    # 2 枚目のノート(対訳)の公開が失敗したら、両方の本文を台帳に持ったまま未公開にし、カードは
+    # 送らない。接続を開き直した次の実行は、LLM を呼ばずに台帳の本文から続きを公開し、両方の
+    # ノートがそろってからカードを送る。公開済みの 1 枚目(take が書かれうる)は置き換えない(GH#255)
+    from app import deepdive as deepdive_module
+
+    # 公開のロックが残っていたら、上限の時間を待たずに分かるようにする(GH#234)
+    monkeypatch.setattr(deepdive_module, "_PUBLISH_LOCK_WAIT_S", 0.05)
+    item = add_item(conn, "https://blog.example/post", language="en")
+    enqueue(conn, item)
+    original = deepdive_module.atomic_write
+    failed: list[str] = []
+
+    def fail_source_note(path, content, *, precondition=None):
+        if "-対訳-" in path.name:  # vault への書き込みの失敗の代わり
+            failed.append(path.name)
+            raise PermissionError("vault に書けない")
+        return original(path, content, precondition=precondition)
+
+    class NoteCheckingApi(FakeApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.notes_at_send: list[list[str]] = []  # 送った時点で vault にあったノート
+
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
+            self.notes_at_send.append(sorted(p.name for p in deepdive_dir(config).glob("*.md")))
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    api = NoteCheckingApi()
+    first_engines: dict[str, ScriptedEngine] = {}
+    with monkeypatch.context() as m:
+        m.setattr(deepdive_module, "atomic_write", fail_source_note)
+        with pytest.raises(DigError, match=f"item {item}: ノート公開 PermissionError"):
+            run_dig_stage(
+                conn, config, make_factory(first_engines), api, logger, today="2026-07-22"
+            )
+
+    assert "medium" in first_engines and "low" in first_engines  # 前提: 解説・対訳とも生成済み
+    row = conn.execute("SELECT * FROM dig_results").fetchone()
+    explainer = deepdive_dir(config) / f"{row['note_name']}.md"
+    source = deepdive_dir(config) / f"{row['source_note_name']}.md"
+    assert failed == [source.name]
+    assert explainer.exists() and not source.exists()
+    assert row["published_at"] is None and row["message_id"] is None
+    assert row["note_markdown"] is not None  # 公開を終えるまで本文を消さない
+    source_body = row["source_note_markdown"]
+    assert source_body is not None
+    assert api.sent == []  # 1 枚目しか無いうちはカードを送らない
+    explainer_body = explainer.read_text(encoding="utf-8")
+    with explainer.open("a", encoding="utf-8") as f:  # 公開済みの 1 枚目に本人が take を書く
+        f.write("\n手書きの take\n")
+
+    # 接続を開き直した次の実行(翌朝の朝バッチ)。障害は無い
+    conn.close()
+    reopened = connect(tmp_path / "intel.db")
+    second_engines: dict[str, ScriptedEngine] = {}
+    try:
+        assert run_dig_stage(
+            reopened, config, make_factory(second_engines), api, logger, today="2026-07-23"
+        ) is True
+        resumed = reopened.execute("SELECT * FROM dig_results").fetchall()
+    finally:
+        reopened.close()
+
+    assert second_engines == {}  # LLM を呼び直さない
+    assert source.read_text(encoding="utf-8") == source_body  # 台帳の同じ生成物から公開する
+    assert explainer.read_text(encoding="utf-8") == explainer_body + "\n手書きの take\n"
+    assert len(resumed) == 1
+    assert resumed[0]["published_at"] is not None and resumed[0]["message_id"] == 901
+    assert resumed[0]["note_markdown"] is None and resumed[0]["source_note_markdown"] is None
+    assert api.notes_at_send == [sorted([explainer.name, source.name])]
+
+
 def block_first_note_write(monkeypatch, *, after_check: bool = False) -> SimpleNamespace:
     """最初のノートの書き出しを、解除まで止める(vault の応答待ちの代わり。GH#234)。
 
