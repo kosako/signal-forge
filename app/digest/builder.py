@@ -20,6 +20,10 @@ from app.ranking import RankedItem, digest_candidates, rank_for_digest
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
 BOOKMARK_SECTION_MAX = 10
 
+# 本文の抽出に失敗し、見出しとメタ情報だけで作った分析の印(GH#240)。digest・Telegram・Items
+# ノートで共通。degraded(LLM の失敗でタイトルのみ)とは別で、分析がある記事にだけ付ける
+EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで分析)"
+
 
 def generate_digest(
     conn: sqlite3.Connection,
@@ -280,6 +284,8 @@ def _render_markdown(
         lines.append(f"- URL: {item.canonical_url}")  # DB 正規 URL のみ(LLM 出力 URL 不使用)
         if not degraded:
             lines.append(f"- カテゴリ: {item.category}")
+            if item.extraction_failed and not item.degraded:
+                lines.append(f"- {EXTRACTION_FAILED_NOTE}")
             lines.append("")
             lines.append(item.summary)
             lines.append("")

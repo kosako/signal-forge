@@ -97,6 +97,7 @@ class Analysis(_Row):
     estimated_cost_usd: float
     analyzed_at: str
     title_ja: str | None  # 002 で追加(ALTER のため実テーブルでは末尾列)
+    extraction_failed: int = 0  # migration 021(GH#240。本文なしで分析した = 1)
 
 
 @dataclass(frozen=True)

@@ -162,6 +162,25 @@ def test_all_degraded_produces_title_only_digest(conn, tmp_path, fixed_today) ->
     assert "推薦理由" not in row["markdown"]  # タイトルのみ
 
 
+def test_extraction_failed_items_are_not_full_degradation(conn, tmp_path, fixed_today) -> None:
+    # GH#240: 当日の全件が本文の抽出に失敗していても、LLM が答えていれば全滅(degraded 配信)
+    # ではない。通常の digest にし、本文を読めていない記事にだけ印を付ける
+    failed = add_analyzed(conn, "https://a/failed", relevance=90)
+    normal = add_analyzed(conn, "https://a/normal", relevance=80)
+    conn.execute("UPDATE analyses SET extraction_failed = 1 WHERE item_id = ?", (failed,))
+    set_analyzed_at(conn, TODAY_AT, failed, normal)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "ok"
+    assert json.loads(row["item_ids"]) == [failed, normal]
+    first, second = row["markdown"].split("## 2. ")
+    assert "- ⚠️ 本文を読めていない(見出しだけで分析)" in first
+    assert "**推薦理由**: 理由" in first  # 理由・示唆はそのまま
+    assert "本文を読めていない" not in second  # 通常の項目は変わらない
+
+
 def test_mixed_degraded_and_ok_is_normal_digest(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
     ok = add_analyzed(conn, "https://a/2", relevance=90)

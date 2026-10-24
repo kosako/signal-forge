@@ -36,9 +36,9 @@ schema_migrations                              (マイグレーション台帳�
 
 digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定の台帳(設計 04 §2)。記事が実際に届いたかの記録として、分析の既知判定の履歴(設計 03 §3.2。GH#177)の基準にも使う。
 
-## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019 の追加)
+## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -107,7 +107,7 @@ CREATE TABLE analyses (
                                             -- digest 直前に決定的に算出して UPDATE で書き戻す
   recommendation_reason TEXT    NOT NULL,   -- 推薦理由(PROPOSAL の必須出力)
   implication           TEXT    NOT NULL,   -- 「自分への示唆」(同上)
-  degraded              INTEGER NOT NULL DEFAULT 0 CHECK (degraded IN (0,1)),  -- タイトルのみ分析
+  degraded              INTEGER NOT NULL DEFAULT 0 CHECK (degraded IN (0,1)),  -- LLM の失敗でタイトルのみ記録
   engine                TEXT    NOT NULL CHECK (engine IN ('codex-cli','claude-cli','anthropic-api')),
   model                 TEXT    NOT NULL,
   prompt_version        TEXT    NOT NULL,   -- prompts/ のファイル名に対応(例 'analyze-v002')
@@ -116,9 +116,13 @@ CREATE TABLE analyses (
   output_tokens         INTEGER,
   estimated_cost_usd    REAL    NOT NULL DEFAULT 0,  -- サブスク枠実行時は 0
   analyzed_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  title_ja              TEXT                          -- 日本語見出し(002 で追加のため末尾列。
+  title_ja              TEXT,                         -- 日本語見出し(002 で追加のため末尾列。
                                                       -- NULL = v001 世代 / degraded。表示側は
                                                       -- title_ja 優先・無ければ items.title)
+  extraction_failed     INTEGER NOT NULL DEFAULT 0 CHECK (extraction_failed IN (0,1))
+                                                      -- 021(GH#240)。1 = 本文の抽出に失敗し、本文なしで
+                                                      -- LLM に渡した(degraded とは別。設計 03 §2)。
+                                                      -- 021 より前の行は 0
 ) STRICT;
 CREATE UNIQUE INDEX ux_analyses_idem ON analyses(item_id, prompt_version, input_hash);
 CREATE INDEX ix_analyses_item ON analyses(item_id, analyzed_at);

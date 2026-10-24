@@ -2,7 +2,7 @@
 
 `status='new'` の items に4規則を上から順に適用し、除外は `status='skipped'` +
 `skip_reason`(規則名)で記録する(黙って脱落させない)。
-extraction_status=failed は除外しない(タイトル+メタで degraded 分析に回る)。
+extraction_status=failed は除外しない(本文なしでタイトル+メタだけの分析に回る。GH#240)。
 duplicate は挿入時 dedup(設計 01 §6)で除外済みのため対象にしない。
 """
 

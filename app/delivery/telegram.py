@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.config import Config
-from app.digest.builder import BOOKMARK_SECTION_MAX
+from app.digest.builder import BOOKMARK_SECTION_MAX, EXTRACTION_FAILED_NOTE
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
@@ -330,7 +330,8 @@ def _header_text(digest: sqlite3.Row, bookmark_rows: list[sqlite3.Row] = ()) -> 
         f"📡 {digest['digest_date']}({weekday})のダイジェスト — {digest['item_count']}件"
     )
     if digest["status"] == "degraded":
-        header += "\n⚠️ 本文抽出失敗/分析縮退あり"
+        # LLM の全滅によるタイトルのみの配信。本文の抽出の失敗は記事ごとに出す(GH#240)
+        header += "\n⚠️ 分析縮退あり(LLM の失敗でタイトルのみ)"
     if digest["trend_markdown"]:  # 「今日のトレンド」節を冒頭メッセージに同梱(GH#75)
         # trend はプレーンテキスト。HTML(parse_mode=HTML)へ載せる前に必ず escape する
         # (LLM 生成の <>& で配信全体が 400 で落ちるのを防ぐ)
@@ -380,6 +381,10 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
         source_line += f" ・{published}"
 
     fixed_lines = [f"{position}. <b>{title}</b>", source_line]
+    # 本文を読めず見出しだけで作った分析は、本文に基づく要約と見分けられるよう印を出す(GH#240)。
+    # 切り詰め対象外の行として予算に含める。degraded は分析が無いので出さない
+    if row["extraction_failed"] and not row["degraded"]:
+        fixed_lines.append(EXTRACTION_FAILED_NOTE)
     # 🎯 推薦の理由と 💡 示唆の行は切り詰め対象外(設計 04 §2: タイトル・URL・理由・示唆は
     # 削らない)。degraded の理由欄は記録用の定型文(LLM 分析失敗)なので出さない(GH#90)
     reason = "" if row["degraded"] else (row["recommendation_reason"] or "").strip()
@@ -494,7 +499,7 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
         SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
                sources.name AS source_name,
                analyses.title_ja, analyses.summary, analyses.implication,
-               analyses.recommendation_reason, analyses.degraded
+               analyses.recommendation_reason, analyses.degraded, analyses.extraction_failed
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (

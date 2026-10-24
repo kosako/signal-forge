@@ -4,8 +4,8 @@
 - raw_payload の raw_content(RSS 全文フィード等)から十分な本文が取れれば HTTP を
   節約する。取れないときのみ共通 HTTP クライアント(SSRF ガード付き)で取得し、HTTP の
   charset と HTML 内の meta の宣言を考慮して復号する(GH#187)
-- failed も documents 行を作って黙って脱落させない(タイトルのみの degraded 分析に
-  回る。設計 00 §6)
+- failed も documents 行を作って黙って脱落させない(本文なしでタイトル+メタだけの分析に
+  回り、配信とノートに「本文を読めていない」と出る。設計 00 §6・GH#240)
 - expires_at は挿入時に確定: ソース別 TTL(RSS/manual 30日・X 7日。設計 01 §6)
 """
 
@@ -81,7 +81,7 @@ def extract_pending(
         counts[status] += 1
         if status == "failed":
             logger.warning(
-                "本文抽出に失敗(degraded 分析に回る)",
+                "本文抽出に失敗(本文なしで分析に回る)",
                 extra={"run_id": run_id, "stage": "extract", "item_id": row["id"]},
             )
     logger.info(

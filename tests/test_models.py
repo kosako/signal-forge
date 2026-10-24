@@ -65,3 +65,4 @@ def test_analysis_from_row_covers_all_columns(conn: sqlite3.Connection) -> None:
     assert analysis.total_score is None
     assert analysis.degraded == 0
     assert analysis.estimated_cost_usd == 0
+    assert analysis.extraction_failed == 0  # migration 021 の既定(GH#240)

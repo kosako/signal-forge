@@ -267,13 +267,18 @@ def _item_block(row: sqlite3.Row, nonce: str, body_max_chars: int) -> str:
         f'<item id="{row["id"]}">\n'
         f"title: {sanitize(row['title'], MAX_TITLE, nonce)}\n"
         f"{meta}\n"
-        f"extraction: {row['extraction_status'] or 'failed'}\n"
+        f"extraction: {_extraction_status(row)}\n"
         "body:\n"
         f"<<<DATA-{nonce}\n"
         f"{body}\n"
         f"DATA-{nonce}>>>\n"
         "</item>"
     )
+
+
+def _extraction_status(row: sqlite3.Row) -> str:
+    """プロンプトに渡す抽出の状態。documents 行が無い記事も本文なし = failed として扱う。"""
+    return row["extraction_status"] or "failed"
 
 
 def _recent_titles(conn: sqlite3.Connection) -> list[str]:
@@ -341,8 +346,8 @@ def _insert_analysis(
         INSERT OR IGNORE INTO analyses
           (item_id, run_id, title_ja, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
-           prompt_version, input_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           prompt_version, input_hash, extraction_failed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
@@ -360,6 +365,7 @@ def _insert_analysis(
             *answered_by,
             PROMPT_VERSION,
             input_hash,
+            _extraction_failed(row),
         ),
     )
 
@@ -377,8 +383,8 @@ def _insert_degraded(
         INSERT OR IGNORE INTO analyses
           (item_id, run_id, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
-           prompt_version, input_hash)
-        VALUES (?, ?, ?, 'その他', NULL, 0, 'new', '[]', ?, ?, 1, ?, ?, ?, ?)
+           prompt_version, input_hash, extraction_failed)
+        VALUES (?, ?, ?, 'その他', NULL, 0, 'new', '[]', ?, ?, 1, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
@@ -390,5 +396,15 @@ def _insert_degraded(
             getattr(engine, "model", "engine-default"),
             PROMPT_VERSION,
             input_hash,
+            _extraction_failed(row),
         ),
     )
+
+
+def _extraction_failed(row: sqlite3.Row) -> int:
+    """本文の抽出に失敗し、本文なしで LLM に渡したか(analyses.extraction_failed。GH#240)。
+
+    degraded(LLM の失敗)とは別の印。LLM が正常に答えた分析は degraded にせず、本文を読めて
+    いないことだけをこの印で配信とノートに出す(設計 03 §2)。
+    """
+    return int(_extraction_status(row) == "failed")
