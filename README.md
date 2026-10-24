@@ -59,7 +59,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 ## 必要なもの
 
 - macOS と launchd。システムのタイムゾーンが JST であること。
-- Python 3.12 以上と uv。
+- Python 3.12 と uv。uv は repo の `.python-version` を読み、.venv を Python 3.12 で作る。
 - Telegram の bot(BotFather で作る)。
 - codex CLI。`codex login` を済ませておく。呼び出しごとの追加の支払いは無い(codex のサブスク枠を使う)が、LLM の呼び出しはその枠(クレジット)を消費する。
 - Obsidian の vault(書き出し先のローカルフォルダ)。

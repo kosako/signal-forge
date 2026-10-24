@@ -222,6 +222,19 @@ def _group_gone(pgid: int) -> bool:
     return False
 
 
+def _is_zombie(pid: int) -> bool:
+    # 子が終わって回収を待つ状態(ゾンビ)かを ps で見る。macOS の Python 3.12 には os.waitid が
+    # 無い(GH#285)。テストは Popen.communicate を差し替えるので、communicate を通る
+    # subprocess.run は使わず、Popen の stdout を直接読む
+    with subprocess.Popen(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ) as ps:
+        return ps.stdout.read().strip().startswith("Z")
+
+
 # 中断の時点の子の状態ごとの、偽の codex の本文({pid_file} に自分の pid を書く)
 _INTERRUPT_SCENARIOS = {
     # 推論を続けている: 孫の sleep を起こしてから待つ
@@ -252,7 +265,7 @@ def test_engine_interrupt_stops_and_reaps_codex(
         if scenario == "reaped":
             self.wait()
         elif scenario == "zombie":
-            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)  # 終わりを待ち、回収しない
+            assert _wait_until(lambda: _is_zombie(self.pid))  # 終わりを待ち、回収しない
         raise interrupt
 
     real_exit = tempfile.TemporaryDirectory.__exit__
