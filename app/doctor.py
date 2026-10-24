@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from app.config import Config, ConfigError, load_config, load_env
 from app.db import MIGRATIONS_DIR, MigrationError, connect, discover_migrations, verify_ledger
 from app.purge import X_SIGNAL_EXCERPT_EXPIRED
+from app.vault_guard import VaultGuard, VaultStalled
 
 BACKUP_STALE_HOURS = 48
 # 生成側(app/backup.py の backup_daily)が作る世代名 intel-YYYYMMDD.tar.gz。置き場にある
@@ -64,25 +65,33 @@ def run_doctor(
     home: Path | None = None,
     x_oauth1_probe: Callable[[dict[str, str]], str] | None = None,
     x_oauth2_probe: Callable[[Config, dict[str, str], Path], str] | None = None,
+    vault: VaultGuard | None = None,
 ) -> list[CheckResult]:
     """14項目を実行して結果リストを返す(表示・終了コードは CLI 側)。"""
     environ = dict(os.environ) if environ is None else environ
     home = Path.home() if home is None else home
+    vault = vault or VaultGuard()
 
     results: list[CheckResult] = []
 
     # #1 config。読込失敗時は None のまま進み、config 依存の検査は「検査不可」の FAIL に
     # 倒す(既定 Config で続行すると意図しない既定 DB を診断してしまう)
+    # 読めない(権限・文字コード)などの前処理の例外も、#1〜#3 の各項目の FAIL に局所化して
+    # 残りの検査を続ける(後段のループと同じ扱い。GH#201)
     config: Config | None = None
     config_path = config_dir / "config.toml"
-    if not config_path.exists():
-        results.append(CheckResult(1, "config.toml", "FAIL", f"{config_path} が存在しない"))
-    else:
-        try:
+    try:
+        if not config_path.exists():
+            results.append(CheckResult(1, "config.toml", "FAIL", f"{config_path} が存在しない"))
+        else:
             config = load_config(config_dir)
             results.append(CheckResult(1, "config.toml", "PASS", "スキーマ検証 OK"))
-        except ConfigError as e:
-            results.append(CheckResult(1, "config.toml", "FAIL", str(e)))
+    except ConfigError as e:
+        results.append(CheckResult(1, "config.toml", "FAIL", str(e)))
+    except Exception as e:
+        results.append(
+            CheckResult(1, "config.toml", "FAIL", f"検査中に例外: {type(e).__name__}: {e}")
+        )
 
     # #2 .env
     env: dict[str, str] = {}
@@ -98,13 +107,17 @@ def run_doctor(
             results.append(CheckResult(2, ".env", "PASS", "パーミッション・必須キー OK"))
     except ConfigError as e:
         results.append(CheckResult(2, ".env", "FAIL", str(e)))
+    except Exception as e:
+        # 例外の文は .env の中身の一部を載せうる(UnicodeDecodeError は読めなかったバイトを
+        # 載せる)ので、型名だけを出す(secret を出力に残さない。GH#205)
+        results.append(CheckResult(2, ".env", "FAIL", f"検査中に例外: {type(e).__name__}"))
 
     conn: sqlite3.Connection | None = None
     try:
         if config is not None:
             try:
                 conn = connect(config.db_path)
-            except sqlite3.Error as e:
+            except Exception as e:  # sqlite3.Error だけでなく、置き場の mkdir の OSError も
                 results.append(CheckResult(3, "SQLite/migrations", "FAIL", f"接続失敗: {e}"))
         # 検査内の例外はその項目の FAIL に局所化する(1つの例外で全体を落とさない)
         checks: list[tuple[int, str, Callable[[], CheckResult]]] = [
@@ -122,7 +135,7 @@ def run_doctor(
                     codex_home_engine_factory=codex_home_engine_factory,
                 ),
             ),
-            (7, "Obsidian Vault", lambda: _check_vault(config)),
+            (7, "Obsidian Vault", lambda: _check_vault(config, vault)),
             (8, "launchd", lambda: _check_launchd(launchctl)),
             (9, "当月コスト", lambda: _check_cost(conn, config)),
             (10, "バックアップ", lambda: _check_backup(config)),
@@ -366,7 +379,9 @@ def _check_x_oauth2(
 ) -> CheckResult:
     """#13 X OAuth2 token(S1 = GH#58)。token 有効性を users/me(読取課金なし)で確認。
 
-    token 未取得は SKIP(S1 取込を使うまで認可は不要。恒久 FAIL にしない)。
+    token 未取得は、S1b 取込が無効([x_signals].daily_read_cap = 0)の間だけ SKIP(取込を
+    使うまで認可は不要。恒久 FAIL にしない)。取込が有効なら未認可・client_id 欠落は FAIL
+    (朝バッチの x_signals 段が失敗するため、doctor でも同じ条件で気づかせる。GH#249)。
     refresh はローテーションを伴うため、この検査は users/me 呼び出しに留める
     (失効時のみセッションが refresh する。無用な token 消費をしない)。
     """
@@ -379,8 +394,19 @@ def _check_x_oauth2(
     except XOAuth2Error as e:
         return CheckResult(13, "X OAuth2 token", "FAIL", str(e))
     if token is None:
+        if not config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(app/run.py と同じ判定)
+            return CheckResult(
+                13, "X OAuth2 token", "SKIP", "未認可(S1 取込を使うときに intel x-auth)"
+            )
+        missing = "未認可"
+        if config.x_oauth2.client_id is None:
+            missing = f"[x_oauth2].client_id 未設定・{missing}"
         return CheckResult(
-            13, "X OAuth2 token", "SKIP", "未認可(S1 取込を使うときに intel x-auth)"
+            13,
+            "X OAuth2 token",
+            "FAIL",
+            f"[x_signals].daily_read_cap > 0 だが{missing}"
+            "(朝の x_signals 段が失敗する。runbook §9 で intel x-auth)",
         )
     if config.x_oauth2.client_id is None:
         return CheckResult(
@@ -615,20 +641,33 @@ def _local_canary_server() -> object:
         thread.join(timeout=2)
 
 
-def _check_vault(config: Config | None) -> CheckResult:
+def _check_vault(config: Config | None, vault: VaultGuard) -> CheckResult:
     if config is None:
         return CheckResult(7, "Obsidian Vault", "FAIL", _CONFIG_UNAVAILABLE)
     if config.obsidian.vault_path is None:
         return CheckResult(7, "Obsidian Vault", "FAIL", "[obsidian].vault_path 未設定(宿題 H4)")
     target = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
     probe = target / f".doctor-write-test-{secrets.token_hex(4)}"
+    # macOS のプライバシーの確認が出ると vault の open() は応答まで止まるので、`intel answer` と
+    # 同じ上限を付け、超えたら #7 の FAIL にして残りの検査へ進む(GH#248)
     try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe.write_text("doctor", encoding="utf-8")
-        probe.unlink()
+        vault.call(lambda: _write_and_remove_probe(target, probe))
         return CheckResult(7, "Obsidian Vault", "PASS", f"書込・削除 OK: {target}")
+    except VaultStalled as e:
+        return CheckResult(7, "Obsidian Vault", "FAIL", f"書込テストが応答しない: {e}。runbook §11")
     except OSError as e:
         return CheckResult(7, "Obsidian Vault", "FAIL", f"書込不可(TCC/FDA 要確認): {e}")
+
+
+def _write_and_remove_probe(target: Path, probe: Path) -> None:
+    """#7 の書込テスト。VaultGuard のスレッドで走る。
+
+    上限を超えて打ち切った後に書き込みが通った(確認に応答した)場合も、同じスレッドが続けて
+    検査用のファイルを消す(vault に残さない。GH#248)。
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    probe.write_text("doctor", encoding="utf-8")
+    probe.unlink()
 
 
 def _check_launchd(launchctl: Callable[[str], bool] | None) -> CheckResult:

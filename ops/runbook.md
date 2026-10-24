@@ -332,6 +332,8 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
   log show --last 30m --predicate 'process == "tccd" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"'
   ```
   確認を出さないようにするには、§4 の FDA を uv の実体に付け直す(uv を更新したときは付け直しが要る)。
+  `intel doctor` の #7(書込テスト)も同じ 10 秒で打ち切り、「書込テストが応答しない」の FAIL にして
+  残りの検査へ進む(GH#248)。
   vault のファイルを自分のシェルで開いて確かめるときも、時間の上限を付ける
   (`perl -e 'alarm 5; exec @ARGV' head -c 1 <file>`。上限なしだとシェルも止まる)。
 
