@@ -1,8 +1,15 @@
+import contextlib
 import gzip
+import socket
+import threading
+import time
+import tracemalloc
+import zlib
 
 import httpx
 import pytest
 
+import app.http
 from app.connectors.base import FatalError, RetryableError
 from app.http import (
     FETCH_DEADLINE_S,
@@ -314,7 +321,7 @@ def test_deadline_message_keeps_dns_failure_host() -> None:
 def test_oversized_body_stops_reading_and_is_not_retried() -> None:
     # 本文はストリーミングで受け、上限を超えた時点で読むのをやめる(GH#203)
     calls = []
-    stream = ChunkStream(b"x" * (1024 * 1024))  # 終わらない応答
+    stream = ChunkStream(b"x" * (1024 * 1024), count=2 * MAX_RESPONSE_BYTES // (1024 * 1024))
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
@@ -335,18 +342,69 @@ def test_body_at_limit_is_returned() -> None:
     assert fetched.response.content == body
 
 
-def test_compressed_body_is_limited_after_decoding() -> None:
-    # 小さく圧縮した巨大な本文も、展開後のバイト数で止める(GH#203)
-    bomb = gzip.compress(b"\0" * (MAX_RESPONSE_BYTES + 1))
-    assert len(bomb) < MAX_RESPONSE_BYTES // 100
+def test_compressed_body_is_limited_while_decoding() -> None:
+    # 小さく圧縮した巨大な本文も展開後のバイト数で止める。1 回の受信分(ここでは約 100 KB)を
+    # 一度に展開すると 100 MiB になるので、少しずつ展開してメモリを使い切らないこと(GH#203)
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    block = bytes(1024 * 1024)
+    bomb = b"".join(compressor.compress(block) for _ in range(100)) + compressor.flush()
+    assert len(bomb) < 200 * 1024
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, headers={"content-encoding": "gzip"}, stream=httpx.ByteStream(bomb)
         )
 
-    with pytest.raises(ResponseTooLargeError):
+    client = make_client(handler)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ResponseTooLargeError):
+            client.get("https://example.com/bomb")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < MAX_RESPONSE_BYTES * 3
+
+
+@pytest.mark.parametrize("encoding", ["gzip, gzip", "deflate, gzip", "br", "zstd"])
+def test_unboundable_content_encoding_is_rejected(encoding: str) -> None:
+    # 重ねた符号化は 1 段目の展開分をまとめて次の段で展開し、br / zstd は展開比が大きい。
+    # 展開後の大きさを抑えられないので、展開せずにそのソース・記事の失敗にする(GH#203)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(
+            200, headers={"content-encoding": encoding}, stream=httpx.ByteStream(b"\x1f\x8b")
+        )
+
+    with pytest.raises(FatalError, match="Content-Encoding"):
         make_client(handler).get("https://example.com/bomb")
+    assert len(calls) == 1
+
+
+def test_unknown_content_encoding_passes_through() -> None:
+    # httpx が展開しない誤った値(実在のサーバが送ることがある)は、従来どおり本文をそのまま返す
+    fetched = make_client(
+        lambda request: httpx.Response(
+            200, headers={"content-encoding": "utf-8"}, content=b"<rss/>"
+        )
+    ).get("https://example.com/feed")
+    assert fetched.response.content == b"<rss/>"
+
+
+def test_accept_encoding_is_limited_to_gzip_and_deflate(monkeypatch) -> None:
+    # httpx は br / zstd の展開器を入れると求める符号化に加える。入れた環境でも、上で受けない
+    # 符号化を求めない(GH#203)
+    monkeypatch.setattr(httpx._client, "ACCEPT_ENCODING", "gzip, deflate, br, zstd")
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200)
+
+    make_client(handler).get("https://example.com/")
+    assert seen[0].headers["accept-encoding"] == "gzip, deflate"
 
 
 def test_compressed_body_within_limit_is_decoded() -> None:
@@ -366,14 +424,16 @@ def test_compressed_body_within_limit_is_decoded() -> None:
 
 
 def test_slow_body_stops_at_deadline() -> None:
-    # 少しずつ送り続ける応答は read timeout では切れない。受信のたびに期限を見る(GH#203)
+    # 少しずつ送り続ける応答は read timeout では切れない。受信のたびに期限を見る(GH#203)。
+    # 実際の接続は期限に切るので受信の途中で止まる(下の実ソケットのテスト)。ここでは
+    # 受信の後の検査を見るため、chunk の到着で時計を進める
     clock = FakeClock()
     calls = []
 
     def advance() -> None:
         clock.now += READ_TIMEOUT_S - 5  # read timeout の内側で 1 chunk ずつ届く
 
-    stream = ChunkStream(b"x", on_chunk=advance)
+    stream = ChunkStream(b"x", count=10, on_chunk=advance)
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
@@ -384,6 +444,83 @@ def test_slow_body_stops_at_deadline() -> None:
     assert stream.sent == 3  # 25s・50s・75s。期限 60s を越えた chunk で止まる
     assert len(calls) == 1  # 期限の超過はリトライしない
     assert clock.sleeps == []
+
+
+def serve_once(respond) -> int:
+    """127.0.0.1 で 1 回だけ応答する TCP サーバ。respond(conn) が応答を書く。port を返す。"""
+    server = socket.create_server(("127.0.0.1", 0))
+
+    def run() -> None:
+        with server:
+            conn, _ = server.accept()
+            with conn, contextlib.suppress(OSError):  # クライアントが接続を切った
+                conn.recv(65536)  # リクエスト
+                respond(conn)
+
+    threading.Thread(target=run, daemon=True).start()
+    return server.getsockname()[1]
+
+
+def make_local_client(monkeypatch, deadline_s: float) -> HttpClient:
+    # 実 transport で検査する。SSRF ガードは loopback を拒むので、接続先の検証だけを差し替える
+    monkeypatch.setattr(app.http, "FETCH_DEADLINE_S", deadline_s)
+    client = HttpClient(sleep=lambda _s: None)
+    monkeypatch.setattr(client, "_check_target", lambda url, deadline: "127.0.0.1")
+    return client
+
+
+def test_slow_headers_are_cut_at_deadline(monkeypatch) -> None:
+    # ヘッダを少しずつ送り続ける相手は read timeout では切れない。期限に接続を切る(GH#203)
+    def respond(conn: socket.socket) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+        for _ in range(60):  # 0.1s ごとに 1 バイト。切られなければ 6s 続く
+            conn.sendall(b"a")
+            time.sleep(0.1)
+
+    port = serve_once(respond)
+    client = make_local_client(monkeypatch, 1.0)
+    started = time.monotonic()
+    with pytest.raises(FetchDeadlineError, match="を超過"):  # リトライの失敗にしない
+        client.get(f"http://local.example:{port}/feed")
+    assert time.monotonic() - started < 3.0
+
+
+def test_body_cut_at_deadline_is_not_taken_as_complete(monkeypatch) -> None:
+    # 接続を閉じて終わる本文(Content-Length なし)を期限で切ったとき、切った接続の終わりを
+    # 本文の終わりと取り違えて途中までの本文を返さない(GH#203)
+    def respond(conn: socket.socket) -> None:
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+        time.sleep(0.3)
+        conn.sendall(b"-more")
+        time.sleep(3)  # 止まる。read timeout(期限の残り)より先に期限が来る
+
+    port = serve_once(respond)
+    client = make_local_client(monkeypatch, 1.0)
+    with pytest.raises(FetchDeadlineError, match="期限"):
+        client.get(f"http://local.example:{port}/article")
+
+
+def test_slow_name_resolution_is_abandoned_at_deadline(monkeypatch) -> None:
+    # 名前解決が返らなくても期限で待つのをやめる。失敗したホストは文言に残す(GH#188・GH#203)
+    monkeypatch.setattr(app.http, "FETCH_DEADLINE_S", 0.5)
+    release = threading.Event()
+
+    def resolve(host: str) -> list[str]:
+        release.wait(5)  # 応答しない resolver
+        raise OSError("timed out")
+
+    client = HttpClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        resolve_host=resolve,
+        sleep=lambda _s: None,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(FetchDeadlineError, match="slow-dns.example"):
+            client.get("https://slow-dns.example/")
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("empty_result", [False, True])
