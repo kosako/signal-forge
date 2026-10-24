@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -98,6 +99,59 @@ def make_http() -> HttpClient:
     )
 
 
+# 前の段が失敗した日も purge・backup が実際に走ったことを、結果で確かめる(GH#257)。
+# 失敗の一覧に名前が無いことだけでは、段を飛ばしても通ってしまう。
+# purge は SQLite の現在時刻と比べるので、期限は実時計に左右されない遠い過去・未来に固定する
+EXPIRED_AT = "2000-01-01T00:00:00Z"
+LIVE_UNTIL = "2999-12-31T00:00:00Z"
+BACKUP_DAY = "2026-07-06"  # backup の世代名(JST の日付)も固定する
+
+
+@pytest.fixture
+def ttl_documents(conn, monkeypatch) -> tuple[int, int]:
+    """期限切れと期限内の本文(documents)を 1 件ずつ用意し、(期限切れ, 期限内) の item_id を返す。
+
+    item は配信済み(digested)にして、collect から dig までの段の対象にしない。
+    """
+    monkeypatch.setattr("app.backup.today_jst", lambda: BACKUP_DAY)
+    ids = []
+    for key, expires_at in (("expired", EXPIRED_AT), ("live", LIVE_UNTIL)):
+        url = f"https://ttl.example/{key}"
+        item_id = conn.execute(
+            "INSERT INTO items (source_id, url, canonical_url, content_hash, status) "
+            "VALUES (1, ?, ?, ?, 'digested')",
+            (url, url, f"sha256:{key}"),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO documents (item_id, extracted_text, extraction_status, expires_at) "
+            "VALUES (?, '本文', 'ok', ?)",
+            (item_id, expires_at),
+        )
+        ids.append(item_id)
+    return ids[0], ids[1]
+
+
+def assert_purged_then_backed_up(conn, tmp_path, ttl_documents) -> None:
+    """purge 段が期限切れだけを消し、同じ実行の backup 段がその結果を写したことを確かめる。"""
+    expired_id, live_id = ttl_documents
+
+    def seeded_documents(db) -> set[int]:
+        rows = db.execute(
+            "SELECT item_id FROM documents WHERE item_id IN (?, ?)", (expired_id, live_id)
+        )
+        return {row[0] for row in rows}
+
+    assert seeded_documents(conn) == {live_id}  # purge: 期限切れは消え、期限内は残る
+    archive = tmp_path / "backups" / f"intel-{BACKUP_DAY.replace('-', '')}.tar.gz"
+    with tarfile.open(archive) as tar:
+        tar.extract("intel.db", path=tmp_path / "restore", filter="data")
+    restored = sqlite3.connect(tmp_path / "restore" / "intel.db")
+    try:
+        assert seeded_documents(restored) == {live_id}  # backup: purge の後のスナップショット
+    finally:
+        restored.close()
+
+
 def test_full_pipeline_end_to_end(conn, tmp_path) -> None:
     config = make_config(tmp_path)
     failures = run_pipeline(
@@ -128,7 +182,7 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
     assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 1
 
 
-def test_stage_failure_is_isolated_and_reported(conn, tmp_path) -> None:
+def test_stage_failure_is_isolated_and_reported(conn, tmp_path, ttl_documents) -> None:
     # プロファイル欠落 → analyze 段は失敗するが、digest(空)・purge まで進む
     config = Config(
         config_dir=tmp_path,
@@ -141,12 +195,16 @@ def test_stage_failure_is_isolated_and_reported(conn, tmp_path) -> None:
     )
     assert "analyze" in failures
     assert "purge" not in failures
-    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 1  # collect は成功
+    collected = conn.execute(
+        "SELECT count(*) FROM items WHERE url = 'https://example.com/article'"
+    ).fetchone()[0]
+    assert collected == 1  # collect は成功(ttl_documents が用意した 2 件は数えない)
     digest = conn.execute("SELECT item_count FROM digests").fetchone()
     assert digest["item_count"] == 0  # 分析なしでも digest 段は空で完走
+    assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
-def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path) -> None:
+def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path, ttl_documents) -> None:
     # 環境障害(codex 不在 = #72)は silent full-degradation でなく analyze 段の失敗になる
     # (failures 非空は CLI の非0終了・失敗通知の入口 = app/run.py docstring。GH#74)。
     # 後続の段は継続する
@@ -169,6 +227,7 @@ def test_analyze_unavailable_fails_stage_without_degraded(conn, tmp_path) -> Non
     assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
     # digest 段は空で完走(トレンドは付加機能として節省略・本体は止めない)
     assert conn.execute("SELECT item_count FROM digests").fetchone()["item_count"] == 0
+    assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
 def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(
@@ -210,7 +269,7 @@ def test_analyze_full_degradation_fails_stage_but_keeps_degraded_digest(
     assert digest["status"] == "degraded" and digest["item_count"] == 1  # 劣化配信は維持
 
 
-def test_export_failure_reported_but_purge_runs(conn, tmp_path) -> None:
+def test_export_failure_reported_but_purge_runs(conn, tmp_path, ttl_documents) -> None:
     profile = tmp_path / "interest-profile.md"
     profile.write_text("---\nupdated: 2026-07-06\n---\n# 関心\n")
     config = Config(  # vault 未設定 → export 失敗
@@ -223,6 +282,7 @@ def test_export_failure_reported_but_purge_runs(conn, tmp_path) -> None:
         lambda: ScriptedEngine(conn), logger, "01RUNID",
     )
     assert failures == ["export"]
+    assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
 def test_deliver_skipped_when_telegram_unconfigured(conn, tmp_path) -> None:
@@ -317,7 +377,7 @@ def test_x_signals_stage_fails_loud_when_enabled_but_unconfigured(conn, tmp_path
     assert "digest" not in failures  # 後続の段は継続
 
 
-def test_dig_stage_failure_is_isolated(conn, tmp_path) -> None:
+def test_dig_stage_failure_is_isolated(conn, tmp_path, ttl_documents) -> None:
     # 材料不足のリプライ指定は dig 段の失敗になる(GH#105)が、後続の段は継続する
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, content_hash) "
@@ -334,6 +394,7 @@ def test_dig_stage_failure_is_isolated(conn, tmp_path) -> None:
     )
     assert "dig" in failures
     assert "purge" not in failures and "backup" not in failures
+    assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
 def test_dig_stage_absent_when_cap_zero(conn, tmp_path) -> None:
