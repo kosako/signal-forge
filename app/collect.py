@@ -83,6 +83,7 @@ def _collect_source(
             result.moved_url,
             resolve_short,
             partial_error=partial_error,
+            budget_exhausted=result.budget_exhausted,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
@@ -123,7 +124,9 @@ def _collect_source(
             **counts,
         },
     }
-    if partial_error is None:
+    if result.budget_exhausted:
+        logger.info("当日の読取の枠が残っていないため読まず。ソースの状態は変えない", extra=extra)
+    elif partial_error is None:
         logger.info("collect 完了", extra=extra)
     else:
         logger.warning(
@@ -141,12 +144,16 @@ def _store_result(
     resolve_short: Callable[[str], str] | None,
     *,
     partial_error: str | None,
+    budget_exhausted: bool = False,
 ) -> dict[str, int]:
     """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
     moved_url は今回の取得の恒久移転の先(無ければ NULL に戻す。GH#150)。
     partial_error は部分取得のあとの失敗の文(GH#183)。あれば items とカーソルは保存しつつ、
     ソースは失敗として数える(連続失敗の警告に載せる。成功の時刻と移転の記録は変えない)。
+    budget_exhausted は X の当日の読取の枠が残っておらず要求しなかった実行(GH#178)。カーソルだけを
+    保存し、成功の時刻・直近のエラー・連続失敗数は変えない(復旧を確かめていないので、失敗の続きを
+    成功で消さない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     # 短縮 URL の解決(HTTP の待ち・再試行)はトランザクションの前に済ませる(GH#179)。
@@ -158,7 +165,11 @@ def _store_result(
     try:
         for raw, canonical in prepared:
             counts[_store_item(conn, source, raw, canonical)] += 1
-        if partial_error is None:
+        if partial_error is None and budget_exhausted:
+            conn.execute(
+                "UPDATE sources SET cursor = ? WHERE id = ?", (json.dumps(next_cursor), source.id)
+            )
+        elif partial_error is None:
             conn.execute(
                 f"""
                 UPDATE sources

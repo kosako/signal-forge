@@ -64,6 +64,9 @@ class FetchResult:
     # 通信のリトライ尽きなど。GH#183・GH#182)。collect は items と next_cursor を保存しつつ、
     # ソースの失敗として記録する。None = 正常な終わり
     partial_error: Exception | None = None
+    # X の当日の読取の枠が残っておらず、読取の要求を 1 回もしなかった(GH#178)。collect は
+    # 復旧を確かめていないので、ソースの成否の状態(成功の時刻・直近のエラー・連続失敗数)を変えない
+    budget_exhausted: bool = False
 
 
 class Connector(Protocol):

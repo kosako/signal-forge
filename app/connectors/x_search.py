@@ -167,6 +167,9 @@ class XSearchConnector:
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
             partial_error=error,
+            # 当日の残り枠でどのスロットも要求しなかった(GH#178)。復旧を確かめていないので
+            # collect にソースの成否の状態を変えさせない(失敗の続きを成功で消さない)
+            budget_exhausted=all(budget < X_SEARCH_MIN_PAGE for budget in budgets),
         )
 
     def _fetch_slot(

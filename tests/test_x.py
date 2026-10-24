@@ -22,6 +22,7 @@ from app.connectors.x_search import XSearchConnector
 from app.db import apply_migrations, connect
 from app.http import HttpClient
 from app.models import Source
+from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
 FULL_ENV = {k: "v" for k in
             ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
@@ -149,7 +150,9 @@ def test_reads_used_today_leaves_only_remaining_budget() -> None:
     assert result.stats.api_reads == 30
     timeline = [r for r in seen if "timelines" in str(r.url)]
     assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in timeline] == [["30"]]
-    # 使い切った日は読まず、since_id も据え置く(翌日に新しい側から取る)
+    assert not result.budget_exhausted
+    # 使い切った日は読まず、since_id も据え置く(翌日に新しい側から取る)。読まなかった印を立て、
+    # collect にソースの成否の状態を変えさせない
     seen.clear()
     result = connector_from(
         [(200, p1, {})], daily_read_cap=130, reads_used_today=130, seen=seen
@@ -157,6 +160,7 @@ def test_reads_used_today_leaves_only_remaining_budget() -> None:
     assert result.stats.api_reads == 0
     assert [r for r in seen if "timelines" in str(r.url)] == []
     assert result.next_cursor == {"since_id": "100"}
+    assert result.budget_exhausted
 
 
 def test_rate_limit_remaining_zero_stops() -> None:
@@ -567,6 +571,60 @@ def test_auth_error_after_partial_fetch_counts_reads_for_same_day_rerun(db, monk
     reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
     assert reads == [100, 30]
     assert seen == ["100", "30", "30"]
+
+
+def test_same_day_rerun_without_budget_keeps_source_failure_state(db, monkeypatch) -> None:
+    # GH#178: 検索の上限 35・3 スロットで、1 本目が 12 件読み、2 本目が 403 で失敗した日。
+    # 同じ日の再走は残り 23(8/8/7)で、どのスロットも要求しない。要求していないので復旧は
+    # 確かめておらず、連続失敗数・直近のエラー・成功の時刻を変えない(警告から外さない)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
+    source_id = add_x_source(db, "x:search", '{"mode": "search"}')
+    db.execute(
+        "UPDATE sources SET cursor = ?, last_success_at = ?, consecutive_failures = 2 WHERE id = ?",
+        ('{"since_id": "1"}', "2026-10-21T21:30:00Z", source_id),
+    )
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(urlsplit(str(request.url)).query)
+        seen.append(query["query"][0])
+        if not query["query"][0].startswith("(a)"):
+            return httpx.Response(403, json={})
+        count = int(query["max_results"][0])
+        tweets = [tweet(str(900 - i), "検索の投稿") for i in range(count)]
+        return httpx.Response(200, json=page(tweets))
+
+    def run_once(utc_time: str) -> None:
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
+        config = _config(True, slots=("a", "b", "c"))
+        router = _build_connectors(config, FULL_ENV, HttpClient(), db)["x"]
+        router._search._session._client = httpx.Client(transport=httpx.MockTransport(handler))
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
+
+    def source_state() -> tuple:
+        row = db.execute(
+            "SELECT cursor, last_success_at, last_error_at, last_error, consecutive_failures "
+            "FROM sources WHERE id = ?",
+            (source_id,),
+        ).fetchone()
+        return tuple(row)
+
+    run_once("2026-10-23T21:30:00Z")  # JST 10/24 6:30
+    assert len(seen) == 2  # a(12 件)と b(403)
+    failed = source_state()
+    assert failed[0] == '{"since_id": "1"}'
+    assert failed[1] == "2026-10-21T21:30:00Z"
+    assert "認証失敗" in failed[3]
+    assert failed[4] == 3
+    assert x_reads_today(db) == {"home": 0, "search": 12}
+
+    run_once("2026-10-24T03:00:00Z")  # 同じ日の再走
+    assert len(seen) == 2  # 残り 23 = 8/8/7 はどれも下限 10 未満。要求しない
+    assert source_state() == failed  # 失敗の状態のまま(成功で消さない)
+    runs = db.execute("SELECT status, api_reads FROM collect_runs ORDER BY id").fetchall()
+    assert [tuple(r) for r in runs] == [("error", 12), ("ok", 0)]
+    assert source_failure_alerts(db, "x", X_FAILURE_ALERT) != []  # 警告に載ったまま
 
 
 def test_build_x_connector_signs_requests() -> None:
