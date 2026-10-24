@@ -86,12 +86,13 @@ rm -rf "${TMP_DIR}"
   2026-10-24 に、上の手順で生成した PATH の下で #6 が PASS)。npm 版で、`npm install -g @openai/codex@0.162.1`
   で入れた。
 - 対応の範囲: 実装は `--strict-config`・permission profile のキー・`--disable` で外す feature 名に頼る
-  (設計 00 §5)。これを受け付けない版(古い版や、feature 名を変えた新しい版)では codex が起動設定エラーで
-  止まり、doctor #6 が `LLMUnavailableError` で FAIL する(隔離が弱まったまま動くことはない)。
-  確かめたのは上の版だけなので、ほかの版は下の手順で doctor #6 を通してから使う。
+  (設計 00 §5)。これを受け付けない版(古い版や、feature 名を変えた新しい版)では codex が起動の時点で
+  エラーで止まり、doctor #6 が FAIL する(起動引数が黙って無視されることはない)。例外の型は codex の stderr の
+  書き出しで決まり、決まった書き出し(`Error: Unknown feature flag` など)なら `LLMUnavailableError`、
+  それ以外は `LLMError` になる。確かめたのは上の版だけなので、ほかの版は下の手順で doctor #6 を通してから使う。
 - npm 版は node の版ごとの global に入る。node を別の版に替えると、PATH の上の `codex` が無くなるか
   別の版になる。新しい node の側にも上の版を入れ、この節の手順をやり直す(plist の PATH が変わったら
-  poller を入れ直す。§11 の 2)。
+  morning と poller の両方を入れ直す。§11 の 2)。
 
 **Codex CLI を更新するとき**(無人運用へ反映する前に doctor #6 を通す):
 
@@ -110,7 +111,7 @@ rm -rf "${TMP_DIR}"
    間は避ける。
 3. もう一度 `uv run intel doctor` を流し、#6 が PASS になることを確かめる。FAIL なら上の確かめた版に戻す
    (`npm install -g @openai/codex@0.162.1`)。codex か node の dir が変わったときは、この節の手順で plist を
-   作り直し、poller を入れ直す(§11 の 2)。
+   作り直し、morning と poller の両方を入れ直す(§11 の 2)。
 4. 上の「確かめた版」の行を新しい版に書き換える。
 
 ## 2. bootstrap(ロード)
@@ -296,12 +297,18 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
 
 **既存のインストールを更新するとき**(PATH に codex の dir が入る前の poller.plist を使っている場合):
 
-1. §1 を実行して plist を再生成・コピーする(morning.plist も同じ内容で上書きされる)。
-2. poller を入れ直す(morning は次回起動で新しい plist を読むので入れ直し不要):
+1. §1 を実行して plist を再生成・コピーする(morning.plist も上書きされる)。
+2. poller と morning を入れ直す。launchd はロードしたときの plist の内容を使い続けるので、コピーし直した
+   だけでは PATH は変わらない(npm 版の codex で node の dir が足されたときは morning の PATH も変わる)。
+   朝バッチ(06:30 から終わるまで)の間は避ける(bootout は動いているジョブを止める):
    ```sh
    launchctl bootout "gui/$(id -u)/com.intel.poller"
    launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.poller.plist"
-   launchctl print "gui/$(id -u)/com.intel.poller" | grep -A3 "environment"   # PATH に codex の dir(npm 版で node が別の dir なら node の dir も)
+   launchctl bootout "gui/$(id -u)/com.intel.morning"
+   launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.morning.plist"
+   # PATH に codex の dir(npm 版で node が別の dir なら node の dir も)
+   launchctl print "gui/$(id -u)/com.intel.poller" | grep -A3 "environment"
+   launchctl print "gui/$(id -u)/com.intel.morning" | grep -A3 "environment"
    ```
 3. 確認: 深掘りカードにリプライし、「📝 記録しました。返事を作っています」の後に返事が届くこと。
    ログは `~/.local/state/intel/logs/answer.log`(子の起動失敗・異常終了は `poller.log`)。
