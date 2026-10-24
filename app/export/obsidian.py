@@ -65,15 +65,18 @@ def export_digest(
     # 🔖 保存節の item(GH#99)も配信 item と同様に Items ノート化する(=「保存」の実体)
     item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
+    # ノートの日付は item が最初に載った digest の日付(後日の保存節への再掲でも同じノート。GH#242)
+    note_dates = _first_listed_dates(conn, [row["item_id"] for row in rows])
 
     wikilinks = []
     conflicts = 0
     for row in rows:
-        note_name = _item_note_name(digest["digest_date"], row["item_id"], row["title"])
+        note_date = note_dates.get(row["item_id"], digest["digest_date"])
+        note_name = _item_note_name(note_date, row["item_id"], row["title"])
         wikilinks.append(f"[[{note_name}]]")
         if not _write_note(
             items_dir / f"{note_name}.md",
-            _item_frontmatter(row, digest["digest_date"]),
+            _item_frontmatter(row, note_date),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
             logger=logger,
             run_id=run_id,
@@ -111,9 +114,10 @@ def export_pending_notes(
 ) -> None:
     """未反映の感想を該当ノートへ投影する(item = GH#92 / digest = GH#96)。
 
-    感想は配信済みメッセージへのリプライでしか生まれないため、item ノート名の digest_date は
-    digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
-    その item は配信済み)。digest 感想は digests.digest_date で直接 Daily を特定する。
+    感想は配信済みメッセージへのリプライでしか生まれないため、対象の item は
+    digest_messages → digests で絞れる(export は deliver より前段だが、感想が付く時点で
+    その item は配信済み)。ノート名の日付は export_digest と同じく、item が最初に載った
+    digest の日付(GH#242)。digest 感想は digests.digest_date で直接 Daily を特定する。
     再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
     """
     if config.obsidian.vault_path is None:
@@ -144,6 +148,7 @@ def export_pending_notes(
     base = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
     items_dir = base / "Items"
     items_dir.mkdir(parents=True, exist_ok=True)
+    note_dates = _first_listed_dates(conn, [entry["item_id"] for entry in pending])
     conflicts = 0
     for entry in pending:
         rows = _load_items(conn, [entry["item_id"]])
@@ -155,10 +160,11 @@ def export_pending_notes(
             )
             continue
         row = rows[0]
-        note_name = _item_note_name(entry["digest_date"], row["item_id"], row["title"])
+        note_date = note_dates.get(row["item_id"], entry["digest_date"])
+        note_name = _item_note_name(note_date, row["item_id"], row["title"])
         if not _write_note(
             items_dir / f"{note_name}.md",
-            _item_frontmatter(row, entry["digest_date"]),
+            _item_frontmatter(row, note_date),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
             logger=logger,
             run_id=run_id,
@@ -285,15 +291,46 @@ def _daily_wikilinks(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[str]
     """digest の item_ids から wikilink 一覧を再計算する(追いパス用。配信順を維持)。"""
     item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
-    return [
-        f"[[{_item_note_name(digest['digest_date'], row['item_id'], row['title'])}]]"
-        for row in rows
-    ]
+    note_dates = _first_listed_dates(conn, [row["item_id"] for row in rows])
+    wikilinks = []
+    for row in rows:
+        note_date = note_dates.get(row["item_id"], digest["digest_date"])
+        wikilinks.append(f"[[{_item_note_name(note_date, row['item_id'], row['title'])}]]")
+    return wikilinks
 
 
 def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
     """配信 item + 🔖 保存節 item(GH#99)。順序 = 配信順 → 保存順。"""
     return json.loads(digest["item_ids"]) + json.loads(digest["bookmark_item_ids"] or "[]")
+
+
+def _first_listed_dates(conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, str]:
+    """item ごとに、最初に載った digest の日付(Items ノート名の日付。GH#242)。
+
+    配信 item(item_ids)と 🔖 保存節(bookmark_item_ids)の両方を見る。配信済みの記事が
+    後日の保存節に再掲されても、ノートの出力先は最初のノートのまま(別日付のノートを
+    作らない)。export_digest・Daily の wikilink・感想の追いパスで同じ規則を使う。
+    """
+    if not item_ids:
+        return {}
+    placeholders = ",".join("?" * len(item_ids))
+    rows = conn.execute(
+        f"""
+        SELECT item_id, MIN(digest_date) AS digest_date
+        FROM (
+            SELECT listed.value AS item_id, digests.digest_date
+            FROM digests, json_each(digests.item_ids) AS listed
+            UNION ALL
+            SELECT listed.value AS item_id, digests.digest_date
+            FROM digests, json_each(digests.bookmark_item_ids) AS listed
+            WHERE digests.bookmark_item_ids IS NOT NULL
+        )
+        WHERE item_id IN ({placeholders})
+        GROUP BY item_id
+        """,
+        item_ids,
+    ).fetchall()
+    return {row["item_id"]: row["digest_date"] for row in rows}
 
 
 def _jst_date(created_at: str) -> str:

@@ -435,6 +435,65 @@ def test_bookmark_items_exported_as_notes_and_wikilinks(conn, tmp_path) -> None:
     assert front["title"] == "保存の見出し"
 
 
+def test_relisted_in_later_bookmark_section_reuses_first_note(conn, tmp_path) -> None:
+    # GH#242: 配信済みの記事が後日の 🔖 保存節に再掲されても、別日付の Items ノートを作らず
+    # 最初のノートを使う。再掲した日の Daily のリンクと、その後の感想の投影も最初のノートへ
+    item = add_digested(conn, "https://a/1", title="配信済み記事")
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, first_id, logger)
+    conn.execute(  # 初日に記事メッセージとして配信済み(感想のリプライ先)
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (first_id, item),
+    )
+
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    first_note = next((base / "Items").glob(f"20260706-{item}-*.md"))
+    first_note.write_text(first_note.read_text() + "\n初日の手書きメモ\n")
+
+    other = add_digested(conn, "https://a/2", title="当日の記事")
+    later_id = add_digest(conn, [other], date="2026-07-10", bookmark_item_ids=[item])
+    export_digest(conn, config, later_id, logger)
+
+    assert list((base / "Items").glob(f"*-{item}-*.md")) == [first_note]  # 別日付を作らない
+    later_daily = base / "Daily" / "2026-07-10.md"
+    assert f"[[{first_note.stem}]]" in later_daily.read_text()
+    text = first_note.read_text()
+    assert "初日の手書きメモ" in text  # 手書き領域は保全
+    assert read_front(first_note)["digest_date"] == "2026-07-06"  # ノート名の日付のまま
+
+    add_note(conn, item, "再掲の後に書いた感想")
+    add_digest_note(conn, later_id, "再掲の日の日次感想")
+    export_pending_notes(conn, config, logger)
+    assert "再掲の後に書いた感想" in first_note.read_text()
+    assert "初日の手書きメモ" in first_note.read_text()
+    assert list((base / "Items").glob(f"*-{item}-*.md")) == [first_note]
+    later_text = later_daily.read_text()
+    assert "再掲の日の日次感想" in later_text
+    assert f"[[{first_note.stem}]]" in later_text  # 追いパスの再計算でも最初のノートへ
+
+
+def test_pending_notes_use_same_note_date_as_export(conn, tmp_path) -> None:
+    # GH#242: 追いパスの投影先は export_digest と同じ規則(最初に載った digest の日付)で決める。
+    # 記事メッセージの台帳が後の digest の行でも、export が書いたノートへ投影する
+    item = add_digested(conn, "https://a/1")
+    first_id = add_digest(conn, [item], date="2026-07-06")
+    config = make_config(tmp_path)
+    export_digest(conn, config, first_id, logger)
+    later_id = add_digest(conn, [], date="2026-07-08", bookmark_item_ids=[item])
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 501)",
+        (later_id, item),
+    )
+    add_note(conn, item, "後の台帳から届いた感想")
+
+    export_pending_notes(conn, config, logger)
+    items_dir = Path(config.obsidian.vault_path) / config.obsidian.folder / "Items"
+    notes = list(items_dir.glob(f"*-{item}-*.md"))
+    assert [p.name[:8] for p in notes] == ["20260706"]
+    assert "後の台帳から届いた感想" in notes[0].read_text()
+
+
 # --- 読み取り後の変更の検出(GH#189)---
 
 
