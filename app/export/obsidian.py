@@ -25,8 +25,8 @@ from pathlib import Path
 import yaml
 
 from app.config import Config
-from app.digest.builder import EXTRACTION_FAILED_NOTE
 from app.jst import JST
+from app.models import EXTRACTION_FAILED_NOTE
 
 GENERATED_BEGIN = "<!-- GENERATED:BEGIN -->"
 GENERATED_END = "<!-- GENERATED:END -->"

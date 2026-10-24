@@ -15,14 +15,11 @@ import sqlite3
 
 from app.config import Config
 from app.jst import jst_day_bounds_utc, today_jst
+from app.models import EXTRACTION_FAILED_NOTE
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
 
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
 BOOKMARK_SECTION_MAX = 10
-
-# 本文の抽出に失敗し、見出しとメタ情報だけで作った分析の印(GH#240)。digest・Telegram・Items
-# ノートで共通。degraded(LLM の失敗でタイトルのみ)とは別で、分析がある記事にだけ付ける
-EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで分析)"
 
 
 def generate_digest(

@@ -32,7 +32,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.config import Config
-from app.digest.builder import BOOKMARK_SECTION_MAX, EXTRACTION_FAILED_NOTE
+from app.digest.builder import BOOKMARK_SECTION_MAX
+from app.models import EXTRACTION_FAILED_NOTE
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"

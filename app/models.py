@@ -14,6 +14,11 @@ from typing import Self
 
 RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
 
+# 本文の抽出に失敗し、見出しとメタ情報だけで作った分析(analyses.extraction_failed)の印(GH#240)。
+# digest・Telegram・Items ノートの 3 つの段で共通なので共通の層に置く(設計 00 §3)。degraded(LLM の
+# 失敗でタイトルのみ)とは別で、分析がある記事にだけ付ける
+EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで分析)"
+
 
 @dataclass(frozen=True)
 class _Row:
