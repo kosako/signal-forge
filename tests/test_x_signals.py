@@ -57,26 +57,46 @@ def page(*tweets: dict, next_token: str | None = None, users=(), ref_tweets=()) 
 
 
 class FakeSession:
-    """URL 部分一致 → ページ列(dict = 200 body / int = ステータス)の順次応答。
+    """URL 部分一致 → ページ列(dict = 200 body / int = ステータス)の応答。
 
+    ページは要求の pagination_token で引く(トークン無し = 先頭ページ、トークンあり =
+    そのトークンを next_token に持つページの次。GH#256)。トークンを落とす回帰では
+    先頭ページが返るので、取得結果と読取数のずれで検出できる。末尾ページの next_token
+    の先(未定義の続き)は空の 200 を返し、発行していないトークンは AssertionError にする。
     実 API と同じく、ページの data は max_results 件までに切り詰めて返す
     (要求したページの大きさで読取数が決まることを再現する。GH#174)。
     """
 
     def __init__(self, routes: dict[str, list]):
         self.routes = {key: list(pages) for key, pages in routes.items()}
+        self.token_index: dict[str, dict[str, int]] = {}
+        for key, pages in self.routes.items():
+            index: dict[str, int] = {}
+            for i, item in enumerate(pages):
+                token = item.get("meta", {}).get("next_token") if isinstance(item, dict) else None
+                if token:
+                    assert token not in index, f"{key} のページのトークンが重複: {token}"
+                    index[token] = i + 1
+            self.token_index[key] = index
         self.calls: list[tuple[str, dict]] = []
 
     def get(self, url: str, params: dict | None = None) -> httpx.Response:
-        self.calls.append((url, dict(params or {})))
+        params = dict(params or {})
+        self.calls.append((url, params))
         for key, pages in self.routes.items():
             if key in url:
-                if not pages:
+                token = params.get("pagination_token")
+                if token is None:
+                    position = 0
+                else:
+                    assert token in self.token_index[key], f"未発行のページのトークン: {token}"
+                    position = self.token_index[key][token]
+                if position >= len(pages):
                     return httpx.Response(200, json={"data": []})
-                item = pages.pop(0)
+                item = pages[position]
                 if isinstance(item, int):
                     return httpx.Response(item)
-                if params and "max_results" in params and "data" in item:
+                if "max_results" in params and "data" in item:
                     item = {**item, "data": item["data"][: params["max_results"]]}
                 return httpx.Response(200, json=item)
         raise AssertionError(f"経路未定義の URL: {url}")
@@ -99,6 +119,11 @@ def rows(conn, kind: str) -> list[sqlite3.Row]:
 
 def calls_to(session: FakeSession, key: str) -> list[dict]:
     return [params for url, params in session.calls if key in url]
+
+
+def page_tokens(session: FakeSession, key: str) -> list[str | None]:
+    """要求ごとの pagination_token(無しは None)。2 ページ目以降の引数の検証用(GH#256)。"""
+    return [params.get("pagination_token") for params in calls_to(session, key)]
 
 
 def test_all_kinds_recorded_with_cost(conn, tmp_path) -> None:
@@ -150,6 +175,8 @@ def test_cap_limits_reads_and_skips_later_kinds(conn, tmp_path) -> None:
     assert totals["api_reads"] == 12  # bookmark で予算を使い切る
     # 差分取得の 1 ページ目は最小ページ、既知到達で止まらなければ 2 ページ目から残枠を要求上限に反映
     assert [c["max_results"] for c in calls_to(session, "/bookmarks")] == [5, 7]
+    assert page_tokens(session, "/bookmarks") == [None, "p2"]  # 2 ページ目は next_token で要求
+    assert [r["tweet_id"] for r in rows(conn, "bookmark")] == [f"b{i:02d}" for i in range(12)]
     assert calls_to(session, "/liked_tweets") == []  # 残 0 < 5 で like は skip
     assert rows(conn, "like") == []
 
@@ -197,8 +224,10 @@ def test_backfill_pages_past_known_within_limit(conn, tmp_path) -> None:
         conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=100
     )
     assert totals["new_signals"] == 2  # b2, b3(b1 は既知でも打ち切らず先へ)
+    assert totals["api_reads"] == 3  # 1 ページ目 2 件 + 2 ページ目 1 件(先頭の読み直しなし)
     assert [r["tweet_id"] for r in rows(conn, "bookmark")] == ["b1", "b2", "b3"]
     assert calls_to(session, "/bookmarks")[0]["max_results"] == 100  # 日次 cap でなく limit
+    assert page_tokens(session, "/bookmarks") == [None, "p2"]  # 2 ページ目は next_token で要求
 
 
 def test_backfill_limit_bounds_each_kind_independently(conn, tmp_path) -> None:
@@ -271,8 +300,10 @@ def test_self_rt_known_source_does_not_stop_paging(conn, tmp_path) -> None:
     session = session_with(
         [], [], [page(rt("300", "900"), next_token="p2"), page(rt("200", "901"))]
     )
-    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    totals = collect_x_signals(conn, make_config(tmp_path), session, logger)
     assert len(calls_to(session, "42/tweets")) == 2  # 既知 RT 元でも次ページへ進む
+    assert page_tokens(session, "42/tweets") == [None, "p2"]  # 2 ページ目は next_token で要求
+    assert totals["api_reads"] == 2  # 各ページ 1 件(先頭の読み直しなし)
     assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["900", "901"]
     cursor = conn.execute(
         "SELECT since_id FROM x_signal_cursors WHERE kind='self_rt'"
