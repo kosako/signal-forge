@@ -160,6 +160,9 @@ class XConnector:
                 duration_ms=int((time.monotonic() - started) * 1000),
             ),
             partial_error=error,
+            # 当日の枠が残っておらずタイムラインを読まなかった(GH#178)。復旧を確かめていないので
+            # collect にソースの成否の状態を変えさせない(失敗の続きを成功で消さない)
+            budget_exhausted=self._read_budget == 0,
         )
 
     def _get_me_id(self) -> str:

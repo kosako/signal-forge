@@ -394,7 +394,9 @@ def test_reads_used_today_splits_only_remaining_budget() -> None:
     ).fetch(make_source(), {})
     assert result.stats.api_reads == 30  # 残り 30 → 10/10/10
     assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in seen] == [["10"]] * 3
-    # 残り 25 → 9/8/8 はどれも下限 10 未満。読まずに据え置く(cap はハード上限)
+    assert not result.budget_exhausted
+    # 残り 25 → 9/8/8 はどれも下限 10 未満。読まずに据え置く(cap はハード上限)。読まなかった
+    # 印を立て、collect にソースの成否の状態を変えさせない
     seen.clear()
     result = connector_from(
         pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=10, seen=seen
@@ -402,6 +404,7 @@ def test_reads_used_today_splits_only_remaining_budget() -> None:
     assert result.stats.api_reads == 0
     assert seen == []
     assert result.next_cursor == {"since_id": "100"}
+    assert result.budget_exhausted
 
 
 def test_slot_left_below_min_page_by_remaining_budget_keeps_cursor() -> None:
@@ -422,6 +425,7 @@ def test_slot_left_below_min_page_by_remaining_budget_keeps_cursor() -> None:
     assert queries == [f"(a) {X_SEARCH_QUERY_SUFFIX}", f"(b) {X_SEARCH_QUERY_SUFFIX}"]
     assert result.partial_error is None  # 予算による打ち切りは失敗にしない
     assert result.next_cursor == {"since_id": "100"}
+    assert not result.budget_exhausted  # 要求したスロットがある(成否はその応答で決まる)
 
 
 def test_all_requests_share_end_time_before_run_start() -> None:
