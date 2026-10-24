@@ -8,7 +8,8 @@
     済みかだけを見る。poller-launchd.log / poller.log で確かめる)
   - 夜アンケート・watchdog はこのプロセスの内蔵タイマー(時刻は config.toml)
   - PATH には uv に加え codex の dir(__CODEX_DIR__)を入れる。深掘りカードへの質問に返事する
-    `intel answer`(このプロセスが起動する子。GH#126)が codex を subprocess 起動するため(#72)
+    `intel answer`(このプロセスが起動する子。GH#126)が codex を subprocess 起動するため(#72)。
+    npm 版の codex で node が別の dir にあるときは、runbook §1 が node の dir も入れる(GH#221)
 -->
 <plist version="1.0">
 <dict>

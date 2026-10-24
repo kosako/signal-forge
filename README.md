@@ -61,7 +61,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 - macOS と launchd。システムのタイムゾーンが JST であること。
 - Python 3.12 と uv。uv は repo の `.python-version` を読み、.venv を Python 3.12 で作る。
 - Telegram の bot(BotFather で作る)。
-- codex CLI。`codex login` を済ませておく。呼び出しごとの追加の支払いは無い(codex のサブスク枠を使う)が、LLM の呼び出しはその枠(クレジット)を消費する。
+- codex CLI。`codex login` を済ませておく。呼び出しごとの追加の支払いは無い(codex のサブスク枠を使う)が、LLM の呼び出しはその枠(クレジット)を消費する。動作と隔離(doctor #6)を確かめた版は `codex-cli 0.162.1`(npm の `@openai/codex`。npm 版は Node.js も要る)。配布の形と更新の手順は [ops/runbook.md](ops/runbook.md) の §1 の末尾にある。
 - Obsidian の vault(書き出し先のローカルフォルダ)。
 - X API は任意で、既定は無効(`[x].enabled = false`)。無効でも RSS と手動 URL だけで全段が動く。使うなら公式 API の従量課金がかかる。
 - 実行環境(とくに launchd)に `ANTHROPIC_API_KEY` を置かない。`intel doctor` の #12 は、doctor を実行した環境にこのキーがあると WARN を出す(launchd 側は plist の雛形が PATH と HOME だけを渡す)。
@@ -129,7 +129,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
    ```
 
    - FAIL があれば exit 1。#1〜#4・#6・#7 を PASS にする(X を有効にしたときは #5 も、`intel x-auth` を済ませたときは #13 も)。#6 は codex を実際に呼んで隔離を検査する。
-   - #6 が `LLMUnavailableError` で FAIL するときは、codex が PATH に無い、`codex login` が済んでいない(`~/.codex/auth.json` が無い)、または codex の版が古く隔離に使う起動引数を受け付けない、のどれか。`command -v codex`、`codex login`、codex の更新の順に確かめる。
+   - #6 が `LLMUnavailableError` で FAIL するときは、codex が PATH に無い、`codex login` が済んでいない(`~/.codex/auth.json` が無い)、または codex の版が隔離に使う起動引数を受け付けない(古い版や、起動引数の名前を変えた新しい版)、のどれか。`command -v codex`、`codex login`、`codex --version` の順に確かめ、版が合わないときは runbook §1 の末尾に記録した確かめた版を入れる。
    - launchd(#8)は runbook の §2 でロードするまで、バックアップ(#10)は `intel run` の backup 段が 1 回走るまで WARN のままになる。
 
 8. 手動で `uv run intel run` を 1 回流し、ダイジェストが Telegram に届くことを確かめる。続けて `uv run intel poll` を起動し、ボタンを押すと `✓` が付くことを確かめたら Ctrl-C で止める(poll は止めるまで常駐する。launchd の poller と同時に動かすと getUpdates を取り合う)。ダイジェストが「該当なし」(0 件)のときは記事のボタンが無いので、`✓` の確認は記事が載った日に行う(`[telegram].survey_time`(既定 21:30)を過ぎてから poll を起動すると夜アンケートが届くので、そのボタンでも確かめられる)。そのうえで無人運用に移る。手順は [ops/runbook.md](ops/runbook.md) の §1〜§5(plist の生成、bootstrap、pmset wake、Full Disk Access、確認)。

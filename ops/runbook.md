@@ -20,12 +20,15 @@
 
 - `~/.config/intel/config.toml` と `.env`(chmod 600)が配置済み(`intel doctor` #1〜2 が PASS)
 - 手動の `intel run` / `intel poll` が動くこと(先に動作確認してから無人化する)
+- codex CLI が入り、`codex login` が済んでいること(`intel doctor` #6 が PASS)。配布の形・確かめた版・
+  更新の手順は §1 の末尾
 
 ## 1. plist の生成(プレースホルダ置換)
 
 `ops/launchd/*.plist` の `__PLACEHOLDER__` を実環境の値に置換し、一時ディレクトリで
 lint を通してから `~/Library/LaunchAgents/` へ**コピー**する(symlink は macOS が
 無視することがあるため不可。lint 前に設置すると壊れた plist が残るため tmp を経由)。
+コピー先が無ければ作る。途中で失敗したらそこで止まるので、失敗したまま §2 に進まない。
 
 リポジトリの root で:
 
@@ -38,24 +41,79 @@ UV_BIN="$(command -v uv)"
 # codex を使うため、__CODEX_DIR__ は両方の plist で使う。
 CODEX_BIN="$(command -v codex)"
 [ -n "$CODEX_BIN" ] || { echo "codex が見つからない(PATH を確認 / codex login 済みか)"; exit 1; }
+# npm 版の codex は先頭行が `#!/usr/bin/env node` の script で、起動に node が要る(配布の形は
+# この節の末尾)。node が codex と別の dir にあると launchd の PATH では起動できないので、
+# そのときは node の dir も __CODEX_DIR__ に `:` でつないで入れる(GH#221)
+CODEX_PATH_DIRS="$(dirname "${CODEX_BIN}")"
+NODE_BIN=""
+if head -n 1 "${CODEX_BIN}" | grep -q '^#!.*node'; then
+  NODE_BIN="$(command -v node)"
+  [ -n "$NODE_BIN" ] || { echo "node が見つからない(npm 版の codex は Node.js が要る)"; exit 1; }
+  [ "$(dirname "${NODE_BIN}")" = "${CODEX_PATH_DIRS}" ] \
+    || CODEX_PATH_DIRS="${CODEX_PATH_DIRS}:$(dirname "${NODE_BIN}")"
+fi
 # sed 置換のため、パスに sed / XML のメタ文字を含む環境は対象外(先に検知して止める)
-case "${UV_BIN}${CODEX_BIN}$(pwd)${HOME}" in
+case "${UV_BIN}${CODEX_BIN}${NODE_BIN}$(pwd)${HOME}" in
   (*[\|\&\<\>]*) echo "パスに | & < > を含む環境は本手順のsed置換が壊れるため非対応"; exit 1;;
 esac
 mkdir -p "${HOME}/.local/state/intel/logs"   # launchd は exec 前に stdout/stderr を開く
+# コピー先。新しい Mac・新しいユーザーでは、ほかのアプリが作るまで無い(GH#220)
+mkdir -p "${HOME}/Library/LaunchAgents" || exit 1
 TMP_DIR="$(mktemp -d)"
 for name in com.intel.morning com.intel.poller; do
   sed -e "s|__UV_BIN__|${UV_BIN}|g" \
       -e "s|__UV_DIR__|$(dirname "${UV_BIN}")|g" \
-      -e "s|__CODEX_DIR__|$(dirname "${CODEX_BIN}")|g" \
+      -e "s|__CODEX_DIR__|${CODEX_PATH_DIRS}|g" \
       -e "s|__REPO_DIR__|$(pwd)|g" \
       -e "s|__HOME__|${HOME}|g" \
       "ops/launchd/${name}.plist" > "${TMP_DIR}/${name}.plist"
   plutil -lint "${TMP_DIR}/${name}.plist" || exit 1
-  cp "${TMP_DIR}/${name}.plist" "${HOME}/Library/LaunchAgents/${name}.plist"
+  # 生成した PATH だけで codex を起動できること(launchd は plist の PATH と HOME で起動する)。
+  # node が見つからないなどを、無人の実行で失敗する前にここで見つける(GH#221)
+  GEN_PATH="$(plutil -extract EnvironmentVariables.PATH raw -o - "${TMP_DIR}/${name}.plist")" || exit 1
+  env -i PATH="${GEN_PATH}" HOME="${HOME}" codex --version >/dev/null \
+    || { echo "${name}: 生成した PATH で codex を起動できない(codex と node の dir を確認)"; exit 1; }
+  cp "${TMP_DIR}/${name}.plist" "${HOME}/Library/LaunchAgents/${name}.plist" || exit 1
 done
 rm -rf "${TMP_DIR}"
 ```
+
+**Codex CLI の配布の形と版**(GH#221・GH#222):
+
+- 対応する配布の形は 2 つ。npm の `@openai/codex`(`codex` は node で動く script なので Node.js が要る)と、
+  Node.js の要らない単体の実行ファイル(Homebrew で入れたものなど)。上の手順は `codex` の先頭行で見分け、
+  npm 版のときだけ node の dir も PATH に入れる。
+- 動作と隔離(`intel doctor` #6)を確かめた版は `codex-cli 0.162.1`(`codex --version` の表示。
+  2026-10-24 に、上の手順で生成した PATH の下で #6 が PASS)。npm 版で、`npm install -g @openai/codex@0.162.1`
+  で入れた。
+- 対応の範囲: 実装は `--strict-config`・permission profile のキー・`--disable` で外す feature 名に頼る
+  (設計 00 §5)。これを受け付けない版(古い版や、feature 名を変えた新しい版)では codex が起動の時点で
+  エラーで止まり、doctor #6 が FAIL する(起動引数が黙って無視されることはない)。例外の型は codex の stderr の
+  書き出しで決まり、決まった書き出し(`Error: Unknown feature flag` など)なら `LLMUnavailableError`、
+  それ以外は `LLMError` になる。確かめたのは上の版だけなので、ほかの版は下の手順で doctor #6 を通してから使う。
+- npm 版は node の版ごとの global に入る。node を別の版に替えると、PATH の上の `codex` が無くなるか
+  別の版になる。新しい node の側にも上の版を入れ、この節の手順をやり直す(plist の PATH が変わったら
+  morning と poller の両方を入れ直す。§11 の 2)。
+
+**Codex CLI を更新するとき**(無人運用へ反映する前に doctor #6 を通す):
+
+1. 新しい版を一時的な場所に入れ、PATH の先頭に置いて doctor を走らせる(npm 版の例。単体の実行ファイルも、
+   一時的な dir に置いて同じように PATH の先頭に置く):
+   ```sh
+   CODEX_TRY="$(mktemp -d)"
+   npm install -g --prefix "${CODEX_TRY}" @openai/codex@<新しい版> || exit 1
+   "${CODEX_TRY}/bin/codex" --version
+   PATH="${CODEX_TRY}/bin:${PATH}" uv run intel doctor   # #6 が PASS になること
+   rm -rf "${CODEX_TRY}"
+   ```
+   #6 が FAIL なら更新しない(launchd のジョブは今の版のまま動き続ける)。
+2. PASS したら、いつもの場所に入れる(`npm install -g @openai/codex@<新しい版>`)。launchd のジョブは
+   PATH の上の `codex` をそのまま使うので、入れた時点から新しい版で動く。朝バッチ(06:30 から終わるまで)の
+   間は避ける。
+3. もう一度 `uv run intel doctor` を流し、#6 が PASS になることを確かめる。FAIL なら上の確かめた版に戻す
+   (`npm install -g @openai/codex@0.162.1`)。codex か node の dir が変わったときは、この節の手順で plist を
+   作り直し、morning と poller の両方を入れ直す(§11 の 2)。
+4. 上の「確かめた版」の行を新しい版に書き換える。
 
 ## 2. bootstrap(ロード)
 
@@ -240,12 +298,18 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
 
 **既存のインストールを更新するとき**(PATH に codex の dir が入る前の poller.plist を使っている場合):
 
-1. §1 を実行して plist を再生成・コピーする(morning.plist も同じ内容で上書きされる)。
-2. poller を入れ直す(morning は次回起動で新しい plist を読むので入れ直し不要):
+1. §1 を実行して plist を再生成・コピーする(morning.plist も上書きされる)。
+2. poller と morning を入れ直す。launchd はロードしたときの plist の内容を使い続けるので、コピーし直した
+   だけでは PATH は変わらない(npm 版の codex で node の dir が足されたときは morning の PATH も変わる)。
+   朝バッチ(06:30 から終わるまで)の間は避ける(bootout は動いているジョブを止める):
    ```sh
    launchctl bootout "gui/$(id -u)/com.intel.poller"
    launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.poller.plist"
-   launchctl print "gui/$(id -u)/com.intel.poller" | grep -A3 "environment"   # PATH に codex の dir
+   launchctl bootout "gui/$(id -u)/com.intel.morning"
+   launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.intel.morning.plist"
+   # PATH に codex の dir(npm 版で node が別の dir なら node の dir も)
+   launchctl print "gui/$(id -u)/com.intel.poller" | grep -A3 "environment"
+   launchctl print "gui/$(id -u)/com.intel.morning" | grep -A3 "environment"
    ```
 3. 確認: 深掘りカードにリプライし、「📝 記録しました。返事を作っています」の後に返事が届くこと。
    ログは `~/.local/state/intel/logs/answer.log`(子の起動失敗・異常終了は `poller.log`)。
