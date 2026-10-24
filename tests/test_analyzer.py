@@ -253,6 +253,57 @@ def test_engine_unavailable_propagates_without_degraded(conn, tmp_path) -> None:
     assert statuses == {"new"}
 
 
+def test_single_unavailable_saves_obtained_results_and_leaves_rest_new(conn, tmp_path) -> None:
+    # 欠落項目の単発再分析で環境障害になっても、同じチャンクで取得済みの正常な結果は
+    # 状態の遷移と一緒に保存し、未解決の項目だけを new のまま残す(GH#243)
+    a, b, c, d = (add_item(conn, f"https://a.example/{i}") for i in range(4))
+    engine = FakeEngine(
+        [
+            AnalysisBatch(results=[analysis_for(a)]),  # b, c, d が欠落
+            AnalysisBatch(results=[analysis_for(b, summary="単発再分析")]),
+            LLMUnavailableError("codex 起動失敗"),  # c の単発再分析
+        ]
+    )
+    with pytest.raises(LLMUnavailableError):  # 環境障害は段の失敗のまま(GH#74)
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b, c, d], logger)
+    assert len(engine.prompts) == 3  # d の単発再分析には進まない
+    rows = {
+        r["item_id"]: r for r in conn.execute("SELECT item_id, degraded, summary FROM analyses")
+    }
+    assert set(rows) == {a, b}  # c, d は degraded にもしない
+    assert rows[a]["degraded"] == 0 and rows[b]["degraded"] == 0
+    assert rows[b]["summary"] == "単発再分析"
+    statuses = dict(conn.execute("SELECT id, status FROM items").fetchall())
+    assert statuses == {a: "analyzed", b: "analyzed", c: "new", d: "new"}
+
+    # 修復後の再実行は new のまま残した項目だけを分析する
+    pending = [r["id"] for r in conn.execute("SELECT id FROM items WHERE status = 'new'")]
+    assert pending == [c, d]
+    retry = FakeEngine([AnalysisBatch(results=[analysis_for(c), analysis_for(d)])])
+    counts = analyze_selected(conn, make_config(tmp_path), retry, "p", pending, logger)
+    assert counts == {"analyzed": 2, "degraded": 0}
+    assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 4
+
+
+def test_single_unavailable_does_not_degrade_earlier_single_failure(conn, tmp_path) -> None:
+    # 環境障害の前に単発再分析が一時的に失敗した項目も、degraded で確定させず new に残す
+    # (再実行で分析し直せる。GH#243)
+    a, b, c = (add_item(conn, f"https://a.example/{i}") for i in range(3))
+    engine = FakeEngine(
+        [
+            AnalysisBatch(results=[analysis_for(a)]),
+            LLMError("落ちた"),  # b の単発再分析(リトライ込み 2 回)
+            LLMError("落ちた"),
+            LLMUnavailableError("codex 起動失敗"),  # c の単発再分析
+        ]
+    )
+    with pytest.raises(LLMUnavailableError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b, c], logger)
+    assert [r["item_id"] for r in conn.execute("SELECT item_id FROM analyses")] == [a]
+    statuses = dict(conn.execute("SELECT id, status FROM items").fetchall())
+    assert statuses == {a: "analyzed", b: "new", c: "new"}
+
+
 def test_batching_respects_batch_size(conn, tmp_path) -> None:
     ids = [add_item(conn, f"https://a.example/{i}") for i in range(5)]
     engine = FakeEngine(

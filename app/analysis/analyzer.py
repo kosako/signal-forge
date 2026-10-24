@@ -135,14 +135,21 @@ def _analyze_chunk(
             extra={"run_id": run_id, "stage": "analyze"},
         )
 
+    # 単発再分析の途中で起きた環境障害。段の失敗として伝播させるが(GH#74)、
+    # 先に取得した正常な結果を保存してから送出する(GH#243)
+    unavailable: LLMUnavailableError | None = None
     if not chunk_failed:
         # スキーマ上は成功したが欠落した item のみ単発再分析(1回)
         for row in rows:
             if row["id"] in results:
                 continue
-            analysis, single_hash = _reanalyze_single(
-                config, engine, profile_body, recent_titles, row, logger, run_id
-            )
+            try:
+                analysis, single_hash = _reanalyze_single(
+                    config, engine, profile_body, recent_titles, row, logger, run_id
+                )
+            except LLMUnavailableError as e:
+                unavailable = e
+                break
             # degraded になっても「実際に渡した入力」= 単発プロンプトの hash を記録する
             hashes[row["id"]] = single_hash
             if analysis is not None:
@@ -163,6 +170,10 @@ def _analyze_chunk(
                     degraded=False,
                 )
                 counts["analyzed"] += 1
+            elif unavailable is not None:
+                # 環境障害で未解決の item は degraded にせず new のまま残す
+                # (修復後の再実行でそこだけを分析する。GH#74・GH#243)
+                continue
             else:
                 _insert_degraded(conn, row, engine, hashes.get(row["id"], chunk_hash), run_id)
                 counts["degraded"] += 1
@@ -171,6 +182,13 @@ def _analyze_chunk(
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    if unavailable is not None:
+        logger.warning(
+            f"単発再分析で環境障害。取得済みの {counts['analyzed']} 件を保存し、"
+            f"残り {len(rows) - counts['analyzed']} 件は new のまま残す",
+            extra={"run_id": run_id, "stage": "analyze"},
+        )
+        raise unavailable
     return counts
 
 
