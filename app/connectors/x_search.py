@@ -8,7 +8,8 @@
   (1つの多産クエリが他スロットを飢えさせない)。残枠が max_results 下限(10)を切ったら
   そのスロットは打ち切る(cap はハード上限。超過方向に丸めない)。cap は JST の暦日の上限で、
   同じ日の実行が読んだぶん(合成点が台帳から出す。connectors/x.py の x_reads_today)を引いた
-  残りを均等割する(GH#178)。
+  残りを均等割する(GH#178)。残りの割り当てが下限に届かず要求しなかったスロットがある実行は
+  完走でないので、下の watermark は据え置く。
 - カーソルは全スロット横断の最大 tweet id を `{"since_id": ...}` に(snowflake id は時刻単調
   のため単一 watermark で足りる。スロット入れ替え後もそのまま有効)。そのために全スロットの
   取得の上限(end_time)を実行の開始で 1 つに固定する(GH#184): スロットは順に取るので、上限が
@@ -126,6 +127,9 @@ class XSearchConnector:
         reads = 0
         http_status: int | None = None
         budgets = _split_budget(self._read_budget, len(self._slots))
+        # 当日の残り枠の均等割で下限に届かず、1 回も要求しないスロット(GH#178)。そのスロットの
+        # その日ぶんを watermark の背後に隠さないよう、ほかのスロットが取れても完走扱いにしない
+        unrun_slot = any(budget < X_SEARCH_MIN_PAGE for budget in budgets)
         stopped = False
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
@@ -146,8 +150,10 @@ class XSearchConnector:
         # 途中打ち切りで進めると未実行スロットのその日ぶんが恒久欠落する(据え置きなら
         # 翌日再取得され UNIQUE で吸収)。スロット内の予算打ち切りで捨てる古い側は
         # ホームTL と同じく追わない(設計 02 §2)。全スロットを同じ end_time で取るので、
-        # あるスロットを取ったあとに入った新着が、後のスロットの最大 id の背後に隠れない(GH#184)
-        next_since = str(max(all_ids)) if all_ids and not stopped else stored_since
+        # あるスロットを取ったあとに入った新着が、後のスロットの最大 id の背後に隠れない(GH#184)。
+        # 残り枠が足りず要求しなかったスロットがある実行も完走でない(GH#178)
+        advance = bool(all_ids) and not stopped and not unrun_slot
+        next_since = str(max(all_ids)) if advance else stored_since
         return FetchResult(
             items=items,
             next_cursor={"since_id": next_since} if next_since else {},

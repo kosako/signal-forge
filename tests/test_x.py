@@ -448,21 +448,23 @@ def test_x_reads_today_sums_jst_calendar_day_per_mode(db) -> None:
     assert x_reads_today(db, "2026-10-26") == {"home": 0, "search": 0}
 
 
-def test_build_connectors_passes_same_day_reads_from_ledger(db) -> None:
+def test_build_connectors_passes_same_day_reads_from_ledger(db, monkeypatch) -> None:
     # GH#178: 合成点が台帳の当日の合計を mode ごとにコネクタへ渡す(前日の読取は数えない)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
     home = add_x_source(db, "home")
     search = add_x_source(db, "x:search", '{"mode": "search"}')
-    add_collect_run(db, home, "2000-01-01T00:00:00Z", 130)  # 前日以前
-    db.execute("INSERT INTO collect_runs (source_id, api_reads) VALUES (?, 100)", (home,))
-    db.execute("INSERT INTO collect_runs (source_id, api_reads) VALUES (?, 20)", (search,))
+    add_collect_run(db, home, "2026-10-23T14:59:59Z", 130)  # JST 10/23 = 前日
+    add_collect_run(db, home, "2026-10-23T21:30:00Z", 100)  # JST 10/24 6:30
+    add_collect_run(db, search, "2026-10-23T21:30:00Z", 20)
     router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, HttpClient(), db)["x"]
     assert router._home._read_budget == 30  # 130 - 100
     assert router._search._read_budget == 15  # 35 - 20
 
 
-def test_second_collect_same_day_reads_only_remaining_budget(db) -> None:
+def test_second_collect_same_day_reads_only_remaining_budget(db, monkeypatch) -> None:
     # GH#178: 同じ日に普通に再実行しても(手動の intel run・intel collect)、日次の上限を超えて
-    # 読まない。1 回目に読んだぶんが台帳(collect_runs)に残り、2 回目はその残りだけを読む
+    # 読まない。1 回目に読んだぶんが台帳(collect_runs)に残り、2 回目はその残りだけを読む。
+    # 翌日(JST)は枠が戻る。当日と台帳の時刻は固定し、実時計に依存させない
     add_x_source(db, "home")
     next_id = iter(range(10_000, 0, -1))
     seen: list[str] = []
@@ -477,16 +479,21 @@ def test_second_collect_same_day_reads_only_remaining_budget(db) -> None:
             200, json=page([tweet(str(next(next_id)), "新着の投稿") for _ in range(count)])
         )
 
-    def run_once() -> None:
+    def run_once(day: str, utc_time: str) -> None:
+        monkeypatch.setattr("app.connectors.x.today_jst", lambda: day)
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
         router = _build_connectors(_config(True), FULL_ENV, HttpClient(), db)["x"]
         router._home._session._client = httpx.Client(transport=httpx.MockTransport(handler))
         collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
 
-    for _ in range(3):
-        run_once()
+    run_once("2026-10-24", "2026-10-23T21:30:00Z")  # JST 10/24 6:30(朝バッチ)
+    run_once("2026-10-24", "2026-10-24T03:00:00Z")  # 同じ日の再走
+    run_once("2026-10-24", "2026-10-24T14:59:59Z")  # 同じ日の終わり
+    run_once("2026-10-25", "2026-10-24T15:00:00Z")  # 翌日の始まり
     reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
-    assert reads == [100, 30, 0]  # 合計は cap(130)ちょうど。3 回目は読まない
-    assert seen == ["100", "30"]
+    assert reads == [100, 30, 0, 100]  # 当日の合計は cap(130)ちょうど。翌日は枠が戻る
+    assert seen == ["100", "30", "100"]
 
 
 def test_build_x_connector_signs_requests() -> None:

@@ -76,7 +76,7 @@ class XSignalsConfig:
 
     daily_read_cap 0 = 取込無効(既定)。有効化は合算予算(combined_daily_read_cap)の
     内側での再配分 = 人間の config 変更(例: home 115 / search 35 / signals 15)。
-    上限は JST の暦日の上限で、同じ日の実行で共有する(GH#178。backfill は別枠)。
+    上限は JST の暦日の上限で、同じ日の実行で共有する(GH#178。backfill は台帳の印で別枠)。
 
     重みは「種類の重み × 直近の重み」(ADR 0001)。直近の重みは半減期
     half_life_days の指数減衰(移動平均の実装)。intel x-insights の表示にのみ

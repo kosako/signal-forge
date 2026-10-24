@@ -186,20 +186,25 @@ def test_daily_cap_limit_one_takes_globally_freshest(conn, tmp_path) -> None:
     assert result.counts["selected"] == 1
 
 
-def add_analysis(conn, item_id: int, analyzed_at: str | None = None, degraded: int = 0) -> None:
+DAY = "2026-10-24"  # 日次上限の判定に使う当日(JST)。実時計に依存させない(GH#178)
+DAY_UTC = "2026-10-23T21:30:00Z"  # DAY の JST 6:30(朝バッチ)
+
+
+def add_analysis(conn, item_id: int, analyzed_at: str = DAY_UTC, degraded: int = 0) -> None:
     conn.execute(
         "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
         "recommendation_reason, implication, degraded, engine, model, prompt_version, "
         "input_hash, analyzed_at) VALUES (?, 's', 'その他', 50, 'new', 'r', 'i', ?, "
-        "'codex-cli', 'm', 'v', ?, coalesce(?, strftime('%Y-%m-%dT%H:%M:%SZ','now')))",
+        "'codex-cli', 'm', 'v', ?, ?)",
         (item_id, degraded, f"h{item_id}", analyzed_at),
     )
     conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (item_id,))
 
 
-def test_daily_cap_shared_with_same_day_runs(conn, tmp_path) -> None:
+def test_daily_cap_shared_with_same_day_runs(conn, tmp_path, monkeypatch) -> None:
     # GH#178: 日次上限は暦日の上限。同じ日の 2 回目の実行(再走・単独の intel analyze)は、
     # その日すでに分析した件数を引いた残りだけを採用する
+    monkeypatch.setattr("app.analysis.stage1.today_jst", lambda: DAY)
     base = datetime.now(UTC)
     for i in range(3):  # 1 回目の実行で分析ずみ(degraded も LLM に渡したぶんとして数える)
         add_analysis(conn, add_item(conn, f"https://a.example/done{i}", published=iso(base)),
@@ -211,7 +216,7 @@ def test_daily_cap_shared_with_same_day_runs(conn, tmp_path) -> None:
     add_analysis(conn, bookmarked)
     # 前日(JST)の分析も数えない
     add_analysis(conn, add_item(conn, "https://a.example/yesterday", published=iso(base)),
-                 analyzed_at="2000-01-01T00:00:00Z")
+                 analyzed_at="2026-10-23T14:59:59Z")
     for i in range(3):
         add_item(conn, f"https://b.example/{i}", source_id=3,
                  published=iso(base - timedelta(hours=i)))
@@ -224,7 +229,7 @@ def test_daily_cap_shared_with_same_day_runs(conn, tmp_path) -> None:
     ).fetchone()
     assert selected["canonical_url"] == "https://b.example/0"  # 残り枠でも published_at 降順
     # 上限に達したあとの実行は採用しない(新着は daily_cap で skipped に記録)
-    add_analysis(conn, result.selected_ids[0])
+    add_analysis(conn, result.selected_ids[0], analyzed_at="2026-10-24T14:59:59Z")
     late = add_item(conn, "https://b.example/late", source_id=3, published=iso(base))
     result = preselect(conn, make_config(tmp_path, daily_llm_limit=4), logger)
     assert result.selected_ids == []
