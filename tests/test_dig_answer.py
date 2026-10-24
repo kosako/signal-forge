@@ -4,6 +4,7 @@ import logging
 import re
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from app import dig_answer
 from app.analysis.llm import CodexCliEngine, LLMError, parse_structured
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
+from app.dig import apply_instructions, parse_dig_reply
 from app.dig_answer import (
     FAILED_TURN_TEXT,
     FAILURE_TEXT,
@@ -618,8 +620,8 @@ def test_redig_queue_failure_rolls_back_and_answers_without_notice(
     ask(conn, dig_id, "もう一度調べて", 71)
     real_apply = dig_answer.apply_instructions
 
-    def broken(conn, instructions):
-        real_apply(conn, instructions)  # キューを queued・新しい観点に書き換えてから
+    def broken(conn, instructions, **kwargs):
+        real_apply(conn, instructions, **kwargs)  # キューを queued・新しい観点に書き換えてから
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(dig_answer, "apply_instructions", broken)
@@ -633,6 +635,137 @@ def test_redig_queue_failure_rolls_back_and_answers_without_notice(
     queue = queue_of(conn, dig_id)
     assert (queue["status"], queue["angle"], queue["requested_at"]) == ("done", "前の観点", None)
     assert not conn.in_transaction
+
+
+# 返事を作る間の本人の操作を、作り終えた古い依頼で上書きしない(GH#235)。時刻は秒の単位なので、
+# 質問を受け付けた時刻を過去にずらして「受け付けてから返事ができるまでの数分」を表す
+
+_AGO = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)"
+
+
+def accept_ago(conn: sqlite3.Connection, question_id: int, ago: str) -> str:
+    """質問を ago(SQLite の時刻の修飾子)前に受け付けたことにし、その時刻を返す。"""
+    conn.execute(f"UPDATE dig_questions SET created_at = {_AGO} WHERE id = ?", (ago, question_id))
+    return conn.execute(
+        "SELECT created_at FROM dig_questions WHERE id = ?", (question_id,)
+    ).fetchone()[0]
+
+
+class OperateDuringAnswer(Engine):
+    """返事を作っている間(返事の呼び出しの中)に operate を行う。"""
+
+    def __init__(self, operate: Callable[[], None], **kwargs):
+        super().__init__(**kwargs)
+        self._operate = operate
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        if schema is DigAnswer:
+            self._operate()
+        return super().complete_structured(prompt, schema, timeout_s)
+
+
+def backlog_reply(db_path: Path, text: str, item_id: int) -> None:
+    """未消化一覧へのリプライの反映(poller と同じ。別のプロセスなので別の接続で)。"""
+    other = connect(db_path)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        apply_instructions(other, parse_dig_reply(text, {item_id}))
+        other.execute("COMMIT")
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [("{} はパス", ("passed", "前の観点")), ("{} を運用の観点で", ("queued", "運用の観点で"))],
+    ids=["pass", "respecify"],
+)
+def test_redig_does_not_override_operation_during_answer(
+    conn, config, tmp_path, reply, expected
+) -> None:
+    # 返事を作っている間に本人が未消化一覧でパス・指定し直しをしたら、後の操作を残す。
+    # 調べ直しは積まず、「調べ直します」の知らせも付けない(返事は送る)
+    dig_id = add_dig(conn, config)
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle, updated_at) "
+        f"VALUES (?, 'done', 'bookmark', '前の観点', {_AGO})",
+        (item_id, "-1 day"),
+    )
+    question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    accept_ago(conn, question_id, "-60 seconds")
+    engine = OperateDuringAnswer(
+        lambda: backlog_reply(tmp_path / "intel.db", reply.format(item_id), item_id),
+        redig_on={1},
+    )
+    sender = Sender()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    queue = queue_of(conn, dig_id)
+    assert (queue["status"], queue["angle"]) == expected
+    assert sender.sent == [(71, "返事1")]
+    row = conn.execute(
+        "SELECT status, redig, answer FROM dig_questions WHERE id = ?", (question_id,)
+    ).fetchone()
+    assert (row["status"], row["redig"], row["answer"]) == ("answered", 0, "返事1")
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("case", ["passed_before", "requested_before", "dug_during_answer"])
+def test_redig_is_queued_without_operation_after_acceptance(conn, config, case) -> None:
+    # 受け付ける前のパス・指定と、返事を作る間に朝の深掘りが done にしたこと(本人の操作では
+    # ない)は、後の操作とみなさない。今どおり積んで知らせを付ける
+    dig_id = add_dig(conn, config)
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle, requested_at, updated_at) "
+        f"VALUES (?, ?, 'bookmark', '前の観点', {_AGO}, {_AGO})",
+        (item_id, "passed" if case == "passed_before" else "queued", "-2 minutes", "-2 minutes"),
+    )
+    question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    accepted_at = accept_ago(conn, question_id, "-60 seconds")
+
+    def dig_done() -> None:  # 調査段(deepdive)が掘り終えて done にする
+        conn.execute(
+            "UPDATE dig_queue SET status = 'done', "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE item_id = ?",
+            (item_id,),
+        )
+
+    engine = OperateDuringAnswer(
+        dig_done if case == "dug_during_answer" else lambda: None, redig_on={1}
+    )
+    sender = Sender()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    queue = queue_of(conn, dig_id)
+    assert (queue["status"], queue["angle"]) == ("queued", "コストの観点で調べ直して")
+    assert queue["requested_at"] == accepted_at  # 依頼の受付時刻(後の質問の照合に使う)
+    assert sender.sent == [(71, "返事1" + dig_answer.REDIG_NOTICE)]
+    assert rows(conn)[0]["redig"] == 1
+
+
+def test_later_redig_on_same_card_is_queued_after_earlier_one(conn, config) -> None:
+    # 続けて送った調べ直しは、後の依頼が残る。先の依頼を積んだキューの更新(後の質問を受け付けた
+    # 後に起きる)を、本人の後の操作と取り違えない
+    dig_id = add_dig(conn, config)
+    first = ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    second = ask(conn, dig_id, "やっぱり運用の観点で調べ直して", 72)
+    accept_ago(conn, first, "-60 seconds")
+    accept_ago(conn, second, "-50 seconds")
+    sender = Sender()
+
+    answer_pending(conn, config, Engine(redig_on={1, 2}).factory, sender, logger)
+
+    queue = queue_of(conn, dig_id)
+    assert (queue["status"], queue["angle"]) == ("queued", "やっぱり運用の観点で調べ直して")
+    assert sender.sent == [
+        (71, "返事1" + dig_answer.REDIG_NOTICE),
+        (72, "返事2" + dig_answer.REDIG_NOTICE),
+    ]
+    assert [r["redig"] for r in rows(conn)] == [1, 1]
 
 
 def test_intent_without_redig_field_is_a_validation_failure() -> None:

@@ -195,7 +195,7 @@ def answer_pending(
 def _next_pending(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
         """
-        SELECT q.id, q.dig_result_id, q.question, q.request, q.retry_of,
+        SELECT q.id, q.dig_result_id, q.question, q.request, q.retry_of, q.created_at,
                r.item_id, r.note_name, r.source_note_name, r.card_text
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'pending'
@@ -277,13 +277,27 @@ def _record_answer_with_redig(
 
     キューに積めたときだけ知らせを付ける(積めなかったのに「調べ直します」と送らない)。
     キューへの積み方は未消化一覧へのリプライ指定と同じ(dig.apply_instructions: queued へ戻し、
-    requested_at を更新して優先し、観点を上書きする。source は変えない)。
+    requested_at を更新して優先し、観点を上書きする。source は変えない)。requested_at には
+    質問を受け付けた時刻を入れる(依頼の受付の順序として、後の質問の照合に使う。GH#235)。
+    質問を受け付けた後に本人がそのアイテムをパス・指定し直していたら(返事を作る数分の間の
+    未消化一覧への操作)、古い依頼で上書きせず、積まずに False を返す(GH#235)。
     """
     angle = row["question"].strip()[:REDIG_ANGLE_MAX_CHARS] or None
     try:
         conn.execute("BEGIN IMMEDIATE")  # 接続は autocommit
+        if _operated_after(conn, row["item_id"], row["created_at"]):
+            conn.execute("ROLLBACK")
+            logger.info(
+                "受け付けた後にパス・指定し直しがあったため、調べ直しを積まない(返事だけ送る)",
+                extra=log_extra,
+            )
+            return False
         _record_answer(conn, row["id"], kind, answer + REDIG_NOTICE, redig=True)
-        apply_instructions(conn, [DigInstruction(row["item_id"], "request", angle=angle)])
+        apply_instructions(
+            conn,
+            [DigInstruction(row["item_id"], "request", angle=angle)],
+            requested_at=row["created_at"],
+        )
         conn.execute("COMMIT")
     except sqlite3.Error as e:
         if conn.in_transaction:
@@ -294,6 +308,26 @@ def _record_answer_with_redig(
         )
         return False
     return True
+
+
+def _operated_after(conn: sqlite3.Connection, item_id: int, accepted_at: str) -> bool:
+    """質問を受け付けた後に、本人がそのアイテムをパスしたか指定し直したか(GH#235)。
+
+    受付の順序は質問の created_at(poller が積んだ時刻)で、キューの版と比べる。版は
+    requested_at(最後に適用した依頼の受付時刻。未消化一覧への指定はその時刻、調べ直しは
+    質問の受付時刻)と、passed の行の updated_at(パスした時刻。passed の行を更新するのは
+    パスだけ)。朝の深掘りが done にした更新は本人の操作ではないので見ない(掘った後の
+    調べ直しは今どおり積む)。時刻は秒の単位なので、同じ秒の操作は先後が分からない。
+    そのときは依頼を落とさずに積む(知らせが付くので、本人はもう一度パスできる)。
+    """
+    queue = conn.execute(
+        "SELECT status, requested_at, updated_at FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    if queue is None:
+        return False
+    if queue["requested_at"] is not None and queue["requested_at"] > accepted_at:
+        return True
+    return queue["status"] == "passed" and queue["updated_at"] > accepted_at
 
 
 class _Sender:

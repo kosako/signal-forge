@@ -115,12 +115,17 @@ def enqueue_bookmark(conn: sqlite3.Connection, item_id: int) -> bool:
 
 
 def apply_instructions(
-    conn: sqlite3.Connection, instructions: list[DigInstruction]
+    conn: sqlite3.Connection,
+    instructions: list[DigInstruction],
+    *,
+    requested_at: str | None = None,
 ) -> None:
     """命令列をキューへ反映する(commit は呼び出し側)。
 
     - request: status を queued に戻し(passed / done からの復帰を含む)、
-      requested_at を現在時刻に(調査段の優先順位①)。観点は指定があれば上書き、
+      requested_at を依頼の受付時刻に(調査段の優先順位①)。受付時刻は既定で現在時刻。
+      深掘りカードへの調べ直しの依頼は、質問を受け付けた時刻を渡す(返事を作る間の
+      本人の操作との先後の照合に使う。GH#235)。観点は指定があれば上書き、
       なければ既存を保持(「3664 も」= 優先度だけ上げる)
     - pass: status を passed に。観点・requested_at は保持する(後で request 復帰した
       とき前回の観点が生きる)
@@ -143,14 +148,15 @@ def apply_instructions(
             conn.execute(
                 """
                 INSERT INTO dig_queue (item_id, status, source, angle, requested_at)
-                VALUES (?, 'queued', 'request', ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                VALUES (?, 'queued', 'request', ?,
+                        COALESCE(?, strftime('%Y-%m-%dT%H:%M:%SZ','now')))
                 ON CONFLICT(item_id) DO UPDATE SET
                   status = 'queued',
                   angle = COALESCE(excluded.angle, dig_queue.angle),
                   requested_at = excluded.requested_at,
                   updated_at = excluded.updated_at
                 """,
-                (instruction.item_id, instruction.angle),
+                (instruction.item_id, instruction.angle, requested_at),
             )
 
 

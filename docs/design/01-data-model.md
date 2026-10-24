@@ -353,7 +353,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 
 - `item_id` UNIQUE(1 item 1 行。状態遷移で履歴を持たない — 観点は最新だけあれば調査に足りる)、items へ ON DELETE CASCADE
 - `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
-- `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)
+- `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)。調べ直しの依頼は、質問を受け付けた時刻を入れる(返事を作る間の本人のパス・指定し直しとの先後の照合に使う。GH#235・設計 06 §6)
 - `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先の認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
 
 ### 深掘り実行結果(dig_results・migration 010・017。GH#105 / GH#153 / 設計 06 §4〜5)
@@ -382,7 +382,7 @@ FROM latest WHERE rn = 1 GROUP BY signal_date;
 - `request`(migration 014)= カードのボタンの種類(`summary` = 📝 要約 / `more` = 📖 詳しく。NULL = 本人のリプライ)。`question` には決まった依頼文が入る。`request` が NULL ⇔ `question_message_id` がある(CHECK)。同じカードの同じボタンは 1 行だけ(部分 UNIQUE。再配達・二重押しで 2 回作らない)。NOT NULL を外すため、migration 014 で表を作り直した
 - `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しとは別の、本人の入力だけを渡す意図の判定の呼び出しが返す(外部由来の材料が判定を動かせないように。GH#245)。take の記録(GH#106)がこれを使う。ボタンからの依頼は判定を呼ばずに `question`
 - `take_recorded_at`(migration 013)= take(`take` / `both`)を解説ノートと `followup_dig` に記録した時刻。NULL = 未記録で、次の `intel answer` が記録し直す(設計 06 §6)
-- `redig`(migration 015)= 1 なら、意図の判定(GH#245)が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった)
+- `redig`(migration 015)= 1 なら、意図の判定(GH#245)が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった・質問を受け付けた後に本人がそのアイテムをパス・指定し直していた。GH#235)
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
 - `retry_of`(migration 020)= 失敗の知らせへのリプライなら、答えられなかった元の質問の id(GH#236)。poller が返信先の message_id(失敗の行の `answer_message_id`)から引いて積む。返事の材料に元の質問を添える(やり直しも失敗していれば最初の質問まで辿る。最初の質問は必ず渡し、途中のやり直しは直近の分だけで合わせて 5 件まで。元がボタンからの依頼なら材料もボタンと同じ元記事の本文)。NULL = カード・返事へのリプライ、ボタンからの依頼
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
