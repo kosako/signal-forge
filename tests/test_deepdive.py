@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from app.analysis.llm import LLMError, LLMUnavailableError, LLMUsage
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.deepdive import (
+    _TRANSLATE_CHUNK_CHARS,
     AUTO_BRIEF,
     REVIEW_MAX_FINDINGS,
     DigDraft,
@@ -26,6 +28,7 @@ from app.deepdive import (
     _revise_draft,
     _select_candidates,
     _split_paragraphs,
+    _translate_body,
     build_dig_prompt,
     build_review_prompt,
     run_dig_stage,
@@ -828,6 +831,86 @@ def test_split_paragraphs_groups_by_blank_line() -> None:
     chunks = _split_paragraphs(text, 100)
     assert len(chunks) > 1
     assert "".join(c.replace("\n\n", "") for c in chunks) == text.replace("\n\n", "")
+
+
+def test_split_paragraphs_keeps_grouping_of_paragraphs_within_limit() -> None:
+    # 段落がどれも上限以内なら、空行の境界でまとめる従来の分け方のまま(段落の中の改行で分けない)
+    text = "\n\n".join(["a" * 40, "b" * 50, "c" * 30, "d" * 90, "e\nf"])
+    assert _split_paragraphs(text, 100) == [
+        "a" * 40 + "\n\n" + "b" * 50,
+        "c" * 30,
+        "d" * 90 + "\n\n" + "e\nf",
+    ]
+
+
+def test_split_paragraphs_splits_long_text_without_blank_lines_at_newlines() -> None:
+    # GH#237: 抽出本文は空行を持たないことが多い。上限を超える段落は行の境界で分ける
+    text = "\n".join(f"Line {i:02d} " + "x" * 30 for i in range(20))
+    chunks = _split_paragraphs(text, 100)
+    assert len(chunks) == 10
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert "".join(chunks) == text
+    assert all(chunk.endswith("\n") for chunk in chunks[:-1])  # 行の途中で切らない
+
+
+@pytest.mark.parametrize(
+    ("sentence", "end"),
+    [
+        ("This is one sentence. ", ". "),
+        ("これは一つの短い文です。", "。"),
+        ('He asked "why?" ', '?" '),
+    ],
+    ids=["en", "ja", "quoted"],
+)
+def test_split_paragraphs_splits_long_line_at_sentence_end(sentence, end) -> None:
+    # GH#237: 改行の無い長い 1 行は文の終わりで分ける(文の長さは上限を割り切らない)
+    assert 100 % len(sentence) != 0
+    text = sentence * 30
+    chunks = _split_paragraphs(text, 100)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert "".join(chunks) == text
+    assert all(chunk.endswith(end) for chunk in chunks)
+
+
+def test_split_paragraphs_splits_long_line_without_sentence_end() -> None:
+    # GH#237: 文の終わりも無い 1 行は語の切れ目で、それも無ければ文字数で分ける
+    words = " ".join(["words"] * 100)
+    chunks = _split_paragraphs(words, 100)
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert "".join(chunks) == words
+    assert all(chunk.endswith(" ") for chunk in chunks[:-1])  # 語の途中で切らない
+    assert _split_paragraphs("あ" * 250, 100) == ["あ" * 100, "あ" * 100, "あ" * 50]
+    assert _split_paragraphs("x" * 100 + "   ", 100) == ["x" * 100]  # 空白だけの片は送らない
+
+
+def test_split_paragraphs_does_not_merge_oversized_paragraph_with_neighbors() -> None:
+    long = "\n".join(["y" * 60] * 3)  # 182 字(上限超え)
+    text = "\n\n".join(["a" * 20, long, "b" * 20])
+    assert _split_paragraphs(text, 100) == [
+        "a" * 20,
+        "y" * 60 + "\n",
+        "y" * 60 + "\n",
+        "y" * 60,
+        "b" * 20,
+    ]
+
+
+def test_translate_body_keeps_each_chunk_within_limit(config) -> None:
+    # GH#237: 空行の無い長文でも、対訳の 1 呼び出しに渡すチャンクは既定の上限以内
+    body = "\n".join(["This is a long sentence in the extracted article body."] * 400)
+    assert _TRANSLATE_CHUNK_CHARS < len(body) <= config.dig.translation_max_chars
+    engines: dict[str, ScriptedEngine] = {}
+
+    _translate_body(config, make_factory(engines), body)
+
+    chunks = [
+        re.search(r"<<<DATA-(\w+)\n(.*)\nDATA-\1>>>", prompt, re.S).group(2)
+        for _, prompt in engines["low"].prompts
+    ]
+    assert len(chunks) == 4
+    assert all(len(chunk) <= _TRANSLATE_CHUNK_CHARS for chunk in chunks)
+    assert "".join(chunks) == body
 
 
 @pytest.mark.parametrize("answer_daily_cap", [20, 0])

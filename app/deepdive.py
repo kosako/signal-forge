@@ -72,8 +72,18 @@ DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
 _REQUESTED_NONE = "(観点指定なし:ブックマーク自動キューからの深掘り)"
 
-# 対訳は 1 チャンクずつ生成する(1 呼び出しの出力を有界に保つ。段落境界で分割)
+# 対訳は 1 チャンクずつ生成する(1 呼び出しの出力を有界に保つ。段落境界で分割)。
+# 出力は原文の再掲(callout の引用記法つき)と訳文の両方を含み、入力のチャンクに訳文の分が
+# 足される。どのチャンクもこの上限を超えないようにして出力の量を抑える(超える段落は追加で
+# 分ける。GH#237)
 _TRANSLATE_CHUNK_CHARS = 6_000
+# 上限を超える段落を分ける境界(粗い順。GH#237): 改行 → 文の終わり → 語の切れ目(空白)。
+# どれでも上限に収まらない片は文字数で切る。境界の字は前の片の末尾に残す
+_OVERSIZED_BOUNDARIES = (
+    re.compile(r"\n"),
+    re.compile(r"[。．！？]+[」』）)]*|[.!?]+[\"'”’)\]]*\s+"),
+    re.compile(r"\s+"),
+)
 # 対訳の effort は low 固定(翻訳は推論負荷が低く、時間コストだけが増える)
 _TRANSLATE_EFFORT = "low"
 
@@ -829,7 +839,8 @@ def _review_card_line(review: ReviewOutcome) -> str:
 def _translate_body(
     config: Config, engine_factory: Callable[[str], LLMEngine], body: str
 ) -> str:
-    """本文を段落境界でチャンク化し、対訳 markdown を順に生成して連結する。"""
+    """本文を段落境界(上限を超える段落は改行・文の境界など)でチャンク化し、対訳 markdown を
+    順に生成して連結する。"""
     engine = engine_factory(_TRANSLATE_EFFORT)
     truncated = ""
     if len(body) > config.dig.translation_max_chars:
@@ -859,11 +870,22 @@ def _translate_body(
 
 
 def _split_paragraphs(text: str, chunk_chars: int) -> list[str]:
-    """空行(段落)境界で貪欲にまとめる。単一段落が上限超過ならそのまま 1 チャンク。"""
+    """空行(段落)境界で貪欲にまとめる。
+
+    上限を超える段落は前後の段落とまとめず、改行・文の境界などで上限以内に分ける(GH#237。
+    抽出本文は空行を持たないことが多く、本文全体が 1 段落になりうる)。
+    """
     paragraphs = re.split(r"\n\s*\n", text)
     chunks: list[str] = []
     current = ""
     for paragraph in paragraphs:
+        if len(paragraph) > chunk_chars:
+            if current.strip():
+                chunks.append(current)
+            current = ""
+            parts = _split_oversized(paragraph, chunk_chars)
+            chunks.extend(part for part in parts if part.strip())  # 空白だけの片は送らない
+            continue
         if current and len(current) + len(paragraph) + 2 > chunk_chars:
             chunks.append(current)
             current = paragraph
@@ -872,6 +894,35 @@ def _split_paragraphs(text: str, chunk_chars: int) -> list[str]:
     if current.strip():
         chunks.append(current)
     return chunks or [text]
+
+
+def _split_oversized(text: str, chunk_chars: int, level: int = 0) -> list[str]:
+    """上限を超える段落を粗い境界から順に分け、上限以内の片に貪欲にまとめる(GH#237)。
+
+    片をつなぐと元の段落に戻る(境界の字は前の片の末尾に残す)。どの境界でも上限に
+    収まらない片は文字数で切る。
+    """
+    if len(text) <= chunk_chars:
+        return [text]
+    if level == len(_OVERSIZED_BOUNDARIES):
+        return [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+    cuts = [m.end() for m in _OVERSIZED_BOUNDARIES[level].finditer(text)]
+    starts = [0, *cuts]
+    ends = [*cuts, len(text)]
+    chunks: list[str] = []
+    current = ""
+    for start, end in zip(starts, ends, strict=True):
+        if end == start:  # 末尾が境界の字で終わるときの空の片
+            continue
+        for part in _split_oversized(text[start:end], chunk_chars, level + 1):
+            if current and len(current) + len(part) > chunk_chars:
+                chunks.append(current)
+                current = part
+            else:
+                current += part
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # --- ノート・カードのレンダリング(書込先は vault/<folder>/DeepDive/ に限定) ---
