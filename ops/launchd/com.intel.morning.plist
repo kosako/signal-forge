@@ -6,7 +6,9 @@
   - 自動再実行しない(KeepAlive なし): 失敗時は watchdog 通知 → 手動 `intel run` 再走
   - EnvironmentVariables は PATH/HOME のみ。ANTHROPIC_API_KEY を絶対に入れない
   - PATH には uv(起動)に加え codex(analyze で subprocess 起動)の dir(__CODEX_DIR__)を
-    必ず含める。抜けると analyze が全チャンク「codex not found」で degraded になる(#72)
+    必ず含める。抜けると analyze が全チャンク「codex not found」で degraded になる(#72)。
+    npm 版の codex は node で動くので、node が codex と別の dir にあるときは runbook §1 が
+    __CODEX_DIR__ に node の dir も `:` でつないで入れる(GH#221)
   - 時刻はシステムのローカルタイムゾーン(JST 前提)。配信時刻(宿題 H5)確定時は
     Hour/Minute と pmset wake を合わせて更新する
 -->
