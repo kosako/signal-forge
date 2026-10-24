@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from app.deepdive import (
 )
 from app.extraction import extract_pending
 from app.http import HttpClient
+from app.vault_guard import VaultGuard
 
 logger = logging.getLogger("test-deepdive")
 
@@ -336,6 +338,23 @@ def test_dig_ja_source_copies_without_translation(conn, config) -> None:
     assert "(原文ノートあり)" in card
 
 
+@pytest.mark.parametrize(("language", "kind"), [("ja", "原文"), ("en", "対訳")])
+def test_source_note_fetched_is_body_extraction_date(conn, config, language, kind) -> None:
+    # fetched は本文を取得・抽出した日(documents.extracted_at の JST の日付)で、深掘りした日では
+    # ない(GH#239)。数日前に取った本文を初めて掘るときも、本文の古さが分かる
+    item = add_item(conn, "https://blog.example/post", language=language)
+    conn.execute(  # JST では 2026-07-19 01:30
+        "UPDATE documents SET extracted_at = '2026-07-18T16:30:00Z' WHERE item_id = ?", (item,)
+    )
+    enqueue(conn, item)
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+
+    source = next(deepdive_dir(config).glob(f"20260722-{item}-{kind}-*.md"))
+    front = yaml.safe_load(source.read_text(encoding="utf-8").split("---\n", 2)[1])
+    assert front["fetched"] == "2026-07-19"
+
+
 def test_dig_tweet_body_has_no_source_note(conn, config) -> None:
     item = add_item(conn, "https://x.com/user/status/1", title=None, language="ja")
     enqueue(conn, item)
@@ -578,6 +597,108 @@ def test_existing_note_not_overwritten_on_publish_retry(conn, config) -> None:
     assert conn.execute("SELECT published_at FROM dig_results").fetchone()[
         "published_at"
     ] is not None
+
+
+def block_first_note_write(monkeypatch) -> tuple[threading.Event, list[str]]:
+    """最初のノートの書き出しだけを release まで止める(vault の応答待ちの代わり。GH#234)。"""
+    from app import deepdive as deepdive_module
+
+    release = threading.Event()
+    calls: list[str] = []
+    original = deepdive_module.atomic_write
+
+    def blocking(path, content, **kwargs):
+        calls.append(path.name)
+        if len(calls) == 1:
+            release.wait(5)
+        return original(path, content, **kwargs)
+
+    monkeypatch.setattr(deepdive_module, "atomic_write", blocking)
+    return release, calls
+
+
+def join_vault_threads() -> None:
+    for thread in threading.enumerate():
+        if thread.name == "vault-io":
+            thread.join(5)
+
+
+def test_publish_stall_keeps_body_in_ledger_and_moves_on(conn, config, monkeypatch) -> None:
+    # vault が応答しない(macOS の確認待ちなど)ときは上限の時間で見切り、本文を台帳に残した
+    # まま先へ進む。公開済みの件のカードは送り、段は失敗として知らせる(GH#234)
+    published = add_item(conn, "https://blog.example/published")
+    conn.execute(  # 前回の実行で公開済み・カードは未送信
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
+        " VALUES (?, 'p-深掘り', 'p のカード', '2026-07-22T00:00:00Z')",
+        (published,),
+    )
+    for name in ("s", "l"):
+        item = add_item(conn, f"https://blog.example/{name}")
+        conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+            " VALUES (?, ?, ?, ?)",
+            (item, f"{name}-深掘り", f"{name} のカード", f"{name} の本文"),
+        )
+    conn.commit()
+    release, calls = block_first_note_write(monkeypatch)
+    api = FakeApi()
+    try:
+        with pytest.raises(DigError, match="VaultStalled"):
+            run_dig_stage(
+                conn, config, make_factory({}), api, logger, today="2026-07-23",
+                vault=VaultGuard(timeout_s=0.05),
+            )
+        assert calls == ["s-深掘り.md"]  # 止まった後は、残りの件で vault に触れない
+        rows = conn.execute(
+            "SELECT published_at, note_markdown FROM dig_results WHERE note_name != 'p-深掘り'"
+        ).fetchall()
+        assert [row["published_at"] for row in rows] == [None, None]
+        assert [row["note_markdown"] for row in rows] == ["s の本文", "l の本文"]
+        assert [text for _, text in api.sent] == ["p のカード"]
+    finally:
+        release.set()
+        join_vault_threads()
+
+    # 次の実行は、遅れて書き終えたノートを公開済みとして記帳し、残りを公開してカードを送る
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+
+    assert (deepdive_dir(config) / "s-深掘り.md").read_text() == "s の本文"
+    assert (deepdive_dir(config) / "l-深掘り.md").read_text() == "l の本文"
+    assert conn.execute(
+        "SELECT count(*) AS n FROM dig_results WHERE published_at IS NULL"
+    ).fetchone()["n"] == 0
+    assert [text for _, text in api.sent] == ["p のカード", "s のカード", "l のカード"]
+
+
+def test_late_publish_does_not_replace_note_published_meanwhile(
+    conn, config, monkeypatch
+) -> None:
+    # 見切ったスレッドが後から書き終えても、その間に次の実行が公開し、take が足された
+    # ノートを置き換えない(既存かどうかは置き換えの直前に確かめる。GH#234)
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+        " VALUES (?, 'n-深掘り', 'カード', '公開の本文')",
+        (item,),
+    )
+    conn.commit()
+    release, _calls = block_first_note_write(monkeypatch)
+    note = deepdive_dir(config) / "n-深掘り.md"
+    try:
+        with pytest.raises(DigError, match="VaultStalled"):
+            run_dig_stage(
+                conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23",
+                vault=VaultGuard(timeout_s=0.05),
+            )
+        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+        with note.open("a", encoding="utf-8") as f:  # 本人の take
+            f.write("\n手書きの take\n")
+    finally:
+        release.set()
+        join_vault_threads()
+
+    assert note.read_text(encoding="utf-8") == "公開の本文\n手書きの take\n"
+    assert not list(deepdive_dir(config).glob(".*.tmp"))  # 一時ファイルを残さない
 
 
 def test_requeue_during_generation_is_preserved(conn, config) -> None:

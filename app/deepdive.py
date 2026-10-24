@@ -59,6 +59,7 @@ from app.delivery.telegram import (
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import JST
 from app.prompting import fill_template, sanitize, sanitize_body
+from app.vault_guard import VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-v001"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
@@ -188,6 +189,9 @@ class DigCandidate:
     summary: str | None
     # 同じ item の前回の解説ノート(調べ直し = done からの再指定。GH#137)。新しいノートからリンクする
     previous_note_name: str | None = None
+    # 本文を取得・抽出した JST の日付(documents.extracted_at)。原文・対訳ノートの fetched に
+    # 書く(深掘りした日ではない。GH#239)
+    fetched_date: str | None = None
 
 
 def run_dig_stage(
@@ -203,6 +207,8 @@ def run_dig_stage(
     today: str | None = None,
     # 別系統の AI のレビュー役(GH#153)。None = レビューしない(config `[dig].review` が off)
     review_engine_factory: Callable[[], LLMEngine] | None = None,
+    # ノートの公開の vault へのアクセスの時間の上限(GH#234。None = 既定の上限。テスト注入用)
+    vault: VaultGuard | None = None,
 ) -> None:
     """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
 
@@ -246,7 +252,9 @@ def run_dig_stage(
         )
 
     # 未公開ノートの書出(過去の中断分を含む)
-    failures.extend(_publish_pending_notes(conn, config, logger, run_id))
+    failures.extend(
+        _publish_pending_notes(conn, config, logger, run_id, vault or VaultGuard())
+    )
 
     # 未送信カード(過去の中断分を含む)の送信。Telegram 未設定なら台帳に残す
     if api is not None:
@@ -289,6 +297,7 @@ def _select_candidates(
         SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
                i.title, i.author, i.published_at, i.canonical_url,
                d.extracted_text, d.language,
+               date(d.extracted_at, '+9 hours') AS fetched_date,
                a.title_ja, a.summary,
                (SELECT r.note_name FROM dig_results r
                 WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
@@ -329,6 +338,7 @@ def _select_candidates(
             title_ja=row["title_ja"],
             summary=row["summary"],
             previous_note_name=row["previous_note_name"],
+            fetched_date=row["fetched_date"],
         )
         if candidate.body and len(candidate.body) >= config.dig.min_body_chars:
             selected.append(candidate)
@@ -459,33 +469,39 @@ def _publish_pending_notes(
     config: Config,
     logger: logging.Logger,
     run_id: str | None,
+    vault: VaultGuard,
 ) -> list[str]:
     """未公開ノート(過去の中断分を含む)を台帳の本文から vault へ書き出す。
 
     公開後は本文列を NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。
+
+    vault へのアクセスは 1 件ごとに時間の上限を付ける(GH#234。仕組みは GH#145 と同じ)。
+    macOS のプライバシーの確認待ちなどで止まると、カードの送信と朝バッチの後続の段・失敗通知
+    まで止まるため。上限を超えたら、その件と残りの件は本文を台帳に持ったまま未公開にして
+    先へ進む(公開済みの件のカードは送り、未公開の件は次の実行で公開し直す)。止まった
+    スレッドが後から書き終えても、_publish_note は既存のノートを上書きしない。
     """
     failures: list[str] = []
     rows = conn.execute(
         "SELECT id, item_id, note_name, source_note_name, note_markdown,"
         " source_note_markdown FROM dig_results WHERE published_at IS NULL ORDER BY id"
     ).fetchall()
-    for row in rows:
+    for index, row in enumerate(rows):
         try:
-            deepdive_dir = _deepdive_dir(config)
-            if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
-                _publish_note(
-                    deepdive_dir / f"{row['note_name']}.md",
-                    row["note_markdown"],
-                    logger,
-                    run_id,
-                )
-            if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
-                _publish_note(
-                    deepdive_dir / f"{row['source_note_name']}.md",
-                    row["source_note_markdown"],
-                    logger,
-                    run_id,
-                )
+            vault.call(lambda row=row: _publish_row_notes(config, row, logger, run_id))
+        except VaultStalled as e:
+            unpublished = len(rows) - index
+            logger.error(
+                "vault が応答しないので、ノートの公開をこの実行では止める"
+                f"(未公開の {unpublished} 件は本文を台帳に残し、次の実行で公開する。"
+                f"runbook §11): {e}",
+                extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+            )
+            failures.append(
+                f"item {row['item_id']}: ノート公開 VaultStalled"
+                f"(未公開 {unpublished} 件は次の実行へ)"
+            )
+            break
         except Exception as e:
             logger.error(
                 f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
@@ -500,6 +516,27 @@ def _publish_pending_notes(
             (row["id"],),
         )
     return failures
+
+
+def _publish_row_notes(
+    config: Config, row: sqlite3.Row, logger: logging.Logger, run_id: str | None
+) -> None:
+    """台帳の 1 行のノート(解説・原文/対訳)を書き出す(vault-io のスレッドで動く。DB に触れない)。"""
+    deepdive_dir = _deepdive_dir(config)
+    if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
+        _publish_note(
+            deepdive_dir / f"{row['note_name']}.md",
+            row["note_markdown"],
+            logger,
+            run_id,
+        )
+    if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
+        _publish_note(
+            deepdive_dir / f"{row['source_note_name']}.md",
+            row["source_note_markdown"],
+            logger,
+            run_id,
+        )
 
 
 def _send_pending_cards(
@@ -938,14 +975,16 @@ def _publish_note(
     盲目的な上書きは take 領域の破壊になる。atomic_write は部分ファイルを残さない
     ので、既存ファイル = 完全な公開済みノート。それを正として再書出は破棄する
     (write-ahead により内容は同一生成物なので、失われるのは何もない)。
+
+    既存かどうかは置き換え(rename)の直前に確かめる(GH#234)。vault が応答せず上限の時間で
+    見切ったスレッドは後から書き終えうる。その間に次の実行が公開し、本人が take を書いた
+    ノートを、遅れた書き込みで置き換えないため。
     """
-    if path.exists():
+    if not atomic_write(path, content, precondition=lambda: not path.exists()):
         logger.warning(
             f"既存の DeepDive ノートを保持(再書出は破棄): {path.name}",
             extra={"run_id": run_id, "stage": "dig"},
         )
-        return
-    atomic_write(path, content)
 
 
 def _deepdive_dir(config: Config) -> Path:
@@ -1007,7 +1046,7 @@ def _source_note_ja(candidate: DigCandidate, explainer_note_name: str) -> str:
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "fetched": datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d"),
+        "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための保全コピー(抽出テキスト)",
     }
     return (
@@ -1033,7 +1072,7 @@ def _source_note_translated(
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "fetched": datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d"),
+        "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための全訳。日本語が地の文、原文は節ごとの折りたたみ内",
     }
     return (

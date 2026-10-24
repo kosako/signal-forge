@@ -69,7 +69,8 @@ app/
   jst.py          # 日本時間(JST)と今日の暦日(複数の段が使う。GH#113)
   prompting.py    # プロンプトの sanitize と単一パスのテンプレート置換(分析・トレンド・深掘り・
                   #   返事が共通に使う。設計 03 §3.2・GH#113)
-  vault_guard.py  # vault へのアクセスに時間の上限を付ける(返事と take の記録が使う。GH#145)
+  vault_guard.py  # vault へのアクセスに時間の上限を付ける(返事・take の記録・深掘りのノートの
+                  #   公開が使う。GH#145・GH#234)
   source_health.py # 情報ソースの健康(連続の失敗の知らせ・週 1 回の健康診断。読み取りだけ。GH#150)
   connectors/     # base.py(Connector の型)、x.py(ホームTL + XRouter)、x_search.py(AI 検索)、
                   #   x_oauth2.py(OAuth2 PKCE・S1)、x_signals.py(興味シグナル取込・S1b)、rss.py
