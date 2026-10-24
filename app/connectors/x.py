@@ -14,6 +14,9 @@
   status id で `x.com/i/web/status/{id}` に統一するため、元ツイの直接ポストと重複排除される)。
   自分宛以外のリプライは除外(設計 02 §2)。
 - api_reads(課金対象の読取件数)× 単価を FetchStats.estimated_cost_usd に載せる。
+- daily_read_cap は JST の暦日の上限で、同じ日の実行で共有する(GH#178)。合成点が台帳
+  (collect_runs.api_reads)の当日の合計を `x_reads_today` で引き、コネクタは上限から
+  それを引いた残りだけを読む(fetch は DB に触らない契約のまま。設計 02 §1)。
 - type='x' の sources 行はホームTL と検索の2種があり、sources.config の mode で識別する
   (NULL = home。設計 02 §2)。collect の「type → Connector 1:1」契約は XRouter が保つ。
 """
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import json
 import random
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -40,6 +44,7 @@ from app.connectors.base import (
     RetryableError,
 )
 from app.http import BACKOFF_S, MAX_RETRIES  # 共通リトライ規約(設計 05 §8)
+from app.jst import jst_day_bounds_utc, today_jst
 from app.models import Source
 
 API_BASE = "https://api.twitter.com/2"
@@ -116,10 +121,12 @@ class XConnector:
         credentials: XCredentials,
         daily_read_cap: int,
         unit_price_usd: float,
+        reads_used_today: int = 0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._session = XApiSession(client=client, credentials=credentials, sleep=sleep)
-        self._daily_read_cap = daily_read_cap
+        # 今回読める上限 = 日次の上限 − 同じ日(JST)の実行が読んだぶん(GH#178)
+        self._read_budget = max(0, daily_read_cap - reads_used_today)
         self._unit_price = unit_price_usd
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
@@ -177,10 +184,10 @@ class XConnector:
         reads = 0
         token: str | None = None
         http_status: int | None = None
-        while reads < self._daily_read_cap:
+        while reads < self._read_budget:
             params: dict[str, str | int] = {
                 # cap を1件も超えないよう残枠を上限に(設計 02 §2 / ADR 0001 予算配分)
-                "max_results": min(MAX_RESULTS, self._daily_read_cap - reads),
+                "max_results": min(MAX_RESULTS, self._read_budget - reads),
                 "tweet.fields": TWEET_FIELDS,
                 "expansions": EXPANSIONS,
             }
@@ -242,15 +249,53 @@ def has_x_credentials(env: dict[str, str]) -> bool:
 
 
 def build_x_connector(
-    daily_read_cap: int, unit_price_usd: float, env: dict[str, str]
+    daily_read_cap: int,
+    unit_price_usd: float,
+    env: dict[str, str],
+    *,
+    reads_used_today: int = 0,
 ) -> XConnector:
-    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真)。"""
+    """cli の合成点から呼ぶ(前提: has_x_credentials(env) が真)。
+
+    reads_used_today = 同じ日のホームTL の読取数(`x_reads_today` の home。GH#178)。
+    """
     return XConnector(
         client=build_x_client(),
         credentials=credentials_from_env(env),
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price_usd,
+        reads_used_today=reads_used_today,
     )
+
+
+def x_reads_today(conn: sqlite3.Connection, day: str | None = None) -> dict[str, int]:
+    """JST の暦日 day(既定 = 今日)に collect が台帳へ記録した X の読取数を mode ごとに返す。
+
+    日次の読取上限は 1 回の実行の上限でなく暦日の上限(ADR 0001 の合算日次ハード上限)。
+    同じ日の再実行(失敗のあとの手動の `intel run`・単独の `intel collect`)が上限を超えて
+    読まないよう、合成点がここで当日の合計を出し、コネクタに残りだけを読ませる(GH#178)。
+    日付は collect_runs.started_at(UTC)を JST の暦日に直して決める(dig の日次上限と同じ
+    暦日)。部分取得のあとの失敗(status='error')の読取も数える(費用は掛かっている)。
+    mode の判定は x_source_mode と同じ(config NULL = home)。mode が不正な行・bookmark 行は
+    fetch の前に失敗するので読取は常に 0 で、どちらに数えても合計は変わらない。
+    """
+    start, end = jst_day_bounds_utc(day or today_jst())
+    rows = conn.execute(
+        """
+        SELECT CASE WHEN json_extract(sources.config, '$.mode') = 'search'
+                    THEN 'search' ELSE 'home' END AS mode,
+               sum(collect_runs.api_reads) AS reads
+        FROM collect_runs
+        JOIN sources ON sources.id = collect_runs.source_id
+        WHERE sources.type = 'x'
+          AND collect_runs.started_at >= ? AND collect_runs.started_at < ?
+        GROUP BY mode
+        """,
+        (start, end),
+    ).fetchall()
+    reads = {"home": 0, "search": 0}
+    reads.update({row["mode"]: row["reads"] for row in rows})
+    return reads
 
 
 def build_x_client() -> httpx.Client:

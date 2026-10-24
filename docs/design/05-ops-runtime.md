@@ -12,7 +12,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 - `ProgramArguments`: `[uv, run, intel, run]`(作業ディレクトリ `WorkingDirectory` = リポジトリ)。`intel run` = **collect→x_signals→extract→analyze→digest→export→deliver→dig→purge→backup** の直列実行(ステージ順序の正本は設計 00 §2。deliver 失敗でも export は完了済みで `delivery_status='failed'` を記録)。dig 段(GH#105)は 1 件あたり分オーダーの LLM 生成を含むが、deliver の後に走るので watchdog(当日のダイジェストの生成・配信と X ソースの連続失敗だけを見る)の判定には影響しない。dig の所要時間で後ろにずれるのは purge と backup の完了時刻と、朝バッチが poller と DB を共有する時間の長さ(上限 `[dig].daily_cap` を増やすときはこちらを見直す)。
 - `StartCalendarInterval`: 06:30 JST(配信 7:00 の30分前。LLM バッチと X ページングの余裕をみる)。
-- **再起動方針: 自動再実行しない**。`intel run` は冪等(sources のカーソル管理+items の content_hash 重複排除)なので失敗時は手動 `intel run` で安全に再走できる。自動リトライを launchd に持たせない理由: 二重課金・二重配信の検知より、watchdog 通知→手動再走の方が単純で事故が少ない。
+- **再起動方針: 自動再実行しない**。`intel run` は冪等(sources のカーソル管理+items の content_hash 重複排除)なので失敗時は手動 `intel run` で安全に再走できる。X の読み取りと本分析の日次の上限は JST の暦日で共有するので、再走は同じ日の残りの枠しか使わない(GH#178。設計 02 §2・03 §2)。自動リトライを launchd に持たせない理由: 二重課金・二重配信の検知より、watchdog 通知→手動再走の方が単純で事故が少ない。
 - スリープ対策: `sudo pmset repeat wakeorpoweron MTWRFSU 06:25:00`。StartCalendarInterval はスリープ中スキップされるため wake を先に確保する。
 - `EnvironmentVariables` は `PATH` と `HOME` のみ。**`ANTHROPIC_API_KEY` を絶対に入れない**(claude -p が API 課金に倒れるのを構成で防ぐ)。
 

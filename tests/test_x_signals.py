@@ -7,8 +7,9 @@ import pytest
 
 from app.analysis.stage1 import preselect
 from app.config import Config, XSignalsConfig
-from app.connectors.x_signals import XSignalsError, collect_x_signals
+from app.connectors.x_signals import XSignalsError, collect_x_signals, signal_reads_on
 from app.db import apply_migrations, connect
+from app.jst import today_jst
 from app.normalize import normalize_url
 
 logger = logging.getLogger("test-x-signals")
@@ -181,6 +182,46 @@ def test_cap_limits_reads_and_skips_later_kinds(conn, tmp_path) -> None:
     assert rows(conn, "like") == []
 
 
+def test_second_run_same_day_reads_only_remaining_budget(conn, tmp_path) -> None:
+    # GH#178: cap は暦日の上限。同じ日の 2 回目の実行(朝バッチの再走・単独の intel x-signals)は
+    # 台帳(x_signal_runs)の当日の合計を引いた残りだけを読む
+    first = session_with(
+        [page(*[tw(f"b{i}") for i in range(5)])], [page(*[tw(f"l{i}") for i in range(5)])]
+    )
+    assert collect_x_signals(conn, make_config(tmp_path, cap=15), first, logger)["api_reads"] == 10
+    second = session_with(
+        [page(*[tw(f"b{i}") for i in range(5, 10)], next_token="more")],
+        [page(*[tw(f"l{i}") for i in range(5, 10)])],
+    )
+    totals = collect_x_signals(conn, make_config(tmp_path, cap=15), second, logger)
+    assert totals["api_reads"] == 5  # 残り 5 = bookmark の最小ページ 1 枚ぶん
+    assert [c["max_results"] for c in calls_to(second, "/bookmarks")] == [5]
+    assert calls_to(second, "/liked_tweets") == []  # 残 0 < 5 で skip
+    third = session_with([page(tw("b_x"))], [page(tw("l_x"))])
+    assert collect_x_signals(conn, make_config(tmp_path, cap=15), third, logger)["api_reads"] == 0
+    assert calls_to(third, "/bookmarks") == [] and calls_to(third, "/liked_tweets") == []
+    reads = [r["api_reads"] for r in conn.execute("SELECT api_reads FROM x_signal_runs")]
+    assert reads == [10, 5, 0]  # 合計は cap(15)ちょうど
+
+
+def test_signal_reads_on_sums_jst_calendar_day(conn) -> None:
+    # GH#178: 当日 = JST の暦日(UTC 15:00 が日付の境界)。失敗の行の読取も数える
+    for started_at, status, reads in (
+        ("2026-10-23T14:59:59Z", "ok", 7),  # JST 10/23 23:59:59 = 前日
+        ("2026-10-23T15:00:00Z", "ok", 10),  # JST 10/24 0:00 = 当日の始まり
+        ("2026-10-24T06:00:00Z", "failed", 3),
+        ("2026-10-24T14:59:59Z", "ok", 20),  # JST 10/24 23:59:59 = 当日の終わり
+        ("2026-10-24T15:00:00Z", "ok", 40),  # JST 10/25 0:00 = 翌日
+    ):
+        conn.execute(
+            "INSERT INTO x_signal_runs (started_at, status, api_reads) VALUES (?, ?, ?)",
+            (started_at, status, reads),
+        )
+    assert signal_reads_on(conn, "2026-10-24") == 33
+    assert signal_reads_on(conn, "2026-10-23") == 7
+    assert signal_reads_on(conn, "2026-10-26") == 0
+
+
 def test_known_bookmarks_leave_budget_for_later_kinds(conn, tmp_path) -> None:
     # 既知のブックマークが上限以上あり新着が無い日も、既知の読み直しで予算を
     # 使い切らず like / self_rt を取り込む(GH#174)
@@ -242,6 +283,31 @@ def test_backfill_limit_bounds_each_kind_independently(conn, tmp_path) -> None:
     assert totals["api_reads"] == 10  # bookmark 5 + like 5(kind ごと独立の上限)
     assert len(calls_to(session, "/bookmarks")) == 1  # limit 到達で次ページに行かない
     assert calls_to(session, "/liked_tweets")[0]["max_results"] == 5
+
+
+def test_backfill_keeps_own_limit_after_daily_budget_is_used(conn, tmp_path) -> None:
+    # GH#178: backfill は日次 cap の外(kind ごとの --limit)。同じ日に通常の取込が cap を
+    # 使い切っていても、台帳を見ずに limit まで読む
+    used_up = session_with(
+        [
+            page(*[tw(f"b{i}") for i in range(5)], next_token="p2"),
+            page(*[tw(f"b{i}") for i in range(5, 10)]),
+        ],
+        [],
+    )
+    collect_x_signals(conn, make_config(tmp_path, cap=10), used_up, logger)
+    assert signal_reads_on(conn, today_jst()) == 10  # 当日の枠は使い切った
+    backfill = session_with(
+        [page(*[tw(f"old_b{i}") for i in range(5)], next_token="more")],
+        [page(*[tw(f"old_l{i}") for i in range(5)], next_token="more")],
+    )
+    totals = collect_x_signals(
+        conn, make_config(tmp_path, cap=10), backfill, logger, backfill_limit=5
+    )
+    assert totals["api_reads"] == 10  # bookmark 5 + like 5(日次 cap の残り 0 に縛られない)
+    # backfill の読取も同じ日の費用として台帳に入り、同じ日の通常の取込はもう読まない
+    after = session_with([page(tw("b_new"))], [page(tw("l_new"))])
+    assert collect_x_signals(conn, make_config(tmp_path, cap=10), after, logger)["api_reads"] == 0
 
 
 def test_backfill_limit_stops_at_page_min_boundary_across_pages(conn, tmp_path) -> None:

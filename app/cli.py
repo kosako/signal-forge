@@ -15,19 +15,22 @@ app = typer.Typer(
 )
 
 
-def _build_connectors(config, env: dict[str, str], http) -> dict:
+def _build_connectors(config, env: dict[str, str], http, conn) -> dict:
     """有効なソース種別のコネクタを組み立てる(合成点)。X は config で有効なときだけ配線。
 
     import は実行時(他コマンドの --help を httpx 等の重い依存に触れさせない)。
+    X の日次の読取上限は同じ日の実行で共有するので、台帳(conn の collect_runs)から当日の
+    読取数を出してコネクタに渡す(GH#178)。collect の直前に組み立てること。
     """
     from app.connectors.rss import RssConnector
 
     connectors = {"rss": RssConnector(http)}
     if config.x.enabled:
-        from app.connectors.x import XRouter, build_x_connector, has_x_credentials
+        from app.connectors.x import XRouter, build_x_connector, has_x_credentials, x_reads_today
 
         # キー欠落は doctor #5 が WARN。ここでは X を載せず RSS の collect を止めない
         if has_x_credentials(env):
+            used = x_reads_today(conn)  # 同じ日(JST)の実行が読んだぶん(GH#178)
             search = None
             if config.x_search.slots:  # slots 空 = 検索無効(設計 02 §2)
                 from app.connectors.x_search import build_x_search_connector
@@ -37,8 +40,14 @@ def _build_connectors(config, env: dict[str, str], http) -> dict:
                     config.x_search.daily_read_cap,
                     config.x.unit_price_usd,
                     env,
+                    reads_used_today=used["search"],
                 )
-            home = build_x_connector(config.x.daily_read_cap, config.x.unit_price_usd, env)
+            home = build_x_connector(
+                config.x.daily_read_cap,
+                config.x.unit_price_usd,
+                env,
+                reads_used_today=used["home"],
+            )
             # type='x' の sources 行は home / search の2種(config.mode で識別)。
             # collect の「type → Connector 1:1」契約は XRouter が保つ
             connectors["x"] = XRouter(home=home, search=search)
@@ -64,7 +73,7 @@ def collect(
     http = HttpClient()
     collect_all(
         conn,
-        _build_connectors(config, env, http),
+        _build_connectors(config, env, http, conn),
         logger,
         resolve_short=http.resolve_short_url,
     )
@@ -469,7 +478,7 @@ def run(
         conn,
         config,
         env,
-        _build_connectors(config, env, http),
+        _build_connectors(config, env, http, conn),
         http,
         lambda: create_engine(config.llm.engine),
         logger,
