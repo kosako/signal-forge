@@ -4,6 +4,7 @@
   カーソル保存はここで一元化する
 - カーソル更新は「そのソースの全 INSERT 成功後、同一トランザクション」
   (途中クラッシュ → カーソル未更新 → 次回重複取得 → UNIQUE で吸収)
+- 外部 I/O(短縮 URL の解決)は書き込みのトランザクションの前に済ませる(GH#179)
 - ソース単位のエラー隔離: 1ソースの失敗で他ソースを止めない
 """
 
@@ -146,10 +147,15 @@ def _store_result(
     ソースは失敗として数える(連続失敗の警告に載せる。成功の時刻と移転の記録は変えない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
+    # 短縮 URL の解決(HTTP の待ち・再試行)はトランザクションの前に済ませる(GH#179)。
+    # 書き込みロックを持ったまま待つと、並行する受信デーモンの記帳が busy_timeout を超えて
+    # 失敗しうる。解決が UrlError 以外で失敗したときは、今までどおりソースの失敗になる
+    # (何も保存せず、カーソルも進めない)
+    prepared = [(raw, _canonical_url(raw, resolve_short)) for raw in items]
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for raw in items:
-            counts[_store_item(conn, source, raw, resolve_short)] += 1
+        for raw, canonical in prepared:
+            counts[_store_item(conn, source, raw, canonical)] += 1
         if partial_error is None:
             conn.execute(
                 f"""
@@ -177,15 +183,21 @@ def _store_result(
     return counts
 
 
+def _canonical_url(raw: RawItem, resolve_short: Callable[[str], str] | None) -> str | None:
+    """u1 の canonical_url(短縮 URL の解決を含む)。正規化できない URL は None。"""
+    try:
+        return normalize_url(raw.url, resolve_short=resolve_short)
+    except UrlError:
+        return None
+
+
 def _store_item(
     conn: sqlite3.Connection,
     source: Source,
     raw: RawItem,
-    resolve_short: Callable[[str], str] | None,
+    canonical: str | None,
 ) -> str:
-    try:
-        canonical = normalize_url(raw.url, resolve_short=resolve_short)
-    except UrlError:
+    if canonical is None:
         # scheme 不正等はアイテムごと reject して status='error' で記録(設計 01 §4 手順0)
         cursor = conn.execute(
             """

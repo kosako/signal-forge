@@ -348,6 +348,46 @@ def test_short_url_redirecting_to_unsplittable_url_recorded_as_error(
     assert source["consecutive_failures"] == 0
 
 
+def test_short_url_resolved_without_holding_write_lock(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    # 短縮 URL の解決(HTTP の待ち・再試行)の間は書き込みロックを持たない(GH#179)。
+    # 解決を待っている間に、別の接続(受信デーモン相当)が待たずに書き込めることで確かめる
+    other = connect(tmp_path / "intel.db")
+    other.execute("PRAGMA busy_timeout=0")  # ロックを持たれていれば待たずに locked で落ちる
+    resolved: list[str] = []
+
+    def slow_resolver(url: str) -> str:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(
+            "INSERT INTO items (source_id, url, canonical_url, content_hash)"
+            " VALUES (1, 'https://manual.example/1', 'https://manual.example/1', '')"
+        )
+        other.execute("COMMIT")
+        resolved.append(url)
+        return "https://example.com/resolved"
+
+    connector = FakeConnector([item("https://example.com/plain"), item("https://bit.ly/abc")])
+    try:
+        collect_all(conn, {"rss": connector}, logger, resolve_short=slow_resolver)
+    finally:
+        other.close()
+
+    assert resolved == ["https://bit.ly/abc"]
+    rows = {r["canonical_url"]: r["source_id"] for r in conn.execute("SELECT * FROM items")}
+    assert rows == {
+        "https://manual.example/1": 1,
+        "https://example.com/plain": 2,
+        "https://example.com/resolved": 2,
+    }
+    # 項目とカーソルは今までどおり一緒に保存される(設計 02 §1)
+    source = conn.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE type='rss'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"etag": "e1", "last_modified": None}
+    assert source["consecutive_failures"] == 0
+
+
 def test_rss_external_id_fallback_to_urlhash(conn: sqlite3.Connection) -> None:
     collect_all(conn, {"rss": FakeConnector([item("https://example.com/1")])}, logger)
     row = conn.execute("SELECT external_id FROM items").fetchone()
