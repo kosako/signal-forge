@@ -53,7 +53,13 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.analysis.llm import DEFAULT_TIMEOUT_S, LLMEngine, LLMError, complete_with_retry
+from app.analysis.llm import (
+    DEFAULT_TIMEOUT_S,
+    AnthropicApiEngine,
+    LLMEngine,
+    LLMError,
+    complete_with_retry,
+)
 from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.delivery.telegram import (
@@ -116,7 +122,9 @@ _REVIEW_KIND_LABELS = {
     "omission": "抜け",
 }
 _REVIEW_SEVERITY_MARKS = {"must": "🔴", "should": "🟡"}
-# ドラフトを予備の Claude が書いたので、レビューを省いた回の表示(GH#180。固定の文言)
+# レビュー役のエンジン(run.py / cli.py が create_anthropic_engine で作る Claude API)。ドラフトを
+# 同じエンジン(予備の Claude)が書いた回はレビューを省き、この文言を出す(GH#180。固定の文言)
+_REVIEWER_ENGINE = AnthropicApiEngine.name
 _SAME_FAMILY_NOTICE = "別の AI のレビューなし(下書きが予備の Claude のため)"
 
 # ツイート URL(リンクなし 🔖 の canonical)。本文非保持ポリシー(GH#2)の対象判定
@@ -833,8 +841,17 @@ def _review_and_revise(
     draft_engine はドラフトを実際に書いたエンジンの name。レビュー役と同じなら、同じ系統の
     点検は別の AI のレビューにならないので、呼ばずに省く(GH#180。費用も掛けない)。主は Codex、
     レビュー役は Claude API なので、同じになるのは Codex が失敗して予備の Claude が書いた回。
+    月の上限より先に見る(上限に達した月でも、予備が書いたことを出す)。
     """
     extra = {"run_id": run_id, "stage": "dig", "item_id": candidate.item_id}
+    if draft_engine == _REVIEWER_ENGINE:
+        logger.warning(
+            f"レビューを省略: ドラフトを書いたエンジン({draft_engine})がレビュー役と同じ"
+            "(予備の Claude が書いたため、別の AI のレビューにならない)"
+            f" item={candidate.item_id}",
+            extra=extra,
+        )
+        return draft, ReviewOutcome("skipped", same_family=True)
     cap = config.dig.review_monthly_cap_usd
     spent = _review_cost_this_month(conn)
     if spent >= cap:
@@ -847,14 +864,6 @@ def _review_and_revise(
     meter: _CostMeter | None = None
     try:
         meter = _CostMeter(review_engine_factory())
-        if meter.name == draft_engine:
-            logger.warning(
-                f"レビューを省略: ドラフトを書いたエンジン({draft_engine})がレビュー役と同じ"
-                "(予備の Claude が書いたため、別の AI のレビューにならない)"
-                f" item={candidate.item_id}",
-                extra=extra,
-            )
-            return draft, ReviewOutcome("skipped", same_family=True)
         prompt = build_review_prompt(config, candidate, draft)
         review = complete_with_retry(meter, prompt, DigReview, timeout_s=config.dig.timeout_s)
     except LLMError as e:

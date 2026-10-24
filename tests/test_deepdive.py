@@ -1489,9 +1489,20 @@ def fallback_factory(conn, config, monkeypatch, primary, fallback):
     )
 
 
-def test_draft_by_fallback_claude_skips_review(conn, config, monkeypatch) -> None:
+@pytest.mark.parametrize("over_cap", [False, True])
+def test_draft_by_fallback_claude_skips_review(conn, config, monkeypatch, over_cap) -> None:
     # Codex が失敗して予備の Claude がドラフトを書いた回は、Claude のレビューは別の AI の
-    # レビューにならない。呼ばずに省き(費用も掛けない)、ノートとカードに出す
+    # レビューにならない。呼ばずに省き(費用も掛けない)、ノートとカードに出す。月の上限に
+    # 達していても、予備が書いたことを出す
+    if over_cap:
+        other = add_item(conn, "https://blog.example/old", language="ja")
+        conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, published_at, message_id,"
+            " review_status, review_cost_usd, created_at) VALUES (?, 'n', 'c', 'x', 1,"
+            " 'clean', 9.5, ?)",
+            (other, utc_stamp(month_start_utc())),
+        )
+        config = replace(config, dig=replace(config.dig, review_monthly_cap_usd=9.5))
     primary, writer = DownCodex(), ClaudeWriter()
     review = ReviewEngine([finding()])
     factory = fallback_factory(conn, config, monkeypatch, primary, writer)
