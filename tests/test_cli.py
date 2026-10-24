@@ -67,6 +67,22 @@ def test_answer_exits_quietly_while_another_runs(tmp_path) -> None:
     assert not (tmp_path / "intel.db").exists()
 
 
+def test_dig_exits_quietly_while_another_digs(tmp_path, monkeypatch) -> None:
+    # 朝バッチの dig 段が進めている間の intel dig は、同じ候補を 2 度掘らずに理由を出して終わる
+    # (GH#196)
+    import fcntl
+
+    from app import logs
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    with (tmp_path / "intel.db.dig.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = runner.invoke(app, ["dig", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "深掘りを進めているため、何もしなかった" in result.output
+
+
 def _unsent_take(tmp_path, monkeypatch) -> Path:
     """返事が未送信の take が 1 件ある DB と vault を用意し、vault の置き場を返す。"""
     from app import logs

@@ -360,6 +360,12 @@ poller が起動する `intel answer` は codex を使う。poller.plist の PAT
   「別の実行のノートの公開が終わっていない」の ERROR は、vault が止まった実行(朝バッチなど)が
   まだ残っているときに出る。その実行が終わってから(`pgrep -fl 'intel (run|dig)'` で確かめる)
   `intel dig` をやり直す。
+- 朝の深掘りの実行は 1 つずつ(DB の隣の `intel.db.dig.lock`。GH#196): `intel run` の dig 段と
+  `intel dig` が重なると、後から来た方は待たずに何もしないで終わる(同じ候補を 2 度掘らない)。
+  `morning.log` に「別の実行(朝バッチか intel dig)が調査段を進めている」の WARNING が出る。朝バッチは
+  dig 段を失敗にせず purge・backup へ進み、`intel dig` は同じ旨を表示して終わる。カードは先の実行が送る。
+  先の実行が終わってもカードが届かなければ(`pgrep -fl 'intel (run|dig)'` で終わったことを確かめる)、
+  `intel dig` をやり直す。
 
 ## 12. ソースの見直し(GH#150・設計 02 §3)
 

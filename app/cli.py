@@ -192,7 +192,7 @@ def dig(
         typer.echo("[dig].daily_cap = 0(調査段は無効)")
         raise typer.Exit(code=0)
     api = create_api(env) if is_telegram_configured(config, env) else None
-    run_dig_stage(
+    ran = run_dig_stage(
         conn,
         config,
         fallback_engine_factory(conn, config, env, logger, stage="dig"),  # GH#156
@@ -204,6 +204,9 @@ def dig(
             else None
         ),
     )
+    if not ran:  # 同じ候補を 2 度掘らない(GH#196)。先の実行が終われば届く
+        typer.echo("別の実行(朝バッチか intel dig)が深掘りを進めているため、何もしなかった")
+        return
     typer.echo("dig 完了(生成・送信の内訳はログ参照)")
 
 

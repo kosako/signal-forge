@@ -192,7 +192,8 @@ def _dig(
     """dig 段(GH#105)。エンジンは effort 可変で生成する(解説 = config / 対訳 = low)。
 
     Telegram 未設定でもノート生成は行い、カードは台帳(dig_results)に未送信で残す
-    (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。
+    (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。別の実行(手動の `intel dig`
+    など)が調査段を進めていれば、待たずに何もしないで後続の段へ進む(段の失敗にしない。GH#196)。
     """
     from app.analysis.llm import create_anthropic_engine
     from app.deepdive import run_dig_stage

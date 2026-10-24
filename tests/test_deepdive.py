@@ -877,6 +877,70 @@ def test_write_started_after_timeout_is_skipped(conn, config, monkeypatch) -> No
     assert api.sent == [(10, "カード")]
 
 
+@pytest.mark.parametrize("hold_at", ["generate", "send"])
+def test_overlapping_runs_dig_each_candidate_once(conn, config, tmp_path, hold_at) -> None:
+    # 朝バッチの dig 段と intel dig が重なっても、同じ候補を 2 度生成せず、カードも 2 度送らない。
+    # 後から来た方は待たずに何もしない(GH#196)。先の実行を生成中・カードの送信中で止めて重ねる
+    item = add_item(conn, "https://ja.example/記事", title="日本語の記事", language="ja")
+    enqueue(conn, item)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold(point: str) -> None:
+        if point == hold_at and not held.is_set():
+            held.set()
+            release.wait(30)
+
+    class HoldingEngine(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            hold("generate")
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    class HoldingApi(FakeApi):
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
+            hold("send")
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    first_engines: dict[str, ScriptedEngine] = {}
+    first_api = HoldingApi()
+    first_outcome: list[object] = []
+
+    def first_run() -> None:
+        first_conn = connect(tmp_path / "intel.db")  # 別の実行 = 同じ DB への別の接続
+        try:
+            first_outcome.append(
+                run_dig_stage(
+                    first_conn, config,
+                    lambda effort: first_engines.setdefault(effort, HoldingEngine()),
+                    first_api, logger, today="2026-07-22",
+                )
+            )
+        except BaseException as e:
+            first_outcome.append(e)
+        finally:
+            first_conn.close()
+
+    first = threading.Thread(target=first_run)
+    first.start()
+    second_engines: dict[str, ScriptedEngine] = {}
+    second_api = FakeApi()
+    try:
+        assert held.wait(5)
+        second = run_dig_stage(
+            conn, config, make_factory(second_engines), second_api, logger, today="2026-07-22"
+        )
+    finally:
+        release.set()
+        first.join(10)
+    assert not first.is_alive() and first_outcome == [True]
+    assert second is False
+    assert second_engines == {} and second_api.sent == []  # LLM も送信も触れない
+    rows = conn.execute("SELECT item_id, message_id FROM dig_results").fetchall()
+    assert [(row["item_id"], row["message_id"]) for row in rows] == [(item, 901)]
+    assert len(first_api.sent) == 1
+    assert len(list(deepdive_dir(config).glob("*-深掘り.md"))) == 1
+
+
 def test_requeue_during_generation_is_preserved(conn, config) -> None:
     # 生成中(分オーダー)に poller が再指定 → 無条件 done で消さない(Codex P1)
     item = add_item(conn, "https://blog.example/post", language="ja")
