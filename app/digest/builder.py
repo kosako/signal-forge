@@ -5,6 +5,9 @@
 - degraded: 当日候補(当日に分析された候補)の分析が LLM 全滅(全件 degraded)のとき、
   当日候補をタイトルのみで最大 max_items 件(min_score は適用しない — 無配信より劣化配信。
   設計 00 §6)。閾値に届かず analyzed のまま残る過去の記事は判定にも劣化配信にも入れない(GH#175)
+- 障害の空(GH#191): 分析の段が失敗した日(hold_if_empty)に載せる記事が無ければ(ランキングも
+  劣化配信も 0 件)、「該当なし」として確定せず DigestHeldError を送出する(行を作らない)。確定すると
+  復旧後の同じ日の再実行が skip し、回復した分析の結果が届かないため
 """
 
 from __future__ import annotations
@@ -22,6 +25,14 @@ from app.ranking import RankedItem, digest_candidates, rank_for_digest
 BOOKMARK_SECTION_MAX = 10
 
 
+class DigestHeldError(RuntimeError):
+    """分析の段が失敗した日に載せる記事が無かった(GH#191)。障害の空なので digest を確定しない。
+
+    送出の前に同じトランザクションを ROLLBACK する(--force の旧採用 item の復帰も戻り、
+    既存の digest はそのまま残る)。
+    """
+
+
 def generate_digest(
     conn: sqlite3.Connection,
     config: Config,
@@ -30,10 +41,12 @@ def generate_digest(
     run_id: str | None = None,
     force: bool = False,
     trend_markdown: str | None = None,
+    hold_if_empty: bool = False,
 ) -> int | None:
     """当日ダイジェストを生成し digests.id を返す(skip 時は None)。
 
     trend_markdown: 「今日のトレンド」節(GH#75)。付加機能なので None 可(節を省く)。
+    hold_if_empty: 分析の段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
     """
     digest_date = today_jst()
     # 置換の準備(旧採用 item の復帰)から新 digest 確定までを同一トランザクションで行う。
@@ -79,6 +92,12 @@ def generate_digest(
             degraded_digest = bool(ranked)
             if not degraded_digest:
                 ranked = rank_for_digest(conn, config)
+            if hold_if_empty and not ranked:
+                # 分析の障害の空を「該当なし」として確定しない(GH#191)。下の except が
+                # ROLLBACK して送出する(--force の旧採用 item の復帰も戻す)
+                raise DigestHeldError(
+                    "analyze 段の失敗で載せる記事が無いため、当日の digest を確定しない"
+                )
 
             # 🔖 保存節(GH#99): ランキング外の must-include 別枠。台帳(bookmark_item_ids)
             # 未掲載のブックマーク item を保存順(新しい順)で全件載せる。リンク列で

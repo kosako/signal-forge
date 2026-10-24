@@ -255,3 +255,25 @@ def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert len(calls) == 1 and calls[0]
+
+
+@pytest.mark.parametrize("digest_held", [True, False])
+def test_run_failure_notice_tells_whether_digest_was_held(
+    tmp_path, monkeypatch, digest_held
+) -> None:
+    # digest 段が保留した事実(run_pipeline の戻り値)を失敗通知へ渡す(GH#191)
+    from app import delivery, logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    failures = run.RunFailures(["analyze"])
+    failures.digest_held = digest_held
+    passed: list[bool] = []
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
+    monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
+    monkeypatch.setattr(
+        delivery, "notify_run_failure", lambda *args, digest_held: passed.append(digest_held)
+    )
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert passed == [digest_held]
