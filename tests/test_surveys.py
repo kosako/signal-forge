@@ -11,6 +11,7 @@ import pytest
 from app.config import Config, TelegramConfig, XConfig
 from app.db import apply_migrations, connect
 from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poller
+from app.delivery.poller import TIMER_RETRY_S
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     STATE_RUN_FAILURE_NOTIFIED,
@@ -21,7 +22,7 @@ from app.delivery.surveys import (
 from app.delivery.telegram import DeliveryError
 from app.jst import JST, today_jst
 from tests.test_delivery import add_digest, add_item
-from tests.test_poller import CHAT_ID, FakeApi, make_callback_update, make_config
+from tests.test_poller import CHAT_ID, FakeApi, FakeWorker, make_callback_update, make_config
 
 logger = logging.getLogger("test-surveys")
 
@@ -445,7 +446,7 @@ def test_watchdog_keeps_one_line_per_source(conn, tmp_path) -> None:
 
 
 def test_watchdog_message_stays_within_telegram_limit(conn, tmp_path) -> None:
-    # 4096 字を超えると送信が毎周期失敗し、同じ周期の getUpdates まで止まる
+    # 4096 字を超えると試し直すたびに送信が失敗し、watchdog が届かない
     silence_watchdog(conn)
     for i in range(40):
         add_source(conn, "x", f"x:{i}-" + "n" * 100, 3, error="e" * 300)
@@ -746,6 +747,91 @@ def test_run_poller_fires_timers_each_cycle(conn, tmp_path) -> None:
     )
     assert [t for _, t in api.sent if "巡回した?" in t]  # タイマー経由で送信された
     assert api.sent[0][0] == CHAT_ID
+
+
+class SendFailingApi(FakeApi):
+    """送信だけが失敗する FakeApi(通知先 chat の誤りなど。GH#224)。fail_first 回まで失敗し、
+    以降は送れる(None なら失敗し続ける)。送信を試みた周期を cycle() で記録する。"""
+
+    def __init__(self, batches=None, *, cycle, fail_first: int | None = None):
+        super().__init__(batches)
+        self._cycle = cycle
+        self._fail_first = fail_first
+        self.attempt_cycles: list[int] = []
+
+    def send_message(self, chat_id, text, *, reply_markup=None):
+        self.attempt_cycles.append(self._cycle())
+        if self._fail_first is None or len(self.attempt_cycles) <= self._fail_first:
+            raise DeliveryError("HTTP 400: chat not found")
+        return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+
+# 日付を固定する(実際の日付を取り直すと、日付の変わり目で翌日分の watchdog が動いて揺れる)
+WATCHDOG_DUE = datetime(2026, 10, 20, 7, 15, tzinfo=JST)
+
+
+def add_undelivered_digest(conn, item_ids: list[int], day: datetime) -> None:
+    """day の未配信の digest(その日の watchdog が通知を試みる)。"""
+    digest_id = add_digest(conn, item_ids)
+    conn.execute(
+        "UPDATE digests SET digest_date = ? WHERE id = ?", (day.strftime("%Y-%m-%d"), digest_id)
+    )
+
+
+def test_run_poller_keeps_receiving_while_notification_keeps_failing(conn, tmp_path) -> None:
+    # GH#224: 内蔵タイマーの送信が失敗し続けても、同じ周期の getUpdates を飛ばさない
+    # (以前は同じ try の中で受信まで飛ばし、30s 待ってまた送信からやり直していた)
+    item_id = add_item(conn, "https://a/1")
+    add_undelivered_digest(conn, [item_id], WATCHDOG_DUE)
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    api = SendFailingApi(
+        [[make_callback_update(item_id, "up")], []], cycle=lambda: calls["n"]
+    )
+    sleeps: list[float] = []
+    run_poller(
+        conn, make_config(tmp_path), api, logger,
+        sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
+        now_fn=lambda: WATCHDOG_DUE,
+        clock=lambda: calls["n"] * TIMER_RETRY_S,  # 毎周期、再試行の間隔が過ぎている
+    )
+
+    assert api.attempt_cycles == [1, 2, 3]  # 毎周期の通知は失敗した
+    assert len(api.offsets) == 3  # それでも毎周期 getUpdates を呼んだ
+    assert api.answered == [("cb1", "👍 記録しました")]  # ボタン操作を受け取って応答した
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == 1
+    assert sleeps == []  # 受信は失敗していないので、再接続の待ちも無い
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) is None  # 届くまで枠を消費しない
+
+
+def test_run_poller_retries_failed_notification_at_own_interval(conn, tmp_path) -> None:
+    # GH#224: 失敗した通知は受信の周期ごとではなく、失敗から TIMER_RETRY_S 経ってから試し直す
+    # (受信が続く間に、送れない通知で Telegram を毎周期叩かない)。届いたら枠を消費する
+    add_undelivered_digest(conn, [], WATCHDOG_DUE)
+    elapsed = [0, 60, TIMER_RETRY_S - 1, TIMER_RETRY_S, TIMER_RETRY_S + 60]  # 周期ごとの clock
+    cycle = {"i": -1}
+
+    def should_stop() -> bool:
+        cycle["i"] += 1
+        return cycle["i"] >= len(elapsed)
+
+    api = SendFailingApi(cycle=lambda: cycle["i"], fail_first=1)
+    sleeps: list[float] = []
+    run_poller(
+        conn, make_config(tmp_path), api, logger,
+        sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
+        now_fn=lambda: WATCHDOG_DUE, clock=lambda: elapsed[cycle["i"]],
+    )
+
+    assert api.attempt_cycles == [0, 3]  # 失敗した周期と、間隔が過ぎた周期だけ試した
+    assert len(api.offsets) == len(elapsed)  # 受信は毎周期
+    assert sleeps == []
+    assert len(api.sent) == 1 and "⚠️ watchdog" in api.sent[0][1]
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) == "2026-10-20"
 
 
 def test_dig_backlog_includes_x_bookmarks(conn, tmp_path) -> None:

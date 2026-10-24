@@ -57,6 +57,9 @@ RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
 # 受信の内容を DB の一時的な失敗(ロック競合)で保存できなかった同じ update を、やり直す回数
 # (初回 + やり直し 3 回。設計 05 §8 の Telegram 送信のリトライ回数に揃える。GH#181)
 TRANSIENT_RETRIES = 3
+# 内蔵タイマーが失敗した後、次に試すまでの間隔(設計 05 §8。GH#224)。受信の周期とは別に数え、
+# 送れない通知で Telegram を毎周期叩かない
+TIMER_RETRY_S = 300
 
 # callback_data の code → signals.value(設計 04 §3 / 01 §7)
 _REACTION_VALUES = {"up": "useful", "dig": "dig", "knw": "known", "no": "noise"}
@@ -76,12 +79,15 @@ def run_poller(
     should_stop: Callable[[], bool] = lambda: False,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
     answer_worker: AnswerWorker | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """常駐ループ。失敗は即時再接続、連続失敗は30s間隔(設計 05 §8)。
 
     各周期で内蔵タイマー(夜アンケート・watchdog。設計 05 §1.2)→ getUpdates の順に
     実行する。long poll は最大50sブロックするため、タイマーの発火粒度は約1分。
-    プロセス生存は launchd KeepAlive の責務。should_stop / now_fn はテスト用の注入点。
+    タイマーが失敗しても同じ周期の getUpdates は止めず、タイマーは TIMER_RETRY_S 後に
+    試し直す(GH#224)。プロセス生存は launchd KeepAlive の責務。should_stop / now_fn /
+    clock はテスト用の注入点。
     """
     if config.telegram.owner_user_id is None:
         raise DeliveryError("config.toml の [telegram].owner_user_id が未設定(設計 04 §6)")
@@ -93,12 +99,16 @@ def run_poller(
     logger.info("poller 起動", extra={"stage": "poll"})
     # 一時的な失敗で再処理を待つ update の、続けて失敗した回数(周期をまたいで持つ。GH#181)
     transient_failures: dict[int, int] = {}
+    # 内蔵タイマーが最後に失敗した時刻(clock の値。成功したら None。GH#224)
+    timer_failed_at: float | None = None
     while not should_stop():
         try:
             # 質問への返事の取りこぼしを拾う(GH#126)。受信やタイマーが失敗する周期でも
             # 終わった子の回収と起動し直しを止めないよう、周期の最初に行う
             answer_worker.sweep(conn, logger)
-            run_due_timers(conn, config, api, logger, now_fn())
+            if timer_failed_at is None or clock() - timer_failed_at >= TIMER_RETRY_S:
+                timer_ok = _run_timers(conn, config, api, logger, now_fn())
+                timer_failed_at = None if timer_ok else clock()
             poll_once(
                 conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker,
                 transient_failures=transient_failures,
@@ -118,6 +128,38 @@ def run_poller(
                 raise
             logger.error(f"DB ロック競合(30s 後に再開): {e}", extra={"stage": "poll"})
             sleep(RECONNECT_BACKOFF_S)
+
+
+def _run_timers(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    now: datetime,
+) -> bool:
+    """内蔵タイマーを実行し、成功したかを返す(GH#224)。
+
+    送信の失敗と DB のロック競合はここで受け止め、同じ周期の受信(getUpdates)を止めない
+    (通知先 chat の誤りなどで送信だけが失敗し続けても、ボタン操作や URL 投入を受け取る)。
+    通知系は送れてから state を立てるので、呼び出し側が TIMER_RETRY_S 後に試し直す。
+    恒久的な DB エラーは握らず投げる(run_poller が落とす)。
+    """
+    try:
+        run_due_timers(conn, config, api, logger, now)
+    except DeliveryError as e:
+        logger.error(
+            f"内蔵タイマーの送信失敗({TIMER_RETRY_S}s 後に再試行): {e}", extra={"stage": "poll"}
+        )
+        return False
+    except sqlite3.OperationalError as e:
+        if not _is_transient_db_error(e):
+            raise
+        logger.error(
+            f"内蔵タイマーの DB ロック競合({TIMER_RETRY_S}s 後に再試行): {e}",
+            extra={"stage": "poll"},
+        )
+        return False
+    return True
 
 
 def poll_once(
