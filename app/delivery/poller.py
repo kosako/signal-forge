@@ -68,13 +68,19 @@ _REACTION_EMOJI = {"up": "👍", "dig": "🔖", "knw": "✅", "no": "👎"}
 
 _URL_RE = re.compile(r"https?://\S+")
 # URL の抜き出し(設計 04 §5。GH#227)。URL を終える文字 = URL に生のまま現れない `<>"` と、
-# 全角の句読点・括弧・引用符。URL の直後に空白なしで続けた文(「（https://…）を読む」)を含めない
-_URL_STOP_CHARS = frozenset('<>"、。，．！？：；…（）［］｛｝「」『』【】〔〕〈〉《》“”‘’')
+# 全角の句読点・引用符。URL の直後に空白なしで続けた文(「https://…、あとで読む」)を含めない
+_URL_STOP_CHARS = frozenset('<>"、。，．！？：；…“”‘’')
 # URL の末尾から外す ASCII の句読点(文の区切り。URL の途中にあるものは外さない)
 _URL_TRAILING_PUNCT = ".,;:!?'"
-# ASCII の閉じ括弧 → 開き括弧。対になっていない閉じ括弧の手前で URL を終える(Wikipedia の
-# `Foo_(bar)` のような URL の中の対になった括弧は残す)
-_URL_BRACKETS = {")": "(", "]": "[", "}": "{"}
+# 閉じ括弧 → 開き括弧(ASCII と全角)。対になっていない閉じ括弧の手前で URL を終える
+# (「（https://…）を読む」)。Wikipedia の `Foo_(bar)` のような URL の中の対になった括弧は残す
+_URL_BRACKETS = {
+    ")": "(", "]": "[", "}": "{",
+    "）": "（", "］": "［", "｝": "｛", "」": "「", "』": "『",
+    "】": "【", "〕": "〔", "〉": "〈", "》": "《",
+}
+# scheme の後ろの authority(最初の `/` `?` `#` まで)。`@` を含めば userinfo 付き
+_URL_AUTHORITY_RE = re.compile(r"https?://([^/?#]*)")
 NO_URL_GUIDE = "URL を送ると翌朝のダイジェスト候補になります"
 
 
@@ -737,16 +743,15 @@ def _entity_urls(text: str, entities: object) -> list[str]:
     encoded = text.encode("utf-16-le", "surrogatepass")
     urls: list[str] = []
     for entity in entities:
-        if not isinstance(entity, dict):
+        if not isinstance(entity, dict) or entity.get("type") not in ("url", "text_link"):
             continue
-        if entity.get("type") == "text_link":
-            url = entity.get("url")
-        elif entity.get("type") == "url":
-            span = _utf16_span(encoded, entity.get("offset"), entity.get("length"))
-            # Telegram の範囲が全角の句読点・括弧まで含む場合に備え、平文と同じ規則で整える
-            url = _trim_url(span) if span is not None else None
-        else:
+        # 範囲が本文の外を指す・surrogate pair の途中で切れる entity は使わない
+        span = _utf16_span(encoded, entity.get("offset"), entity.get("length"))
+        if span is None:
             continue
+        # text_link は文字列に付けたリンクの url をそのまま使う。url は本文の範囲を、Telegram の
+        # 範囲が全角の句読点・括弧まで含む場合に備えて平文と同じ規則で整える
+        url = entity.get("url") if entity["type"] == "text_link" else _trim_url(span)
         if isinstance(url, str) and _URL_RE.fullmatch(url):
             urls.append(url)
     return urls
@@ -767,10 +772,15 @@ def _utf16_span(encoded: bytes, offset: object, length: object) -> str | None:
 def _trim_url(candidate: str) -> str:
     """URL の候補から、URL の後ろに続けて書いた文字を外す(GH#227)。
 
-    URL を終える文字(_URL_STOP_CHARS)か、対になっていない ASCII の閉じ括弧の手前で切り、
-    末尾の ASCII の句読点を外す。URL の中の対になった括弧は残す。正規化(normalize_url)の
-    規則は変えない。
+    URL を終える文字(_URL_STOP_CHARS)か、対になっていない閉じ括弧の手前で切り、末尾の
+    ASCII の句読点を外す。URL の中の対になった括弧は残す。正規化(normalize_url)の規則は
+    変えない。
     """
+    authority = _URL_AUTHORITY_RE.match(candidate)
+    if authority is not None and "@" in authority.group(1):
+        # userinfo 付きの URL は切らずに渡し、正規化で拒否させる(`https://a:1)@host` を `)` で
+        # 切ると、資格情報の一部が host・port として通ってしまう)
+        return candidate
     depth = dict.fromkeys(_URL_BRACKETS.values(), 0)
     end = len(candidate)
     for i, ch in enumerate(candidate):

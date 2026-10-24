@@ -351,6 +351,9 @@ def test_url_message_ingested_and_acked(conn, tmp_path) -> None:
         # URL の中の対になった括弧は残し、対になっていない閉じ括弧と句点だけを外す
         ("https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"),
         ("(https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+        # 全角の括弧も同じ
+        ("https://example.com/記事（補足）/詳細", "https://example.com/記事（補足）/詳細"),
+        ("（https://example.com/記事（補足））", "https://example.com/記事（補足）"),
     ],
 )
 def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
@@ -381,6 +384,12 @@ def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
             [{"type": "url", "offset": 1, "length": 28}],
             ["https://example.com/article"],
         ),
+        # URL の中の対になった全角の括弧は残す
+        (
+            "https://example.com/記事（補足）/詳細",
+            [{"type": "url", "offset": 0, "length": 29}],
+            ["https://example.com/記事（補足）/詳細"],
+        ),
         # 文字列に付けたリンク(text_link)は、その url を投入する
         (
             "この記事",
@@ -396,6 +405,12 @@ def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
                 {"type": "url", "offset": 99, "length": 5},  # 本文の外を指す
             ],
             ["https://example.com/article"],
+        ),
+        # 範囲が本文の外を指す text_link は使わない
+        (
+            "https://example.com/real",
+            [{"type": "text_link", "offset": 999, "length": 4, "url": "https://example.com/other"}],
+            ["https://example.com/real"],
         ),
     ],
 )
@@ -472,6 +487,8 @@ def test_message_without_url_gets_guide(conn, tmp_path, no_url_text) -> None:
         "https://alice:secret@example.com/a",  # userinfo(credential 漏えい防止で reject)
         "https://example.com:99999/a",  # 不正ポート
         "https://?x=1",  # host なし
+        # userinfo 付きは括弧で切らない(切ると資格情報の一部が host・port として通る。GH#227)
+        "https://alice:123)@example.com/a",
     ],
 )
 def test_invalid_urls_rejected_with_reply(conn, tmp_path, invalid_url) -> None:
