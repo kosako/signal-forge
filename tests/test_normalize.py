@@ -33,6 +33,21 @@ def test_invalid_port_rejected_as_url_error() -> None:
         normalize_url("https://example.com:bad/a")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::1",  # IPv6 の括弧が閉じていない
+        "https://example.com]/a",  # 括弧の不整合
+        "http://[abc]/x",  # 括弧の中が IP でない
+        "https://ex\uff03ample.com/a",  # NFKC で不正になる netloc
+    ],
+)
+def test_unsplittable_url_rejected_as_url_error(url) -> None:
+    # urlsplit の ValueError を UrlError 系にそろえる(collect がアイテムごとに隔離できる。GH#186)
+    with pytest.raises(InvalidUrlError, match="分解できない"):
+        normalize_url(url)
+
+
 def test_lowercases_scheme_and_host_only() -> None:
     assert normalize_url("HTTPS://Example.COM/Path/File") == "https://example.com/Path/File"
 
@@ -99,6 +114,21 @@ def test_non_short_host_not_resolved() -> None:
 def test_short_url_resolving_to_bad_scheme_rejected() -> None:
     with pytest.raises(UnsupportedSchemeError):
         normalize_url("https://t.co/x", resolve_short=lambda _: "javascript:alert(1)")
+
+
+def test_short_url_resolving_to_unsplittable_url_rejected() -> None:
+    # 解決先も入力 URL と同じく分解の失敗を UrlError 系にそろえる(GH#186)
+    with pytest.raises(InvalidUrlError, match="短縮 URL の解決先を分解できない"):
+        normalize_url("https://t.co/x", resolve_short=lambda _: "https://[::1/a")
+
+
+def test_short_url_resolver_value_error_rejected() -> None:
+    # 解決の途中(転送先の Location 等)の分解の失敗も UrlError 系にする(GH#186)
+    def resolver(url: str) -> str:
+        raise ValueError("Invalid IPv6 URL")
+
+    with pytest.raises(InvalidUrlError, match="短縮 URL の解決先を分解できない"):
+        normalize_url("https://t.co/x", resolve_short=resolver)
 
 
 # --- content_hash (h1) ---
