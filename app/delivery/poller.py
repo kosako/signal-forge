@@ -70,7 +70,8 @@ _URL_RE = re.compile(r"https?://\S+")
 # URL の抜き出し(設計 04 §5。GH#227)。URL を終える文字 = URL に生のまま現れない `<>"` と、
 # 全角の句読点・引用符。URL の直後に空白なしで続けた文(「https://…、あとで読む」)を含めない
 _URL_STOP_CHARS = frozenset('<>"、。，．！？：；…“”‘’')
-# URL の末尾から外す ASCII の句読点(文の区切り。URL の途中にあるものは外さない)
+# 平文の URL の末尾から外す ASCII の句読点(文の区切り。URL の途中にあるものは外さない。
+# url entity の範囲には当てない)
 _URL_TRAILING_PUNCT = ".,;:!?'"
 # 閉じ括弧 → 開き括弧(ASCII と全角)。対になっていない閉じ括弧の手前で URL を終える
 # (「（https://…）を読む」)。Wikipedia の `Foo_(bar)` のような URL の中の対になった括弧は残す
@@ -750,8 +751,13 @@ def _entity_urls(text: str, entities: object) -> list[str]:
         if span is None:
             continue
         # text_link は文字列に付けたリンクの url をそのまま使う。url は本文の範囲を、Telegram の
-        # 範囲が全角の句読点・括弧まで含む場合に備えて平文と同じ規則で整える
-        url = entity.get("url") if entity["type"] == "text_link" else _trim_url(span)
+        # 範囲が全角の句読点・括弧まで含む場合に備えて、URL を終える文字と対になっていない閉じ
+        # 括弧の手前で切る。末尾の ASCII の句読点は、Telegram が URL の一部として範囲に含めた
+        # 文字なので外さない(`https://example.com/report!` の `!`)
+        if entity["type"] == "text_link":
+            url = entity.get("url")
+        else:
+            url = _trim_url(span, strip_trailing_punct=False)
         if isinstance(url, str) and _URL_RE.fullmatch(url):
             urls.append(url)
     return urls
@@ -759,7 +765,7 @@ def _entity_urls(text: str, entities: object) -> list[str]:
 
 def _utf16_span(encoded: bytes, offset: object, length: object) -> str | None:
     """UTF-16LE に直した本文から entity の範囲を取り出す。範囲が不正なら None。"""
-    if not isinstance(offset, int) or not isinstance(length, int):
+    if type(offset) is not int or type(length) is not int:  # bool は int の派生型のため除く
         return None
     if offset < 0 or length <= 0 or (offset + length) * 2 > len(encoded):
         return None
@@ -769,12 +775,12 @@ def _utf16_span(encoded: bytes, offset: object, length: object) -> str | None:
         return None
 
 
-def _trim_url(candidate: str) -> str:
+def _trim_url(candidate: str, *, strip_trailing_punct: bool = True) -> str:
     """URL の候補から、URL の後ろに続けて書いた文字を外す(GH#227)。
 
-    URL を終える文字(_URL_STOP_CHARS)か、対になっていない閉じ括弧の手前で切り、末尾の
-    ASCII の句読点を外す。URL の中の対になった括弧は残す。正規化(normalize_url)の規則は
-    変えない。
+    URL を終える文字(_URL_STOP_CHARS)か、対になっていない閉じ括弧の手前で切り、
+    strip_trailing_punct なら(平文の解析)末尾の ASCII の句読点を外す。URL の中の対になった
+    括弧は残す。正規化(normalize_url)の規則は変えない。
     """
     authority = _URL_AUTHORITY_RE.match(candidate)
     if authority is not None and "@" in authority.group(1):
@@ -795,7 +801,8 @@ def _trim_url(candidate: str) -> str:
                 end = i
                 break
             depth[opener] -= 1
-    return candidate[:end].rstrip(_URL_TRAILING_PUNCT)
+    trimmed = candidate[:end]
+    return trimmed.rstrip(_URL_TRAILING_PUNCT) if strip_trailing_punct else trimmed
 
 
 def _ingest_manual_urls(

@@ -348,6 +348,8 @@ def test_url_message_ingested_and_acked(conn, tmp_path) -> None:
         ("https://example.com/article、あとで読む", "https://example.com/article"),  # 読点の後に文
         ("Read this (https://example.com/article).", "https://example.com/article"),
         ("Is it https://example.com/article?", "https://example.com/article"),
+        # 平文では末尾の `!` を文の区切りとして外す(url entity の範囲なら残す)
+        ("https://example.com/report!", "https://example.com/report"),
         # URL の中の対になった括弧は残し、対になっていない閉じ括弧と句点だけを外す
         ("https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"),
         ("(https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)"),
@@ -390,6 +392,12 @@ def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
             [{"type": "url", "offset": 0, "length": 29}],
             ["https://example.com/記事（補足）/詳細"],
         ),
+        # Telegram が範囲に含めた末尾の ASCII の句読点は URL の一部として残す(平文の規則を当てない)
+        (
+            "https://example.com/report!",
+            [{"type": "url", "offset": 0, "length": 27}],
+            ["https://example.com/report!"],
+        ),
         # 文字列に付けたリンク(text_link)は、その url を投入する
         (
             "この記事",
@@ -410,6 +418,17 @@ def test_plain_text_url_excludes_trailing_punctuation_and_unpaired_brackets(
         (
             "https://example.com/real",
             [{"type": "text_link", "offset": 999, "length": 4, "url": "https://example.com/other"}],
+            ["https://example.com/real"],
+        ),
+        # offset・length が bool の text_link は使わない(bool は int の派生型だが不正な範囲)
+        (
+            "https://example.com/real",
+            [{"type": "text_link", "offset": False, "length": 4, "url": "https://example.com/other"}],
+            ["https://example.com/real"],
+        ),
+        (
+            "https://example.com/real",
+            [{"type": "text_link", "offset": 0, "length": True, "url": "https://example.com/other"}],
             ["https://example.com/real"],
         ),
     ],
