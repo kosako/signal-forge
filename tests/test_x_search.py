@@ -404,6 +404,26 @@ def test_reads_used_today_splits_only_remaining_budget() -> None:
     assert result.next_cursor == {"since_id": "100"}
 
 
+def test_slot_left_below_min_page_by_remaining_budget_keeps_cursor() -> None:
+    # GH#178: 残り 29 → 10/10/9。最後のスロットは下限 10 に届かず要求しない。先の 2 スロットが
+    # 取れても完走ではないので watermark は据え置く(進めると、要求しなかったスロットのその日
+    # ぶんが watermark の背後に隠れて恒久欠落する)
+    seen: list[httpx.Request] = []
+    pages = {
+        "a": [(200, page([tweet(str(500 - i)) for i in range(10)]), {})],
+        "b": [(200, page([tweet(str(700 - i)) for i in range(10)]), {})],
+        "c": [(200, page([tweet(str(900 - i)) for i in range(10)]), {})],
+    }
+    result = connector_from(
+        pages, slots=("a", "b", "c"), daily_read_cap=35, reads_used_today=6, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 20
+    queries = [parse_qs(urlsplit(str(r.url)).query)["query"][0] for r in seen]
+    assert queries == [f"(a) {X_SEARCH_QUERY_SUFFIX}", f"(b) {X_SEARCH_QUERY_SUFFIX}"]
+    assert result.partial_error is None  # 予算による打ち切りは失敗にしない
+    assert result.next_cursor == {"since_id": "100"}
+
+
 def test_all_requests_share_end_time_before_run_start() -> None:
     # GH#184: 全スロット・全ページで同じ end_time(実行の開始の 30 秒前。API は要求の時刻より
     # 10 秒以上前に限る。値は実装の定数とは独立に書く)

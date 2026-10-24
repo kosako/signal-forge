@@ -21,9 +21,9 @@
 - 予算: [x_signals].daily_read_cap(既定 0 = 無効)。読取 = 取得ツイート数で
   collect と同じ意味論。途中失敗でも取得済みページぶんは必ず予算・台帳に計上する。
   上限は JST の暦日の上限で、同じ日の実行で共有する: 台帳(x_signal_runs.api_reads)の
-  当日の合計を引いた残りだけを読む(GH#178。朝バッチの再走・単独の intel x-signals で
-  上限を超えない)。backfill は日次の上限の外なので台帳を見ないが、その読取は台帳に入り、
-  同じ日の通常の取込の残りを減らす
+  通常の取込の当日の合計を引いた残りだけを読む(GH#178。朝バッチの再走・単独の
+  intel x-signals で上限を超えない)。backfill は日次の上限の外の別枠: 台帳を見ずに読み、
+  その行は backfill = 1 で記録して通常の取込の使用量に数えない(費用の集計には入る)
   差分取得の各 kind の 1 ページ目は最小ページにし、既知到達なら残りを次の kind に
   残す(既知の読み直しで予算を使い切り like / self_rt が毎日 skip されない。GH#174)
   cold start は日次 run でなく intel x-signals --backfill の手動実行(課金操作は
@@ -104,7 +104,8 @@ def collect_x_signals(
     代わりに **kind ごと**の読取上限として適用する(最悪コスト = 3 × limit × 単価)。
     kinds で対象 kind を限定できる(既定 = 全種。過去ブックマークの再読取 backfill 等、
     コストを 1 kind に絞る用途。GH#99)。
-    通常の取込の日次 cap は同じ日(JST)の実行で共有する(GH#178)。backfill は台帳を見ない。
+    通常の取込の日次 cap は同じ日(JST)の実行で共有する(GH#178)。backfill は台帳を見ず、
+    その行は backfill = 1 で記録して通常の取込の使用量に数えない(別枠)。
     """
     backfill = backfill_limit is not None
     # 同じ日の実行がすでに読んだぶん(GH#178)。backfill は日次 cap の外なので数えない
@@ -153,7 +154,7 @@ def collect_x_signals(
     all_failed = bool(outcomes) and all(v == "failed" for v in outcomes.values())
     conn.execute(
         "INSERT INTO x_signal_runs (status, api_reads, estimated_cost_usd, new_signals, "
-        "error, run_id) VALUES (?, ?, ?, ?, ?, ?)",
+        "error, run_id, backfill) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             "failed" if all_failed else "ok",
             totals["api_reads"],
@@ -161,6 +162,7 @@ def collect_x_signals(
             totals["new_signals"],
             " / ".join(errors) or None,
             run_id,
+            1 if backfill else 0,  # backfill は日次 cap の別枠(GH#178。migration 022)
         ),
     )
     logger.info(
@@ -177,16 +179,16 @@ def collect_x_signals(
 
 
 def signal_reads_on(conn: sqlite3.Connection, day: str) -> int:
-    """JST の暦日 day に x_signal_runs へ記録した読取数の合計(GH#178)。
+    """JST の暦日 day に通常の取込が x_signal_runs へ記録した読取数の合計(GH#178)。
 
     日付は started_at(UTC)を JST の暦日に直して決める(collect の X の日次上限と同じ暦日)。
     失敗の行も数える(途中ページ失敗でも取得済みぶんは計上済み。費用は掛かっている)。
-    backfill の行も区別せずに数える(台帳に印の列が無い。読んだぶんは同じ日の費用)。
+    backfill の行(backfill = 1)は日次 cap の別枠なので数えない(費用の集計には入る)。
     """
     start, end = jst_day_bounds_utc(day)
     return conn.execute(
         "SELECT coalesce(sum(api_reads), 0) AS reads FROM x_signal_runs "
-        "WHERE started_at >= ? AND started_at < ?",
+        "WHERE started_at >= ? AND started_at < ? AND backfill = 0",
         (start, end),
     ).fetchone()["reads"]
 
