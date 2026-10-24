@@ -29,7 +29,7 @@ extraction_status=failed の items は除外**しない**(タイトル+メタで
 
 ### Stage 2: 本分析(LLM)
 
-- 1 呼び出し 10〜20 件のバッチ(既定 15、config で調整)。timeout 120s・リトライ 1 回・スキーマ検証失敗は失敗チャンクのみ再実行。なお失敗なら該当チャンクを degraded 記録して先へ進む(予備 `[llm_fallback]`(既定 off)を有効にしているときは、主のエンジンが失敗した呼び出しを予備の `anthropic-api` でやり直し、予備も失敗した呼び出しだけが失敗になる。設計 00 §5・GH#156)。例外(GH#74): 環境障害(`LLMUnavailableError`)は degraded にせず raise。全チャンク degraded(analyzed=0)も全チャンク処理後に raise して失敗通知に載せる(degraded 行は書き込み済みのため劣化配信は維持)。
+- 1 呼び出し 10〜20 件のバッチ(既定 15、config で調整)。timeout 120s・リトライ 1 回・スキーマ検証失敗は失敗チャンクのみ再実行。なお失敗なら該当チャンクを degraded 記録して先へ進む(予備 `[llm_fallback]`(既定 off)を有効にしているときは、主のエンジンが失敗した呼び出しを予備の `anthropic-api` でやり直し、予備も失敗した呼び出しだけが失敗になる。設計 00 §5・GH#156)。例外(GH#74): 環境障害(`LLMUnavailableError`)は degraded にせず raise。欠落項目の単発再分析の途中で環境障害になったときは、同じチャンクで取得済みの正常な結果を items の状態の遷移と一緒に保存してから raise し、未解決の項目は new のまま残す(再実行でそこだけを分析する。GH#243)。全チャンク degraded(analyzed=0)も全チャンク処理後に raise して失敗通知に載せる(degraded 行は書き込み済みのため劣化配信は維持)。
 - 本文は先頭 2,000 字に切り詰めて注入(config `analysis.body_max_chars`)。理由: 要約とランキングには冒頭で十分で、トークン費を上限管理可能にする。
 
 ## 3. 分析プロンプト設計
