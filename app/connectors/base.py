@@ -48,6 +48,9 @@ class FetchResult:
     stats: FetchStats
     # 恒久移転(301/308)を経由したときの移転先(RSS。sources.moved_url へ。設計 02 §3・GH#150)
     moved_url: str | None = None
+    # 部分取得のあとの失敗(X 検索の後ろのスロットの 400 など。GH#183)。collect は items と
+    # next_cursor を保存しつつ、ソースの失敗として記録する。None = 正常な終わり
+    partial_error: Exception | None = None
 
 
 class Connector(Protocol):

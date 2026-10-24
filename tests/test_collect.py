@@ -11,6 +11,7 @@ from app.collect import collect_all
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
 from app.db import apply_migrations, connect
 from app.http import HttpClient
+from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
 logger = logging.getLogger("test-collect")
 
@@ -97,6 +98,59 @@ def test_estimated_cost_persisted_to_collect_runs(conn: sqlite3.Connection) -> N
     ).fetchone()
     assert row["api_reads"] == 50
     assert row["estimated_cost_usd"] == pytest.approx(0.2)
+
+
+class PartialFakeConnector:
+    """X 検索相当: 先のスロットの取得ぶんと、後ろのスロットの失敗の理由を返す(GH#183)。"""
+
+    def fetch(self, source_row, cursor):
+        return FetchResult(
+            items=[item("https://x.com/i/web/status/500", external_id="500")],
+            next_cursor=cursor,  # 打ち切りなので watermark は据え置き(設計 02 §2)
+            stats=FetchStats(
+                items_fetched=1, api_reads=1, estimated_cost_usd=0.004,
+                http_status=402, duration_ms=1,
+            ),
+            partial_error=FatalError("X が HTTP 402: https://api.twitter.com/2/tweets/search/recent"),
+        )
+
+
+def test_partial_failure_saves_items_and_counts_as_source_failure(
+    conn: sqlite3.Connection,
+) -> None:
+    # GH#183: 部分取得のあとの失敗は、取得ぶんとカーソルを保存しつつソースの失敗として数える
+    # (連続失敗の警告に載せる)。成功の時刻は変えず、run は費用つきの error で残す
+    conn.execute(
+        "INSERT INTO sources (type, name, config, cursor, last_success_at, consecutive_failures) "
+        "VALUES ('x', 'x:search', '{\"mode\": \"search\"}', '{\"since_id\": \"100\"}', "
+        "'2026-10-20T21:30:00Z', 2)"
+    )
+    collect_all(conn, {"rss": FakeConnector([]), "x": PartialFakeConnector()}, logger)
+
+    assert conn.execute(
+        "SELECT external_id FROM items WHERE source_id = "
+        "(SELECT id FROM sources WHERE type='x')"
+    ).fetchall()[0][0] == "500"
+    source = conn.execute(
+        "SELECT cursor, last_success_at, last_error_at, last_error, consecutive_failures "
+        "FROM sources WHERE type='x'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"since_id": "100"}
+    assert source["last_success_at"] == "2026-10-20T21:30:00Z"
+    assert source["last_error_at"] is not None
+    assert "402" in source["last_error"]
+    assert source["consecutive_failures"] == 3
+    run = conn.execute(
+        "SELECT status, error, items_fetched, api_reads, estimated_cost_usd FROM collect_runs "
+        "WHERE source_id = (SELECT id FROM sources WHERE type='x')"
+    ).fetchone()
+    assert (run["status"], run["items_fetched"], run["api_reads"]) == ("error", 1, 1)
+    assert "402" in run["error"]
+    assert run["estimated_cost_usd"] == pytest.approx(0.004)  # 掛かった費用は doctor #9 に入る
+    assert source_failure_alerts(conn, "x", X_FAILURE_ALERT) == [
+        "「x:search」が 3 回連続で失敗(直近: FatalError: X が HTTP 402: "
+        "https://api.twitter.com/2/tweets/search/recent)"
+    ]
 
 
 def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:

@@ -270,6 +270,7 @@ def test_rate_limit_zero_stops_remaining_slots_and_keeps_cursor() -> None:
     assert len(seen) == 1
     # 未実行スロット(b)の当日ぶんを watermark の背後に隠さない → カーソル据え置き
     assert result.next_cursor == {"since_id": "100"}
+    assert result.partial_error is None  # 応答は正常。ソースの失敗にはしない(GH#183)
 
 
 def test_first_page_429_with_zero_total_raises() -> None:
@@ -292,6 +293,126 @@ def test_failure_after_prior_slot_returns_partial_without_advancing_cursor() -> 
     assert result.next_cursor == {}
     sent = [parse_qs(urlsplit(str(r.url)).query)["query"][0] for r in seen]
     assert sent.count(f"(b) {X_SEARCH_QUERY_SUFFIX}") == 3  # 5xx は初回+2回リトライ
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [(400, FatalError), (402, FatalError), (429, RetryableError), (503, RetryableError)],
+)
+def test_later_slot_failure_carries_error_with_partial_items(status, error_type) -> None:
+    # GH#183: 先のスロットが取れていても、後ろのスロットの失敗(壊れたクエリの 400・クレジット
+    # 切れの 402 など)を正常扱いで隠さない。取得ぶんは返し、理由を載せてソースの失敗にさせる
+    pages = {
+        "a": [(200, page([tweet("500")]), {})],
+        "b": [(status, {}, {})],
+        "c": [(200, page([tweet("600")]), {})],
+    }
+    result = connector_from(pages, slots=("a", "b", "c")).fetch(
+        make_source(), {"since_id": "100"}
+    )
+    assert [i.external_id for i in result.items] == ["500"]
+    assert isinstance(result.partial_error, error_type)
+    assert str(status) in str(result.partial_error)
+    assert result.next_cursor == {"since_id": "100"}  # watermark は据え置き(既存の契約)
+
+
+def test_budget_cut_is_normal_and_advances_cursor() -> None:
+    # 予算に届いた打ち切りは正常な終わり(古い側を捨てるだけ。設計 02 §2)。失敗にせず進める
+    pages = {
+        "a": [(200, page([tweet(str(500 - i)) for i in range(10)], next_token="tok1"), {})],
+        "b": [(200, page([tweet(str(700 - i)) for i in range(10)], next_token="tok2"), {})],
+    }
+    result = connector_from(pages, slots=("a", "b"), daily_read_cap=20).fetch(
+        make_source(), {"since_id": "100"}
+    )
+    assert result.stats.api_reads == 20  # 10/10 で両スロットとも予算に届いた
+    assert result.partial_error is None
+    assert result.next_cursor == {"since_id": "700"}
+
+
+def test_all_requests_share_end_time_before_run_start() -> None:
+    # GH#184: 全スロット・全ページで同じ end_time(実行の開始の 30 秒前。API は要求の時刻より
+    # 10 秒以上前に限る。値は実装の定数とは独立に書く)
+    seen: list[httpx.Request] = []
+    pages = {
+        "a": [
+            (200, page([tweet(str(500 - i)) for i in range(100)], next_token="tok1"), {}),
+            (200, page([tweet(str(400 - i)) for i in range(10)]), {}),
+        ],
+        "b": [(200, page([tweet("600")]), {})],
+    }
+    connector_from(pages, slots=("a", "b"), daily_read_cap=220, seen=seen, now=NOW).fetch(
+        make_source(), {}
+    )
+    assert len(seen) == 3
+    assert [parse_qs(urlsplit(str(r.url)).query)["end_time"] for r in seen] == [
+        ["2026-10-17T13:48:30Z"]
+    ] * 3
+
+
+class SearchServer:
+    """スロットごとの投稿を作成の時刻つきで持つ search/recent の模型(GH#184)。
+
+    要求ごとに時計を gap 進める。end_time が無ければ要求の 30 秒前より前を返し(API の既定)、
+    あれば end_time より前(end_time は含まない)を返す。end_time が要求の 10 秒前より新しければ
+    400(API の制約)。新しい順・since_id より新しいものだけ・max_results まで。
+    """
+
+    def __init__(self, posts: list[tuple[str, datetime]], *, start: datetime, gap: timedelta):
+        self._posts = posts
+        self._clock = start - gap
+        self._gap = gap
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self._clock += self._gap
+        query = parse_qs(urlsplit(str(request.url)).query)
+        slot = query["query"][0].removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
+        if "end_time" in query:
+            until = datetime.strptime(query["end_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=UTC
+            )
+            if until > self._clock - timedelta(seconds=10):
+                return httpx.Response(400, json={})
+        else:
+            until = self._clock - timedelta(seconds=30)
+        since = int(query.get("since_id", ["0"])[0])
+        ids = sorted(
+            (int(snowflake_at(at)) for s, at in self._posts if s == slot and at < until),
+            reverse=True,
+        )
+        data = [tweet(str(i)) for i in ids if i > since][: int(query["max_results"][0])]
+        return httpx.Response(200, json=page(data))
+
+
+def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
+    # GH#184: スロットは順に取る。A を取ったあと・B を取る前に A に入った新着 a' より新しい b' を
+    # B が取ると、次回の since_id が a' を越えて a' が恒久欠落する。上限を共通にして防ぐ
+    a_new = NOW + timedelta(seconds=10)  # A の要求(NOW+1 秒)のあと・B の要求(NOW+61 秒)の前
+    posts = [
+        ("a", NOW - timedelta(minutes=5)),
+        ("b", NOW - timedelta(minutes=4)),
+        ("a", a_new),
+        ("b", NOW + timedelta(seconds=20)),  # b': B の要求の前に入る
+    ]
+
+    def run(run_start: datetime, cursor: dict):
+        server = SearchServer(
+            posts, start=run_start + timedelta(seconds=1), gap=timedelta(seconds=60)
+        )
+        return XSearchConnector(
+            client=httpx.Client(transport=httpx.MockTransport(server.handle)),
+            credentials=CREDS,
+            slots=("a", "b"),
+            daily_read_cap=20,
+            unit_price_usd=0.004,
+            sleep=lambda _s: None,
+            now=lambda: run_start,
+        ).fetch(make_source(), cursor)
+
+    first = run(NOW, {})
+    assert first.partial_error is None
+    second = run(NOW + timedelta(days=1), first.next_cursor)
+    assert snowflake_at(a_new) in [i.external_id for i in second.items]
 
 
 def test_auth_error_is_fatal() -> None:

@@ -69,8 +69,17 @@ def _collect_source(
     try:
         cursor = json.loads(source.cursor) if source.cursor else {}
         result = connector.fetch(source, cursor)
+        partial_error = (
+            None if result.partial_error is None else _safe_error_text(result.partial_error)
+        )
         counts = _store_result(
-            conn, source, result.items, result.next_cursor, result.moved_url, resolve_short
+            conn,
+            source,
+            result.items,
+            result.next_cursor,
+            result.moved_url,
+            resolve_short,
+            partial_error=partial_error,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
@@ -85,31 +94,39 @@ def _collect_source(
         )
         return
 
+    # 部分取得のあとの失敗も run は error で残す。読み取りの費用は掛かっているので件数・費用は
+    # 記録する(doctor #9 の当月の集計に入れる。GH#183)
     conn.execute(
         f"""
         UPDATE collect_runs
-        SET finished_at = {_NOW_UTC}, status = 'ok', items_fetched = ?, api_reads = ?,
+        SET finished_at = {_NOW_UTC}, status = ?, error = ?, items_fetched = ?, api_reads = ?,
             estimated_cost_usd = ?
         WHERE id = ?
         """,
         (
+            "ok" if partial_error is None else "error",
+            partial_error,
             result.stats.items_fetched,
             result.stats.api_reads,
             result.stats.estimated_cost_usd,  # X は api_reads×単価、RSS は 0.0(設計 02 §2)
             run_row_id,
         ),
     )
-    logger.info(
-        "collect 完了",
-        extra={
-            **log_ctx,
-            "extra": {
-                "http_status": result.stats.http_status,
-                "duration_ms": result.stats.duration_ms,
-                **counts,
-            },
+    extra = {
+        **log_ctx,
+        "extra": {
+            "http_status": result.stats.http_status,
+            "duration_ms": result.stats.duration_ms,
+            **counts,
         },
-    )
+    }
+    if partial_error is None:
+        logger.info("collect 完了", extra=extra)
+    else:
+        logger.warning(
+            f"collect は部分取得のあと失敗。取得ぶんは保存し失敗として記録: {partial_error}",
+            extra=extra,
+        )
 
 
 def _store_result(
@@ -119,25 +136,40 @@ def _store_result(
     next_cursor: dict,
     moved_url: str | None,
     resolve_short: Callable[[str], str] | None,
+    *,
+    partial_error: str | None,
 ) -> dict[str, int]:
     """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
     moved_url は今回の取得の恒久移転の先(無ければ NULL に戻す。GH#150)。
+    partial_error は部分取得のあとの失敗の文(GH#183)。あれば items とカーソルは保存しつつ、
+    ソースは失敗として数える(連続失敗の警告に載せる。成功の時刻と移転の記録は変えない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     conn.execute("BEGIN IMMEDIATE")
     try:
         for raw in items:
             counts[_store_item(conn, source, raw, resolve_short)] += 1
-        conn.execute(
-            f"""
-            UPDATE sources
-            SET cursor = ?, last_success_at = {_NOW_UTC}, consecutive_failures = 0,
-                last_error = NULL, moved_url = ?
-            WHERE id = ?
-            """,
-            (json.dumps(next_cursor), moved_url, source.id),
-        )
+        if partial_error is None:
+            conn.execute(
+                f"""
+                UPDATE sources
+                SET cursor = ?, last_success_at = {_NOW_UTC}, consecutive_failures = 0,
+                    last_error = NULL, moved_url = ?
+                WHERE id = ?
+                """,
+                (json.dumps(next_cursor), moved_url, source.id),
+            )
+        else:
+            conn.execute(
+                f"""
+                UPDATE sources
+                SET cursor = ?, last_error_at = {_NOW_UTC}, last_error = ?,
+                    consecutive_failures = consecutive_failures + 1
+                WHERE id = ?
+                """,
+                (json.dumps(next_cursor), partial_error, source.id),
+            )
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
