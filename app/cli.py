@@ -508,6 +508,7 @@ def run(
                 notify_run_failure(
                     conn, config, create_api(env), failures, run_id, logger,
                     digest_held=failures.digest_held,  # GH#191
+                    deliver_date=failures.deliver_date,  # GH#247
                 )
             except Exception as e:  # create_api の設定不備等でも終了コードを汚さない
                 logger.error(f"失敗通知を送れない: {e}", extra={"run_id": run_id, "stage": "run"})

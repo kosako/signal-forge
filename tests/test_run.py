@@ -327,6 +327,31 @@ def test_date_change_after_digest_is_not_taken_as_held(conn, tmp_path, monkeypat
     # 日付をまたいだ扱いは従来どおり段の失敗として知らせる(保留として黙って省かない)
     assert "deliver" in failures
     assert sent == []
+    assert failures.deliver_date is None  # 送る digest を引けていない(送り直し方を添えない)
+
+
+def test_failed_delivery_keeps_digest_date_across_midnight(conn, tmp_path, monkeypatch) -> None:
+    # deliver 段の失敗の後、失敗通知まで(dig・purge・backup)に JST の 0 時を越えても、
+    # 送り直し方の日付は送ろうとした digest の日付のまま(GH#247)
+    from app import run as run_module
+    from app.delivery import DeliveryError
+
+    day = {"today": "2026-07-06"}
+    monkeypatch.setattr("app.digest.builder.today_jst", lambda: "2026-07-06")
+    monkeypatch.setattr(run_module, "today_jst", lambda: day["today"])
+
+    def fail_then_cross_midnight(*args, **kwargs):
+        day["today"] = "2026-07-07"  # 配信の失敗の後に JST の 0 時を越える
+        raise DeliveryError("Telegram sendMessage が失敗: HTTP 400")
+
+    monkeypatch.setattr(run_module, "deliver_digest", fail_then_cross_midnight)
+    use_fake_telegram(monkeypatch)
+    failures = run_pipeline(
+        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        {"rss": StaticConnector()}, make_http(), lambda: ScriptedEngine(conn), logger, "01RUN",
+    )
+    assert "deliver" in failures
+    assert failures.deliver_date == "2026-07-06"
 
 
 def test_no_qualified_items_digest_is_finalized_as_before(conn, tmp_path, monkeypatch) -> None:

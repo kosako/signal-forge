@@ -456,21 +456,36 @@ def test_notify_run_failure_once_per_day(conn, tmp_path) -> None:
     assert "ダイジェストを作れませんでした" not in api.sent[0][1]
 
 
-def test_notify_run_failure_tells_resend_by_date_when_deliver_failed(conn, tmp_path) -> None:
-    # 配信だけが失敗した日は、日をまたいだら日付を指定して送り直せることを添える(GH#247)
+def test_notify_run_failure_tells_resend_by_date_of_failed_delivery(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # 配信の段が失敗した日は、日をまたいだら日付を指定して送り直せることを添える(GH#247)。
+    # 日付は送ろうとした digest のもの。通知までに 0 時を越えても、通知の時点の日付にしない
+    monkeypatch.setattr("app.delivery.surveys.today_jst", lambda: "2026-10-24")
     api = FakeApi()
-    notify_run_failure(conn, make_config(tmp_path), api, ["deliver"], "01RUN", logger)
+    notify_run_failure(
+        conn, make_config(tmp_path), api, ["deliver"], "01RUN", logger,
+        deliver_date="2026-10-23",
+    )
 
     ((_, text),) = api.sent
     assert "`intel run` で再走してください" in text
-    assert f"`intel deliver --date {today_jst()}`" in text
+    assert "`intel deliver --date 2026-10-23`" in text
 
 
-def test_notify_run_failure_omits_resend_by_date_without_digest(conn, tmp_path) -> None:
-    # digest を作れなかった日は日付を指定しても送るものが無いので、送り直し方を添えない
+@pytest.mark.parametrize(
+    ("failures", "deliver_date"),
+    [
+        (["digest", "export", "deliver"], None),  # 送る digest を引けなかった
+        (["dig"], "2026-10-23"),  # 配信は届いた
+    ],
+)
+def test_notify_run_failure_omits_resend_by_date_unless_delivery_failed(
+    conn, tmp_path, failures, deliver_date
+) -> None:
     api = FakeApi()
     notify_run_failure(
-        conn, make_config(tmp_path), api, ["digest", "export", "deliver"], "01RUN", logger
+        conn, make_config(tmp_path), api, failures, "01RUN", logger, deliver_date=deliver_date
     )
 
     ((_, text),) = api.sent

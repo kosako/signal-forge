@@ -216,13 +216,14 @@ def notify_run_failure(
     logger: logging.Logger,
     *,
     digest_held: bool = False,
+    deliver_date: str | None = None,
 ) -> None:
     """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。
 
     digest_held: 分析の障害で当日の digest を確定しなかった(GH#191)。同じ 1 通で、
     復旧したら同じ日の再走で届くことを知らせる。
-    配信だけが失敗した(digest はある)日は、日をまたいだら日付を指定して送り直せることも
-    添える。翌日の再走は当日分しか送らないため(GH#247)。
+    deliver_date: deliver 段が送ろうとした digest の日付。その配信が失敗したら、日をまたいだ
+    ときに日付を指定して送り直せることを添える。翌日の再走は当日分しか送らないため(GH#247)。
     """
     today = today_jst()
     if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
@@ -233,8 +234,8 @@ def notify_run_failure(
         if digest_held
         else "`intel run` で再走してください"
     )
-    if "deliver" in failures and "digest" not in failures:
-        guide += f"。日をまたいだら `intel deliver --date {today}` で送れます"
+    if deliver_date is not None and "deliver" in failures:
+        guide += f"。日をまたいだら `intel deliver --date {deliver_date}` で送れます"
     try:
         api.send_message(
             _require_chat_id(config),

@@ -83,13 +83,8 @@ def test_dig_exits_quietly_while_another_digs(tmp_path, monkeypatch) -> None:
     assert "深掘りを進めているため、何もしなかった" in result.output
 
 
-def _days_ago(days: int) -> str:
-    from datetime import datetime, timedelta
-
-    from app.jst import today_jst
-
-    today = datetime.strptime(today_jst(), "%Y-%m-%d")
-    return (today - timedelta(days=days)).strftime("%Y-%m-%d")
+# 配信のテストの当日と前日(JST)。実際の日付に依らないよう today_jst を差し替える
+_TODAY, _YESTERDAY = "2026-10-24", "2026-10-23"
 
 
 class _RecordingApi:
@@ -106,15 +101,16 @@ class _RecordingApi:
 def _undelivered_digests(
     tmp_path, monkeypatch, titles_by_date: dict[str, list[str]]
 ) -> tuple[_RecordingApi, dict[str, int]]:
-    """日付ごとに記事を載せた未配信の digest がある DB を用意する。
+    """日付ごとに記事を載せた未配信の digest がある DB を用意する(当日 = _TODAY)。
     送った本文の記録先と、日付ごとの digest の id を返す。"""
     import json
 
     import app.delivery as delivery
-    from app import logs
+    from app import jst, logs
     from app.db import apply_migrations, connect
 
     monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    monkeypatch.setattr(jst, "today_jst", lambda: _TODAY)
     _answer_config(tmp_path, telegram=True)
     conn = connect(tmp_path / "intel.db")
     apply_migrations(conn, tmp_path / "intel.db")
@@ -166,7 +162,7 @@ def _delivery_state(tmp_path, digest_id: int) -> tuple[str, int]:
 def test_deliver_date_sends_past_unsent_digest(tmp_path, monkeypatch) -> None:
     # 配信の失敗が翌日に持ち越されても、前日の未配信の digest を日付で指定して送れる(GH#247)。
     # 当日の digest には触れない(過去の分を自動で繰り越さない)
-    yesterday, today = _days_ago(1), _days_ago(0)
+    yesterday, today = _YESTERDAY, _TODAY
     api, ids = _undelivered_digests(
         tmp_path, monkeypatch, {yesterday: ["前日の記事"], today: ["当日の記事"]}
     )
@@ -187,7 +183,7 @@ def test_deliver_date_does_not_resend_delivered_messages(tmp_path, monkeypatch) 
     # 送り終えた後にもう一度打っても配信済みとして何も送らない(GH#247)
     from app.db import connect
 
-    yesterday = _days_ago(1)
+    yesterday = _YESTERDAY
     api, ids = _undelivered_digests(
         tmp_path, monkeypatch, {yesterday: ["届いた記事", "残りの記事"]}
     )
@@ -220,7 +216,7 @@ def test_deliver_date_does_not_resend_delivered_messages(tmp_path, monkeypatch) 
 
 def test_deliver_without_date_sends_only_today(tmp_path, monkeypatch) -> None:
     # 日付を指定しない通常の配信は従来どおり当日分だけ。前日の未配信は拾わない(GH#247)
-    yesterday, today = _days_ago(1), _days_ago(0)
+    yesterday, today = _YESTERDAY, _TODAY
     api, ids = _undelivered_digests(
         tmp_path, monkeypatch, {yesterday: ["前日の記事"], today: ["当日の記事"]}
     )
@@ -437,6 +433,28 @@ def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     assert len(calls) == 1 and calls[0]
 
 
+def test_run_failure_notice_gets_date_of_failed_delivery(tmp_path, monkeypatch) -> None:
+    # deliver 段が送ろうとした digest の日付(run_pipeline の戻り値)を失敗通知へ渡す。
+    # 通知の時点の日付ではなく、この日付で送り直し方を添える(GH#247)
+    from app import delivery, logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    failures = run.RunFailures(["deliver"])
+    failures.deliver_date = "2026-10-23"
+    passed: list[str | None] = []
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
+    monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
+    monkeypatch.setattr(
+        delivery,
+        "notify_run_failure",
+        lambda *args, digest_held, deliver_date: passed.append(deliver_date),
+    )
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert passed == ["2026-10-23"]
+
+
 @pytest.mark.parametrize("digest_held", [True, False])
 def test_run_failure_notice_tells_whether_digest_was_held(
     tmp_path, monkeypatch, digest_held
@@ -452,8 +470,11 @@ def test_run_failure_notice_tells_whether_digest_was_held(
     monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
     monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
     monkeypatch.setattr(
-        delivery, "notify_run_failure", lambda *args, digest_held: passed.append(digest_held)
+        delivery,
+        "notify_run_failure",
+        lambda *args, digest_held, **kwargs: passed.append(digest_held),
     )
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert passed == [digest_held]
+
