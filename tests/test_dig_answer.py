@@ -800,3 +800,43 @@ def test_retry_reaches_the_first_question_beyond_history_window(conn, config) ->
     prompt = engine.prompts[0]
     assert "私: 元の質問XYZ" not in prompt  # やり取りの直近の件数からは外れている
     assert f"もう一度\n\n{RETRY_LEAD}\n\n元の質問XYZ\n\nもう一度。コスト面も" in prompt
+
+
+def test_long_retry_chain_keeps_the_first_question(conn, config) -> None:
+    # やり直しが続けて失敗しても、最初の質問は必ず残す(途中のやり直しは直近の分だけ)
+    dig_id = add_dig(conn, config)
+    failed = ask(conn, dig_id, "元の質問XYZ", 71)
+    sender = Sender()
+    answer_pending(conn, config, Engine(fail_on={1, 2}).factory, sender, logger)
+    for i in range(1, HISTORY_TURNS + 1):
+        failed = reply_to_failure(conn, dig_id, f"やり直し{i}", 71 + i, failed)
+        answer_pending(conn, config, Engine(fail_on={1, 2}).factory, sender, logger)
+    reply_to_failure(conn, dig_id, "もう一度", 90, failed)
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    prompt = engine.prompts[0]
+    assert "私: 元の質問XYZ" not in prompt  # やり取りの直近の件数からは外れている
+    kept = "\n\n".join(["元の質問XYZ"] + [f"やり直し{i}" for i in range(2, HISTORY_TURNS + 1)])
+    assert f"もう一度\n\n{RETRY_LEAD}\n\n{kept}\n\n" in prompt
+
+
+def test_retry_of_failed_button_request_uses_the_article_body(conn, config) -> None:
+    # ボタンからの依頼のやり直しも、材料はボタンと同じ(DB の元記事の本文。ノートには頼らない)
+    dig_id = add_dig(conn, config, note=None, source=None)
+    add_document(conn, dig_id, "The original article body extracted from the web.")
+    enqueue_request(conn, dig_id, "summary")
+    sender = Sender()
+    answer_pending(conn, config, Engine(fail_on={1, 2}).factory, sender, logger)
+    request_id = rows(conn)[0]["id"]
+    reply_to_failure(conn, dig_id, "もう一度", 72, request_id)
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    prompt = engine.prompts[0]
+    assert "The original article body extracted from the web." in prompt
+    assert "## 解説ノート" not in prompt
+    assert f"もう一度\n\n{RETRY_LEAD}\n\n{REQUESTS['summary']}" in prompt
+    assert len(engine.intent_prompts) == 1  # やり直しは本人のリプライなので意図は判定する

@@ -357,15 +357,17 @@ def build_answer_prompt(
     if retried:
         question = "\n\n".join(
             [question, RETRY_LEAD]
-            + [sanitize_body(q, nonce)[:QUESTION_MAX_CHARS] for q in retried]
+            + [sanitize_body(q["question"], nonce)[:QUESTION_MAX_CHARS] for q in retried]
         )
+    # ボタンからの依頼のやり直しは、材料もボタンと同じにする(元記事の本文。GH#141・GH#236)
+    request = retried[0]["request"] if retried else row["request"]
     return fill_template(
         template,
         {
             "interest_profile": profile,
             "materials": (
                 _request_materials(conn, config, row, nonce, vault)
-                if row["request"] is not None
+                if request is not None
                 else _materials(config, row, nonce, vault)
             ),
             "history": _history(conn, row["dig_result_id"], row["id"], nonce),
@@ -403,20 +405,24 @@ def build_intent_prompt(row: sqlite3.Row) -> str:
     )
 
 
-def _retried_questions(conn: sqlite3.Connection, retry_of: int | None) -> list[str]:
+def _retried_questions(conn: sqlite3.Connection, retry_of: int | None) -> list[sqlite3.Row]:
     """失敗の知らせへのリプライが、やり直しを求めている元の質問(古い順。GH#236)。
 
     やり直しも失敗し、その知らせにまたリプライしたときは、最初の質問まで辿る(retry_of は常に
-    前の行を指すので巡回しない。プロンプトを伸ばしすぎないよう HISTORY_TURNS 件まで)。
+    前の行を指すので巡回しない)。最初の質問(ボタンからの依頼でありうる)は必ず残し、途中の
+    やり直しは直近の分だけにする(合わせて HISTORY_TURNS 件まで。プロンプトを伸ばしすぎない)。
     """
-    questions: list[str] = []
-    while retry_of is not None and len(questions) < HISTORY_TURNS:
+    chain: list[sqlite3.Row] = []
+    while retry_of is not None:
         row = conn.execute(
-            "SELECT question, retry_of FROM dig_questions WHERE id = ?", (retry_of,)
+            "SELECT question, request, retry_of FROM dig_questions WHERE id = ?", (retry_of,)
         ).fetchone()
-        questions.append(row["question"])
+        chain.append(row)
         retry_of = row["retry_of"]
-    return questions[::-1]
+    chain.reverse()
+    if len(chain) > HISTORY_TURNS:
+        chain = [chain[0], *chain[len(chain) - HISTORY_TURNS + 1 :]]
+    return chain
 
 
 def _materials(config: Config, row: sqlite3.Row, nonce: str, vault: VaultGuard) -> str:

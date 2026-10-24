@@ -1,7 +1,8 @@
 """深掘りカードへのリプライのうち take を記録する(GH#106 / 設計 06 §6 / ADR 0003)。
 
-- take かどうかは、返事を作る LLM 呼び出しが返す分類(dig_questions.kind)で決める
-  (GH#126。別の呼び出しを増やさない)。take / both が対象で、question は記録しない
+- take かどうかは、本人の入力だけを渡す意図の判定の LLM 呼び出しが返す分類
+  (dig_questions.kind)で決める(GH#245。外部由来の材料を読む返事の呼び出しの出力では
+  決めない)。take / both が対象で、question は記録しない
 - 記録は 2 つ: 解説ノートの末尾(take 領域)への追記と、followup_dig = yes(未消化一覧から
   消える = ブックマークの消化動線。GH#99 の既知境界)。記録済みかの正本は台帳
   (dig_questions.take_recorded_at)
