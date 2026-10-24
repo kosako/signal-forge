@@ -499,6 +499,8 @@ def test_item_dropped_by_force_and_delivered_later_reuses_first_note(conn, tmp_p
     assert [p.name[:8] for p in notes] == ["20260706"]  # 別日付を作らない
     assert f"[[{notes[0].stem}]]" in (base / "Daily" / "2026-07-08.md").read_text()
     assert "後日の配信へのリプライ" in notes[0].read_text()
+    # 追いパスで書き直しても、frontmatter の日付は配信の日ではなくノート名の日付
+    assert read_front(notes[0])["digest_date"] == "2026-07-06"
 
 
 def test_existing_duplicate_notes_are_left_in_place(conn, tmp_path) -> None:
