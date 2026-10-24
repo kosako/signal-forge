@@ -78,6 +78,17 @@ def test_x_status_rebuilt_to_id_form() -> None:
         assert normalize_url(url) == "https://x.com/i/web/status/12345"
 
 
+def test_www_x_hosts_unified_like_internal_link_hosts() -> None:
+    # ブックマークの内部リンクの判定と同じ別名を x.com に寄せる(GH#232)
+    for url in (
+        "https://www.x.com/someone/status/12345",
+        "https://www.twitter.com/someone/status/12345",
+        "https://mobile.twitter.com/someone/status/12345",
+    ):
+        assert normalize_url(url) == "https://x.com/i/web/status/12345"
+    assert normalize_url("https://www.x.com/someone/lists") == "https://x.com/someone/lists"
+
+
 def test_fragment_removed() -> None:
     assert normalize_url("https://example.com/a#section") == "https://example.com/a"
 

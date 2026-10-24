@@ -24,7 +24,11 @@ _TRACKING_PARAMS = frozenset(
     {"fbclid", "gclid", "yclid", "igshid", "mc_cid", "mc_eid", "ref", "ref_src", "s", "t"}
 )
 
-_X_HOSTS = frozenset({"twitter.com", "mobile.twitter.com", "x.com"})
+# u1 手順3: X のホストの別名。ブックマークの内部リンクの判定(connectors/x_signals)も
+# 同じ集合を使う(GH#232)。www つきは GH#232 から(それより前の行は遡及しない)
+X_HOSTS = frozenset(
+    {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+)
 _X_STATUS_PATH = re.compile(r"^/(?:[A-Za-z0-9_]+|i/web)/status(?:es)?/(\d+)")
 
 _URL_IN_TEXT = re.compile(r"https?://\S+")
@@ -88,7 +92,7 @@ def normalize_url(url: str, *, resolve_short: Callable[[str], str] | None = None
         host = f"{host}:{port}"
 
     # 手順3: twitter.com 系 → x.com。X ポストは /i/web/status/{id} 形式に組み立てる
-    if host in _X_HOSTS:
+    if host in X_HOSTS:
         host = "x.com"
         m = _X_STATUS_PATH.match(split.path)
         if m:

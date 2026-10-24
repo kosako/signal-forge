@@ -311,6 +311,68 @@ def test_self_rt_known_source_does_not_stop_paging(conn, tmp_path) -> None:
     assert cursor["since_id"] == "300"
 
 
+def self_rt_cursor(conn) -> str:
+    return conn.execute(
+        "SELECT since_id FROM x_signal_cursors WHERE kind='self_rt'"
+    ).fetchone()["since_id"]
+
+
+def test_self_rt_backfill_reads_past_saved_cursor(conn, tmp_path) -> None:
+    # backfill は「kind ごと直近 N 件」: 保存済みのカーソルがあっても since_id を送らず、
+    # カーソルより古い過去分も補う(GH#231)
+    conn.execute("INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', '1000')")
+    session = session_with([], [], [page(rt("1100", "901"), rt("500", "900"))])
+    collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger,
+        backfill_limit=10, kinds=("self_rt",),
+    )
+    call = calls_to(session, "42/tweets")[0]
+    assert "since_id" not in call
+    assert call["max_results"] == 10  # backfill は 1 ページ目から limit まで(GH#174 の対象外)
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["900", "901"]
+    assert self_rt_cursor(conn) == "1100"  # 今回の最大 id へ進める
+
+
+def test_self_rt_backfill_does_not_move_cursor_back(conn, tmp_path) -> None:
+    # 最新の投稿の削除などで backfill の最大 id が既存のカーソルより小さくても、通常用の
+    # カーソルは後ろへ戻さない(戻すと次の差分取得が取込済みの範囲を読み直す。GH#231)
+    conn.execute("INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', '1000')")
+    session = session_with([], [], [page(rt("500", "900"))])
+    collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger,
+        backfill_limit=10, kinds=("self_rt",),
+    )
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["900"]
+    assert self_rt_cursor(conn) == "1000"
+    daily = session_with([], [], [page(rt("1200", "902"))])
+    collect_x_signals(conn, make_config(tmp_path), daily, logger)
+    assert calls_to(daily, "42/tweets")[0]["since_id"] == "1000"  # 差分取得は従来どおり
+    assert self_rt_cursor(conn) == "1200"
+
+
+def test_self_rt_cursor_not_moved_back_past_concurrent_advance(conn, tmp_path) -> None:
+    # 取得中に別の実行(朝バッチなど)がカーソルを進めても戻さない。比較は取得の開始時
+    # でなく保存時の値で行う(GH#231)
+    conn.execute("INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', '1000')")
+    session = session_with([], [], [page(rt("1100", "901"))])
+    fetch = session.get
+
+    def get_while_other_run_advances(url: str, params: dict | None = None) -> httpx.Response:
+        if "42/tweets" in url:
+            other = connect(tmp_path / "intel.db")
+            other.execute("UPDATE x_signal_cursors SET since_id = '1300' WHERE kind = 'self_rt'")
+            other.close()
+        return fetch(url, params)
+
+    session.get = get_while_other_run_advances
+    collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger,
+        backfill_limit=10, kinds=("self_rt",),
+    )
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["901"]
+    assert self_rt_cursor(conn) == "1300"
+
+
 def test_page_rolls_back_atomically_on_midpage_failure(conn, tmp_path) -> None:
     # ページ途中の失敗はページ全体を rollback(半端ページが残ると次回の既知到達
     # 判定が未保存の残りを飛ばす。SF82-09)。想定外の応答形は kind の失敗に隔離
@@ -445,6 +507,39 @@ def test_bookmark_internal_link_falls_back_to_tweet_url(conn, tmp_path) -> None:
     collect_x_signals(conn, make_config(tmp_path), session, logger)
     item = item_for(conn, "b1")
     assert "/status/b1" in item["canonical_url"]
+
+
+@pytest.mark.parametrize(
+    "host", ["mobile.twitter.com", "twitter.com", "www.twitter.com", "x.com", "www.x.com"]
+)
+def test_bookmark_x_host_alias_link_keeps_bookmarked_tweet(conn, tmp_path, host) -> None:
+    # X のホストの別名の投稿リンクは外部記事でない。外部記事と誤ると正規化でリンク先の
+    # 別の投稿の URL になり、ブックマークした投稿の本文が失われる(GH#232)
+    tweet = linked_tw("111", f"https://{host}/someone/status/999", text="古いリンクの紹介")
+    session = session_with([page(tweet)], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = item_for(conn, "111")
+    assert item["canonical_url"] == "https://x.com/i/web/status/111"
+    assert "古いリンクの紹介" in item["raw_payload"]
+
+
+def test_bookmark_skips_mobile_twitter_link_before_external_article(conn, tmp_path) -> None:
+    # 先頭の mobile.twitter.com の投稿リンクを飛ばし、後ろの外部記事を canonical に(GH#232)
+    tweet = tw("111")
+    tweet["entities"] = {
+        "urls": [
+            {
+                "url": "https://t.co/a",
+                "expanded_url": "https://mobile.twitter.com/someone/status/999",
+            },
+            {"url": "https://t.co/b", "expanded_url": "https://example.com/article"},
+        ]
+    }
+    session = session_with([page(tweet)], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = item_for(conn, "111")
+    assert item["canonical_url"] == "https://example.com/article"
+    assert '"raw_content"' not in (item["raw_payload"] or "")
 
 
 def test_bookmark_note_tweet_link_and_full_text(conn, tmp_path) -> None:

@@ -24,7 +24,8 @@
   残す(既知の読み直しで予算を使い切り like / self_rt が毎日 skip されない。GH#174)
   cold start は日次 run でなく intel x-signals --backfill の手動実行(課金操作は
   人間ゲート。ADR 0001)。backfill は「kind ごと直近 N 件を種に」の上限つき
-  (全ページ辿りは過去のいいねが多いとコスト事故になる。GH#84)
+  (全ページ辿りは過去のいいねが多いとコスト事故になる。GH#84)。自RT の backfill は
+  since_id カーソルを送らず直近 N 件を読み、カーソルは後ろへ戻さない(GH#231)
 - text_excerpt は TTL キャッシュのみ(purge が retention.x_cache_ttl_days で
   NULL 化。Issue #2 の確定ポリシー)
 - 失敗は kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。
@@ -48,6 +49,7 @@ from app.db import insert_item_with_dedup
 from app.dig import enqueue_bookmark
 from app.models import RAW_CONTENT_MAX_CHARS
 from app.normalize import (
+    X_HOSTS,
     UrlError,
     content_hash,
     is_dedup_eligible,
@@ -65,15 +67,10 @@ EXPANSIONS = "author_id,referenced_tweets.id,referenced_tweets.id.author_id"
 
 BOOKMARK_SOURCE_NAME = "x:bookmark"  # item の帰属先(enabled=0 = collect 対象外)
 
-# 引用・メディア・自己リンクは「外部記事」でない(canonical 素材から除外)
-_INTERNAL_LINK_HOSTS = {
-    "x.com",
-    "www.x.com",
-    "twitter.com",
-    "www.twitter.com",
-    "t.co",
-    "pic.twitter.com",
-}
+# 引用・メディア・自己リンクは「外部記事」でない(canonical 素材から除外)。X のホストの
+# 別名は URL の正規化と同じ集合を使う(漏れたホストの投稿リンクを外部記事と誤り、
+# 正規化で別の投稿の URL になるのを防ぐ。GH#232)
+_INTERNAL_LINK_HOSTS = X_HOSTS | {"t.co", "pic.twitter.com"}
 
 KIND_ENDPOINTS = {  # 取込は強シグナル優先の順(collect_x_signals のループ順)
     "bookmark": "/users/{me_id}/bookmarks",
@@ -201,7 +198,9 @@ def _collect_kind(
     url = API_BASE + KIND_ENDPOINTS[kind].format(me_id=me_id)
     # ブックマークは items にも登録する(GH#99)。帰属先 sources 行はページ処理前に確保
     bookmark_source_id = ensure_bookmark_source(conn) if kind == "bookmark" else None
-    since_id = _load_cursor(conn, kind) if kind == "self_rt" else None
+    # backfill は「kind ごと直近 N 件」なので since_id を送らない(送るとカーソルより
+    # 古い過去分を補えない。GH#231)。カーソルの後退は保存の側で防ぐ
+    since_id = _load_cursor(conn, kind) if kind == "self_rt" and not backfill else None
     max_wrapper_id = 0  # self_rt のカーソル素材(自分のタイムライン上の最大 tweet id)
     next_token: str | None = None
     while True:
@@ -291,10 +290,16 @@ def _collect_kind(
             break
     if kind == "self_rt" and max_wrapper_id:
         # ホームTL と同じカーソル規約: 打ち切り時も今回の最大 id へ進める(古い側は
-        # 追わない)。進めないと、通常投稿が多い日に同じ先頭ページを毎日再課金する
+        # 追わない)。進めないと、通常投稿が多い日に同じ先頭ページを毎日再課金する。
+        # since_id を送らない backfill の最大 id は既存のカーソルより小さいことがある
+        # (最新の投稿の削除など)ため、既存の値から後ろへは戻さない(GH#231)。比較は
+        # 保存時の値と 1 文の中で数値で行う(取得中に朝バッチなど別の実行がカーソルを
+        # 進めても戻さない。id は桁数が変わるため文字列では比べない)
         conn.execute(
             "INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', ?) "
-            "ON CONFLICT(kind) DO UPDATE SET since_id = excluded.since_id",
+            "ON CONFLICT(kind) DO UPDATE SET since_id = excluded.since_id "
+            "WHERE CAST(excluded.since_id AS INTEGER) "
+            "> CAST(x_signal_cursors.since_id AS INTEGER)",
             (str(max_wrapper_id),),
         )
 
