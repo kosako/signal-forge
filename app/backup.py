@@ -56,8 +56,8 @@ def backup_daily(
         try:
             with os.fdopen(fd, "wb") as fh, tarfile.open(fileobj=fh, mode="w:gz") as tar:
                 tar.add(snapshot, arcname="intel.db")
-                _add_dir_if_exists(tar, config.config_dir, "config")
-                _add_dir_if_exists(tar, prompts_dir, "prompts")
+                _add_dir_if_exists(tar, config.config_dir, "config", logger, run_id=run_id)
+                _add_dir_if_exists(tar, prompts_dir, "prompts", logger, run_id=run_id)
             os.replace(partial_path, archive_path)  # 当日再実行は置換(冪等)
         except BaseException:
             partial_path.unlink(missing_ok=True)
@@ -75,9 +75,29 @@ def backup_daily(
     return archive_path
 
 
-def _add_dir_if_exists(tar: tarfile.TarFile, directory: Path, arcname: str) -> None:
+def _add_dir_if_exists(
+    tar: tarfile.TarFile,
+    directory: Path,
+    arcname: str,
+    logger: logging.Logger,
+    *,
+    run_id: str | None,
+) -> None:
     # config_dir / prompts が無い環境(セットアップ前・テスト)は黙って skip せず
     # tar に含めない事実だけが残る(復旧時に気付ける)。存在すれば再帰追加
+    if directory.is_symlink():
+        # tarfile は既定で symlink をたどらず、リンクの 1 件だけが入って中身が残らない。
+        # 実体を解決してから中身を入れる(arcname はそのまま。中の symlink はリンクのまま。GH#279)。
+        # 循環・リンク切れで解決できなければ、その dir は入れずに WARN を残し、DB を含む世代は
+        # 作る(resolve() は循環で Python 3.12 は RuntimeError、3.13 以降は OSError を出す)
+        try:
+            directory = directory.resolve(strict=True)
+        except (OSError, RuntimeError) as e:
+            logger.warning(
+                f"symlink を解決できず {arcname}/ をバックアップに入れない: {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "backup"},
+            )
+            return
     if directory.is_dir():
         tar.add(directory, arcname=arcname)
 

@@ -95,3 +95,53 @@ def test_rotation_keeps_14_generations(conn, tmp_path, monkeypatch) -> None:
     archives = sorted(p.name for p in config.backup_dir.glob("intel-*.tar.gz"))
     # 最古の世代から削除され、当日分(06-17)を含む新しい 14 世代が残る
     assert archives == [f"intel-202606{day:02d}.tar.gz" for day in range(4, 18)]
+
+
+def test_backup_follows_symlinked_config_dir(conn, tmp_path) -> None:
+    # 設定ディレクトリが symlink(dotfiles の管理など)でも、リンクの 1 件ではなく中身が
+    # config/ に入る。中にある symlink は今までどおりリンクのまま入る(GH#279)
+    real = make_config(tmp_path).config_dir
+    (real / "interest-profile.md").write_text("# profile\n", encoding="utf-8")
+    (real / "profile-link.md").symlink_to(real / "interest-profile.md")
+    link = tmp_path / "conf-link"
+    link.symlink_to(real, target_is_directory=True)
+    config = Config(
+        config_dir=link,
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
+    )
+
+    archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        assert tar.getmember("config").isdir()  # 名前は config のまま、リンクではなく実体
+        assert tar.getmember("config/profile-link.md").issym()
+    assert "config/config.toml" in names
+    assert "config/.env" in names
+    assert "config/interest-profile.md" in names
+    assert "prompts/analyze-v001.md" in names
+
+
+def test_backup_skips_circular_symlink_config_dir_with_warning(conn, tmp_path, caplog) -> None:
+    # 循環する symlink は resolve() が例外を出す(Python 3.12 は RuntimeError)。その dir は
+    # 入れずに WARN を残し、DB を含む世代は作る(GH#279)
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b, target_is_directory=True)
+    loop_b.symlink_to(loop_a, target_is_directory=True)
+    config = Config(
+        config_dir=loop_a,
+        storage=StorageConfig(backup_dir=str(tmp_path / "backups")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        archive = backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+    assert "intel.db" in names
+    assert "prompts/analyze-v001.md" in names
+    assert not [n for n in names if n == "config" or n.startswith("config/")]
+    assert any(
+        r.levelno == logging.WARNING and "config/" in r.getMessage() for r in caplog.records
+    )
