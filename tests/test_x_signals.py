@@ -350,6 +350,29 @@ def test_self_rt_backfill_does_not_move_cursor_back(conn, tmp_path) -> None:
     assert self_rt_cursor(conn) == "1200"
 
 
+def test_self_rt_cursor_not_moved_back_past_concurrent_advance(conn, tmp_path) -> None:
+    # 取得中に別の実行(朝バッチなど)がカーソルを進めても戻さない。比較は取得の開始時
+    # でなく保存時の値で行う(GH#231)
+    conn.execute("INSERT INTO x_signal_cursors (kind, since_id) VALUES ('self_rt', '1000')")
+    session = session_with([], [], [page(rt("1100", "901"))])
+    fetch = session.get
+
+    def get_while_other_run_advances(url: str, params: dict | None = None) -> httpx.Response:
+        if "42/tweets" in url:
+            other = connect(tmp_path / "intel.db")
+            other.execute("UPDATE x_signal_cursors SET since_id = '1300' WHERE kind = 'self_rt'")
+            other.close()
+        return fetch(url, params)
+
+    session.get = get_while_other_run_advances
+    collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger,
+        backfill_limit=10, kinds=("self_rt",),
+    )
+    assert [r["tweet_id"] for r in rows(conn, "self_rt")] == ["901"]
+    assert self_rt_cursor(conn) == "1300"
+
+
 def test_page_rolls_back_atomically_on_midpage_failure(conn, tmp_path) -> None:
     # ページ途中の失敗はページ全体を rollback(半端ページが残ると次回の既知到達
     # 判定が未保存の残りを飛ばす。SF82-09)。想定外の応答形は kind の失敗に隔離
