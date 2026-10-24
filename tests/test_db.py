@@ -52,6 +52,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (19, "019_notes_received_message.sql"),
         (20, "020_dig_questions_retry.sql"),
         (21, "021_analyses_extraction_failed.sql"),
+        (24, "024_digest_messages_superseded.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -130,6 +131,30 @@ def test_digest_messages_header_is_unique_per_digest(conn: sqlite3.Connection) -
         conn.execute(
             "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (1, NULL, 11)"
         )
+
+
+def test_digest_messages_unique_within_current_generation(conn: sqlite3.Connection) -> None:
+    # GH#190: --force の置換で印(superseded_at)を付けた前の世代の行を残したまま、今の世代の
+    # ヘッダと記事を記帳できる。今の世代の中の重複は従来どおり入らない
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count) "
+        "VALUES ('2026-07-06', '# d', '[]', 0)"
+    )
+    conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://a', 'https://a', 'sha256:x')"
+    )
+    insert = (
+        "INSERT INTO digest_messages (digest_id, item_id, message_id, superseded_at) "
+        "VALUES (1, ?, ?, ?)"
+    )
+    conn.execute(insert, (None, 10, "2026-07-06T00:00:00Z"))
+    conn.execute(insert, (1, 11, "2026-07-06T00:00:00Z"))
+    conn.execute(insert, (None, 20, None))
+    conn.execute(insert, (1, 21, None))
+    for item_id in (None, 1):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, (item_id, 22, None))
 
 
 def test_documents_cascade_on_item_delete(conn: sqlite3.Connection) -> None:

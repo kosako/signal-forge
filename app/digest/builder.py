@@ -69,7 +69,7 @@ def generate_digest(
             if existing:
                 # --force 置換: 旧 digest 採用 item(🔖保存節の分も)を候補(analyzed)に
                 # 戻してから再ランキング(戻さないと旧採用分が新 digest から黙って消える)。
-                # 配信台帳も作り直す
+                # 配信台帳は今の世代を空にする(次の deliver が全通を送り直す)
                 old_ids = json.loads(existing["item_ids"]) + json.loads(
                     existing["bookmark_item_ids"] or "[]"
                 )
@@ -80,7 +80,14 @@ def generate_digest(
                         f"WHERE id IN ({placeholders}) AND status = 'digested'",
                         old_ids,
                     )
-                conn.execute("DELETE FROM digest_messages WHERE digest_id = ?", (existing["id"],))
+                # 前の世代の行は消さず、置換の印(superseded_at)を付けて残す。Telegram に残る
+                # 前のメッセージへのリプライの帰属と、再選抜で外れた記事の感想の投影に使う(GH#190)
+                conn.execute(
+                    "UPDATE digest_messages "
+                    "SET superseded_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                    "WHERE digest_id = ? AND superseded_at IS NULL",
+                    (existing["id"],),
+                )
                 # digests 行は DELETE せず id を維持して下の UPDATE で上書きする。
                 # digest_notes(日次感想 = 恒久記録。GH#96)が digest_id を参照しており、
                 # DELETE は FK 違反(CASCADE にすると感想が消える)。置換後も同じ

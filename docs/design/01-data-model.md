@@ -28,17 +28,17 @@ x_signals ──> items(item_id NULL 可)          (X の興味シグナル。�
 x_signal_cursors / x_signal_runs               (シグナル取込のカーソル / 読取の実行ログ)
 dig_backlog_messages                           (未消化一覧の message_id 台帳。GH#104)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
-digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送用)
+digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送・リプライの帰属用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
 telegram_state                                 (getUpdates offset 等の単一行KV)
 schema_migrations                              (マイグレーション台帳。ランナーが管理)
 ```
 
-digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定の台帳(設計 04 §2)。記事が実際に届いたかの記録として、分析の既知判定の履歴(設計 03 §3.2。GH#177)の基準にも使う。
+digests↔items に KPI 用の結合表を作らない理由: 参照は表示と手動 KPI 集計のみで、`json_each(digests.item_ids)` で足りる(結合表はフェーズ2の拡張点)。`digest_messages` は KPI 用でなく配信の部分再送判定の台帳(設計 04 §2)。記事が実際に届いたかの記録として、分析の既知判定の履歴(設計 03 §3.2。GH#177)の基準にも使う。感想のリプライの帰属(設計 04 §5)と感想の投影先の解決(04 §7)にも使うので、`--force` の置換では行を消さず、`superseded_at`(migration 024)に置換の時刻を入れて前の世代として残す。部分再送の判定と一意の制約は今の世代(`superseded_at IS NULL`)の行だけで見て、リプライの帰属・感想の投影・既知判定の履歴は前の世代の行も含めて見る(前の世代のメッセージも届いたことは変わらないため。GH#190)。
 
-## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021 の追加)
+## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021・024 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -179,20 +179,26 @@ CREATE TABLE telegram_state (
 ) STRICT;
 
 -- 配信済み Telegram メッセージの台帳(送信途中失敗時の部分再送用。設計 04 §2)
+-- superseded_at(migration 024。GH#190)= --force の置換で前の世代になった時刻。NULL = 今の世代。
+-- 置換は行を消さずにこの列を入れる(Telegram に残る置換の前のメッセージへのリプライの帰属と、
+-- 再選抜で外れた記事の感想の投影に使う。設計 04 §2・§5・§7)。024 より前の行は NULL。
 CREATE TABLE digest_messages (
-  id         INTEGER PRIMARY KEY,
-  digest_id  INTEGER NOT NULL REFERENCES digests(id),
-  item_id    INTEGER REFERENCES items(id),  -- NULL = ヘッダメッセージ
-  message_id INTEGER NOT NULL,              -- Telegram の message_id
-  sent_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  id            INTEGER PRIMARY KEY,
+  digest_id     INTEGER NOT NULL REFERENCES digests(id),
+  item_id       INTEGER REFERENCES items(id),  -- NULL = ヘッダメッセージ
+  message_id    INTEGER NOT NULL,              -- Telegram の message_id
+  sent_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  superseded_at TEXT                           -- migration 024
 ) STRICT;
 -- SQLite の UNIQUE index は NULL 同士を別値として扱うため、ヘッダ行(item_id IS NULL)は
 -- 複合 UNIQUE では一意にならず重複挿入できてしまう。部分 UNIQUE index 2本で担保する
 -- (message_kind 列の追加案より、列と挿入コードの変更が不要な index 2本の方がシンプル)。
+-- 一意にするのは今の世代の中だけ(migration 024 で superseded_at IS NULL を条件に足した。
+-- 置換の後の配信が、前の世代と同じヘッダ・記事を記帳できるように)。
 CREATE UNIQUE INDEX ux_digest_messages_item   ON digest_messages(digest_id, item_id)
-  WHERE item_id IS NOT NULL;
+  WHERE item_id IS NOT NULL AND superseded_at IS NULL;
 CREATE UNIQUE INDEX ux_digest_messages_header ON digest_messages(digest_id)
-  WHERE item_id IS NULL;
+  WHERE item_id IS NULL AND superseded_at IS NULL;
 
 -- 感想(Telegram 配信の記事メッセージへのリプライ。GH#92 / migration 005)。
 -- 「その場で書いた自分の take」= 知見の種(ADR 0003)。自分の文章のため Issue #2
@@ -237,7 +243,7 @@ CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定台帳)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。§7)の 12。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。§7)の 12。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 

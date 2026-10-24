@@ -118,8 +118,10 @@ def export_pending_notes(
 
     感想は配信済みメッセージへのリプライでしか生まれないため、item ノート名の digest_date は
     digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
-    その item は配信済み)。その名前のノートが無ければ、export_digest と同じく item の既存の
-    ノートへ投影する(GH#242)。digest 感想は digests.digest_date で直接 Daily を特定する。
+    その item は配信済み)。--force の置換で印を付けた前の世代の行も含めるので、再選抜で外れた
+    記事の感想も投影先を失わない(GH#190)。その名前のノートが無ければ、export_digest と同じく
+    item の既存のノートへ投影する(GH#242)。digest 感想は digests.digest_date で直接 Daily を
+    特定する。
     再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
     """
     if config.obsidian.vault_path is None:
