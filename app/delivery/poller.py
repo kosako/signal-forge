@@ -508,7 +508,7 @@ def _record_followup(
     code: str,
     logger: logging.Logger,
 ) -> None:
-    """🔖追い掛け回答。signal_date は 🔖 を付けた日(設計 01 §7)。
+    """🔖追い掛け回答。signal_date は 🔖 の reaction と同じ配信日(KPI の帰属。設計 01 §7)。
 
     item の**最新 reaction が dig のときだけ**記帳する(タイブレークは送信側と同一)。
     dig の後に 👎 等へ訂正された item は 🔖 対象でなくなるため、古い追い掛けボタン

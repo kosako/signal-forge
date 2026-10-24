@@ -12,6 +12,7 @@ import pytest
 from app import dig_take
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
+from app.delivery.surveys import pending_dig_items
 from app.dig_take import has_unrecorded_take, record_takes
 from app.vault_guard import VaultGuard
 from tests.test_dig_answer import add_dig, ask
@@ -147,6 +148,35 @@ def test_followup_uses_bookmark_date_and_is_not_duplicated(conn, config) -> None
 
     assert record_takes(conn, config, logger) == 2
     assert followups(conn, item_id) == [("yes", "2026-10-15")]  # 🔖 を付けた日・1 回だけ
+
+
+def test_take_after_followup_corrected_to_no_records_yes(conn, config) -> None:
+    # GH#195: 追い掛けを「はい」→「いいえ」に訂正した後の take は yes を足す。未消化一覧と
+    # KPI 06 は最新の記録を見るので、足さないと take の後も一覧に残り、深掘り済みにならない
+    dig_id = add_dig(conn, config, note=NOTE)
+    item_id = item_of(conn, dig_id)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'dig', '2026-10-15')",
+        (item_id,),
+    )
+    for value in ("yes", "no"):
+        conn.execute(
+            "INSERT INTO signals (kind, item_id, value, signal_date) "
+            "VALUES ('followup_dig', ?, ?, '2026-10-15')",
+            (item_id, value),
+        )
+    assert item_id in {row["item_id"] for row in pending_dig_items(conn)}
+    answered(conn, dig_id, "結論", 940, "take")
+
+    assert record_takes(conn, config, logger) == 1
+    latest = conn.execute(
+        "SELECT value, signal_date FROM signals WHERE kind = 'followup_dig' AND item_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    assert tuple(latest) == ("yes", "2026-10-15")
+    assert item_id not in {row["item_id"] for row in pending_dig_items(conn)}
 
 
 def test_missing_note_still_records_followup(conn, config, caplog) -> None:

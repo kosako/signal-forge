@@ -23,7 +23,7 @@ from app.delivery.telegram import (
     escape_and_truncate,
     escape_attr,
 )
-from app.jst import JST, today_jst
+from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
 STATE_SURVEY_SENT = "survey_sent_date"
@@ -233,7 +233,14 @@ def notify_run_failure(
 
 
 def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.Row]:
-    """dig_date の最新 reaction が 🔖 で、followup_dig 未記録のアイテム(設計 04 §4)。"""
+    """最新 reaction が 🔖 で、その 🔖 を dig_date(JST)に押し、followup_dig 未記録の
+    アイテム(設計 04 §4)。
+
+    押した日は reaction の created_at(UTC)を JST に直した日付で見る。signal_date は
+    KPI の帰属(配信日)なので、過去の digest に後から付けた 🔖 を取りこぼす(GH#226)。
+    最新 reaction は item ごとに決める(追い掛け回答の記帳 poller._record_followup と同じ)。
+    """
+    start, end = jst_day_bounds_utc(dig_date)
     return conn.execute(
         """
         SELECT items.id AS item_id, items.title, items.canonical_url,
@@ -241,11 +248,11 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
                 ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS title_ja
         FROM signals AS s
         JOIN items ON items.id = s.item_id
-        WHERE s.kind = 'reaction' AND s.signal_date = ? AND s.value = 'dig'
+        WHERE s.kind = 'reaction' AND s.value = 'dig'
+          AND s.created_at >= ? AND s.created_at < ?
           AND s.id = (
             SELECT id FROM signals AS s2
             WHERE s2.kind = 'reaction' AND s2.item_id = s.item_id
-              AND s2.signal_date = s.signal_date
             ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
           )
           AND NOT EXISTS (
@@ -254,7 +261,7 @@ def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.R
           )
         ORDER BY items.id
         """,
-        (dig_date,),
+        (start, end),
     ).fetchall()
 
 
@@ -266,8 +273,9 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
       いない)
     - X 側: bookmark 紐付けのある保存アイテム。Telegram の訂正(👎等)があっても
       X 上のブックマークが実在する限り候補に残す
-    - どちらも深掘り実施(followup_dig=yes)の記録で消える。両方に該当する item は
-      1 行(マーク時刻は新しい方)。新しいマークが上(直近の関心を先頭に)
+    - どちらも深掘り実施(最新の followup_dig が yes)の記録で消える。「はい」から
+      「いいえ」への訂正で一覧に戻る(GH#195)。両方に該当する item は 1 行(マーク時刻は
+      新しい方)。新しいマークが上(直近の関心を先頭に)
     """
     return conn.execute(
         """
@@ -292,11 +300,11 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                MAX(marked.marked_at) AS marked_at
         FROM marked
         JOIN items ON items.id = marked.item_id
-        WHERE NOT EXISTS (
-            SELECT 1 FROM signals AS f
+        WHERE (
+            SELECT f.value FROM signals AS f
             WHERE f.kind = 'followup_dig' AND f.item_id = marked.item_id
-              AND f.value = 'yes'
-          )
+            ORDER BY f.created_at DESC, f.id DESC LIMIT 1
+          ) IS NOT 'yes'
         GROUP BY items.id
         ORDER BY marked_at DESC, items.id DESC
         """

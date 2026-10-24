@@ -222,15 +222,21 @@ def _read_all(fd: int) -> bytes:
 
 
 def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
-    """followup_dig = yes(既にあれば足さない)。signal_date は 🔖 を付けた日(設計 01 §7)。
+    """followup_dig = yes(最新の記録が yes なら足さない)。signal_date は 🔖 の reaction と
+    同じ配信日(設計 01 §7)。
 
-    🔖 の無いアイテム(X のブックマーク・自動キュー)は take の日にする。
+    🔖 の無いアイテム(X のブックマーク・自動キュー)は take の日にする。追い掛けで
+    「いいえ」に訂正した後の take は yes を足す(未消化一覧と KPI 06 は最新の記録を見る。GH#195)。
     """
-    exists = conn.execute(
-        "SELECT 1 FROM signals WHERE kind = 'followup_dig' AND item_id = ? AND value = 'yes'",
+    latest = conn.execute(
+        """
+        SELECT value FROM signals
+        WHERE kind = 'followup_dig' AND item_id = ?
+        ORDER BY created_at DESC, id DESC LIMIT 1
+        """,
         (row["item_id"],),
     ).fetchone()
-    if exists is not None:
+    if latest is not None and latest["value"] == "yes":
         return
     dig = conn.execute(
         """
