@@ -39,9 +39,13 @@ class RunFailures(list[str]):
     digest_held: analyze 段の失敗で載せる記事が無く、当日の digest を確定しなかった(GH#191)。
     digest 段が DigestHeldError を受けたときだけ立てる。当日の行の有無からは推し量らない
     (実行の途中で JST の日付が変わると、作った digest を保留と取り違えるため)。
+    deliver_date: deliver 段が送ろうとした digest の日付(GH#247)。失敗通知が、日をまたいだ
+    ときの送り直し方(`intel deliver --date`)をこの日付で添える。通知は全段の後なので、
+    その時点の日付からは推し量らない。deliver 段が digest を引けなかった実行は None。
     """
 
     digest_held: bool = False
+    deliver_date: str | None = None
 
 
 def run_pipeline(
@@ -101,7 +105,7 @@ def run_pipeline(
     if is_telegram_configured(config, env):
         stage(
             "deliver",
-            lambda: _deliver_today(conn, config, env, logger, run_id, held=failures.digest_held),
+            lambda: _deliver_today(conn, config, env, logger, run_id, failures),
         )
     else:
         # 完全未設定 = M2a 前の未セットアップ。欠落検知は doctor #4 の責務(設計 05 §2)
@@ -276,14 +280,18 @@ def _deliver_today(
     env: dict[str, str],
     logger: logging.Logger,
     run_id: str,
-    *,
-    held: bool = False,
+    failures: RunFailures,
 ) -> None:
     # 配信済みは deliver_digest 側で skip(再実行の冪等性)。障害で当日の digest を
     # 確定しなかった日(GH#191)は送るものが無い(同じ日の再走で作って送る)
-    if held:
+    if failures.digest_held:
         return
-    deliver_digest(conn, config, create_api(env), _today_digest_id(conn), logger, run_id=run_id)
+    digest_id = _today_digest_id(conn)
+    # 送ろうとした digest の日付を、送る前に残す(失敗通知の送り直し方に使う。GH#247)
+    failures.deliver_date = conn.execute(
+        "SELECT digest_date FROM digests WHERE id = ?", (digest_id,)
+    ).fetchone()["digest_date"]
+    deliver_digest(conn, config, create_api(env), digest_id, logger, run_id=run_id)
 
 
 def _today_digest_id(conn: sqlite3.Connection) -> int:

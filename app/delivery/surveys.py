@@ -216,11 +216,14 @@ def notify_run_failure(
     logger: logging.Logger,
     *,
     digest_held: bool = False,
+    deliver_date: str | None = None,
 ) -> None:
     """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。
 
     digest_held: 分析の障害で当日の digest を確定しなかった(GH#191)。同じ 1 通で、
     復旧したら同じ日の再走で届くことを知らせる。
+    deliver_date: deliver 段が送ろうとした digest の日付。その配信が失敗したら、日をまたいだ
+    ときに日付を指定して送り直せることを添える。翌日の再走は当日分しか送らないため(GH#247)。
     """
     today = today_jst()
     if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
@@ -231,6 +234,8 @@ def notify_run_failure(
         if digest_held
         else "`intel run` で再走してください"
     )
+    if deliver_date is not None and "deliver" in failures:
+        guide += f"。日をまたいだら `intel deliver --date {deliver_date}` で送れます"
     try:
         api.send_message(
             _require_chat_id(config),
@@ -331,7 +336,11 @@ def _watchdog_problems(conn: sqlite3.Connection, config: Config, today: str) -> 
     if row is None:
         problems.append("今朝のダイジェストが未生成です。`intel run` で再走できます")
     elif row["delivery_status"] != "sent":
-        problems.append("今朝のダイジェストが未配信です。`intel run` で再走できます")
+        # 翌日の配信は当日分しか送らないので、日をまたいだときの送り直し方も添える(GH#247)
+        problems.append(
+            "今朝のダイジェストが未配信です。`intel run` で再走できます"
+            f"(日をまたいだら `intel deliver --date {today}`)"
+        )
     # X ソースの連続失敗(設計 02 §2)。collect はソースの失敗を run の失敗にしないので、
     # ここで拾わないと誰も気づかない(GH#124)。X を止めている間は回数が進まないので見ない
     if config.x.enabled:

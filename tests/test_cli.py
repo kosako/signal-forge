@@ -83,6 +83,182 @@ def test_dig_exits_quietly_while_another_digs(tmp_path, monkeypatch) -> None:
     assert "深掘りを進めているため、何もしなかった" in result.output
 
 
+# 配信のテストの当日と前日(JST)。実際の日付に依らないよう today_jst を差し替える
+_TODAY, _YESTERDAY = "2026-10-24", "2026-10-23"
+
+
+class _RecordingApi:
+    """送った本文を順に記録する Telegram の代役。"""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def send_message(self, chat_id, text, *, reply_markup=None):
+        self.texts.append(text)
+        return 900 + len(self.texts)
+
+
+def _undelivered_digests(
+    tmp_path, monkeypatch, titles_by_date: dict[str, list[str]]
+) -> tuple[_RecordingApi, dict[str, int]]:
+    """日付ごとに記事を載せた未配信の digest がある DB を用意する(当日 = _TODAY)。
+    送った本文の記録先と、日付ごとの digest の id を返す。"""
+    import json
+
+    import app.delivery as delivery
+    from app import jst, logs
+    from app.db import apply_migrations, connect
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    monkeypatch.setattr(jst, "today_jst", lambda: _TODAY)
+    _answer_config(tmp_path, telegram=True)
+    conn = connect(tmp_path / "intel.db")
+    apply_migrations(conn, tmp_path / "intel.db")
+    source_id = conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')").lastrowid
+    digest_ids = {}
+    for day, titles in titles_by_date.items():
+        item_ids = []
+        for title in titles:
+            url = f"https://a/{day}/{len(item_ids)}"
+            item_id = conn.execute(
+                "INSERT INTO items (source_id, url, canonical_url, title, content_hash, status) "
+                "VALUES (?, ?, ?, ?, 'sha256:x', 'digested')",
+                (source_id, url, url, title),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO analyses (item_id, summary, category, relevance_score, novelty, "
+                "recommendation_reason, implication, engine, model, prompt_version, input_hash) "
+                "VALUES (?, '要約', '課題直結', 80, 'new', '理由', '示唆', 'codex-cli', 'm', "
+                "'analyze-v001', ?)",
+                (item_id, f"sha256:{url}"),
+            )
+            item_ids.append(item_id)
+        digest_ids[day] = conn.execute(
+            "INSERT INTO digests (digest_date, markdown, item_ids, item_count) "
+            "VALUES (?, '# md', ?, ?)",
+            (day, json.dumps(item_ids), len(item_ids)),
+        ).lastrowid
+    conn.close()
+    api = _RecordingApi()
+    monkeypatch.setattr(delivery, "create_api", lambda env: api)
+    return api, digest_ids
+
+
+def _delivery_state(tmp_path, digest_id: int) -> tuple[str, int]:
+    """digest の配信状態と、台帳に載った message の数。"""
+    from app.db import connect
+
+    conn = connect(tmp_path / "intel.db")
+    status = conn.execute(
+        "SELECT delivery_status FROM digests WHERE id = ?", (digest_id,)
+    ).fetchone()[0]
+    count = conn.execute(
+        "SELECT COUNT(*) FROM digest_messages WHERE digest_id = ?", (digest_id,)
+    ).fetchone()[0]
+    conn.close()
+    return status, count
+
+
+def test_deliver_date_sends_past_unsent_digest(tmp_path, monkeypatch) -> None:
+    # 配信の失敗が翌日に持ち越されても、前日の未配信の digest を日付で指定して送れる(GH#247)。
+    # 当日の digest には触れない(過去の分を自動で繰り越さない)
+    yesterday, today = _YESTERDAY, _TODAY
+    api, ids = _undelivered_digests(
+        tmp_path, monkeypatch, {yesterday: ["前日の記事"], today: ["当日の記事"]}
+    )
+
+    result = runner.invoke(app, ["deliver", "--config-dir", str(tmp_path), "--date", yesterday])
+
+    assert result.exit_code == 0, result.output
+    assert "配信完了(2通)" in result.output
+    assert len(api.texts) == 2
+    assert yesterday in api.texts[0]  # ヘッダはその日の digest の日付のまま
+    assert "前日の記事" in api.texts[1]
+    assert _delivery_state(tmp_path, ids[yesterday]) == ("sent", 2)
+    assert _delivery_state(tmp_path, ids[today]) == ("pending", 0)
+
+
+def test_deliver_date_does_not_resend_delivered_messages(tmp_path, monkeypatch) -> None:
+    # 途中まで届いた前日の分は、台帳にある分(ヘッダと 1 件目)を重ねて送らない。
+    # 送り終えた後にもう一度打っても配信済みとして何も送らない(GH#247)
+    from app.db import connect
+
+    yesterday = _YESTERDAY
+    api, ids = _undelivered_digests(
+        tmp_path, monkeypatch, {yesterday: ["届いた記事", "残りの記事"]}
+    )
+    conn = connect(tmp_path / "intel.db")
+    delivered_item = conn.execute(
+        "SELECT id FROM items WHERE title = '届いた記事'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) "
+        "VALUES (?, NULL, 501), (?, ?, 502)",
+        (ids[yesterday], ids[yesterday], delivered_item),
+    )
+    conn.execute(
+        "UPDATE digests SET delivery_status = 'failed' WHERE id = ?", (ids[yesterday],)
+    )
+    conn.close()
+    args = ["deliver", "--config-dir", str(tmp_path), "--date", yesterday]
+
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == 0, first.output
+    assert "配信完了(1通)" in first.output
+    assert second.exit_code == 0, second.output
+    assert "配信済み(skip)" in second.output
+    assert len(api.texts) == 1
+    assert "残りの記事" in api.texts[0]
+    assert _delivery_state(tmp_path, ids[yesterday]) == ("sent", 3)
+
+
+def test_deliver_without_date_sends_only_today(tmp_path, monkeypatch) -> None:
+    # 日付を指定しない通常の配信は従来どおり当日分だけ。前日の未配信は拾わない(GH#247)
+    yesterday, today = _YESTERDAY, _TODAY
+    api, ids = _undelivered_digests(
+        tmp_path, monkeypatch, {yesterday: ["前日の記事"], today: ["当日の記事"]}
+    )
+
+    result = runner.invoke(app, ["deliver", "--config-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert len(api.texts) == 2
+    assert today in api.texts[0]
+    assert "当日の記事" in api.texts[1]
+    assert _delivery_state(tmp_path, ids[today]) == ("sent", 2)
+    assert _delivery_state(tmp_path, ids[yesterday]) == ("pending", 0)
+
+
+def test_deliver_date_accepts_unpadded_date(tmp_path, monkeypatch) -> None:
+    # 0 埋めしない日付も DB の digest_date の形に揃えて引く
+    api, ids = _undelivered_digests(tmp_path, monkeypatch, {"2026-01-05": ["記事"]})
+
+    result = runner.invoke(app, ["deliver", "--config-dir", str(tmp_path), "--date", "2026-1-5"])
+
+    assert result.exit_code == 0, result.output
+    assert _delivery_state(tmp_path, ids["2026-01-05"]) == ("sent", 2)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("2026/01/05", "--date が不正"),
+        ("2026-02-30", "--date が不正"),
+        ("2026-01-06", "2026-01-06 の digest が存在しない"),
+    ],
+)
+def test_deliver_date_rejects_bad_or_missing_date(tmp_path, monkeypatch, value, message) -> None:
+    api, _ = _undelivered_digests(tmp_path, monkeypatch, {"2026-01-05": ["記事"]})
+
+    result = runner.invoke(app, ["deliver", "--config-dir", str(tmp_path), "--date", value])
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert api.texts == []
+
+
 def _unsent_take(tmp_path, monkeypatch) -> Path:
     """返事が未送信の take が 1 件ある DB と vault を用意し、vault の置き場を返す。"""
     from app import logs
@@ -257,6 +433,28 @@ def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     assert len(calls) == 1 and calls[0]
 
 
+def test_run_failure_notice_gets_date_of_failed_delivery(tmp_path, monkeypatch) -> None:
+    # deliver 段が送ろうとした digest の日付(run_pipeline の戻り値)を失敗通知へ渡す。
+    # 通知の時点の日付ではなく、この日付で送り直し方を添える(GH#247)
+    from app import delivery, logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    failures = run.RunFailures(["deliver"])
+    failures.deliver_date = "2026-10-23"
+    passed: list[str | None] = []
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
+    monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
+    monkeypatch.setattr(
+        delivery,
+        "notify_run_failure",
+        lambda *args, digest_held, deliver_date: passed.append(deliver_date),
+    )
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert passed == ["2026-10-23"]
+
+
 @pytest.mark.parametrize("digest_held", [True, False])
 def test_run_failure_notice_tells_whether_digest_was_held(
     tmp_path, monkeypatch, digest_held
@@ -272,8 +470,11 @@ def test_run_failure_notice_tells_whether_digest_was_held(
     monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
     monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
     monkeypatch.setattr(
-        delivery, "notify_run_failure", lambda *args, digest_held: passed.append(digest_held)
+        delivery,
+        "notify_run_failure",
+        lambda *args, digest_held, **kwargs: passed.append(digest_held),
     )
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert passed == [digest_held]
+

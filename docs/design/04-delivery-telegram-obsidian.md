@@ -44,6 +44,7 @@
 - **配信の冪等性**: 送信完了時に `digests.delivery_status='sent'` + `sent_at` を記録し(語彙は 01 §3 に統一。delivered_at という別名は使わない)、`intel deliver` は既配信の digest を再送しない(再実行安全)。送信途中失敗時は未送信アイテムのみ再送できるよう、送信済み message_id をアイテムごとに `digest_messages`(01 §3)へ記録する。
   - **配信の直列化**(GH#192): 台帳の確認から送信・記帳までを、同じ DB への配信どうしでプロセス間に直列化する(DB の隣の `<DB>.deliver.lock`(既定 `intel.db.deliver.lock`)を flock。migration の `<DB>.migrate.lock` と同じ名付け。01 §10)。朝バッチの deliver 段と手動の `intel deliver` / `intel run` が重なっても、後の側は先の側が終わるまで待ち、その記帳を読んでから未送信だけを送る(先の側が送り終えていれば配信済みとして skip)。
   - **送信後の記帳の失敗**(GH#225): 送信が成功して message_id を受け取った後に台帳の INSERT が失敗したら(ディスクの一時的な異常など)、送り直さず記帳だけを 3 回までやり直す(待ちは 1s→2s→4s。制約違反などはやり直さない)。それでも記帳できなければ、その message_id を ERROR のログ(朝バッチは `morning.log`)に残して配信を止める(先のアイテムは送らない。書ければ `delivery_status='failed'`)。台帳に無い message は再走で未送信として送り直され、感想のリプライの帰属(§5)も引けないため、再走の前にログの message_id を台帳へ入れて復旧する(手順は runbook §15)。送信と記帳の間でプロセスが止まったときは message_id が残らず、再走で送り直しうる(この対処の外)。
+  - **日をまたいだ未配信**(GH#247): `intel run` と `intel deliver`(日付の指定なし)は当日(JST)の digest だけを送る。配信が失敗したまま日をまたいだ digest は自動では繰り越さず(日次の配信の契約と通知の量を変えない)、本人が `intel deliver --date YYYY-MM-DD` で日付を指定して送る。送り方は上の部分再送と同じ(台帳にある分は送らず、配信済みなら skip)。ヘッダはその digest の日付のまま。載せた記事は `digested` のままで、翌日以降のランキングの候補には戻さない(Obsidian には書き出し済み)。朝バッチ失敗通知(配信の段が失敗した日)と watchdog の「未配信」に、その digest の日付を入れた送り方を添える(設計 05 §4。手順は runbook §16)。
 
 ## 3. callback_query 処理(受信デーモン)
 
