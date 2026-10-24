@@ -353,28 +353,33 @@ def test_all_requests_share_end_time_before_run_start() -> None:
 class SearchServer:
     """スロットごとの投稿を作成の時刻つきで持つ search/recent の模型(GH#184)。
 
-    要求ごとに時計を gap 進める。end_time が無ければ要求の 30 秒前より前を返し(API の既定)、
-    あれば end_time より前(end_time は含まない)を返す。end_time が要求の 10 秒前より新しければ
-    400(API の制約)。新しい順・since_id より新しいものだけ・max_results まで。
+    時計は start から始まり、要求に応えるたびに gap 進む(コネクタの時計も now で共有する)。
+    end_time が無ければ要求の 30 秒前より前を返し(API の既定)、あれば end_time より前
+    (end_time は含まない)を返す。end_time が要求の 10 秒前より新しければ 400(API の制約)。
+    新しい順・since_id より新しいものだけ・max_results まで。
     """
 
     def __init__(self, posts: list[tuple[str, datetime]], *, start: datetime, gap: timedelta):
         self._posts = posts
-        self._clock = start - gap
+        self._clock = start
         self._gap = gap
 
+    def now(self) -> datetime:
+        return self._clock
+
     def handle(self, request: httpx.Request) -> httpx.Response:
-        self._clock += self._gap
+        requested = self._clock  # この要求の時刻
+        self._clock += self._gap  # 次の要求までに経つ時間
         query = parse_qs(urlsplit(str(request.url)).query)
         slot = query["query"][0].removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
         if "end_time" in query:
             until = datetime.strptime(query["end_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=UTC
             )
-            if until > self._clock - timedelta(seconds=10):
+            if until > requested - timedelta(seconds=10):
                 return httpx.Response(400, json={})
         else:
-            until = self._clock - timedelta(seconds=30)
+            until = requested - timedelta(seconds=30)
         since = int(query.get("since_id", ["0"])[0])
         ids = sorted(
             (int(snowflake_at(at)) for s, at in self._posts if s == slot and at < until),
@@ -386,8 +391,9 @@ class SearchServer:
 
 def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
     # GH#184: スロットは順に取る。A を取ったあと・B を取る前に A に入った新着 a' より新しい b' を
-    # B が取ると、次回の since_id が a' を越えて a' が恒久欠落する。上限を共通にして防ぐ
-    a_new = NOW + timedelta(seconds=10)  # A の要求(NOW+1 秒)のあと・B の要求(NOW+61 秒)の前
+    # B が取ると、次回の since_id が a' を越えて a' が恒久欠落する。上限を共通にして防ぐ。
+    # コネクタの時計も実行中に進めて、上限を要求ごとに取り直す実装も捉える
+    a_new = NOW + timedelta(seconds=10)  # A の要求(NOW)のあと・B の要求(NOW+60 秒)の前
     posts = [
         ("a", NOW - timedelta(minutes=5)),
         ("b", NOW - timedelta(minutes=4)),
@@ -396,9 +402,7 @@ def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
     ]
 
     def run(run_start: datetime, cursor: dict):
-        server = SearchServer(
-            posts, start=run_start + timedelta(seconds=1), gap=timedelta(seconds=60)
-        )
+        server = SearchServer(posts, start=run_start, gap=timedelta(seconds=60))
         return XSearchConnector(
             client=httpx.Client(transport=httpx.MockTransport(server.handle)),
             credentials=CREDS,
@@ -406,7 +410,7 @@ def test_new_post_in_earlier_slot_during_run_is_fetched_next_run() -> None:
             daily_read_cap=20,
             unit_price_usd=0.004,
             sleep=lambda _s: None,
-            now=lambda: run_start,
+            now=server.now,
         ).fetch(make_source(), cursor)
 
     first = run(NOW, {})
