@@ -766,11 +766,23 @@ class SendFailingApi(FakeApi):
         return super().send_message(chat_id, text, reply_markup=reply_markup)
 
 
+# 日付を固定する(実際の日付を取り直すと、日付の変わり目で翌日分の watchdog が動いて揺れる)
+WATCHDOG_DUE = datetime(2026, 10, 20, 7, 15, tzinfo=JST)
+
+
+def add_undelivered_digest(conn, item_ids: list[int], day: datetime) -> None:
+    """day の未配信の digest(その日の watchdog が通知を試みる)。"""
+    digest_id = add_digest(conn, item_ids)
+    conn.execute(
+        "UPDATE digests SET digest_date = ? WHERE id = ?", (day.strftime("%Y-%m-%d"), digest_id)
+    )
+
+
 def test_run_poller_keeps_receiving_while_notification_keeps_failing(conn, tmp_path) -> None:
     # GH#224: 内蔵タイマーの送信が失敗し続けても、同じ周期の getUpdates を飛ばさない
     # (以前は同じ try の中で受信まで飛ばし、30s 待ってまた送信からやり直していた)
     item_id = add_item(conn, "https://a/1")
-    add_digest(conn, [item_id])  # 未配信 → 7:15 の watchdog が通知を試みる
+    add_undelivered_digest(conn, [item_id], WATCHDOG_DUE)
     calls = {"n": 0}
 
     def should_stop() -> bool:
@@ -784,7 +796,7 @@ def test_run_poller_keeps_receiving_while_notification_keeps_failing(conn, tmp_p
     run_poller(
         conn, make_config(tmp_path), api, logger,
         sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
-        now_fn=lambda: jst_now("07:15"),
+        now_fn=lambda: WATCHDOG_DUE,
         clock=lambda: calls["n"] * TIMER_RETRY_S,  # 毎周期、再試行の間隔が過ぎている
     )
 
@@ -799,7 +811,7 @@ def test_run_poller_keeps_receiving_while_notification_keeps_failing(conn, tmp_p
 def test_run_poller_retries_failed_notification_at_own_interval(conn, tmp_path) -> None:
     # GH#224: 失敗した通知は受信の周期ごとではなく、失敗から TIMER_RETRY_S 経ってから試し直す
     # (受信が続く間に、送れない通知で Telegram を毎周期叩かない)。届いたら枠を消費する
-    add_digest(conn, [])  # 未配信 → 7:15 の watchdog が通知を試みる
+    add_undelivered_digest(conn, [], WATCHDOG_DUE)
     elapsed = [0, 60, TIMER_RETRY_S - 1, TIMER_RETRY_S, TIMER_RETRY_S + 60]  # 周期ごとの clock
     cycle = {"i": -1}
 
@@ -812,14 +824,14 @@ def test_run_poller_retries_failed_notification_at_own_interval(conn, tmp_path) 
     run_poller(
         conn, make_config(tmp_path), api, logger,
         sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
-        now_fn=lambda: jst_now("07:15"), clock=lambda: elapsed[cycle["i"]],
+        now_fn=lambda: WATCHDOG_DUE, clock=lambda: elapsed[cycle["i"]],
     )
 
     assert api.attempt_cycles == [0, 3]  # 失敗した周期と、間隔が過ぎた周期だけ試した
     assert len(api.offsets) == len(elapsed)  # 受信は毎周期
     assert sleeps == []
     assert len(api.sent) == 1 and "⚠️ watchdog" in api.sent[0][1]
-    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) == jst_now().strftime("%Y-%m-%d")
+    assert get_state(conn, STATE_WATCHDOG_NOTIFIED) == "2026-10-20"
 
 
 def test_dig_backlog_includes_x_bookmarks(conn, tmp_path) -> None:
