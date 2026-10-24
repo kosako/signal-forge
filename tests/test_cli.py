@@ -33,6 +33,7 @@ def test_doctor_accepts_documented_options(tmp_path, monkeypatch) -> None:
     )
     assert result.exit_code == 0
     assert "purge 完了" in result.output
+    assert "text_excerpt 0 件 NULL 化" in result.output  # doctor #11 の WARN と同じ単位(GH#250)
     assert "着地見込み" in result.output
     assert (tmp_path / "logs" / "morning.log").exists()  # purge の記録は隔離先に書かれる
 

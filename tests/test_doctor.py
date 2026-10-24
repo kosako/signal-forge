@@ -8,7 +8,7 @@ import pytest
 
 from app.connectors.base import FatalError, RetryableError
 from app.connectors.x import XApiSession, XCredentials
-from app.db import apply_migrations, connect
+from app.db import MigrationError, apply_migrations, connect
 from app.doctor import (
     CanaryProbe,
     CheckResult,
@@ -244,6 +244,32 @@ def test_pending_migration_fails(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 3)
     assert result.status == "FAIL"
     assert "未適用" in result.detail
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        # DB より古い checkout(ファイルに無い適用済み番号)
+        "INSERT INTO schema_migrations (version, filename) VALUES (999, '999_future.sql')",
+        # 適用済みファイルの改名
+        "UPDATE schema_migrations SET filename = '001_renamed.sql' WHERE version = 1",
+    ],
+)
+def test_migration_ledger_mismatch_fails(config_dir, tmp_path, tamper) -> None:
+    # run・poll が起動時に拒否する台帳を、doctor も PASS にしない(GH#252)
+    conn = sqlite3.connect(tmp_path / "intel.db")
+    conn.execute(tamper)
+    conn.commit()
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 3)
+    assert result.status == "FAIL"
+    assert "台帳の不整合" in result.detail
+    conn = connect(tmp_path / "intel.db")
+    try:
+        with pytest.raises(MigrationError):
+            apply_migrations(conn, tmp_path / "intel.db")
+    finally:
+        conn.close()
 
 
 def test_telegram_allowlist_missing_fails_without_api_call(config_dir, tmp_path) -> None:
@@ -698,6 +724,27 @@ def test_backup_permission_warn(config_dir, tmp_path) -> None:
     assert "パーミッション" in result.detail
 
 
+def test_backup_ignores_unrelated_archives(config_dir, tmp_path) -> None:
+    # 置き場にある別用途の新しい tar.gz で、世代の欠落・古さを隠さない(GH#253)
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    unrelated = backup_dir / "unrelated.tar.gz"
+    with tarfile.open(unrelated, "w:gz"):
+        pass
+    unrelated.chmod(0o600)
+    result = by_number(doctor(config_dir, tmp_path), 10)
+    assert result.status == "WARN"
+    assert "世代" in result.detail and "なし" in result.detail
+
+    make_fresh_backup(tmp_path)
+    old = backup_dir / "intel-20260707.tar.gz"
+    stale = 60 * 60 * 72  # 72h 前
+    os.utime(old, (old.stat().st_atime - stale, old.stat().st_mtime - stale))
+    result = by_number(doctor(config_dir, tmp_path), 10)
+    assert result.status == "WARN"
+    assert "48h 超" in result.detail
+
+
 def test_ttl_leftover_warn(config_dir, tmp_path) -> None:
     conn = connect(tmp_path / "intel.db")
     conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
@@ -714,6 +761,27 @@ def test_ttl_leftover_warn(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 11)
     assert result.status == "WARN"
     assert "documents 1 件" in result.detail
+
+
+def test_ttl_leftover_counts_expired_signal_excerpts(config_dir, tmp_path) -> None:
+    # 記事行を持たないシグナルの抜粋だけが残っても見逃さない(purge と同じ条件。GH#250)
+    conn = connect(tmp_path / "intel.db")
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt, observed_at) "
+        "VALUES ('like', 'old', '古い本文', '2020-01-01T00:00:00Z')"
+    )
+    # 期限内の抜粋と、NULL 化済みの古い行は数えない
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt) VALUES ('like', 'new', '新しい本文')"
+    )
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt, observed_at) "
+        "VALUES ('bookmark', 'purged', NULL, '2020-01-01T00:00:00Z')"
+    )
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 11)
+    assert result.status == "WARN"
+    assert "text_excerpt 1 件" in result.detail
 
 
 def _add_failing_source(
