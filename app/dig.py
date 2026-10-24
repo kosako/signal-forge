@@ -32,6 +32,15 @@ _LEAD_PARTICLE_RE = re.compile(
     r"^[\s、,。.::]*(?:を|(?:は|が|も|の|に|で|と)(?=[\s、,。.]|$))?\s*"
 )
 _TRAIL_PUNCT_RE = re.compile(r"[\s、,。.!!??]*$")
+# 次の番号の前置きになる接続語(GH#238)。最後以外の命令で、読点の後ろがこれだけの
+# ときに限り前置きとして切り落とす(読点の後ろに自由文が続くなら観点の一部として残す)
+_CONNECTOR_WORDS = (
+    "あとは", "あと", "それと", "それから", "それに", "そして", "で", "次に", "次は",
+    "ついでに", "さらに", "加えて", "また", "やっぱり", "えっと", "えーと", "あ",
+)
+_CONNECTOR_ONLY_RE = re.compile(
+    r"\s*(?:(?:" + "|".join(_CONNECTOR_WORDS) + r")\s*)*"
+)
 
 
 @dataclass(frozen=True)
@@ -60,14 +69,28 @@ def parse_dig_reply(text: str, valid_ids: set[int]) -> list[DigInstruction]:
         end = len(text) if is_last else boundaries[position + 1].start()
         segment = text[match.end() : end]
         if not is_last:
-            # 次の番号の前置き(「、あと」「。それと」等)を前の命令に混入させない:
-            # 最後の読点・句点で切り落とす(読点のない連結は全体を観点として残す)。
-            # ASCII の「.」は切らない(「GPT-5.6」等の術語を壊さない)
-            cut = max(segment.rfind("、"), segment.rfind("。"), segment.rfind("\n"))
+            # 次の番号の前置き(「。それと」「、あと」等)を前の命令に混入させない。
+            # 切るのは命令どうしの区切りと分かるところだけ(GH#238):
+            # - 句点・改行は文の区切りなので、最後のものより後ろを切る。ASCII の「.」は
+            #   切らない(「GPT-5.6」等の術語を壊さない)
+            # - 読点は観点の中にも現れる(「コスト、運用の観点で」)ので、後ろが接続語
+            #   だけのときに限り切る。読点で分けて末尾の区間から 1 回ずつ判定する
+            #   (末尾に固定した正規表現の探索は長い入力で二乗になる)
+            cut = max(segment.rfind("。"), segment.rfind("\n"))
             if cut != -1:
                 segment = segment[:cut]
+            parts = segment.split("、")
+            while len(parts) > 1 and _CONNECTOR_ONLY_RE.fullmatch(parts[-1]):
+                parts.pop()
+            segment = "、".join(parts)
         core = _LEAD_PARTICLE_RE.sub("", segment, count=1)
         core = _TRAIL_PUNCT_RE.sub("", core)
+        if not is_last:
+            # パスは観点をとらないので、パス語の直後の読点はそこで命令を終える
+            # (「3773 はパス、気になるのは 3660 の方」の後半は次の番号の前置き)
+            head = _TRAIL_PUNCT_RE.sub("", core.partition("、")[0])
+            if _PASS_RE.fullmatch(head):
+                core = head
         if _PASS_RE.fullmatch(core):
             instruction = DigInstruction(item_id, "pass")
         else:
