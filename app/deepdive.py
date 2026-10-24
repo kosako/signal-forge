@@ -293,12 +293,15 @@ def _run_dig_stage_locked(
     if remaining > 0:
         selected, skipped_requested = _select_candidates(conn, config, remaining, day)
         for candidate in skipped_requested:
-            _drop_request(conn, candidate)
-        failures.extend(
-            f"item {c.item_id}: リプライ指定だが本文の抽出材料がない"
-            "(指定を外した。次の朝からは知らせない)"
-            for c in skipped_requested
-        )
+            dropped = _drop_request(conn, candidate, logger, run_id)
+            failures.append(
+                f"item {candidate.item_id}: リプライ指定だが本文の抽出材料がない"
+                + (
+                    "(指定を外した。次の朝からは知らせない)"
+                    if dropped
+                    else "(パスするか手動対応)"
+                )
+            )
         for candidate in selected:
             try:
                 _dig_one(
@@ -443,27 +446,43 @@ def _select_candidates(
     return selected, skipped_requested
 
 
-def _drop_request(conn: sqlite3.Connection, candidate: DigCandidate) -> None:
-    """材料不足のリプライ指定を、知らせた後に自動キューの扱いへ戻す(GH#197)。
+def _drop_request(
+    conn: sqlite3.Connection,
+    candidate: DigCandidate,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> bool:
+    """材料不足のリプライ指定を、知らせた後に自動キューの扱いへ戻す(GH#197)。外せたら True。
 
     requested_at を外すだけで、status(queued)・観点・source・受付の順序の印
     (backlog_op_question_id。本人の未消化一覧への操作ではない)は変えない。本文を取り直す
     経路は無いので、指定のまま残すと毎朝同じ失敗を知らせ続ける。材料不足の自動選出と同じく
     静かに残り、本人が指定し直せばまた 1 回知らせる。選定の後に poller が更新していたら
     (再指定・パス)、本人の操作を優先して変えない(done 化と同じ compare-and-set)。
+    DB の失敗は item 単位に閉じ(ERROR を残して False)、他の件の深掘りと公開・送信を止めない。
     """
-    conn.execute(
-        "UPDATE dig_queue SET requested_at = NULL, "
-        "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-        "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
-        "  AND angle IS ? AND requested_at IS ?",
-        (
-            candidate.item_id,
-            candidate.queue_updated_at,
-            candidate.angle,
-            candidate.queue_requested_at,
-        ),
-    )
+    try:
+        return (
+            conn.execute(
+                "UPDATE dig_queue SET requested_at = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
+                "  AND angle IS ? AND requested_at IS ?",
+                (
+                    candidate.item_id,
+                    candidate.queue_updated_at,
+                    candidate.angle,
+                    candidate.queue_requested_at,
+                ),
+            ).rowcount
+            == 1
+        )
+    except sqlite3.Error as e:
+        logger.error(
+            f"材料不足の指定を外せなかった item={candidate.item_id}: {type(e).__name__}: {e}",
+            extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
+        )
+        return False
 
 
 def _dig_one(
