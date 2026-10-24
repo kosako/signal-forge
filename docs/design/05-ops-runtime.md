@@ -25,7 +25,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 ### 1.3 事前セットアップ(doctor で検査)
 
-実行ユーザーの `uv` バイナリへ **Full Disk Access** 付与(launchd 背景ジョブの Obsidian Vault 書き込みが TCC で止まるため)。付与確認は doctor の書き込みテストで行う。
+実行ユーザーの `uv` バイナリへ **Full Disk Access** 付与(launchd 背景ジョブの Obsidian Vault 書き込みが TCC で止まるため)。付与確認は doctor の書き込みテストで行う。付与が外れて確認待ちになっても、深掘りのノートの公開(dig 段・`intel dig`)と返事(§1.2)は時間の上限で先へ進む(設計 06 §4。GH#145・GH#234)。export 段の書き込みには上限が無い(止まれば配信に進まず、watchdog が未配信を知らせる。§4)。
 
 ## 2. `intel doctor` チェック項目
 

@@ -33,11 +33,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,6 +63,7 @@ from app.delivery.telegram import (
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import JST
 from app.prompting import fill_template, sanitize, sanitize_body
+from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-v001"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
@@ -67,6 +72,11 @@ REVISE_PROMPT_VERSION = "dig-revise-v001"  # 指摘を受けて書き手が 1 �
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限定。ADR 0004)
+
+# ノートの公開を実行どうしで 1 つに絞るロック(台帳の DB と同じ置き場。GH#234)。
+# 別の実行が握っていたら、この時間だけ待って諦める(ふだんの公開は数ミリ秒で終わる)
+_PUBLISH_LOCK_NAME = "dig-publish.lock"
+_PUBLISH_LOCK_WAIT_S = VAULT_TIMEOUT_S
 
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
@@ -188,6 +198,9 @@ class DigCandidate:
     summary: str | None
     # 同じ item の前回の解説ノート(調べ直し = done からの再指定。GH#137)。新しいノートからリンクする
     previous_note_name: str | None = None
+    # 本文を取得・抽出した JST の日付(documents.extracted_at)。原文・対訳ノートの fetched に
+    # 書く(深掘りした日ではない。GH#239)
+    fetched_date: str | None = None
 
 
 def run_dig_stage(
@@ -203,6 +216,8 @@ def run_dig_stage(
     today: str | None = None,
     # 別系統の AI のレビュー役(GH#153)。None = レビューしない(config `[dig].review` が off)
     review_engine_factory: Callable[[], LLMEngine] | None = None,
+    # ノートの公開の vault へのアクセスの時間の上限(GH#234。None = 既定の上限。テスト注入用)
+    vault: VaultGuard | None = None,
 ) -> None:
     """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
 
@@ -246,7 +261,9 @@ def run_dig_stage(
         )
 
     # 未公開ノートの書出(過去の中断分を含む)
-    failures.extend(_publish_pending_notes(conn, config, logger, run_id))
+    failures.extend(
+        _publish_pending_notes(conn, config, logger, run_id, vault or VaultGuard())
+    )
 
     # 未送信カード(過去の中断分を含む)の送信。Telegram 未設定なら台帳に残す
     if api is not None:
@@ -289,6 +306,7 @@ def _select_candidates(
         SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
                i.title, i.author, i.published_at, i.canonical_url,
                d.extracted_text, d.language,
+               date(d.extracted_at, '+9 hours') AS fetched_date,
                a.title_ja, a.summary,
                (SELECT r.note_name FROM dig_results r
                 WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
@@ -329,6 +347,7 @@ def _select_candidates(
             title_ja=row["title_ja"],
             summary=row["summary"],
             previous_note_name=row["previous_note_name"],
+            fetched_date=row["fetched_date"],
         )
         if candidate.body and len(candidate.body) >= config.dig.min_body_chars:
             selected.append(candidate)
@@ -459,47 +478,178 @@ def _publish_pending_notes(
     config: Config,
     logger: logging.Logger,
     run_id: str | None,
+    vault: VaultGuard,
 ) -> list[str]:
     """未公開ノート(過去の中断分を含む)を台帳の本文から vault へ書き出す。
 
     公開後は本文列を NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。
+
+    vault へのアクセスは 1 件ごとに時間の上限を付ける(GH#234。仕組みは GH#145 と同じ)。
+    macOS のプライバシーの確認待ちなどで止まると、カードの送信と朝バッチの後続の段・失敗通知
+    まで止まるため。上限を超えたら、その件と残りの件は本文を台帳に持ったまま未公開にして
+    先へ進む(公開済みの件のカードは送り、未公開の件は次の実行で公開し直す)。止まった
+    スレッドは後から書き終えうるので、それが終わるまで公開のロック(_PublishLock)を握り、
+    別の実行に同じノートを公開させない。
     """
     failures: list[str] = []
     rows = conn.execute(
         "SELECT id, item_id, note_name, source_note_name, note_markdown,"
         " source_note_markdown FROM dig_results WHERE published_at IS NULL ORDER BY id"
     ).fetchall()
-    for row in rows:
-        try:
-            deepdive_dir = _deepdive_dir(config)
-            if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
-                _publish_note(
-                    deepdive_dir / f"{row['note_name']}.md",
-                    row["note_markdown"],
-                    logger,
-                    run_id,
-                )
-            if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
-                _publish_note(
-                    deepdive_dir / f"{row['source_note_name']}.md",
-                    row["source_note_markdown"],
-                    logger,
-                    run_id,
-                )
-        except Exception as e:
-            logger.error(
-                f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
-                extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
-                exc_info=True,
-            )
-            failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
-            continue
-        conn.execute(
-            "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
-            " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
-            (row["id"],),
+    if not rows:
+        return failures
+    lock = _PublishLock.acquire(conn)
+    if lock is None:
+        logger.error(
+            "別の実行のノートの公開が終わっていない(vault が応答しないまま止まっている可能性)"
+            f"ので、この実行では公開しない(未公開の {len(rows)} 件は次の実行へ。runbook §11)",
+            extra={"run_id": run_id, "stage": "dig"},
         )
+        failures.append(f"ノート公開: 別の実行の公開が終わっていない(未公開 {len(rows)} 件)")
+        return failures
+
+    def publish(row: sqlite3.Row) -> None:
+        if not lock.begin_write():  # 見切られた後に動き出した。ロックは放されたので書かない
+            return
+        try:
+            _publish_row_notes(config, row, logger, run_id)
+        finally:
+            lock.end_write()  # 見切られた後に終わったなら、ここで放す
+
+    try:
+        for index, row in enumerate(rows):
+            try:
+                vault.call(lambda row=row: publish(row))
+            except VaultStalled as e:
+                unpublished = len(rows) - index
+                logger.error(
+                    "vault が応答しないので、ノートの公開をこの実行では止める"
+                    f"(未公開の {unpublished} 件は本文を台帳に残し、次の実行で公開する。"
+                    f"runbook §11): {e}",
+                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                )
+                failures.append(
+                    f"item {row['item_id']}: ノート公開 VaultStalled"
+                    f"(未公開 {unpublished} 件は次の実行へ)"
+                )
+                break
+            except Exception as e:
+                logger.error(
+                    f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
+                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                    exc_info=True,
+                )
+                failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
+                continue
+            conn.execute(
+                "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+                " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
+                (row["id"],),
+            )
+    finally:
+        # 見切ったスレッドがまだ書いているなら、それが終わるまで(またはプロセスの終了まで)握る
+        lock.leave()
     return failures
+
+
+def _publish_row_notes(
+    config: Config, row: sqlite3.Row, logger: logging.Logger, run_id: str | None
+) -> None:
+    """台帳の 1 行のノート(解説・原文/対訳)を書き出す(vault-io のスレッドで動く。DB に触れない)。"""
+    deepdive_dir = _deepdive_dir(config)
+    if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
+        _publish_note(
+            deepdive_dir / f"{row['note_name']}.md",
+            row["note_markdown"],
+            logger,
+            run_id,
+        )
+    if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
+        _publish_note(
+            deepdive_dir / f"{row['source_note_name']}.md",
+            row["source_note_markdown"],
+            logger,
+            run_id,
+        )
+
+
+class _PublishLock:
+    """ノートの公開を、同じ台帳を使う実行どうし(朝バッチと `intel dig`)で 1 つに絞る(GH#234)。
+
+    vault が応答せず見切ったスレッドは中断できず、後から書き終えうる。その間に別の実行が
+    同じノートを公開し、本人が take を足したあとで、遅れた書き込みがノートを置き換えないよう、
+    見切ったときはそのスレッドが終わるまで握る。flock なのでプロセスが終われば外れる
+    (止まったスレッドもプロセスと一緒に消える)。answer.lock(GH#145)と同じ考え方。
+
+    放す役は 1 つの mutex の下で決める: 書き出しのスレッドの終わり(end_write)と呼び出し側の
+    離脱(leave)のうち、後になった側が放す。見切りの判定の直後にスレッドが書き終えても、
+    どちらも放さずに残ることはない。
+    """
+
+    def __init__(self, fd: int | None) -> None:
+        self._fd = fd
+        self._mutex = threading.Lock()
+        self._writing = False  # 書き出しのスレッドが動いている
+        self._left = False  # 呼び出し側が公開を終えた(見切った場合を含む)
+
+    @classmethod
+    def acquire(cls, conn: sqlite3.Connection) -> _PublishLock | None:
+        """取れなければ None(別の実行が _PUBLISH_LOCK_WAIT_S を過ぎても握っている)。"""
+        path = _publish_lock_path(conn)
+        if path is None:  # ファイルでない DB は、別の実行と台帳を共有しない
+            return cls(None)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            deadline = time.monotonic() + _PUBLISH_LOCK_WAIT_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return cls(fd)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.1)
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+        return None
+
+    def begin_write(self) -> bool:
+        """書き出しのスレッドの始まり。呼び出し側が既に離れていれば False(書かない)。"""
+        with self._mutex:
+            if self._left:
+                return False
+            self._writing = True
+            return True
+
+    def end_write(self) -> None:
+        """書き出しのスレッドの終わり。呼び出し側が先に離れていれば、ここで放す。"""
+        with self._mutex:
+            self._writing = False
+            if self._left:
+                self._close()
+
+    def leave(self) -> None:
+        """呼び出し側の離脱。書き出し中のスレッドがあれば、放すのはその終わり(end_write)に任せる。"""
+        with self._mutex:
+            self._left = True
+            if not self._writing:
+                self._close()
+
+    def _close(self) -> None:
+        """放す(fd を閉じると flock も外れる。2 回目は何もしない)。mutex の中で呼ぶ。"""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
+def _publish_lock_path(conn: sqlite3.Connection) -> Path | None:
+    """この接続の DB と同じ置き場のロックファイル(設定の値でなく、開いている台帳から決める)。"""
+    for _seq, name, file in conn.execute("PRAGMA database_list").fetchall():
+        if name == "main":
+            return Path(file).with_name(_PUBLISH_LOCK_NAME) if file else None
+    return None
 
 
 def _send_pending_cards(
@@ -938,14 +1088,16 @@ def _publish_note(
     盲目的な上書きは take 領域の破壊になる。atomic_write は部分ファイルを残さない
     ので、既存ファイル = 完全な公開済みノート。それを正として再書出は破棄する
     (write-ahead により内容は同一生成物なので、失われるのは何もない)。
+
+    既存かどうかは置き換え(rename)の直前に確かめる(GH#234)。vault が応答せず上限の時間で
+    見切ったスレッドは後から書き終えうるので、その間にできたノートを置き換えないため。
+    別の実行の公開との競合は、公開のロック(_PublishLock)で防ぐ。
     """
-    if path.exists():
+    if not atomic_write(path, content, precondition=lambda: not path.exists()):
         logger.warning(
             f"既存の DeepDive ノートを保持(再書出は破棄): {path.name}",
             extra={"run_id": run_id, "stage": "dig"},
         )
-        return
-    atomic_write(path, content)
 
 
 def _deepdive_dir(config: Config) -> Path:
@@ -1007,7 +1159,7 @@ def _source_note_ja(candidate: DigCandidate, explainer_note_name: str) -> str:
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "fetched": datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d"),
+        "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための保全コピー(抽出テキスト)",
     }
     return (
@@ -1033,7 +1185,7 @@ def _source_note_translated(
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "fetched": datetime.now(UTC).astimezone(JST).strftime("%Y-%m-%d"),
+        "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための全訳。日本語が地の文、原文は節ごとの折りたたみ内",
     }
     return (
