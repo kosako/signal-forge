@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from app import dig_answer
-from app.analysis.llm import LLMError, parse_structured
+from app.analysis.llm import CodexCliEngine, LLMError, parse_structured
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.dig_answer import (
@@ -241,6 +241,36 @@ def test_unexpected_error_still_moves_question_out_of_pending(conn, config) -> N
 
     assert sent == 1
     assert rows(conn)[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("case", ["nonzero_exit", "not_json", "schema_type"])
+def test_codex_failure_text_stays_out_of_error_column_and_log(
+    conn, config, tmp_path, monkeypatch, caplog, case
+) -> None:
+    # GH#202: 偽の codex が stderr・応答に再掲した文字列(秘密に見える文字列・記事の文)は、
+    # dig_questions.error にも失敗のログにも残らない。失敗の種類は残す
+    from tests.test_llm import _CODEX_LEAK_CASES, fake_codex
+
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "auth.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))  # 使い捨て CODEX_HOME が実ユーザーの ~/.codex に触れない
+    dig_id = add_dig(conn, config)
+    ask(conn, dig_id, "質問", 71)
+    codex = fake_codex(tmp_path, _CODEX_LEAK_CASES[case][0])
+    sender = Sender()
+
+    with caplog.at_level(logging.ERROR):
+        answer_pending(conn, config, lambda effort: CodexCliEngine(codex_bin=codex), sender, logger)
+
+    assert sender.sent == [(71, FAILURE_TEXT)]
+    (row,) = rows(conn)
+    assert row["status"] == "failed"
+    assert row["error"].startswith("LLMError: ")
+    assert not any("SECRET" in str(value) for value in row)
+    assert "返事を作れなかった" in caplog.text
+    assert "SECRET" not in caplog.text
+    assert "記事の本文" not in caplog.text
 
 
 def test_send_failure_keeps_answer_and_stops_sending_for_the_run(conn, config) -> None:

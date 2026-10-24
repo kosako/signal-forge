@@ -16,6 +16,8 @@
 - 出力は Pydantic でスキーマ検証。検証失敗・タイムアウトは LLMError に正規化し、
   リトライ(同一エンジンで1回)は complete_with_retry が担う。なお失敗したチャンクの
   degraded 直行は analyzer 側(設計 00 §6)
+- 失敗の例外(呼び出し側がログ・DB に書く)には失敗の種類・合わない場所・終了コードだけを載せ、
+  応答の本文・stderr の中身・本文を持つ原因の例外は載せない(GH#156・GH#202。設計 05 §3)
 - `anthropic-api`(AnthropicApiEngine)は深掘りノートのレビュー役(GH#153)。推論専用は
   構造で作る: ツールを一切渡さない素の Messages API で、宛先は API に固定。キーは .env の
   別名キーだけから読む(設計 00 §4)。主経路(config `llm.engine`)にはまだ配線しない
@@ -83,7 +85,11 @@ _FENCE = re.compile(r"\A\s*```[ \t]*(?:json)?\s*(.*?)\s*```\s*\Z", re.DOTALL | r
 
 
 def parse_structured[M: BaseModel](raw: str, schema: type[M]) -> M:
-    """フェンス除去 → JSON パース → Pydantic 検証。失敗は LLMError に正規化。"""
+    """フェンス除去 → JSON パース → Pydantic 検証。失敗は LLMError に正規化。
+
+    失敗の例外は応答の先頭・入力値を含み、原因の例外にも本文が残る。エンジンはこれを外へ
+    そのまま返さず、_content_free_parse_error で本文を含まない説明に置き換える(GH#202)
+    """
     text = raw.strip()
     m = _FENCE.match(text)
     if m:
@@ -176,9 +182,11 @@ class CodexCliEngine:
                 raise LLMUnavailableError(f"codex 起動失敗: {e}") from e
             try:
                 _, stderr_tail = process.communicate(input=prompt, timeout=timeout_s)
-            except subprocess.TimeoutExpired as e:
+            except subprocess.TimeoutExpired:
                 _kill_process_group(process)
-                raise LLMError(f"タイムアウト({timeout_s}s)") from e
+                # TimeoutExpired は読み取り済みの stdout・stderr(外部本文が混入しうる)を
+                # 属性に持つので、原因の例外としてつながない(GH#202)
+                raise LLMError(f"タイムアウト({timeout_s}s)") from None
             except BaseException:
                 # 手動実行の中断(Ctrl-C の KeyboardInterrupt)や想定外の例外でも子を残さない
                 # (GH#244)。子は別セッションなので端末の SIGINT が届かず、放っておくと推論を
@@ -186,17 +194,25 @@ class CodexCliEngine:
                 _kill_process_group(process)
                 raise
             if process.returncode != 0:
-                # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。
-                # 例外(=ログ)には制御文字を除去した末尾200字だけを載せる
-                tail = re.sub(r"[\x00-\x1f\x7f]", " ", stderr_tail)[-200:]
-                if stderr_tail.lstrip().startswith(_CODEX_CONFIG_ERRORS):
+                # stderr は外部本文(プロンプト経由)が混入しうる untrusted data。分類に読む
+                # だけで、例外(= ログ・DB)には載せない。載せるのは終了コードと、当たった
+                # 決まった書き出し(この module の定数)だけ(GH#202)
+                head = stderr_tail.lstrip()
+                config_error = next((p for p in _CODEX_CONFIG_ERRORS if head.startswith(p)), None)
+                if config_error is not None:
                     # 起動引数(無効化する feature 名・profile キー)を codex が受け付けない
                     # = 版の不一致。リトライでも回復しない環境障害として扱う(GH#129)
-                    raise LLMUnavailableError(f"codex の起動設定エラー: {tail}")
-                raise LLMError(f"codex 非0終了({process.returncode}): {tail}")
+                    raise LLMUnavailableError(f"codex の起動設定エラー({config_error})")
+                raise LLMError(f"codex 非0終了({process.returncode})")
             if not out_file.exists():
                 raise LLMError("codex が最終応答ファイルを書かなかった")
-            return parse_structured(out_file.read_text(encoding="utf-8"), schema)
+            try:
+                return parse_structured(out_file.read_text(encoding="utf-8"), schema)
+            except LLMError as e:
+                # 応答の本文(外部の記事の文・本人の質問を含みうる)を例外 = ログ・DB に載せない。
+                # 種類と合わない場所だけにし、本文を持つ原因の例外もつながない(GH#202。
+                # Claude API 側と同じ)。書き出しは予備の側が主の失敗の種類として読む
+                raise LLMError(_content_free_parse_error(e, _CODEX_PARSE_LABELS)) from None
 
     def _isolated_env(self, workdir: str, codex_home: str) -> dict[str, str]:
         """PATH + 隔離 HOME + CODEX_HOME のみの環境。
@@ -479,7 +495,7 @@ class AnthropicApiEngine:
             # 応答の本文(外部の記事の文を含みうる)を例外 = ログに載せない。合わない場所だけ
             # (parse_structured は応答の先頭・入力値を載せ、原因の例外にも本文が残るため
             # つながない。GH#156 のレビュー)
-            raise LLMError(_content_free_parse_error(e)) from None
+            raise LLMError(_content_free_parse_error(e, _ANTHROPIC_PARSE_LABELS)) from None
 
     def _usage(self, usage: object) -> LLMUsage | None:
         if not isinstance(usage, dict):
@@ -497,11 +513,22 @@ class AnthropicApiEngine:
         return LLMUsage(input_tokens, output_tokens, round(cost, 6))
 
 
-def _content_free_parse_error(error: LLMError) -> str:
+# parse_structured の失敗の言い方(JSON でない / スキーマに合わない / そのほか)。codex 側は
+# parse_structured と同じ書き出しを保つ(予備の側が主の失敗の種類として読む。fallback.py)
+_CODEX_PARSE_LABELS = ("JSON パース失敗", "スキーマ検証失敗", "codex の応答を検証できない")
+_ANTHROPIC_PARSE_LABELS = (
+    "Anthropic API の応答が JSON でない",
+    "Anthropic API の応答がスキーマに合わない",
+    "Anthropic API の応答を検証できない",
+)
+
+
+def _content_free_parse_error(error: LLMError, labels: tuple[str, str, str]) -> str:
     """parse_structured の失敗を、応答の本文を含まない説明にする(場所と種類だけ)。"""
+    not_json, schema_mismatch, other = labels
     cause = error.__cause__
     if isinstance(cause, json.JSONDecodeError):
-        return f"Anthropic API の応答が JSON でない({cause.msg}・位置 {cause.pos})"
+        return f"{not_json}({cause.msg}・位置 {cause.pos})"
     if isinstance(cause, ValidationError):
         places = [
             f"{'.'.join(str(part) for part in item['loc'])}: {item['type']}"
@@ -510,8 +537,8 @@ def _content_free_parse_error(error: LLMError) -> str:
             )[:5]
         ]
         detail = re.sub(r"[^\w.:/ -]", "", " / ".join(places))[:200]
-        return f"Anthropic API の応答がスキーマに合わない({detail})"
-    return "Anthropic API の応答を検証できない"
+        return f"{schema_mismatch}({detail})"
+    return other
 
 
 def _anthropic_error_type(response: httpx.Response) -> str:

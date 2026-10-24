@@ -469,8 +469,8 @@ def _check_llm(
     except Exception as e:
         return CheckResult(6, "LLM", "FAIL", f"エンジン生成失敗: {e}")
 
-    # プローブの例外は raw LLM 出力・stderr を含みうる(parse_structured は不正 JSON の
-    # 先頭を、CodexCliEngine は stderr を例外に載せる)。CODEX_HOME プローブでは canary と
+    # プローブの例外は raw LLM 出力・stderr を含みうる(エンジンの実装しだい。codex-cli は
+    # GH#202 で載せなくしたが、検査はそれに頼らない)。CODEX_HOME プローブでは canary と
     # auth.json が同居するため、例外文字列をそのまま出すと credential 露出の恐れがある。
     # よって detail には「どのプローブが失敗したか」と例外型名だけを載せ、本文は載せない
     home_leak = _run_probe("HOME 隔離", lambda: _probe_home_isolation(engine, home))

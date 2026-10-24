@@ -54,7 +54,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - 形式: **JSON Lines**(ts, level, run_id, stage, source_id, item_id, msg, extra)。理由: KPI 週次レビューや障害調査を `jq` の一発クエリで済ませるため。
 - `run_id` は朝バッチ1回ごとの ULID。digests・analyses にも記録し、ログ⇔DB を突合可能にする。
 - ローテーション: Python `logging.handlers.TimedRotatingFileHandler`(日次・14世代)。newsyslog 等の外部設定は持たない(依存最小)。
-- レベル方針: 正常系は stage 境界の INFO 1行(件数・所要・推定コスト)。外部本文・プロンプト全文は**ログに書かない**(untrusted data の拡散と肥大化を防ぐ)。詳細ログの切り替え(`setup_logging` の `verbose` 引数)は CLI からはまだ渡せない(`--verbose` オプションは未実装)。
+- レベル方針: 正常系は stage 境界の INFO 1行(件数・所要・推定コスト)。外部本文・プロンプト全文は**ログに書かない**(untrusted data の拡散と肥大化を防ぐ)。LLM の失敗の例外も同じ扱いにする: 各段はその文言をログ(traceback を含む)と DB(返事の失敗の `dig_questions.error`)に書くので、エンジンは失敗の種類・合わない場所・終了コードだけを載せ、応答の本文・codex の stderr の中身・本文を持つ原因の例外は載せない(GH#156・GH#202。設計 00 §5)。詳細ログの切り替え(`setup_logging` の `verbose` 引数)は CLI からはまだ渡せない(`--verbose` オプションは未実装)。
 
 ## 4. 失敗時の Telegram 通知
 
