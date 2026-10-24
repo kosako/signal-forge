@@ -150,7 +150,17 @@ def test_followup_uses_bookmark_date_and_is_not_duplicated(conn, config) -> None
     assert followups(conn, item_id) == [("yes", "2026-10-15")]  # 🔖 を付けた日・1 回だけ
 
 
-def test_take_after_followup_corrected_to_no_records_yes(conn, config) -> None:
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # created_at が後の「いいえ」(id は小さい)
+        [("no", "2026-10-16T12:00:00Z"), ("yes", "2026-10-16T11:00:00Z")],
+        # 同じ秒なら id の大きい「いいえ」
+        [("yes", "2026-10-16T12:00:00Z"), ("no", "2026-10-16T12:00:00Z")],
+    ],
+    ids=["later-no", "same-second-no"],
+)
+def test_take_after_followup_corrected_to_no_records_yes(conn, config, rows) -> None:
     # GH#195: 追い掛けを「はい」→「いいえ」に訂正した後の take は yes を足す。未消化一覧と
     # KPI 06 は最新の記録を見るので、足さないと take の後も一覧に残り、深掘り済みにならない
     dig_id = add_dig(conn, config, note=NOTE)
@@ -160,16 +170,17 @@ def test_take_after_followup_corrected_to_no_records_yes(conn, config) -> None:
         "VALUES ('reaction', ?, 'dig', '2026-10-15')",
         (item_id,),
     )
-    for value in ("yes", "no"):
+    for value, created_at in rows:  # この順に INSERT する(後ほど id が大きい)
         conn.execute(
-            "INSERT INTO signals (kind, item_id, value, signal_date) "
-            "VALUES ('followup_dig', ?, ?, '2026-10-15')",
-            (item_id, value),
+            "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+            "VALUES ('followup_dig', ?, ?, '2026-10-15', ?)",
+            (item_id, value, created_at),
         )
     assert item_id in {row["item_id"] for row in pending_dig_items(conn)}
     answered(conn, dig_id, "結論", 940, "take")
 
     assert record_takes(conn, config, logger) == 1
+    assert len(followups(conn, item_id)) == 3
     latest = conn.execute(
         "SELECT value, signal_date FROM signals WHERE kind = 'followup_dig' AND item_id = ? "
         "ORDER BY created_at DESC, id DESC LIMIT 1",
