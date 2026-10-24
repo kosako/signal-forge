@@ -397,6 +397,32 @@ def test_dig_stage_failure_is_isolated(conn, tmp_path, ttl_documents) -> None:
     assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
+def test_dig_stage_yields_without_failure_while_another_dig_runs(conn, tmp_path) -> None:
+    # 手動の intel dig が調査段を進めている間は、朝バッチの dig 段は待たずに何もしないで後続の段へ
+    # 進み、段の失敗にもしない(GH#196)。走れば失敗になる材料不足のリプライ指定で確かめる
+    import fcntl
+
+    item_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://q/1', 'https://q/1', 'sha256:q')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, requested_at) "
+        "VALUES (?, 'queued', 'request', '2026-07-21T00:00:00Z')",
+        (item_id,),
+    )
+    with (tmp_path / "intel.db.dig.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        failures = run_pipeline(
+            conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+            lambda: ScriptedEngine(conn), logger, "01RUNID",
+        )
+    assert failures == []
+    assert conn.execute(
+        "SELECT status FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()["status"] == "queued"  # 先の実行に任せ、キューに触れない
+
+
 def test_dig_stage_absent_when_cap_zero(conn, tmp_path) -> None:
     from dataclasses import replace
 

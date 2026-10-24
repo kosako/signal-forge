@@ -15,6 +15,8 @@
 - 優先順位: ①リプライ指定(requested_at 新しい順)②自動キューの新しい順
 - 材料不足(本文抽出なし・短すぎ)は、自動選出なら skip(未消化一覧には残る)、
   リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)
+- 同じ台帳を使う実行(朝バッチの dig 段と `intel dig`)は 1 つずつ。候補の選定から公開・送信までを
+  ロックで囲み、後から来た方は待たずに何もしない(朝バッチを止めない。GH#196)
 
 別系統の AI のレビュー(GH#153。config `[dig].review`): ドラフトを Claude API が元記事と
 照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
@@ -35,6 +37,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -44,7 +47,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,6 +88,9 @@ DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限
 # 別の実行が握っていたら、この時間だけ待って諦める(ふだんの公開は数ミリ秒で終わる)
 _PUBLISH_LOCK_NAME = "dig-publish.lock"
 _PUBLISH_LOCK_WAIT_S = VAULT_TIMEOUT_S
+# 調査段の実行を 1 つに絞るロック(GH#196)。DB の隣の `<DB>.dig.lock`(migrate.lock・
+# deliver.lock と同じ名付け)。公開のロックはこの中で取る(入れ子の順はこの 1 通り)
+_DIG_LOCK_SUFFIX = ".dig.lock"
 
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
@@ -233,12 +239,52 @@ def run_dig_stage(
     review_engine_factory: Callable[[], LLMEngine] | None = None,
     # ノートの公開の vault へのアクセスの時間の上限(GH#234。None = 既定の上限。テスト注入用)
     vault: VaultGuard | None = None,
-) -> None:
+) -> bool:
     """調査段の本体。生成(台帳へ write-ahead)→ 未公開ノート書出 → 未送信カード送信。
 
     3 段はそれぞれ台帳(dig_results)から再開可能で、どこで中断しても再実行は
     同一生成物の続きだけを行う(LLM 再呼び出し・生成物の食い違いを起こさない)。
+
+    候補の選定から公開・送信までは、同じ台帳を使う実行どうしで 1 つに絞る(GH#196)。
+    別の実行が進めている間に来たら、待たずに何もしないで False を返す(段の失敗にはしない)。
+    重なると、両方が同じ候補を選んで生成し、1 日上限を超え、カードが重複するため。待たない
+    のは、生成が分オーダーで続き、朝バッチの purge・backup を遅らせるため(先の実行が同じ
+    台帳から生成・公開・送信を終えるので、何もしなくても取りこぼさない)。
     """
+    with _dig_lock(conn) as acquired:
+        if not acquired:
+            logger.warning(
+                "dig: 別の実行(朝バッチか intel dig)が調査段を進めているので、この実行では"
+                "何もしない(生成・公開・送信はその実行が行う)",
+                extra={"run_id": run_id, "stage": "dig"},
+            )
+            return False
+        _run_dig_stage_locked(
+            conn,
+            config,
+            engine_factory,
+            api,
+            logger,
+            run_id,
+            today,
+            review_engine_factory,
+            vault,
+        )
+    return True
+
+
+def _run_dig_stage_locked(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    run_id: str | None,
+    today: str | None,
+    review_engine_factory: Callable[[], LLMEngine] | None,
+    vault: VaultGuard | None,
+) -> None:
+    """run_dig_stage の本体(_dig_lock の中で呼ぶ)。"""
     day = today or datetime.now(JST).strftime("%Y-%m-%d")
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
@@ -662,10 +708,45 @@ class _PublishLock:
 
 def _publish_lock_path(conn: sqlite3.Connection) -> Path | None:
     """この接続の DB と同じ置き場のロックファイル(設定の値でなく、開いている台帳から決める)。"""
+    db_file = _db_file(conn)
+    return db_file.with_name(_PUBLISH_LOCK_NAME) if db_file is not None else None
+
+
+def _db_file(conn: sqlite3.Connection) -> Path | None:
+    """この接続が開いている DB のファイル(メモリ上の DB は None)。"""
     for _seq, name, file in conn.execute("PRAGMA database_list").fetchall():
         if name == "main":
-            return Path(file).with_name(_PUBLISH_LOCK_NAME) if file else None
+            return Path(file) if file else None
     return None
+
+
+@contextlib.contextmanager
+def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
+    """調査段の実行を、同じ台帳を使う実行どうし(朝バッチの dig 段と `intel dig`)で 1 つに絞る
+    (GH#196)。取れたら True、別の実行が握っていれば待たずに False。
+
+    SQLite のロックは 1 トランザクションの間しか続かず、LLM の待ち(分オーダー)をまたいで
+    書き込みのトランザクションを持つと poller の書き込みを止めるので、DB の隣の専用ファイルに
+    flock を取る(db._migration_lock と同じ考え方)。公開のロック(_PublishLock)はこの中でだけ
+    取る。入れ子の順はこの 1 通りで、こちらは待たないので、見切ったスレッドが公開のロックを
+    握ったまま残っていてもデッドロックしない(公開のロックの待ちには上限がある)。メモリ上の
+    DB は別の実行と台帳を共有しない。
+    """
+    db_file = _db_file(conn)
+    if db_file is None:
+        yield True
+        return
+    lock_path = db_file.with_name(db_file.name + _DIG_LOCK_SUFFIX)
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        os.close(fd)  # close で flock は解放される
 
 
 def _send_pending_cards(
