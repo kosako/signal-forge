@@ -718,6 +718,50 @@ def test_run_poller_fails_fast_on_permanent_db_error(conn, tmp_path) -> None:
         run_poller(conn, make_config(tmp_path), FakeApi([[]]), logger)
 
 
+@pytest.mark.parametrize(
+    ("error", "receives"),
+    [("database is locked", True), ("no such table: telegram_state", False)],
+    ids=["transient", "permanent"],
+)
+def test_run_poller_timer_db_error_boundary(conn, tmp_path, monkeypatch, error, receives) -> None:
+    # GH#224: 内蔵タイマーのロック競合は受信を止めず、間隔を空けて試し直す。恒久エラーは
+    # 今どおり握らずに落とす(受信へ進まない)
+    from app.delivery import poller
+
+    timer_calls: list[datetime] = []
+
+    def run_due_timers(conn, config, api, logger, now):
+        timer_calls.append(now)
+        raise sqlite3.OperationalError(error)
+
+    monkeypatch.setattr(poller, "run_due_timers", run_due_timers)
+    api = FakeApi([[make_message_update("https://example.com/a")]])
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    def run() -> None:
+        run_poller(
+            conn, make_config(tmp_path), api, logger,
+            sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
+            clock=lambda: 0.0,  # 再試行の間隔は過ぎない
+        )
+
+    if not receives:
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            run()
+        assert api.offsets == []
+        return
+    run()
+    assert len(timer_calls) == 1  # 2 周目は間隔が過ぎていないので試さない
+    assert len(api.offsets) == 2  # 受信は毎周期
+    assert len(manual_items(conn)) == 1
+    assert sleeps == []
+
+
 # --- 感想キャプチャ(digest 記事メッセージへのリプライ。GH#92)---
 
 

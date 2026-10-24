@@ -37,8 +37,8 @@ READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4
 DIG_BACKLOG_MAX_ITEMS = 15
 DIG_BACKLOG_TITLE_MAX_CHARS = 80
 
-# watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると送信が毎周期失敗し、
-# 同じ周期の getUpdates まで止まる。GH#124 でソースの行が可変長になった)
+# watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると試し直すたびに送信が
+# 失敗し、watchdog が届かない。GH#124 でソースの行が可変長になった)
 WATCHDOG_TEXT_MAX_CHARS = 4000
 SOURCE_REPORT_MAX_CHARS = 4000
 
@@ -88,7 +88,8 @@ def run_due_timers(
     now: datetime,
 ) -> None:
     """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断)を実行する。
-    poll ループから毎周期呼ぶ。
+    poll ループから毎周期呼ぶ(失敗した後は受信と別に間を空けて試し直す。poller の
+    TIMER_RETRY_S。GH#224)。
 
     now は JST aware。ポーラー停止中に時刻を跨いだ場合は次の起動周期で送る(遅延送信)。
     日付を跨いだ分は送らない(昨日の夜アンケートを今日送っても回答が汚れるだけ)。
