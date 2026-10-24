@@ -281,6 +281,21 @@ def test_auth_error_is_fatal() -> None:
         conn.fetch(make_source(), {})
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_error_after_first_page_is_fatal_with_reads_and_cost(status) -> None:
+    # GH#178: 2 ページ目以降の 401/403 は致命の失敗のまま送出し、それまでの読取数と費用を添える
+    # (collect が台帳に残す。漏れると同じ日の再実行が日次の上限を超えて読む)
+    p1 = page([tweet(str(1000 - i), "t") for i in range(100)], next_token="tok1")
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from([(200, p1, {}), (status, {}, {})]).fetch(make_source(), {})
+    assert raised.value.api_reads == 100
+    assert raised.value.estimated_cost_usd == pytest.approx(0.4)
+    # 1 ページ目の 401/403 は読取なし(0 件)
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from([(status, {}, {})]).fetch(make_source(), {})
+    assert (raised.value.api_reads, raised.value.estimated_cost_usd) == (0, 0.0)
+
+
 def test_5xx_on_first_page_is_retryable() -> None:
     with pytest.raises(RetryableError, match="503"):
         connector_from([(503, {}, {})]).fetch(make_source(), {})
@@ -494,6 +509,64 @@ def test_second_collect_same_day_reads_only_remaining_budget(db, monkeypatch) ->
     reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
     assert reads == [100, 30, 0, 100]  # 当日の合計は cap(130)ちょうど。翌日は枠が戻る
     assert seen == ["100", "30", "100"]
+
+
+def test_auth_error_after_partial_fetch_counts_reads_for_same_day_rerun(db, monkeypatch) -> None:
+    # GH#178: 途中まで読んだあとの 401 は、今までどおりソースの失敗(取得ぶんは保存せず
+    # since_id は据え置く)のまま、読取数と費用を台帳(collect_runs)に残す。認証が直ったあとの
+    # 同じ日の再実行は、その残りだけを読む(上限 130 で 100 + 30。読取が漏れると 100 + 130)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
+    source_id = add_x_source(db, "home")
+    db.execute("UPDATE sources SET cursor = ? WHERE id = ?", ('{"since_id": "1"}', source_id))
+    next_id = iter(range(10_000, 0, -1))
+    seen: list[str] = []
+
+    def handler_for(auth_fails_on_second_page: bool):
+        def handler(request: httpx.Request) -> httpx.Response:
+            split = urlsplit(str(request.url))
+            if split.path.endswith("/users/me"):
+                return httpx.Response(200, json={"data": {"id": "me"}})
+            query = parse_qs(split.query)
+            seen.append(query["max_results"][0])
+            if "pagination_token" in query:
+                return httpx.Response(401, json={})
+            count = min(int(query["max_results"][0]), 100)
+            body = page(
+                [tweet(str(next(next_id)), "新着の投稿") for _ in range(count)],
+                next_token="tok1" if auth_fails_on_second_page else None,
+            )
+            return httpx.Response(200, json=body)
+
+        return handler
+
+    def run_once(utc_time: str, *, auth_fails_on_second_page: bool) -> None:
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
+        router = _build_connectors(_config(True), FULL_ENV, HttpClient(), db)["x"]
+        router._home._session._client = httpx.Client(
+            transport=httpx.MockTransport(handler_for(auth_fails_on_second_page))
+        )
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
+
+    run_once("2026-10-23T21:30:00Z", auth_fails_on_second_page=True)  # JST 10/24 6:30
+    failed = db.execute(
+        "SELECT status, api_reads, estimated_cost_usd, error FROM collect_runs"
+    ).fetchone()
+    assert (failed["status"], failed["api_reads"]) == ("error", 100)
+    assert failed["estimated_cost_usd"] == pytest.approx(0.4)
+    assert "認証失敗" in failed["error"]
+    source = db.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE id = ?", (source_id,)
+    ).fetchone()
+    assert source["cursor"] == '{"since_id": "1"}'  # 据え置き
+    assert source["consecutive_failures"] == 1
+    assert db.execute("SELECT count(*) FROM items").fetchone()[0] == 0  # 取得ぶんは保存しない
+    assert x_reads_today(db) == {"home": 100, "search": 0}
+
+    run_once("2026-10-24T03:00:00Z", auth_fails_on_second_page=False)  # 同じ日の再走
+    reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
+    assert reads == [100, 30]
+    assert seen == ["100", "30", "30"]
 
 
 def test_build_x_connector_signs_requests() -> None:

@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 
-from app.connectors.base import Connector, FatalError, RawItem, RetryableError
+from app.connectors.base import Connector, FatalError, FetchStats, RawItem, RetryableError
 from app.db import insert_item_with_dedup
 from app.models import RAW_CONTENT_MAX_CHARS, Source
 from app.normalize import (
@@ -67,9 +67,11 @@ def _collect_source(
         "INSERT INTO collect_runs (source_id) VALUES (?)", (source.id,)
     ).lastrowid
 
+    fetched: FetchStats | None = None  # fetch が返したあとの失敗(保存の失敗)で台帳に残す読取
     try:
         cursor = json.loads(source.cursor) if source.cursor else {}
         result = connector.fetch(source, cursor)
+        fetched = result.stats
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
@@ -86,7 +88,7 @@ def _collect_source(
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
         # (1本の壊れたフィード・コネクタのバグで他ソースの collect を止めない。
         # 設計 00 §6 / 02 §1 の「他ソースは必ず継続」の保証)
-        _record_failure(conn, source, run_row_id, e)
+        _record_failure(conn, source, run_row_id, e, fetched)
         log = logger.warning if isinstance(e, RetryableError | FatalError) else logger.error
         log(
             f"collect 失敗。ソースをスキップ: {_safe_error_text(e)}",
@@ -265,18 +267,36 @@ def _safe_error_text(error: Exception) -> str:
 
 
 def _record_failure(
-    conn: sqlite3.Connection, source: Source, run_row_id: int, error: Exception
+    conn: sqlite3.Connection,
+    source: Source,
+    run_row_id: int,
+    error: Exception,
+    fetched: FetchStats | None = None,
 ) -> None:
+    """ソースの失敗を記録する。取得ぶんは保存せず、カーソルも据え置く。
+
+    失敗の行にも、それまでに読んだ課金対象の件数と費用を残す(GH#178)。X の日次の読取上限は
+    台帳の当日の合計から残りを出すので、漏れると同じ日の再実行が上限を超えて読む(doctor #9 の
+    当月の費用も過少になる)。fetched = fetch は返したが保存で失敗したときの取得の統計。
+    X の部分取得のあとの認証の失敗は、それまでの読取数と費用を FatalError に添えて来る。
+    """
     message = _safe_error_text(error)
+    if fetched is not None:
+        api_reads, cost = fetched.api_reads, fetched.estimated_cost_usd
+    elif isinstance(error, FatalError):
+        api_reads, cost = error.api_reads, error.estimated_cost_usd
+    else:
+        api_reads, cost = 0, 0.0
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
             f"""
             UPDATE collect_runs
-            SET finished_at = {_NOW_UTC}, status = 'error', error = ?
+            SET finished_at = {_NOW_UTC}, status = 'error', error = ?, api_reads = ?,
+                estimated_cost_usd = ?
             WHERE id = ?
             """,
-            (message, run_row_id),
+            (message, api_reads, cost, run_row_id),
         )
         conn.execute(
             f"""
