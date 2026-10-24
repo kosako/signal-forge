@@ -159,6 +159,8 @@ class ItemNote(_Row):
     note: str
     created_at: str
     exported_at: str | None
+    chat_id: int | None = None  # migration 019(GH#193。受信したリプライの冪等キー)
+    message_id: int | None = None  # 同上
 
 
 @dataclass(frozen=True)
@@ -168,3 +170,5 @@ class DigestNote(_Row):
     note: str
     created_at: str
     exported_at: str | None
+    chat_id: int | None = None  # migration 019(GH#193。受信したリプライの冪等キー)
+    message_id: int | None = None  # 同上

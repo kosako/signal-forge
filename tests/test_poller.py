@@ -11,7 +11,12 @@ import pytest
 from app.config import Config, DigConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
-from app.delivery.poller import NO_URL_GUIDE, OFFSET_KEY, RECONNECT_BACKOFF_S
+from app.delivery.poller import (
+    NO_URL_GUIDE,
+    OFFSET_KEY,
+    RECONNECT_BACKOFF_S,
+    TRANSIENT_RETRIES,
+)
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
 from app.jst import JST
 from tests.test_delivery import add_digest, add_item
@@ -74,6 +79,46 @@ class FakeApi:
         self, chat_id: int, message_id: int, reply_markup: dict
     ) -> None:
         self.edited.append((chat_id, message_id, reply_markup))
+
+
+class RedeliveringApi(FakeApi):
+    """getUpdates の offset を Telegram と同じに扱う FakeApi(GH#181)。offset より前の update は
+    確認済みとして捨て、残りを毎回返す(offset を保存しなければ、同じ update が再配達される)。"""
+
+    def __init__(self, updates: list[dict]):
+        super().__init__()
+        self.pending = list(updates)
+
+    def get_updates(self, offset: int | None) -> list[dict]:
+        self.offsets.append(offset)
+        if offset is not None:
+            self.pending = [u for u in self.pending if u["update_id"] >= offset]
+        return list(self.pending)
+
+
+class _Stopped(BaseException):
+    """プロセスが止まったことの代わり(poll_once の except Exception を素通りする)。"""
+
+
+def stop_before_saving_offset(monkeypatch) -> None:
+    """次の 1 回の offset の保存の前でプロセスが止まった状態を作る(再起動の後、同じ update が
+    再配達される)。2 回目からは本物の保存に戻す。"""
+    from app.delivery import poller
+
+    real_save_offset = poller._save_offset
+
+    def stop(conn, offset):
+        monkeypatch.setattr(poller, "_save_offset", real_save_offset)
+        raise _Stopped
+
+    monkeypatch.setattr(poller, "_save_offset", stop)
+
+
+def saved_offset(conn) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (OFFSET_KEY,)
+    ).fetchone()
+    return row["value"] if row else None
 
 
 def make_callback_update(
@@ -217,13 +262,22 @@ def test_malformed_message_skips_edit_but_records(conn, tmp_path, bad_message) -
     ).fetchone()["value"] == "2"
 
 
-def test_unexpected_exception_advances_offset(conn, tmp_path) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("想定外"),
+        # 待っても直らない DB の失敗(制約違反・スキーマ破損)も、ロック競合と違って進める(GH#181)
+        sqlite3.IntegrityError("constraint failed"),
+        sqlite3.OperationalError("no such table: x"),
+    ],
+)
+def test_unexpected_exception_advances_offset(conn, tmp_path, error) -> None:
     a = add_item(conn, "https://a/1")
     add_digest(conn, [a])
 
     class ExplodingApi(FakeApi):
         def answer_callback_query(self, callback_query_id, *, text=None):
-            raise RuntimeError("想定外")
+            raise error
 
     api = ExplodingApi([[make_callback_update(a, "up")]])
     poll_once(conn, make_config(tmp_path), api, logger)  # 例外が漏れない
@@ -559,6 +613,104 @@ def test_run_poller_backs_off_on_db_lock_instead_of_crashing(conn, tmp_path) -> 
     assert sleeps == [RECONNECT_BACKOFF_S, RECONNECT_BACKOFF_S]
 
 
+def test_locked_db_while_saving_note_redelivers_the_update(conn, tmp_path) -> None:
+    # GH#181: 受信した後の記帳がロック競合で失敗したら offset を進めず、待った後に Telegram から
+    # 再配達された同じ update で記帳する(上の LockedApi と違い、受信した後の DB 書き込みの失敗)
+    add_delivered_item(conn, "https://a/article", message_id=500)
+    update = make_reply_update("あとで読み返す", 500, update_id=5)
+    update["message"]["message_id"] = 31
+    api = RedeliveringApi([update])
+    conn.execute("PRAGMA busy_timeout=0")  # busy_timeout の超過を待たずに起こす
+    holder = connect(tmp_path / "intel.db")
+    holder.execute("BEGIN IMMEDIATE")  # 朝バッチが書き込みのロックを握っている状態
+
+    def release_lock() -> None:
+        if holder.in_transaction:
+            holder.execute("ROLLBACK")
+
+    # ロックは、記帳に失敗した後に offset を保存しようとした時点で解ける(Issue の狭い窓。
+    # 以前はここで未保存の update の offset を進めていた)。保存しようとしなければ、待つ間に解ける
+    conn.set_trace_callback(
+        lambda sql: release_lock() if sql.startswith("INSERT INTO telegram_state") else None
+    )
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        release_lock()
+
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    try:
+        run_poller(
+            conn, make_config(tmp_path), api, logger,
+            sleep=sleep, should_stop=should_stop, answer_worker=FakeWorker(),
+            # 内蔵タイマーが DB に書かない時刻(夜アンケート・watchdog の前)
+            now_fn=lambda: datetime(2026, 10, 20, 6, 0, tzinfo=JST),
+        )
+    finally:
+        conn.set_trace_callback(None)
+        holder.close()
+
+    assert sleeps == [RECONNECT_BACKOFF_S]
+    assert api.offsets == [None, None]  # offset を進めずに取り直した
+    assert conn.execute("SELECT note FROM item_notes").fetchall()[0]["note"] == "あとで読み返す"
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
+    assert api.sent == [
+        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
+    ]
+    assert saved_offset(conn) == "6"
+
+
+def test_update_failing_transiently_too_often_is_quarantined(
+    conn, tmp_path, monkeypatch, caplog
+) -> None:
+    # GH#181: 同じ update が続けて一時的に失敗するなら、やり直しの上限を超えたところで隔離して
+    # offset を進める(無限に再処理しない)。ログは WARN で、本文は残さない。後ろの update は処理する
+    from app.delivery import poller
+
+    real_handle_update = poller.handle_update
+
+    def handle_update(conn, config, api, update, logger, **kwargs):
+        if update["update_id"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        real_handle_update(conn, config, api, update, logger, **kwargs)
+
+    monkeypatch.setattr(poller, "handle_update", handle_update)
+    api = RedeliveringApi([
+        make_message_update("隔離される本文", update_id=1),
+        make_message_update("https://example.com/next", update_id=2),
+    ])
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > TRANSIENT_RETRIES + 1
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        run_poller(
+            conn, make_config(tmp_path), api, logger,
+            sleep=sleeps.append, should_stop=should_stop, answer_worker=FakeWorker(),
+            now_fn=lambda: datetime(2026, 10, 20, 6, 0, tzinfo=JST),
+        )
+
+    # 初回 + やり直し TRANSIENT_RETRIES 回。最後の失敗の後は待たずに隔離して進める
+    assert api.offsets == [None] * (TRANSIENT_RETRIES + 1)
+    assert sleeps == [RECONNECT_BACKOFF_S] * TRANSIENT_RETRIES
+    assert saved_offset(conn) == "3"
+    assert len(manual_items(conn)) == 1  # 後ろの update は隔離の後に処理した
+    quarantined = [r for r in caplog.records if "隔離" in r.getMessage()]
+    assert len(quarantined) == 1
+    assert quarantined[0].levelno == logging.WARNING
+    assert quarantined[0].extra == {"update_id": 1, "keys": ["message"]}
+    assert "隔離される本文" not in caplog.text
+
+
 def test_run_poller_fails_fast_on_permanent_db_error(conn, tmp_path) -> None:
     # スキーマ破損等の恒久エラーは 30s ループせず落とす(KeepAlive → doctor #3 で検知)
     conn.execute("DROP TABLE telegram_state")
@@ -748,24 +900,35 @@ def test_daily_cap_counts_by_jst_day(conn, tmp_path, earlier_created_at, accepte
     assert worker.kicks == (1 if accepted else 0)
 
 
-def test_note_and_question_are_recorded_together(conn, tmp_path) -> None:
-    # 台帳に積めなかったら感想も残さない(再配達で感想だけ二重にならない)
+def test_note_and_question_are_recorded_together(conn, tmp_path, monkeypatch) -> None:
+    # 台帳に積めなかったら感想も残さない(再配達で感想だけ二重にならない)。積めなかったのが
+    # ロック競合なら offset を進めず、Telegram が再配達した同じ update で両方を記帳する(GH#181)
+    from app.delivery import poller
+
     _item_id, _dig_id = add_dig_card(conn)
-    update = card_reply("質問", 700)
+    api, worker = RedeliveringApi([card_reply("質問", 700)]), FakeWorker()
     config = answer_config(tmp_path)
-    conn.execute(
-        "CREATE TRIGGER boom BEFORE INSERT ON dig_questions "
-        "BEGIN SELECT RAISE(ABORT, 'boom'); END"
-    )
+    real_enqueue_question = poller.enqueue_question
 
-    poll_once(conn, config, FakeApi([[update]]), logger, answer_worker=FakeWorker())
+    def locked_once(*args):
+        monkeypatch.setattr(poller, "enqueue_question", real_enqueue_question)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(poller, "enqueue_question", locked_once)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):  # run_poller が待って再開する
+        poll_once(conn, config, api, logger, answer_worker=worker)
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 0
+    assert saved_offset(conn) is None  # offset を進めない
+    assert api.sent == []
 
-    conn.execute("DROP TRIGGER boom")
-    conn.execute("DELETE FROM telegram_state")  # offset を保存できなかった状態 → 再配達
-    poll_once(conn, config, FakeApi([[update]]), logger, answer_worker=FakeWorker())
+    poll_once(conn, config, api, logger, answer_worker=worker)
+    assert api.offsets == [None, None]  # 同じ offset で取り直した = 再配達
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 1
+    assert api.sent == [(CHAT_ID, "📝 記録しました。返事を作っています(数分かかることがあります)")]
+    assert worker.kicks == 1
+    assert saved_offset(conn) == "2"
 
 
 def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
@@ -782,21 +945,52 @@ def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
     assert worker.kicks == 0
 
 
-def test_redelivered_card_reply_is_not_queued_twice(conn, tmp_path) -> None:
+def test_redelivered_card_reply_is_not_queued_twice(conn, tmp_path, monkeypatch) -> None:
     # 台帳に積んだ後、offset を保存する前に止まると同じ update が再配達される
     _item_id, _dig_id = add_dig_card(conn)
-    update = card_reply("質問", 700)
-    api, worker = FakeApi([[update], [update]]), FakeWorker()
+    api, worker = RedeliveringApi([card_reply("質問", 700)]), FakeWorker()
     config = answer_config(tmp_path)
+    stop_before_saving_offset(monkeypatch)
 
-    poll_once(conn, config, api, logger, answer_worker=worker)
-    conn.execute("DELETE FROM telegram_state")  # offset を保存できなかった状態
-    poll_once(conn, config, api, logger, answer_worker=worker)
+    with pytest.raises(_Stopped):
+        poll_once(conn, config, api, logger, answer_worker=worker)
+    poll_once(conn, config, api, logger, answer_worker=worker)  # 再起動の後
 
+    assert api.offsets == [None, None]  # 同じ update が再配達された
     assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
     assert len(api.sent) == 1
     assert worker.kicks == 1
+    assert saved_offset(conn) == "2"
+
+
+@pytest.mark.parametrize("cap", [0, 1])  # 返事をしない設定 / 今日の上限に達した
+def test_redelivered_card_reply_recorded_only_is_not_noted_twice(
+    conn, tmp_path, monkeypatch, cap
+) -> None:
+    # GH#193: 質問として受け付けなかった感想は台帳(dig_questions)に無い。感想の記帳そのもので
+    # 再配達を見分け、感想を二重にしない
+    _item_id, dig_id = add_dig_card(conn)
+    if cap:
+        conn.execute(
+            "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+            "VALUES (?, '今日の 1 件目', 80)",
+            (dig_id,),
+        )
+    api, worker = RedeliveringApi([card_reply("感想", 700)]), FakeWorker()
+    config = answer_config(tmp_path, cap=cap)
+    stop_before_saving_offset(monkeypatch)
+
+    with pytest.raises(_Stopped):
+        poll_once(conn, config, api, logger, answer_worker=worker)
+    poll_once(conn, config, api, logger, answer_worker=worker)  # 再起動の後
+
+    assert api.offsets == [None, None]
+    assert conn.execute("SELECT count(*) FROM item_notes").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == cap
+    assert len(api.sent) == 1
+    assert worker.kicks == 0
+    assert saved_offset(conn) == "2"
 
 
 @pytest.mark.parametrize("fail_updates", [False, True])
@@ -908,6 +1102,35 @@ def test_reply_to_header_records_digest_note(conn, tmp_path) -> None:
     )]
 
 
+@pytest.mark.parametrize("table", ["item_notes", "digest_notes"])  # 記事への感想 / 日次感想
+def test_redelivered_note_is_recorded_once(conn, tmp_path, monkeypatch, table) -> None:
+    # GH#193: 感想を記帳した後、offset を保存する前に止まると同じ update が再配達される。
+    # 同じリプライ(chat_id と message_id)は 1 回だけ記帳し、知らせも二重にしない。
+    # 別のリプライは同じ文面でも別の感想として記帳する
+    item_id = add_item(conn, "https://a/article")
+    digest_id = add_digest(conn, [item_id])
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (digest_id, item_id if table == "item_notes" else None),
+    )
+    first = make_reply_update("同じ文面", 500, update_id=9)
+    first["message"]["message_id"] = 31
+    second = make_reply_update("同じ文面", 500, update_id=10)
+    second["message"]["message_id"] = 32
+    api = RedeliveringApi([first, second])
+    stop_before_saving_offset(monkeypatch)
+
+    with pytest.raises(_Stopped):
+        poll_once(conn, make_config(tmp_path), api, logger)
+    poll_once(conn, make_config(tmp_path), api, logger)  # 再起動の後
+
+    assert api.offsets == [None, None]  # first が再配達された
+    rows = conn.execute(f"SELECT note, chat_id, message_id FROM {table} ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [("同じ文面", CHAT_ID, 31), ("同じ文面", CHAT_ID, 32)]
+    assert len(api.sent) == 2  # first と second に 1 回ずつ
+    assert saved_offset(conn) == "11"
+
+
 # --- 未消化一覧へのリプライ = 深掘り指定(GH#104) ---
 
 BACKLOG_MSG_ID = 640
@@ -958,6 +1181,39 @@ def test_dig_reply_pass_and_request_combined(conn, tmp_path) -> None:
     text = api.sent[0][1]
     assert f"⏭️ {first} を深掘り対象から外しました" in text
     assert f"🔍 {second} を登録しました(観点なし)" in text
+
+
+def test_dig_reply_failed_midway_applies_nothing_until_redelivered(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # GH#181: 2 件目の反映がロック競合で失敗したら 1 件目も戻し、再配達で全部を 1 回で反映する
+    # (反映済みの 1 件目をやり直して requested_at を動かすと、生成中の深掘りの
+    # compare-and-set が外れて同じ依頼を翌朝も掘ってしまう)
+    from app.delivery import poller
+
+    first = add_dig_candidate(conn, "https://a/1")
+    second = add_dig_candidate(conn, "https://a/2")
+    api = RedeliveringApi([make_reply_update(f"{first} を観点Aで、{second} も", BACKLOG_MSG_ID)])
+    real_apply_instructions = poller.apply_instructions
+
+    def locked_at_second(conn, instructions):
+        monkeypatch.setattr(poller, "apply_instructions", real_apply_instructions)
+        real_apply_instructions(conn, instructions[:1])
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(poller, "apply_instructions", locked_at_second)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        poll_once(conn, make_config(tmp_path), api, logger)
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0  # 1 件目も戻した
+    assert saved_offset(conn) is None
+    assert api.sent == []
+
+    poll_once(conn, make_config(tmp_path), api, logger)  # 再配達
+    rows = conn.execute("SELECT item_id, status, angle FROM dig_queue ORDER BY item_id").fetchall()
+    assert [tuple(r) for r in rows] == [(first, "queued", "観点Aで"), (second, "queued", None)]
+    assert len(api.sent) == 1
+    assert saved_offset(conn) == "2"
 
 
 def test_dig_reply_without_valid_numbers_gets_guide(conn, tmp_path) -> None:
