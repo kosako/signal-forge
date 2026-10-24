@@ -9,7 +9,7 @@ import pytest
 from app.config import Config
 from app.db import apply_migrations, connect
 from app.extraction import extract_pending
-from app.http import HttpClient
+from app.http import MAX_RESPONSE_BYTES, HttpClient
 
 logger = logging.getLogger("test-extract")
 
@@ -99,6 +99,26 @@ def test_fetch_failure_creates_failed_row(conn, tmp_path) -> None:
     assert doc["extraction_status"] == "failed"
     assert doc["extracted_text"] is None
     assert "404" in doc["extraction_error"]
+
+
+def test_oversized_response_fails_item_and_rest_continue(conn, tmp_path) -> None:
+    # 上限を超える応答の記事は failed にし、次の記事の抽出は続ける(GH#203)
+    add_item(conn, url="https://example.com/huge")
+    add_item(conn, url="https://example.com/2")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/huge":
+            return httpx.Response(200, content=b"x" * (MAX_RESPONSE_BYTES + 1))
+        return httpx.Response(200, text=ARTICLE_HTML)
+
+    counts = extract_pending(conn, config(tmp_path), make_http(handler), logger)
+    assert counts == {"ok": 1, "partial": 0, "failed": 1}
+    docs = conn.execute(
+        "SELECT extraction_status, extraction_error FROM documents ORDER BY item_id"
+    ).fetchall()
+    assert docs[0]["extraction_status"] == "failed"
+    assert "ResponseTooLargeError" in docs[0]["extraction_error"]
+    assert docs[1]["extraction_status"] == "ok"
 
 
 def test_short_result_is_partial_and_short_raw_survives_fetch_failure(conn, tmp_path) -> None:
