@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import signal
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -310,6 +312,32 @@ def test_note_symlink_is_not_followed_and_goes_to_conflict(conn, tmp_path, caplo
     assert "更新された要約" in conflict.read_text()
     assert "外の手書き" not in conflict.read_text()  # 外の中身を読んで取り込まない
     assert "symlink" in caplog.text
+
+
+def test_note_fifo_does_not_block_and_goes_to_conflict(conn, tmp_path) -> None:
+    # ノートの名前に FIFO(名前付きパイプ)があっても、書き手を待って止まらない。通常のファイル
+    # でないので触れずに新版を .conflict.md に退避する(GH#204)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    note.unlink()
+    os.mkfifo(note)
+
+    def stuck(signum, frame):  # 止まったら待ち続けずにテストを失敗させる
+        raise TimeoutError("FIFO の open で止まった")
+
+    previous = signal.signal(signal.SIGALRM, stuck)
+    signal.alarm(5)
+    try:
+        export_digest(conn, config, digest_id, logger)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert stat.S_ISFIFO(note.lstat().st_mode)  # FIFO には触れない
+    assert "要約文" in note.with_suffix(".conflict.md").read_text()
 
 
 def test_handwriting_before_begin_marker_preserved(conn, tmp_path) -> None:

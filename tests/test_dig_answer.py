@@ -1,6 +1,8 @@
 """深掘りカードへの質問への返事(GH#126 / ADR 0005 / 設計 06 §6)。"""
 
+import contextlib
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -451,6 +453,30 @@ def test_folder_symlink_outside_vault_is_not_read(conn, config, tmp_path, swappe
 
     assert "vault の外の内容" not in engine.prompts[0]
     assert "(解説ノートが見つからない)" in engine.prompts[0]
+
+
+def test_note_fifo_is_not_waited_on_and_later_notes_are_read(conn, config) -> None:
+    # ノートの名前に FIFO(名前付きパイプ)があっても、書き手を待って止まらない。通常のファイル
+    # でないので見つからない扱いにし、vault の停止とはみなさずに後の原文/対訳ノートも読む(GH#204)
+    dig_id = add_dig(conn, config, note=None)
+    note_name = conn.execute(
+        "SELECT note_name FROM dig_results WHERE id = ?", (dig_id,)
+    ).fetchone()[0]
+    fifo = Path(config.obsidian.vault_path) / "SignalForge" / "DeepDive" / f"{note_name}.md"
+    os.mkfifo(fifo)
+    ask(conn, dig_id, "質問", 71)
+    engine = Engine()
+    vault = VaultGuard(timeout_s=2)
+    try:
+        answer_pending(conn, config, engine.factory, Sender(), logger, vault)
+    finally:
+        # 待って止まったスレッドがあれば放す(修正の前の振る舞いのときだけ要る)
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+    assert not vault.stalled
+    assert "(解説ノートが見つからない)" in engine.prompts[0]
+    assert "訳文の段落。" in engine.prompts[0]
 
 
 def test_answer_and_failure_are_committed_before_sending(conn, config, tmp_path) -> None:

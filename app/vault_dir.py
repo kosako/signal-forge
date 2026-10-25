@@ -104,10 +104,14 @@ def _open_child_dir(dir_fd: int, name: str, *, create: bool) -> int:
 
 
 def open_regular(dir_fd: int, name: str, flags: int = os.O_RDONLY) -> int:
-    """dir_fd の中の通常のファイルを symlink を辿らずに開く(無ければ FileNotFoundError)。"""
+    """dir_fd の中の通常のファイルを symlink を辿らずに開く(無ければ FileNotFoundError)。
+
+    O_NONBLOCK で開いてから種類を見る(同じ名前の FIFO を書き手が現れるまで待たない)。
+    通常のファイルと確かめたら、ふつうの読み書きに戻す。
+    """
     check_name(name)
     try:
-        fd = os.open(name, flags | os.O_NOFOLLOW, dir_fd=dir_fd)
+        fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError as e:
         if e.errno == errno.ELOOP:
             raise VaultPathError(f"vault の中の {name} が symlink") from e
@@ -115,6 +119,7 @@ def open_regular(dir_fd: int, name: str, flags: int = os.O_RDONLY) -> int:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise VaultPathError(f"vault の中の {name} が通常のファイルでない")
+        os.set_blocking(fd, True)
     except BaseException:
         os.close(fd)
         raise
