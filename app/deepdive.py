@@ -955,7 +955,13 @@ def _prompt_body(config: Config, candidate: DigCandidate, nonce: str) -> str:
 
 
 class _CostMeter:
-    """呼び出しごとの usage(LLMUsage)を合算する。やり直しの分も課金されるため。"""
+    """呼び出しごとの usage(LLMUsage)を合算する。やり直しの分も課金されるため。
+
+    送った後に応答の usage を受け取れず費用が分からない呼び出し(時間切れ・応答の切断など)は、
+    エンジンが残す課金されうる最大の額(`last_cost_bound_usd`)を積む。0 円で数えると、月の
+    上限の判定が実際の課金より少なめの累計で行われるため(GH#323。予備の台帳と同じ。GH#241)。
+    どちらも無い呼び出し(送っていない・エラーの応答・その属性を持たないエンジン)は 0。
+    """
 
     def __init__(self, engine: LLMEngine) -> None:
         self._engine = engine
@@ -972,6 +978,10 @@ class _CostMeter:
             usage = getattr(self._engine, "last_usage", None)
             if usage is not None:
                 self.cost_usd += usage.cost_usd
+            else:
+                bound = getattr(self._engine, "last_cost_bound_usd", None)
+                if bound is not None:
+                    self.cost_usd += bound
 
 
 def _review_and_revise(

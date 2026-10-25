@@ -16,7 +16,13 @@ import pytest
 import yaml
 
 from app.analysis.fallback import fallback_engine_factory
-from app.analysis.llm import LLMError, LLMUnavailableError, LLMUsage
+from app.analysis.llm import (
+    ANTHROPIC_API_KEY_ENV,
+    LLMError,
+    LLMUnavailableError,
+    LLMUsage,
+    create_anthropic_engine,
+)
 from app.config import Config, DigConfig, LLMFallbackConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.deepdive import (
@@ -1646,6 +1652,73 @@ def test_review_failure_still_delivers_unreviewed(conn, config, error) -> None:
     assert "日本語見出し" in card
 
 
+def claude_review_engine(config, *outcomes: str):
+    """本物のレビュー役(create_anthropic_engine)。通信だけを偽物にし、呼び出しごとに outcomes の
+    順で応える(answered = 指摘なしの応答 / timeout = 送った後に応答が来ない / refused = 接続
+    できない = 送っていない)。戻り値 = (エンジン, 呼び出しごとの prompt)。
+    """
+    prompts: list[str] = []
+    replies = iter(outcomes)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompts.append(json.loads(request.content)["messages"][0]["content"])
+        outcome = next(replies)
+        if outcome == "refused":
+            raise httpx.ConnectError("refused", request=request)
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": '{"findings": []}'}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 12_000, "output_tokens": 3_000},
+            },
+        )
+
+    engine = create_anthropic_engine(
+        config.anthropic_api,
+        {ANTHROPIC_API_KEY_ENV: "test-key"},
+        transport=httpx.MockTransport(handler),
+    )
+    return engine, prompts
+
+
+def cost_bound(config, prompt: str) -> float:
+    """費用が分からない呼び出しの最大の額(入力 = prompt の UTF-8 のバイト数、出力 = max_tokens)。"""
+    settings = config.anthropic_api
+    cost = (
+        len(prompt.encode("utf-8")) * settings.input_usd_per_mtok
+        + settings.max_tokens * settings.output_usd_per_mtok
+    ) / 1_000_000
+    return round(cost, 6)
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "status", "bounds", "answered"),
+    [
+        (("timeout", "timeout"), "failed", 2, 0),  # 応答が来ない: やり直しの分も最大の額
+        (("timeout", "answered"), "clean", 1, 1),  # やり直しで答えた: 最大の額 + 実額
+        (("refused", "refused"), "failed", 0, 0),  # 送っていない: 今までどおり 0 円
+        (("answered",), "clean", 0, 1),  # 普通の応答: 今までどおり実額
+    ],
+)
+def test_review_cost_counts_unknown_cost_as_bound(
+    conn, config, outcomes, status, bounds, answered
+) -> None:
+    # 送った後に応答の usage を受け取れなかった呼び出しは、0 円でなく課金されうる最大の額で
+    # review_cost_usd に積む(GH#323。予備の台帳と同じ。GH#241)
+    engine, prompts = claude_review_engine(config, *outcomes)
+    row, note, _, _ = run_with_review(conn, config, engine)
+    assert len(prompts) == len(outcomes)
+    assert row["review_status"] == status
+    # 実額: 12k × $4/M + 3k × $20/M = 0.108。最大の額は出力の上限だけで 16k × $20/M = 0.32
+    expected = bounds * cost_bound(config, prompts[0]) + answered * 0.108
+    assert row["review_cost_usd"] == pytest.approx(expected)
+    if status == "failed":
+        assert "> [!warning] 別 AI のレビュー(claude-opus-5-5)は失敗(未レビューのまま)" in note
+
+
 def test_review_engine_unavailable_at_creation(conn, config) -> None:
     def no_key() -> ReviewEngine:
         raise LLMUnavailableError(".env に INTEL_ANTHROPIC_API_KEY が無い")
@@ -1738,6 +1811,29 @@ def test_review_under_cap_runs(conn, config) -> None:
     row, _, _, _ = run_with_review(conn, config, review)
     assert len(review.prompts) == 1
     assert row["review_status"] == "clean"
+
+
+def test_review_cost_bound_counts_toward_monthly_cap(conn, config) -> None:
+    # 応答が来なかったレビューは最大の額の見積もりで今月の費用に入り、上限の判定に効く(GH#323)。
+    # 0 円で数えると、実際の課金が上限を超えた月もレビューを呼び続ける
+    config = replace(config, dig=replace(config.dig, review_monthly_cap_usd=0.5))
+    engine, prompts = claude_review_engine(config, "timeout", "timeout")
+    first, _, _, _ = run_with_review(conn, config, engine)
+    assert first["review_status"] == "failed"
+    assert first["review_cost_usd"] == pytest.approx(2 * cost_bound(config, prompts[0]))
+
+    later = ReviewEngine([finding()])
+    api = FakeApi()
+    item = add_item(conn, "https://blog.example/next", language="ja")
+    enqueue(conn, item)
+    run_dig_stage(
+        conn, config, make_factory({}), api, logger, today="2026-07-22",
+        review_engine_factory=lambda: later,
+    )
+    row = conn.execute("SELECT * FROM dig_results WHERE item_id = ?", (item,)).fetchone()
+    assert later.prompts == []  # 呼ばない
+    assert (row["review_status"], row["review_cost_usd"]) == ("skipped", 0)
+    assert "🧪 今月のレビュー費用が上限に達したため未レビュー" in api.sent[-1][1]
 
 
 def test_review_off_leaves_no_trace(conn, config) -> None:
