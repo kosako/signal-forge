@@ -417,6 +417,38 @@ def test_commands_build_engines_through_fallback(tmp_path, monkeypatch, command,
         assert isinstance(result.exception, _StopAtFactory)
 
 
+@pytest.mark.parametrize(
+    ("args", "shared", "returned", "passed", "output"),
+    [
+        (["analyze"], "analyze_stage", {"analyzed": 3, "degraded": 1}, {}, "analyzed=3 degraded=1"),
+        (["digest"], "digest_stage", None, {"force": False}, "skip(生成済み)"),
+        (["digest", "--force"], "digest_stage", 8, {"force": True}, "digest id=8"),
+        (["dig"], "dig_stage", True, {}, "dig 完了"),
+    ],
+)
+def test_commands_run_same_stage_as_morning_batch(
+    tmp_path, monkeypatch, args, shared, returned, passed, output
+) -> None:
+    # 単独の CLI は、朝バッチ(run_pipeline)と同じ段の組み立てと実行の口を呼び、表示だけを
+    # 自分で持つ(GH#206)。run_id と主の作り方は渡さない(主は config の `[llm].engine`)
+    from app import logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    calls: list[tuple[dict, dict]] = []
+
+    def spy(conn, config, env, logger, **kwargs):
+        calls.append((dict(env), kwargs))
+        return returned
+
+    monkeypatch.setattr(run, shared, spy)
+    result = runner.invoke(app, [*args, "--config-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert [kwargs for _, kwargs in calls] == [passed]
+    assert calls[0][0].get("TELEGRAM_BOT_TOKEN") == "test-token"  # .env の dict を渡す
+    assert output in result.output
+
+
 def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     # 朝バッチは、段が成功していても予備の利用(GH#156)を知らせる経路を通る
     from app import logs, run
@@ -477,4 +509,3 @@ def test_run_failure_notice_tells_whether_digest_was_held(
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert passed == [digest_held]
-

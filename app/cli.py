@@ -102,24 +102,17 @@ def analyze(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """事前選別+LLM 本分析で analyses を生成する。"""
-    from app.analysis.analyzer import analyze_selected
-    from app.analysis.fallback import fallback_engine_factory
-    from app.analysis.profile import load_interest_profile
-    from app.analysis.stage1 import preselect
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import analyze_stage
 
     config = load_config(config_dir)
     env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
-    profile = load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
-    # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
-    engine = fallback_engine_factory(conn, config, env, logger, stage="analyze")("low")
-    result = preselect(conn, config, logger)
-    counts = analyze_selected(conn, config, engine, profile.body, result.selected_ids, logger)
+    counts = analyze_stage(conn, config, env, logger)  # 朝バッチと同じ段の組み立て(GH#206)
     typer.echo(f"analyzed={counts['analyzed']} degraded={counts['degraded']}")
 
 
@@ -129,29 +122,18 @@ def digest(
     force: bool = typer.Option(False, "--force", help="生成済みでも当日分を置換する"),
 ) -> None:
     """ランキングして日本語ダイジェスト(digests)を生成する。"""
-    from app.analysis.fallback import fallback_engine_factory
-    from app.analysis.trend import synthesize_trend
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
-    from app.digest import generate_digest
-    from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import digest_stage
 
     config = load_config(config_dir)
     env = load_env(config_dir)
     conn = connect(config.db_path)
     apply_migrations(conn, config.db_path)
     logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
-    trend = None
-    exists = conn.execute("SELECT 1 FROM digests WHERE digest_date = ?", (today_jst(),)).fetchone()
-    # 生成済み & not force なら generate_digest は skip する。無駄な synthesis を避ける
-    if force or exists is None:
-        try:  # トレンドは付加機能。失敗しても digest 本体を止めない
-            engine = fallback_engine_factory(conn, config, env, logger, stage="trend")("low")
-            trend = synthesize_trend(conn, engine, logger)
-        except Exception as e:
-            logger.warning(f"トレンド synthesis が例外(節を省略): {type(e).__name__}")
-    digest_id = generate_digest(conn, config, logger, force=force, trend_markdown=trend)
+    # 朝バッチと同じ段の組み立て(トレンドの省略・生成済みの skip を含む。GH#206)
+    digest_id = digest_stage(conn, config, env, logger, force=force)
     typer.echo("skip(生成済み)" if digest_id is None else f"digest id={digest_id}")
 
 
@@ -205,13 +187,10 @@ def dig(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:
     """深掘りキューから本日分を調査し、DeepDive ノート生成+概要カード送信(GH#105)。"""
-    from app.analysis.fallback import fallback_engine_factory
-    from app.analysis.llm import create_anthropic_engine
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
-    from app.deepdive import run_dig_stage
-    from app.delivery import create_api, is_telegram_configured
     from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import dig_stage
 
     config = load_config(config_dir)
     env = load_env(config_dir)
@@ -221,19 +200,7 @@ def dig(
     if config.dig.daily_cap <= 0:
         typer.echo("[dig].daily_cap = 0(調査段は無効)")
         raise typer.Exit(code=0)
-    api = create_api(env) if is_telegram_configured(config, env) else None
-    ran = run_dig_stage(
-        conn,
-        config,
-        fallback_engine_factory(conn, config, env, logger, stage="dig"),  # GH#156
-        api,
-        logger,
-        review_engine_factory=(  # GH#153
-            (lambda: create_anthropic_engine(config.anthropic_api, env))
-            if config.dig.review
-            else None
-        ),
-    )
+    ran = dig_stage(conn, config, env, logger)  # 朝バッチと同じ段の組み立て(GH#206)
     if not ran:  # 同じ候補を 2 度掘らない(GH#196)。先の実行が終われば届く
         typer.echo("別の実行(朝バッチか intel dig)が深掘りを進めているため、何もしなかった")
         return
