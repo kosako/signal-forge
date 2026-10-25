@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -601,6 +602,61 @@ def test_existing_note_not_overwritten_on_publish_retry(conn, config) -> None:
     ] is not None
 
 
+@pytest.mark.parametrize("swapped", ["SignalForge", "DeepDive"])
+def test_folder_symlink_outside_vault_is_never_published(
+    conn, config, tmp_path, swapped
+) -> None:
+    # DeepDive までのフォルダが vault の外への symlink なら、辿って外に書かない。その件の公開の
+    # 失敗にし、本文は台帳に残してカードも送らない(GH#204)
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+        " VALUES (?, 'n-深掘り', 'カード', '解説本文')",
+        (item,),
+    )
+    conn.commit()
+    link = deepdive_dir(config) if swapped == "DeepDive" else deepdive_dir(config).parent
+    link.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    (outside / "DeepDive").mkdir(parents=True)
+    os.symlink(outside / "DeepDive" if swapped == "DeepDive" else outside, link)
+    api = FakeApi()
+
+    with pytest.raises(DigError, match=f"item {item}: ノート公開 VaultPathError"):
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+
+    assert [p for p in outside.rglob("*") if p.is_file()] == []
+    row = conn.execute("SELECT * FROM dig_results").fetchone()
+    assert row["published_at"] is None and row["note_markdown"] == "解説本文"
+    assert api.sent == []
+
+
+def test_note_name_symlink_is_not_replaced_and_body_kept(conn, config, tmp_path) -> None:
+    # 公開するノートの名前に symlink があれば、辿らず置き換えず、既存のノートともみなさない。
+    # 公開の失敗にして本文を台帳に残す(本文を消すとノートの中身がどこにも残らない。GH#204)
+    item = add_item(conn, "https://blog.example/post")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, note_markdown)"
+        " VALUES (?, 'n-深掘り', 'カード', '解説本文')",
+        (item,),
+    )
+    conn.commit()
+    target = deepdive_dir(config)
+    target.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("外のファイル")
+    (target / "n-深掘り.md").symlink_to(outside)
+
+    with pytest.raises(DigError, match=f"item {item}: ノート公開 VaultPathError"):
+        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+    assert outside.read_text() == "外のファイル"
+    assert (target / "n-深掘り.md").is_symlink()
+    assert [p.name for p in target.iterdir()] == ["n-深掘り.md"]  # 一時ファイルを残さない
+    row = conn.execute("SELECT * FROM dig_results").fetchone()
+    assert row["published_at"] is None and row["note_markdown"] == "解説本文"
+
+
 def test_queue_update_failure_rolls_back_ledger_insert(conn, config, tmp_path) -> None:
     # 生成物の記帳(結果の INSERT)とキューの done 化は 1 つのトランザクション。INSERT の後で
     # キューの更新が失敗したら両方を戻す。結果だけ残ってキューが queued のままだと、次の実行が
@@ -659,11 +715,11 @@ def test_second_note_failure_resumes_after_reconnect_without_llm(
     original = deepdive_module.atomic_write
     failed: list[str] = []
 
-    def fail_source_note(path, content, *, precondition=None):
-        if "-対訳-" in path.name:  # vault への書き込みの失敗の代わり
-            failed.append(path.name)
+    def fail_source_note(dir_fd, name, content, *, precondition=None):
+        if "-対訳-" in name:  # vault への書き込みの失敗の代わり
+            failed.append(name)
             raise PermissionError("vault に書けない")
-        return original(path, content, precondition=precondition)
+        return original(dir_fd, name, content, precondition=precondition)
 
     class NoteCheckingApi(FakeApi):
         def __init__(self) -> None:
@@ -737,20 +793,20 @@ def block_first_note_write(monkeypatch, *, after_check: bool = False) -> SimpleN
         if not blocker.release.wait(30):
             blocker.timed_out.append(True)
 
-    def blocking(path, content, *, precondition=None):
-        blocker.calls.append(path.name)
+    def blocking(dir_fd, name, content, *, precondition=None):
+        blocker.calls.append(name)
         if len(blocker.calls) > 1:
-            return original(path, content, precondition=precondition)
+            return original(dir_fd, name, content, precondition=precondition)
         if not after_check:
             hold()
-            return original(path, content, precondition=precondition)
+            return original(dir_fd, name, content, precondition=precondition)
 
         def check_then_hold() -> bool:
             unchanged = precondition() if precondition is not None else True
             hold()
             return unchanged
 
-        return original(path, content, precondition=check_then_hold)
+        return original(dir_fd, name, content, precondition=check_then_hold)
 
     monkeypatch.setattr(deepdive_module, "atomic_write", blocking)
     return blocker

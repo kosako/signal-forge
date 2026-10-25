@@ -6,17 +6,19 @@
   保持し、マーカー欠損時は上書きせず .conflict.md を並置(fail-safe)
 - 書込は一時ファイル→rename のアトミック書き(同期ツールとの競合対策)。rename の直前に
   読み取り後の変更を確かめ、変わっていれば上書きしない(GH#189)
+- 読み書きは vault の実体から 1 段ずつ symlink を辿らずに開いたフォルダの中で行う(途中の
+  フォルダが外への symlink なら書かない。ノートが symlink なら辿らずに新版を退避する。GH#204)
 - X 由来は抜粋を出力しない(恒久保存層に本文を置かない。Issue #2 の確定ポリシー)
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import sqlite3
-import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
@@ -27,6 +29,14 @@ import yaml
 from app.config import Config
 from app.jst import JST
 from app.models import EXTRACTION_FAILED_NOTE
+from app.vault_dir import (
+    VaultDir,
+    VaultPathError,
+    create_temp,
+    entry_exists,
+    folder_dir,
+    open_regular,
+)
 
 GENERATED_BEGIN = "<!-- GENERATED:BEGIN -->"
 GENERATED_END = "<!-- GENERATED:END -->"
@@ -56,11 +66,10 @@ def export_digest(
 ) -> None:
     if config.obsidian.vault_path is None:
         raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
-    base = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
-    daily_dir = base / "Daily"
-    items_dir = base / "Items"
-    daily_dir.mkdir(parents=True, exist_ok=True)
-    items_dir.mkdir(parents=True, exist_ok=True)
+    daily_dir = folder_dir(config, "Daily")
+    items_dir = folder_dir(config, "Items")
+    daily_dir.ensure()
+    items_dir.ensure()
 
     digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     if digest is None:
@@ -77,7 +86,8 @@ def export_digest(
         note_name, note_date = _item_note_target(existing_notes, row, digest["digest_date"])
         wikilinks.append(f"[[{note_name}]]")
         if not _write_note(
-            items_dir / f"{note_name}.md",
+            items_dir,
+            f"{note_name}.md",
             _item_frontmatter(row, note_date),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
             logger=logger,
@@ -87,7 +97,8 @@ def export_digest(
 
     daily_front, daily_body = _daily_note_content(conn, digest, wikilinks)
     if not _write_note(
-        daily_dir / f"{digest['digest_date']}.md",
+        daily_dir,
+        f"{digest['digest_date']}.md",
         daily_front,
         daily_body,
         logger=logger,
@@ -147,9 +158,8 @@ def export_pending_notes(
     ).fetchall()
     if not pending and not pending_digests:
         return
-    base = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
-    items_dir = base / "Items"
-    items_dir.mkdir(parents=True, exist_ok=True)
+    items_dir = folder_dir(config, "Items")
+    items_dir.ensure()
     existing_notes = _existing_item_notes(items_dir)
     conflicts = 0
     for entry in pending:
@@ -166,7 +176,8 @@ def export_pending_notes(
         # 新しく作るノートも、下の Daily の wikilink の再計算で同じ出力先として扱う
         existing_notes.setdefault(note_name[8:], [note_name])
         if not _write_note(
-            items_dir / f"{note_name}.md",
+            items_dir,
+            f"{note_name}.md",
             _item_frontmatter(row, note_date),
             _item_generated_body(row, _load_notes(conn, row["item_id"])),
             logger=logger,
@@ -183,14 +194,15 @@ def export_pending_notes(
             (entry["item_id"], entry["max_note_id"]),
         )
         conn.commit()
-    daily_dir = base / "Daily"
-    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily_dir = folder_dir(config, "Daily")
+    daily_dir.ensure()
     for digest in pending_digests:
         front, body = _daily_note_content(
             conn, digest, _daily_wikilinks(conn, digest, existing_notes)
         )
         if not _write_note(
-            daily_dir / f"{digest['digest_date']}.md",
+            daily_dir,
+            f"{digest['digest_date']}.md",
             front,
             body,
             logger=logger,
@@ -313,13 +325,16 @@ def _digest_item_ids(digest: sqlite3.Row) -> list[int]:
     return json.loads(digest["item_ids"]) + json.loads(digest["bookmark_item_ids"] or "[]")
 
 
-def _existing_item_notes(items_dir: Path) -> dict[str, list[str]]:
+def _existing_item_notes(items_dir: VaultDir) -> dict[str, list[str]]:
     """Items/ に既にあるノート名(拡張子なし)を、日付より後ろ(`-{item_id}-{slug}`)ごとに
     名前順(= 日付の古い順)で返す(GH#242)。"""
     notes: dict[str, list[str]] = {}
-    for path in items_dir.glob("*.md"):
-        if _ITEM_NOTE_FILE.fullmatch(path.name):
-            notes.setdefault(path.stem[8:], []).append(path.stem)
+    with items_dir.opened() as dir_fd:
+        names = os.listdir(dir_fd)
+    for name in names:
+        if _ITEM_NOTE_FILE.fullmatch(name):
+            stem = Path(name).stem
+            notes.setdefault(stem[8:], []).append(stem)
     for names in notes.values():
         names.sort()
     return notes
@@ -381,7 +396,8 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
 
 
 def _write_note(
-    path: Path,
+    directory: VaultDir,
+    name: str,
     frontmatter: dict,
     generated_body: str,
     *,
@@ -399,24 +415,35 @@ def _write_note(
       比べ、変わっていれば上書きしない。読み直して 1 回だけやり直し、それでも変わって
       いれば新版を .conflict に退避して WARN を出す。比べてから rename までの短い窓は
       残る(保証の範囲は設計 04 §7)
+    - 読み書きは vault の実体から symlink を辿らずに開いたフォルダの中で行う(GH#204)。
+      ノートが symlink・通常のファイルでなければ、辿らず触れずに新版を .conflict に退避する
     """
     generated_body = _strip_markers(generated_body)
     fresh = _render(frontmatter, generated_body)
-    for _attempt in range(2):  # 初回 + 読み直しての 1 回
-        snapshot = _read_snapshot(path)
-        if snapshot is None:
-            content = fresh
-        else:
-            content = _merge_existing(_decode_note(snapshot), frontmatter, generated_body)
-            if content is None:
-                return _write_conflict(path, fresh)
-        if atomic_write(path, content, precondition=partial(_unchanged, path, snapshot)):
-            return True
-    logger.warning(
-        f"読み取り後にノートが変更され続けたため、新版を .conflict に退避: {path.name}",
-        extra={"run_id": run_id, "stage": "export"},
-    )
-    return _write_conflict(path, fresh)
+    with directory.opened() as dir_fd:
+        for _attempt in range(2):  # 初回 + 読み直しての 1 回
+            try:
+                snapshot = _read_snapshot(dir_fd, name)
+            except VaultPathError:
+                logger.warning(
+                    f"ノートが symlink か通常のファイルでないため、新版を .conflict に退避: {name}",
+                    extra={"run_id": run_id, "stage": "export"},
+                )
+                return _write_conflict(dir_fd, name, fresh)
+            if snapshot is None:
+                content = fresh
+            else:
+                content = _merge_existing(_decode_note(snapshot), frontmatter, generated_body)
+                if content is None:
+                    return _write_conflict(dir_fd, name, fresh)
+            unchanged = partial(_unchanged, dir_fd, name, snapshot)
+            if atomic_write(dir_fd, name, content, precondition=unchanged):
+                return True
+        logger.warning(
+            f"読み取り後にノートが変更され続けたため、新版を .conflict に退避: {name}",
+            extra={"run_id": run_id, "stage": "export"},
+        )
+        return _write_conflict(dir_fd, name, fresh)
 
 
 def _merge_existing(existing: str, frontmatter: dict, generated_body: str) -> str | None:
@@ -459,17 +486,26 @@ def _merge_existing(existing: str, frontmatter: dict, generated_body: str) -> st
     )
 
 
-def _read_snapshot(path: Path) -> bytes | None:
-    """ノートの今の中身(バイト列)。無ければ None。"""
+def _read_snapshot(dir_fd: int, name: str) -> bytes | None:
+    """ノートの今の中身(バイト列)。無ければ None。symlink・通常のファイルでなければ
+    VaultPathError(辿らない。GH#204)。"""
     try:
-        return path.read_bytes()
+        fd = open_regular(dir_fd, name)
     except FileNotFoundError:
         return None
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
 
 
-def _unchanged(path: Path, snapshot: bytes | None) -> bool:
-    """rename の直前の確認: 読んだときから中身(有無を含む)が変わっていないか(GH#189)。"""
-    return _read_snapshot(path) == snapshot
+def _unchanged(dir_fd: int, name: str, snapshot: bytes | None) -> bool:
+    """rename の直前の確認: 読んだときから中身(有無を含む)が変わっていないか(GH#189)。
+
+    symlink などに置き換わっていれば変わったとみなす(読み直しで退避に回る。GH#204)。
+    """
+    try:
+        return _read_snapshot(dir_fd, name) == snapshot
+    except VaultPathError:
+        return False
 
 
 def _decode_note(raw: bytes) -> str:
@@ -477,14 +513,17 @@ def _decode_note(raw: bytes) -> str:
     return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _write_conflict(path: Path, content: str) -> bool:
-    """新版を空いている .conflict 名に退避する(既存 conflict を上書きしない)。"""
-    candidate = path.with_suffix(".conflict.md")
+def _write_conflict(dir_fd: int, name: str, content: str) -> bool:
+    """新版を空いている .conflict 名に退避する(既存 conflict を上書きしない)。
+
+    symlink は辿らず、名前があれば使用中とみなす(GH#204)。
+    """
+    candidate = Path(name).with_suffix(".conflict.md").name
     counter = 2
-    while candidate.exists():
-        candidate = path.with_suffix(f".conflict-{counter}.md")
+    while entry_exists(dir_fd, candidate):
+        candidate = Path(name).with_suffix(f".conflict-{counter}.md").name
         counter += 1
-    atomic_write(candidate, content)
+    atomic_write(dir_fd, candidate, content)
     return False
 
 
@@ -523,22 +562,29 @@ def _strip_markers(content: str) -> str:
 
 
 def atomic_write(
-    path: Path, content: str, *, precondition: Callable[[], bool] | None = None
+    dir_fd: int, name: str, content: str, *, precondition: Callable[[], bool] | None = None
 ) -> bool:
     """一時ファイル→rename で書く(部分ファイルを残さない)。
 
+    dir_fd は vault の実体から symlink を辿らずに開いたフォルダ(app/vault_dir.py。GH#204)。
+    一時ファイルもその中に作り、同じフォルダの name へ rename する(パスを辿り直さない)。
     precondition は rename の直前に呼ぶ。False なら置換せず、一時ファイルを消して False を
     返す(読み取り後の変更の検出。GH#189)。置換したら True。
     """
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp_name = create_temp(dir_fd, name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         if precondition is not None and not precondition():
-            Path(tmp_name).unlink(missing_ok=True)
+            _discard(dir_fd, tmp_name)
             return False
-        os.replace(tmp_name, path)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
+        _discard(dir_fd, tmp_name)
         raise
     return True
+
+
+def _discard(dir_fd: int, name: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(name, dir_fd=dir_fd)

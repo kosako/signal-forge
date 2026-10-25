@@ -304,6 +304,26 @@ def test_obsidian_vault_path_rejects_blank(tmp_path: Path) -> None:
     assert load_config(write_config(tmp_path, "[obsidian]\n")).obsidian.vault_path is None
 
 
+@pytest.mark.parametrize(
+    "folder", ["/tmp/SignalForge", "../outside", "SignalForge/../..", "a/../b", "", "  ", ".", "./"]
+)
+def test_obsidian_folder_rejects_path_outside_vault(tmp_path: Path, folder: str) -> None:
+    # folder は vault の中の相対パスに限る。絶対パス・`..` は vault の外を指し、空は vault の
+    # 直下に散らばる(GH#204)
+    with pytest.raises(ConfigError, match=r"\[obsidian\].folder"):
+        load_config(write_config(tmp_path, f'[obsidian]\nfolder = "{folder}"\n'))
+
+
+@pytest.mark.parametrize(
+    "folder", ["SignalForge", "Notes/SignalForge", "SignalForge/", "./SignalForge", "Signal Forge"]
+)
+def test_obsidian_folder_accepts_relative_path(tmp_path: Path, folder: str) -> None:
+    # 既存の正しい設定(既定・入れ子の相対パス)は通す(GH#204)
+    config = load_config(write_config(tmp_path, f'[obsidian]\nfolder = "{folder}"\n'))
+    assert config.obsidian.folder == folder
+    assert load_config(write_config(tmp_path, "[obsidian]\n")).obsidian.folder == "SignalForge"
+
+
 def test_x_signals_cap_counts_toward_combined_budget(tmp_path: Path) -> None:
     # S1b 取込も合算予算の単一ノブの内側(ADR 0001)。既定 0 は挙動不変
     assert load_config(tmp_path / "nowhere").x_signals.daily_read_cap == 0

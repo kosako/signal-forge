@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from app.config import Config, ConfigError, load_config, load_env
 from app.db import MIGRATIONS_DIR, MigrationError, connect, discover_migrations, verify_ledger
 from app.purge import X_SIGNAL_EXCERPT_EXPIRED
+from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VaultGuard, VaultStalled
 
 BACKUP_STALE_HOURS = 48
@@ -647,27 +648,36 @@ def _check_vault(config: Config | None, vault: VaultGuard) -> CheckResult:
     if config.obsidian.vault_path is None:
         return CheckResult(7, "Obsidian Vault", "FAIL", "[obsidian].vault_path 未設定(宿題 H4)")
     target = Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder
-    probe = target / f".doctor-write-test-{secrets.token_hex(4)}"
+    probe = f".doctor-write-test-{secrets.token_hex(4)}"
     # macOS のプライバシーの確認が出ると vault の open() は応答まで止まるので、`intel answer` と
     # 同じ上限を付け、超えたら #7 の FAIL にして残りの検査へ進む(GH#248)
     try:
-        vault.call(lambda: _write_and_remove_probe(target, probe))
+        vault.call(lambda: _write_and_remove_probe(folder_dir(config), probe))
         return CheckResult(7, "Obsidian Vault", "PASS", f"書込・削除 OK: {target}")
     except VaultStalled as e:
         return CheckResult(7, "Obsidian Vault", "FAIL", f"書込テストが応答しない: {e}。runbook §11")
+    except VaultPathError as e:  # export と同じく、vault の外を指しうる出力先には書かない(GH#204)
+        return CheckResult(7, "Obsidian Vault", "FAIL", f"出力先に書かない: {e}")
     except OSError as e:
         return CheckResult(7, "Obsidian Vault", "FAIL", f"書込不可(TCC/FDA 要確認): {e}")
 
 
-def _write_and_remove_probe(target: Path, probe: Path) -> None:
+def _write_and_remove_probe(folder: VaultDir, probe: str) -> None:
     """#7 の書込テスト。VaultGuard のスレッドで走る。
 
+    export と同じく、vault の実体から symlink を辿らずに開いた出力先のフォルダに書く(GH#204)。
     上限を超えて打ち切った後に書き込みが通った(確認に応答した)場合も、同じスレッドが続けて
     検査用のファイルを消す(vault に残さない。GH#248)。
     """
-    target.mkdir(parents=True, exist_ok=True)
-    probe.write_text("doctor", encoding="utf-8")
-    probe.unlink()
+    with folder.opened(create=True) as dir_fd:
+        fd = os.open(
+            probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+        )
+        try:
+            os.write(fd, b"doctor")
+        finally:
+            os.close(fd)
+        os.unlink(probe, dir_fd=dir_fd)
 
 
 def _check_launchd(launchctl: Callable[[str], bool] | None) -> CheckResult:
