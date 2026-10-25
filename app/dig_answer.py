@@ -61,6 +61,11 @@ REDIG_NOTICE = (
     "\n\n🔁 次の朝の深掘りで、このリプライを観点にして調べ直します"
     "(新しい解説ノートとカードで届きます)"
 )
+# 調べ直しの依頼を受けられないときの知らせ(GH#197)。調査段の材料(元記事の本文)は保存の期間を
+# 過ぎると消え、取り直す経路を持たない(X の本文を保持しない方針。GH#2)ので、翌朝の実行を約束しない
+REDIG_NO_MATERIAL_NOTICE = (
+    "\n\n⚠️ 元記事の本文の保存の期間が過ぎて材料が無いため、この記事は調べ直せません"
+)
 
 # カードのボタンからの依頼(GH#141)。台帳の question にこの文を入れ、質問と同じ流れで答える
 # (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)
@@ -230,13 +235,30 @@ def _answer_one(
         logger.error(f"返事を作れなかった: {type(e).__name__}: {e}", extra=log_extra)
         return
     kind = intent.kind
+    answer = result.answer
     # 調べ直しは深掘りの段が動いているときだけ受ける(daily_cap = 0 では翌朝に掘られない)
     redig = intent.redig and config.dig.daily_cap > 0
-    if redig and not _record_answer_with_redig(conn, row, kind, result.answer, logger, log_extra):
+    if redig and not _has_dig_material(conn, config, row["item_id"]):
+        # 材料(元記事の本文)が無ければ翌朝に掘れないので、積まずに理由を伝える(GH#197)
+        redig = False
+        answer += REDIG_NO_MATERIAL_NOTICE
+        logger.info(
+            "本文の保存の期間が過ぎて材料が無いため、調べ直しを積まない(理由を返事に添える)",
+            extra=log_extra,
+        )
+    if redig and not _record_answer_with_redig(conn, row, kind, answer, logger, log_extra):
         redig = False
     if not redig:
-        _record_answer(conn, row["id"], kind, result.answer, redig=False)
+        _record_answer(conn, row["id"], kind, answer, redig=False)
     logger.info(f"返事を作った(kind={kind}・調べ直し={redig})", extra=log_extra)
+
+
+def _has_dig_material(conn: sqlite3.Connection, config: Config, item_id: int) -> bool:
+    """調査段がその item を掘れるだけの材料を持つか(調査段の選定と同じ条件。GH#197)。"""
+    # 呼び出し時に import する(deepdive → delivery → poller → 本モジュールの循環を避ける)
+    from app.deepdive import item_has_material
+
+    return item_has_material(conn, config, item_id)
 
 
 def _intent(engine: LLMEngine, config: Config, row: sqlite3.Row) -> DigIntent:

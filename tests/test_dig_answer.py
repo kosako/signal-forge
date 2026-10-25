@@ -540,8 +540,65 @@ def queue_of(conn: sqlite3.Connection, dig_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def test_redig_request_is_queued_with_reply_as_angle(conn, config) -> None:
+# 調査段の材料(documents の本文。min_body_chars 字以上)に足りる元記事の本文
+BODY = "元記事の本文の段落。" * 30
+
+
+def add_dig_with_body(conn: sqlite3.Connection, config: Config, **kwargs) -> int:
+    """元記事の本文が DB に残っている(保存の期間の中の)カード。調べ直しを受け付けられる
+    (GH#197)。"""
+    dig_id = add_dig(conn, config, **kwargs)
+    add_document(conn, dig_id, BODY)
+    conn.commit()
+    return dig_id
+
+
+@pytest.mark.parametrize(
+    ("body", "redig", "notice"),
+    [
+        (None, True, dig_answer.REDIG_NO_MATERIAL_NOTICE),
+        ("本" * (DigConfig().min_body_chars - 1), True, dig_answer.REDIG_NO_MATERIAL_NOTICE),
+        ("本" * DigConfig().min_body_chars, True, dig_answer.REDIG_NOTICE),
+        (None, False, ""),
+    ],
+    ids=["purged", "short", "enough", "purged_question"],
+)
+def test_redig_needs_the_material_the_dig_stage_reads(conn, config, body, redig, notice) -> None:
+    # 調べ直しは、翌朝の調査段が材料に読む元記事の本文(documents。調査段の選定と同じ
+    # min_body_chars 字以上)があるときだけ受け付ける。保存の期間が過ぎて消えていたら積まず
+    # (掘ったアイテムの done のまま)、翌朝の実行を約束せずに理由を返す(GH#197)。
+    # 調べ直しの依頼でなければ、材料が無くても何も添えない
     dig_id = add_dig(conn, config)
+    if body is not None:
+        add_document(conn, dig_id, body)
+    item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle) "
+        "VALUES (?, 'done', 'bookmark', '前の観点')",
+        (item_id,),
+    )
+    ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    sender = Sender()
+
+    answer_pending(conn, config, Engine(redig_on={1} if redig else set()).factory, sender, logger)
+
+    accepted = notice == dig_answer.REDIG_NOTICE
+    assert sender.sent == [(71, "返事1" + notice)]
+    row = rows(conn)[0]
+    assert (row["status"], row["redig"], row["answer"]) == (
+        "answered", int(accepted), "返事1" + notice
+    )
+    queue = queue_of(conn, dig_id)
+    if accepted:
+        assert (queue["status"], queue["angle"]) == ("queued", "コストの観点で調べ直して")
+    else:
+        assert (queue["status"], queue["angle"], queue["requested_at"]) == (
+            "done", "前の観点", None
+        )
+
+
+def test_redig_request_is_queued_with_reply_as_angle(conn, config) -> None:
+    dig_id = add_dig_with_body(conn, config)
     reply = "  承認フローを運用している会社の事例を中心に、もう一度調べてほしい  "
     question_id = ask(conn, dig_id, reply, 71)
     engine = Engine(redig_on={1})
@@ -564,7 +621,7 @@ def test_redig_request_is_queued_with_reply_as_angle(conn, config) -> None:
 
 def test_redig_returns_done_item_to_queue_keeping_source(conn, config) -> None:
     # 深掘り済み(done)の 🔖 のアイテムも queued へ戻る。source は初回投入の経路のまま
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
     conn.execute(
         "INSERT INTO dig_queue (item_id, status, source, angle) "
@@ -584,7 +641,7 @@ def test_redig_returns_done_item_to_queue_keeping_source(conn, config) -> None:
 @pytest.mark.parametrize("case", ["not_requested", "dig_disabled", "button"])
 def test_redig_is_not_queued(conn, config, tmp_path, case) -> None:
     # 依頼でない / 深掘りの段が止まっている(daily_cap = 0)/ ボタンからの依頼 は積まず、知らせない
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     run_config = config
     if case == "button":
         enqueue_request(conn, dig_id, "summary")
@@ -610,7 +667,7 @@ def test_redig_queue_failure_rolls_back_and_answers_without_notice(
 ) -> None:
     # キューを書き換えた後に失敗しても、キューは元のまま(ロールバック)。「調べ直します」とは
     # 送らず、返事だけは送る(質問を残し続けない)
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     item_id = conn.execute("SELECT item_id FROM dig_results WHERE id = ?", (dig_id,)).fetchone()[0]
     conn.execute(
         "INSERT INTO dig_queue (item_id, status, source, angle) "
@@ -705,7 +762,7 @@ def test_redig_does_not_override_operation_during_answer(
     # 返事を作っている間に本人が未消化一覧でパス・指定し直しをしたら、後の操作を残す。
     # 調べ直しは積まず、「調べ直します」の知らせも付けない(返事は送る)。受付と操作が
     # 同じ秒でも先後を取り違えない
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     item_id = put_queue(conn, dig_id, "done")
     question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
     pin_question(conn, question_id)
@@ -732,7 +789,7 @@ def test_redig_does_not_override_operation_during_answer(
 def test_redig_is_queued_without_operation_after_acceptance(conn, config, tmp_path, case) -> None:
     # 受け付ける前のパス・指定し直し(同じ秒でも)と、返事を作る間に朝の深掘りが done にした
     # こと(本人の操作ではない)は、後の操作とみなさない。今どおり積んで知らせを付ける
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     item_id = put_queue(conn, dig_id, "queued" if case == "dug_during_answer" else "done")
     before = {"passed_before": "{} はパス", "respecified_before": "{} を運用の観点で"}.get(case)
     if before is not None:
@@ -764,7 +821,7 @@ def test_redig_is_queued_without_operation_after_acceptance(conn, config, tmp_pa
 def test_later_redig_on_same_card_is_queued_after_earlier_one(conn, config) -> None:
     # 続けて送った調べ直しは、後の依頼が残る。先の依頼を積んだこと(後の質問を受け付けた後の
     # キューの更新)を、本人の後の操作と取り違えない
-    dig_id = add_dig(conn, config)
+    dig_id = add_dig_with_body(conn, config)
     ask(conn, dig_id, "コストの観点で調べ直して", 71)
     ask(conn, dig_id, "やっぱり運用の観点で調べ直して", 72)
     sender = Sender()
@@ -812,7 +869,7 @@ class ObedientEngine(Engine):
 def test_material_injection_cannot_record_take_or_queue_redig(conn, config) -> None:
     # カード・解説ノート・原文ノート・それまでの返事に take・調べ直しを指示する文があっても、
     # 本人のリプライが質問なら take としても調べ直しとしても記録しない
-    dig_id = add_dig(
+    dig_id = add_dig_with_body(
         conn, config, note=f"{EXPLAINER}\n\n{INJECTION}", source=f"{SOURCE}\n\n{INJECTION}"
     )
     conn.execute(

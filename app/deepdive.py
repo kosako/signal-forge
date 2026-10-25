@@ -14,7 +14,8 @@
 - 1 日上限 = config `[dig].daily_cap`(JST 暦日。同日再実行は残枠のみ = 冪等)
 - 優先順位: ①リプライ指定(requested_at 新しい順)②自動キューの新しい順
 - 材料不足(本文抽出なし・短すぎ)は、自動選出なら skip(未消化一覧には残る)、
-  リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)
+  リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)。報告は 1 回に
+  して指定を外す(本文を取り直す経路は無く、毎朝の失敗を続けない。GH#197)
 - 同じ台帳を使う実行(朝バッチの dig 段と `intel dig`)は 1 つずつ。候補の選定から公開・送信までを
   ロックで囲み、後から来た方は待たずに何もしない(朝バッチを止めない。GH#196)
 
@@ -291,10 +292,16 @@ def _run_dig_stage_locked(
 
     if remaining > 0:
         selected, skipped_requested = _select_candidates(conn, config, remaining, day)
-        failures.extend(
-            f"item {c.item_id}: リプライ指定だが本文の抽出材料がない(パスするか手動対応)"
-            for c in skipped_requested
-        )
+        for candidate in skipped_requested:
+            dropped = _drop_request(conn, candidate, logger, run_id)
+            failures.append(
+                f"item {candidate.item_id}: リプライ指定だが本文の抽出材料がない"
+                + (
+                    "(指定を外した。次の朝からは知らせない)"
+                    if dropped
+                    else "(パスするか手動対応)"
+                )
+            )
         for candidate in selected:
             try:
                 _dig_one(
@@ -349,6 +356,27 @@ def _digs_on(conn: sqlite3.Connection, day: str) -> int:
         "SELECT count(*) AS n FROM dig_results WHERE date(created_at, '+9 hours') = ?",
         (day,),
     ).fetchone()["n"]
+
+
+def has_material(body: str | None, config: Config) -> bool:
+    """調査段の材料が足りるか(documents の抽出本文が min_body_chars 字以上)。
+
+    朝の選定と、深掘りカードへの調べ直しの受付(dig_answer。GH#197)が同じ条件を使う。
+    """
+    return bool(body) and len(body) >= config.dig.min_body_chars
+
+
+def item_has_material(conn: sqlite3.Connection, config: Config, item_id: int) -> bool:
+    """その item の今の documents の本文が、調査段の材料に足りるか(GH#197)。
+
+    本文は保存の期間(既定で RSS 30 日・X 7 日)を過ぎると purge で消え、取り直す経路は無い
+    (抽出の対象は新着 = status 'new' の item だけ)。調べ直しを受け付けて翌朝の実行を約束する
+    前に確かめる。
+    """
+    row = conn.execute(
+        "SELECT extracted_text FROM documents WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    return has_material(row["extracted_text"] if row is not None else None, config)
 
 
 def _select_candidates(
@@ -410,12 +438,51 @@ def _select_candidates(
             previous_note_name=row["previous_note_name"],
             fetched_date=row["fetched_date"],
         )
-        if candidate.body and len(candidate.body) >= config.dig.min_body_chars:
+        if has_material(candidate.body, config):
             selected.append(candidate)
         elif candidate.requested:
             skipped_requested.append(candidate)
         # 材料不足の自動選出は対象外のまま(キューに残る。docstring 参照)
     return selected, skipped_requested
+
+
+def _drop_request(
+    conn: sqlite3.Connection,
+    candidate: DigCandidate,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> bool:
+    """材料不足のリプライ指定を、知らせた後に自動キューの扱いへ戻す(GH#197)。外せたら True。
+
+    requested_at を外すだけで、status(queued)・観点・source・受付の順序の印
+    (backlog_op_question_id。本人の未消化一覧への操作ではない)は変えない。本文を取り直す
+    経路は無いので、指定のまま残すと毎朝同じ失敗を知らせ続ける。材料不足の自動選出と同じく
+    静かに残り、本人が指定し直せばまた 1 回知らせる。選定の後に poller が更新していたら
+    (再指定・パス)、本人の操作を優先して変えない(done 化と同じ compare-and-set)。
+    DB の失敗は item 単位に閉じ(ERROR を残して False)、他の件の深掘りと公開・送信を止めない。
+    """
+    try:
+        return (
+            conn.execute(
+                "UPDATE dig_queue SET requested_at = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
+                "  AND angle IS ? AND requested_at IS ?",
+                (
+                    candidate.item_id,
+                    candidate.queue_updated_at,
+                    candidate.angle,
+                    candidate.queue_requested_at,
+                ),
+            ).rowcount
+            == 1
+        )
+    except sqlite3.Error as e:
+        logger.error(
+            f"材料不足の指定を外せなかった item={candidate.item_id}: {type(e).__name__}: {e}",
+            extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
+        )
+        return False
 
 
 def _dig_one(

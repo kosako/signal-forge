@@ -1179,11 +1179,71 @@ def test_requested_without_material_fails_loud(conn, config) -> None:
     item = add_item(conn, "https://a.example/1", body=None)
     enqueue(conn, item, angle="観点", requested_at="2026-07-21T00:00:00Z")
 
-    with pytest.raises(DigError, match="リプライ指定だが本文の抽出材料がない"):
+    dropped = r"本文の抽出材料がない\(指定を外した。次の朝からは知らせない\)"
+    with pytest.raises(DigError, match=dropped):
         run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
-    # キューには残る(ユーザーがパスするまで)
-    row = conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
-    assert row["status"] == "queued"
+    # 知らせるのは 1 回だけ。本文を取り直す経路は無いので指定を外し、自動キューの材料不足と
+    # 同じく静かに残す(観点・状態は保つ)。次の朝から同じ失敗を続けない(GH#197)
+    row = conn.execute(
+        "SELECT status, angle, requested_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()
+    assert (row["status"], row["angle"], row["requested_at"]) == ("queued", "観点", None)
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+
+def test_requested_without_material_keeps_respecification_after_selection(
+    conn, config, monkeypatch
+) -> None:
+    # 選定の後に本人が指定し直していたら(poller の更新)、指定を外さずに本人の操作を残す
+    from app import deepdive as deepdive_module
+
+    item = add_item(conn, "https://a.example/1", body=None)
+    enqueue(conn, item, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    real_select = deepdive_module._select_candidates
+
+    def select_then_respecify(*args, **kwargs):
+        selected = real_select(*args, **kwargs)
+        conn.execute(
+            "UPDATE dig_queue SET angle = '新しい観点', requested_at = '2026-07-21T21:00:00Z' "
+            "WHERE item_id = ?",
+            (item,),
+        )
+        return selected
+
+    monkeypatch.setattr(deepdive_module, "_select_candidates", select_then_respecify)
+
+    # 外せなかったので「次の朝からは知らせない」とは言わない
+    with pytest.raises(DigError, match=r"本文の抽出材料がない\(パスするか手動対応\)"):
+        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+    row = conn.execute(
+        "SELECT angle, requested_at FROM dig_queue WHERE item_id = ?", (item,)
+    ).fetchone()
+    assert (row["angle"], row["requested_at"]) == ("新しい観点", "2026-07-21T21:00:00Z")
+
+
+def test_requested_without_material_drop_failure_does_not_stop_other_items(conn, config) -> None:
+    # 指定を外す更新が DB の失敗(ロックなど)で通らなくても、item 単位に閉じる。他の件は
+    # 掘って公開・送信し、指定は残して段の失敗として知らせる(GH#197)
+    no_body = add_item(conn, "https://a.example/1", body=None)
+    ok_item = add_item(conn, "https://a.example/2", language="ja")
+    enqueue(conn, no_body, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    enqueue(conn, ok_item)
+    conn.execute(
+        "CREATE TRIGGER boom BEFORE UPDATE OF requested_at ON dig_queue "
+        "WHEN NEW.requested_at IS NULL BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    api = FakeApi()
+
+    with pytest.raises(DigError, match=r"本文の抽出材料がない\(パスするか手動対応\)"):
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert conn.execute("SELECT item_id FROM dig_results").fetchall()[0]["item_id"] == ok_item
+    assert len(api.sent) == 1
+    rows = conn.execute("SELECT item_id, status, requested_at FROM dig_queue ORDER BY item_id")
+    assert [tuple(r) for r in rows] == [
+        (no_body, "queued", "2026-07-21T00:00:00Z"),
+        (ok_item, "done", None),
+    ]
+    assert not conn.in_transaction
 
 
 def test_item_failure_isolated_but_stage_fails(conn, config) -> None:
