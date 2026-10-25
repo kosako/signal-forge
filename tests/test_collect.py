@@ -352,6 +352,121 @@ def test_failure_keeps_reads_and_cost_already_spent(
     assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 0
 
 
+class FeedsFakeConnector:
+    """ソースの名前ごとの項目とカーソルを返す。読取の件数と費用も返す(失敗の行に残るかを見る)。"""
+
+    source_type = "rss"
+
+    def __init__(self, feeds: dict[str, tuple[list[RawItem], dict]]):
+        self.feeds = feeds
+        self.seen_cursors: list[tuple[str, dict]] = []
+
+    def fetch(self, source_row, cursor):
+        self.seen_cursors.append((source_row.name, cursor))
+        items, next_cursor = self.feeds[source_row.name]
+        return FetchResult(
+            items=items,
+            next_cursor=next_cursor,
+            stats=FetchStats(
+                items_fetched=len(items), api_reads=len(items),
+                estimated_cost_usd=0.004 * len(items), http_status=200, duration_ms=1,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "fail_on",
+    [
+        # 2 件目の項目の INSERT(短縮 URL を解決した先)。1 件目は同じトランザクションで INSERT 済み
+        "INSERT ON items WHEN NEW.canonical_url = 'https://a.example/a2'",
+        # 全項目の INSERT のあとのカーソルの更新
+        "UPDATE OF cursor ON sources WHEN NEW.name = 'feed-a'",
+    ],
+)
+def test_store_failure_mid_transaction_rolls_back_items_and_cursor(
+    conn: sqlite3.Connection, fail_on: str
+) -> None:
+    # 設計 02 §1: 項目の INSERT とカーソルの保存は 1 つのトランザクション。途中で失敗したら
+    # 両方を戻す(カーソルだけ進んで項目が欠ける取りこぼしを起こさない)。失敗はソース単位で
+    # 隔離して後ろのソースは続け、障害が去った再実行で欠落も重複も出ない(GH#208)。
+    # 短縮 URL の解決はトランザクションの前に済む(GH#179)が、そのあとの保存の失敗でも何も残さない
+    conn.execute(
+        "UPDATE sources SET cursor = '{\"etag\": \"old\"}',"
+        " last_success_at = '2026-10-20T21:30:00Z' WHERE name = 'feed-a'"
+    )
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-b', '{\"url\": \"https://b\"}')"
+    )
+    connector = FeedsFakeConnector({
+        "feed-a": ([item("https://a.example/a1"), item("https://bit.ly/a2")], {"etag": "new-a"}),
+        "feed-b": ([item("https://b.example/b1")], {"etag": "new-b"}),
+    })
+
+    def resolver(url: str) -> str:
+        return {"https://bit.ly/a2": "https://a.example/a2"}[url]
+
+    def stored(name: str) -> list[tuple]:
+        return [tuple(r) for r in conn.execute(
+            "SELECT url, canonical_url, status FROM items"
+            " WHERE source_id = (SELECT id FROM sources WHERE name = ?) ORDER BY canonical_url",
+            (name,),
+        )]
+
+    def source(name: str) -> sqlite3.Row:
+        return conn.execute(
+            "SELECT cursor, last_success_at, last_error, consecutive_failures FROM sources"
+            " WHERE name = ?",
+            (name,),
+        ).fetchone()
+
+    conn.execute(  # この接続の保存の途中だけを失敗させる(DB の書き込みの失敗の代わり)
+        f"CREATE TEMP TRIGGER fail_store BEFORE {fail_on}"
+        " BEGIN SELECT RAISE(ABORT, '保存の途中の失敗'); END"
+    )
+    collect_all(conn, {"rss": connector}, logger, resolve_short=resolver)
+
+    assert not conn.in_transaction  # 書き込みのトランザクションを開いたまま残さない
+    assert stored("feed-a") == []  # 先に INSERT した 1 件目も戻る
+    failed = source("feed-a")
+    assert json.loads(failed["cursor"]) == {"etag": "old"}  # カーソルは進めない
+    assert failed["last_success_at"] == "2026-10-20T21:30:00Z"
+    assert "保存の途中の失敗" in failed["last_error"]
+    assert failed["consecutive_failures"] == 1
+    runs = conn.execute(
+        "SELECT s.name, r.finished_at, r.status, r.error, r.api_reads, r.estimated_cost_usd"
+        " FROM collect_runs r JOIN sources s ON s.id = r.source_id ORDER BY r.id"
+    ).fetchall()
+    assert [(r["name"], r["status"]) for r in runs] == [("feed-a", "error"), ("feed-b", "ok")]
+    assert runs[0]["finished_at"] is not None
+    assert runs[0]["error"] == "IntegrityError: 保存の途中の失敗"
+    # 保存で失敗しても、読んだ件数と費用は台帳に残す(日次の読取上限と月次の費用。GH#178)
+    assert runs[0]["api_reads"] == 2
+    assert runs[0]["estimated_cost_usd"] == pytest.approx(2 * 0.004)
+    # 後ろのソースは続けて保存する
+    assert stored("feed-b") == [("https://b.example/b1", "https://b.example/b1", "new")]
+    assert json.loads(source("feed-b")["cursor"]) == {"etag": "new-b"}
+
+    # 障害が去った再実行: feed-a は据え置いたカーソルから取り直し、欠落も重複も無い
+    conn.execute("DROP TRIGGER fail_store")
+    collect_all(conn, {"rss": connector}, logger, resolve_short=resolver)
+
+    assert connector.seen_cursors[2:] == [
+        ("feed-a", {"etag": "old"}),
+        ("feed-b", {"etag": "new-b"}),
+    ]
+    assert stored("feed-a") == [
+        ("https://a.example/a1", "https://a.example/a1", "new"),
+        ("https://bit.ly/a2", "https://a.example/a2", "new"),
+    ]
+    assert stored("feed-b") == [("https://b.example/b1", "https://b.example/b1", "new")]
+    recovered = source("feed-a")
+    assert json.loads(recovered["cursor"]) == {"etag": "new-a"}
+    assert recovered["last_error"] is None
+    assert recovered["consecutive_failures"] == 0
+    statuses = conn.execute("SELECT status FROM collect_runs ORDER BY id").fetchall()
+    assert [r["status"] for r in statuses] == ["error", "ok", "ok", "ok"]
+
+
 def test_invalid_scheme_item_recorded_as_error(conn: sqlite3.Connection) -> None:
     connector = FakeConnector([item("javascript:alert(1)"), item("https://example.com/ok")])
     collect_all(conn, {"rss": connector}, logger)
