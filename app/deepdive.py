@@ -46,11 +46,13 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -75,6 +77,7 @@ from app.delivery.telegram import (
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import JST
 from app.prompting import fill_template, sanitize, sanitize_body
+from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-v001"
@@ -688,14 +691,16 @@ def _publish_row_notes(
     deepdive_dir = _deepdive_dir(config)
     if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
         _publish_note(
-            deepdive_dir / f"{row['note_name']}.md",
+            deepdive_dir,
+            f"{row['note_name']}.md",
             row["note_markdown"],
             logger,
             run_id,
         )
     if row["source_note_name"] is not None and row["source_note_markdown"] is not None:
         _publish_note(
-            deepdive_dir / f"{row['source_note_name']}.md",
+            deepdive_dir,
+            f"{row['source_note_name']}.md",
             row["source_note_markdown"],
             logger,
             run_id,
@@ -1267,7 +1272,7 @@ def _split_oversized(text: str, chunk_chars: int, level: int = 0) -> list[str]:
 
 
 def _publish_note(
-    path: Path, content: str, logger: logging.Logger, run_id: str | None
+    directory: VaultDir, name: str, content: str, logger: logging.Logger, run_id: str | None
 ) -> None:
     """既存ノートは上書きしない(Codex P1)。
 
@@ -1280,23 +1285,40 @@ def _publish_note(
     既存かどうかは置き換え(rename)の直前に確かめる(GH#234)。vault が応答せず上限の時間で
     見切ったスレッドは後から書き終えうるので、その間にできたノートを置き換えないため。
     別の実行の公開との競合は、公開のロック(_PublishLock)で防ぐ。
+
+    書き出し先は vault の実体から 1 段ずつ symlink を辿らずに開いた DeepDive の置き場(GH#204)。
+    途中のフォルダが外への symlink なら書かない(VaultPathError でその件の公開の失敗になり、
+    本文は台帳に残る)。
     """
-    if not atomic_write(path, content, precondition=lambda: not path.exists()):
-        logger.warning(
-            f"既存の DeepDive ノートを保持(再書出は破棄): {path.name}",
-            extra={"run_id": run_id, "stage": "dig"},
-        )
+    with directory.opened() as dir_fd:
+        absent = partial(_note_absent, dir_fd, name)
+        if not atomic_write(dir_fd, name, content, precondition=absent):
+            logger.warning(
+                f"既存の DeepDive ノートを保持(再書出は破棄): {name}",
+                extra={"run_id": run_id, "stage": "dig"},
+            )
 
 
-def _deepdive_dir(config: Config) -> Path:
+def _note_absent(dir_fd: int, name: str) -> bool:
+    """置き換えの直前の確認: 同じ名前のノートが無いか(GH#234)。
+
+    同じ名前が symlink・通常のファイルでなければ、辿らず置き換えずに公開の失敗にする(既存の
+    ノートとみなして本文を台帳から消すと、ノートの中身がどこにも残らないため。GH#204)。
+    """
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    if not stat.S_ISREG(st.st_mode):
+        raise VaultPathError(f"DeepDive の {name} が symlink か通常のファイルでない")
+    return False
+
+
+def _deepdive_dir(config: Config) -> VaultDir:
     if config.obsidian.vault_path is None:
         raise DigError("[obsidian].vault_path が未設定(宿題 H4)。DeepDive ノートを書けない")
-    base = (
-        Path(config.obsidian.vault_path).expanduser()
-        / config.obsidian.folder
-        / DEEPDIVE_FOLDER
-    )
-    base.mkdir(parents=True, exist_ok=True)
+    base = folder_dir(config, DEEPDIVE_FOLDER)
+    base.ensure()
     return base
 
 

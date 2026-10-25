@@ -34,9 +34,9 @@ import logging
 import os
 import sqlite3
 import stat
-from pathlib import Path
 
 from app.config import Config
+from app.vault_dir import VaultPathError, folder_dir
 from app.vault_guard import VaultGuard, VaultStalled
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
@@ -154,7 +154,8 @@ def _open_deepdive(config: Config) -> int:
 
     vault そのものが無い・途中のフォルダが無いのは、vault が一時的に使えない(外付けの取り外し
     など)とみて再試行に回す(FileNotFoundError をそのまま上げる)。途中が symlink・フォルダで
-    ないときは、ノートへの追記を諦める。
+    ないとき(置き場の名前が不正なときを含む)は、ノートへの追記を諦める。開き方はノートの出力・
+    返事の材料の読み取りと共通(app/vault_dir.py。GH#204)。
     """
     # 呼び出し時に import する(deepdive → delivery → poller → answer_worker → 本モジュール
     # の循環を避ける)
@@ -162,27 +163,10 @@ def _open_deepdive(config: Config) -> int:
 
     if config.obsidian.vault_path is None:
         raise _NoteMissing("vault が未設定")
-    root = Path(config.obsidian.vault_path).expanduser().resolve(strict=True)
-    parts = [*Path(config.obsidian.folder).parts, DEEPDIVE_FOLDER]
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in parts:
-            if part in ("", ".", "..") or os.sep in part:
-                raise _NoteMissing("DeepDive の置き場の名前が不正")
-            try:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except OSError as e:
-                if e.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise _NoteMissing(
-                        f"DeepDive までのフォルダ {part} が symlink かフォルダでない"
-                    ) from e
-                raise
-            os.close(fd)
-            fd = child
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+        return folder_dir(config, DEEPDIVE_FOLDER).open()
+    except VaultPathError as e:
+        raise _NoteMissing(f"DeepDive までのフォルダ: {e}") from e
 
 
 def _take_body(row: sqlite3.Row) -> bytes:

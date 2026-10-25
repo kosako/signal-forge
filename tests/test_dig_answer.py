@@ -2,6 +2,7 @@
 
 import logging
 import re
+import shutil
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -424,6 +425,31 @@ def test_note_symlink_outside_deepdive_is_not_read(conn, config) -> None:
     answer_pending(conn, config, engine.factory, Sender(), logger)
 
     assert "vault の別の場所の内容" not in engine.prompts[0]
+    assert "(解説ノートが見つからない)" in engine.prompts[0]
+
+
+@pytest.mark.parametrize("swapped", ["SignalForge", "DeepDive"])
+def test_folder_symlink_outside_vault_is_not_read(conn, config, tmp_path, swapped) -> None:
+    # DeepDive までのフォルダが vault の外への symlink なら、外の同じ名前のノートを読んで
+    # LLM に渡さない(GH#204)
+    dig_id = add_dig(conn, config, note=None, source=None)
+    note_name = conn.execute(
+        "SELECT note_name FROM dig_results WHERE id = ?", (dig_id,)
+    ).fetchone()[0]
+    deepdive = Path(config.obsidian.vault_path) / "SignalForge" / "DeepDive"
+    folder = deepdive if swapped == "DeepDive" else deepdive.parent
+    outside = tmp_path / "outside"
+    target = outside if swapped == "DeepDive" else outside / "DeepDive"
+    target.mkdir(parents=True)
+    (target / f"{note_name}.md").write_text("vault の外の内容", encoding="utf-8")
+    shutil.rmtree(folder)
+    folder.symlink_to(outside)
+    ask(conn, dig_id, "質問", 71)
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, Sender(), logger)
+
+    assert "vault の外の内容" not in engine.prompts[0]
     assert "(解説ノートが見つからない)" in engine.prompts[0]
 
 

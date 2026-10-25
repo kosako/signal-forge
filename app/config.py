@@ -202,7 +202,7 @@ class TelegramConfig:
 @dataclass(frozen=True)
 class ObsidianConfig:
     vault_path: str | None = None  # 宿題 H4 確定までは未設定を許容(export 実行時に要求)
-    folder: str = "SignalForge"  # Vault 内の出力フォルダ(設計 04 §7)
+    folder: str = "SignalForge"  # Vault 内の出力フォルダ(vault の中の相対パス。設計 04 §7)
 
 
 @dataclass(frozen=True)
@@ -398,6 +398,19 @@ def _validate(path: Path, config: Config) -> None:
     # (doctor・export は None だけを未設定として扱う)。未設定はキーの省略で表す(GH#251)
     if config.obsidian.vault_path is not None and not config.obsidian.vault_path.strip():
         raise ConfigError(f"{path}: [obsidian].vault_path が空文字(未設定なら行ごと削除)")
+    # folder は vault の中の相対パスに限る。絶対パスや `..` は vault の外を指し、空(`.` を含む)は
+    # ノートが vault の直下に散らばる(書き込み先を vault の中に限る。設計 04 §7・06 §4。GH#204)
+    folder = Path(config.obsidian.folder)
+    if (
+        not config.obsidian.folder.strip()
+        or not folder.parts
+        or folder.is_absolute()
+        or ".." in folder.parts
+    ):
+        raise ConfigError(
+            f"{path}: [obsidian].folder は vault の中の相対パス(絶対パス・`..`・空は不可): "
+            f"{config.obsidian.folder!r}"
+        )
     cap = config.dig.review_monthly_cap_usd
     if not (math.isfinite(cap) and cap > 0):
         raise ConfigError(f"{path}: [dig].review_monthly_cap_usd は正の有限値: {cap}")

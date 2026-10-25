@@ -32,6 +32,7 @@ from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.dig import DigInstruction, apply_instructions
 from app.prompting import fill_template, sanitize_body
+from app.vault_dir import VaultDir, folder_dir, open_regular
 from app.vault_guard import VaultGuard, VaultStalled
 
 PROMPT_VERSION = "dig-answer-v003"
@@ -554,17 +555,17 @@ def _history(conn: sqlite3.Connection, dig_result_id: int, before_id: int, nonce
     return "\n\n".join(turns)
 
 
-def _deepdive_dir(config: Config) -> Path | None:
+def _deepdive_dir(config: Config) -> VaultDir | None:
     # 呼び出し時に import する(deepdive → delivery → poller → 本モジュールの循環を避ける)
     from app.deepdive import DEEPDIVE_FOLDER
 
     if config.obsidian.vault_path is None:
         return None
-    return Path(config.obsidian.vault_path).expanduser() / config.obsidian.folder / DEEPDIVE_FOLDER
+    return folder_dir(config, DEEPDIVE_FOLDER)
 
 
 def _read_note_guarded(
-    vault: VaultGuard, deepdive_dir: Path | None, note_name: str
+    vault: VaultGuard, deepdive_dir: VaultDir | None, note_name: str
 ) -> str | None:
     """_read_note を時間の上限つきで(vault が応答しないときは None。理由は vault.stalled)。"""
     if deepdive_dir is None:
@@ -581,17 +582,18 @@ def _missing_note(label: str, vault: VaultGuard) -> str:
     return f"({label}が見つからない)"
 
 
-def _read_note(deepdive_dir: Path | None, note_name: str) -> str | None:
-    # note_name は調査段が付けた名前(台帳由来)。念のため DeepDive の外を指すもの(`../` を
-    # 含む名前や、外への symlink)は読まない。symlink を辿った後の実体の置き場所で判定する
+def _read_note(deepdive_dir: VaultDir | None, note_name: str) -> str | None:
+    # note_name は調査段が付けた名前(台帳由来)。念のため DeepDive の外を指すもの(`/` を含む
+    # 名前や symlink)は読まない。vault の実体から DeepDive まで 1 段ずつ symlink を辿らずに開き、
+    # その中の通常のファイルだけを読む(途中のフォルダが外への symlink でも、外の同名のノートを
+    # 読まない。GH#204)
     if deepdive_dir is None:
         return None
     try:
-        base = deepdive_dir.resolve(strict=True)
-        path = (deepdive_dir / f"{note_name}.md").resolve(strict=True)
-        if path.parent != base or not path.is_file():
-            return None
-        return path.read_text(encoding="utf-8", errors="replace")
+        with deepdive_dir.opened() as dir_fd:
+            fd = open_regular(dir_fd, f"{note_name}.md")
+        with open(fd, encoding="utf-8", errors="replace") as f:
+            return f.read()
     except OSError:
         return None
 

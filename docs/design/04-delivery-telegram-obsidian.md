@@ -80,8 +80,9 @@
 
 ## 7. Obsidian 出力
 
-- **設定**: config.toml の `[obsidian] vault_path` + `folder`(既定 `SignalForge`)。パスはハードコード禁止。書込は **一時ファイル→rename のアトミック書き**(同期ツールとの競合対策。防ぐのは書きかけのファイルが残ることで、読み取り後に保存された変更との競合は下の「読み取り後の変更の検出」で扱う)。
+- **設定**: config.toml の `[obsidian] vault_path` + `folder`(既定 `SignalForge`)。パスはハードコード禁止。`folder` は vault の中の相対パスに限り(`Notes/SignalForge` のような入れ子は可)、絶対パスと `..` を含むもの(vault の外を指す)、空(`.` を含む。vault の直下に散らばる)は設定の読み込みで拒む(GH#204)。書込は **一時ファイル→rename のアトミック書き**(同期ツールとの競合対策。防ぐのは書きかけのファイルが残ることで、読み取り後に保存された変更との競合は下の「読み取り後の変更の検出」で扱う)。
 - **ディレクトリ**: `{vault}/{folder}/Daily/` と `{vault}/{folder}/Items/`。
+  - **vault の中に限る(GH#204)**: 読み書きは、vault の実体(`vault_path` を resolve したもの。`vault_path` 自体は symlink でもよい)から 1 段ずつ symlink を辿らずに開いたフォルダの中で行う(深掘りの公開・take の追記・返事の材料の読み取り・doctor #7 と共通。設計 06 §4)。途中のフォルダ(folder・`Daily`・`Items`)が外への symlink なら書かず、export を失敗にする(§8 の失敗通知。感想の追いパスは書けなかったぶんの `exported_at` を立てない)。ノート自体が symlink・通常のファイルでなければ、辿って読み書きせず、新版を `.conflict.md` に退避する(下の再生成ポリシーのマーカー欠損と同じ扱い)。Items のファイル名は下の規則で `/` などを除くので、記事のタイトルから `Items/` の外を指すことはない。
 - **ファイル名規則**:
   - Daily: `YYYY-MM-DD.md`(digest 生成日)
   - Items: `YYYYMMDD-{item_id}-{slug}.md`。slug は**原文タイトル(items.title)**の Obsidian 禁止文字(`/\:*?"<>|#^[]`)と空白の連続を `-` に置き換え、両端の `-` を落として 40 字で切る(title_ja 導入後もファイル名規則は不変。frontmatter の `title` のみ title_ja 優先)。item_id を含めるので slug 衝突は無害(一意性は id が担保)。

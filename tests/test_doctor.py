@@ -770,6 +770,20 @@ def test_vault_unset_fails(config_dir, tmp_path) -> None:
     assert "H4" in result.detail
 
 
+def test_vault_folder_symlink_outside_fails_without_writing(config_dir, tmp_path) -> None:
+    # 出力先のフォルダが vault の外への symlink なら、export と同じく辿って書かずに FAIL(GH#204)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "vault").mkdir()
+    os.symlink(outside, tmp_path / "vault" / "SignalForge")
+
+    result = by_number(doctor(config_dir, tmp_path), 7)
+
+    assert result.status == "FAIL"
+    assert "symlink" in result.detail
+    assert list(outside.iterdir()) == []
+
+
 def test_vault_stall_is_fail_and_later_checks_run(config_dir, tmp_path, monkeypatch) -> None:
     # 書込テストが応答待ちで止まっても、上限で #7 を FAIL にして残りの検査へ進む(GH#248)
     import app.doctor as doctor_module

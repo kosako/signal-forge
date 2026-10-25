@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from app.config import Config, ObsidianConfig
 from app.db import apply_migrations, connect
 from app.export import ExportError, export_digest, export_pending_notes
 from app.export import obsidian as obsidian_module
+from app.vault_dir import VaultPathError
 
 logger = logging.getLogger("test-obsidian")
 
@@ -78,6 +80,67 @@ def test_vault_unset_raises(conn, tmp_path) -> None:
         export_digest(conn, Config(config_dir=tmp_path), digest_id, logger)
 
 
+@pytest.mark.parametrize("swapped", ["SignalForge", "Daily", "Items"])
+def test_folder_symlink_outside_vault_is_never_written(conn, tmp_path, swapped) -> None:
+    # 出力先のフォルダ(folder・Daily・Items)が vault の外への symlink なら、辿って外に書かず、
+    # export を失敗にする。感想の追いパスも同じで、反映済みにしない(GH#204)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, 500)",
+        (digest_id, item),
+    )
+    add_note(conn, item, "記事への感想")
+    add_digest_note(conn, digest_id, "日次の感想")
+    config = make_config(tmp_path)
+    base = tmp_path / "vault" / "SignalForge"
+    link = base if swapped == "SignalForge" else base / swapped
+    link.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    for sub in ("Daily", "Items"):  # 外にも同じ形の置き場がある
+        (outside / sub).mkdir(parents=True)
+    os.symlink(outside if swapped == "SignalForge" else outside / swapped, link)
+
+    with pytest.raises(VaultPathError, match=swapped):
+        export_digest(conn, config, digest_id, logger)
+    with pytest.raises(VaultPathError, match=swapped):
+        export_pending_notes(conn, config, logger)
+
+    assert [p for p in outside.rglob("*") if p.is_file()] == []
+    pending_items = conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    pending_digests = conn.execute(
+        "SELECT count(*) FROM digest_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    # Daily だけが外を指すときは、Items のノートは vault の中に書けるので反映済みになる
+    assert pending_items == (0 if swapped == "Daily" else 1)
+    assert pending_digests == 1
+
+
+def test_vault_path_symlink_and_nested_folder_are_written_inside(conn, tmp_path) -> None:
+    # vault_path そのものは本人が設定した起点なので symlink(同期フォルダへのリンクなど)でよく、
+    # folder が入れ子の相対パスでも、従来どおりその中に書く(GH#204 の境界は vault の実体から下)
+    real = tmp_path / "real-vault"
+    real.mkdir()
+    (tmp_path / "vault-link").symlink_to(real)
+    config = Config(
+        config_dir=tmp_path,
+        obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault-link"), folder="Notes/SF"),
+    )
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+
+    export_digest(conn, config, digest_id, logger)
+
+    base = real / "Notes" / "SF"
+    notes = list((base / "Items").glob("*.md"))
+    assert [p.name[:8] for p in notes] == ["20260706"]
+    daily = (base / "Daily" / "2026-07-06.md").read_text()
+    assert f"[[{notes[0].stem}]]" in daily and "# ダイジェスト本文" in daily
+    assert "要約文" in notes[0].read_text()
+
+
 def test_notes_created_with_naming_and_wikilinks(conn, tmp_path) -> None:
     item = add_digested(conn, "https://a/1", title='悪い/タイトル:*?"<>|#^[]と 空白')
     digest_id = add_digest(conn, [item])
@@ -98,6 +161,21 @@ def test_notes_created_with_naming_and_wikilinks(conn, tmp_path) -> None:
     assert "# ダイジェスト本文" in text
     front = read_front(daily)
     assert front == {"date": "2026-07-06", "item_count": 1, "degraded": False}
+
+
+@pytest.mark.parametrize(
+    "title", ["../../../outside", "..", "/etc/passwd", "a/../../b", ".hidden", "..\\..\\x"]
+)
+def test_note_name_from_title_stays_inside_items(conn, tmp_path, title) -> None:
+    # 外部の記事のタイトルから作るノートの名前(slug)は、Items の中の 1 つの名前に収まる(GH#204)
+    item = add_digested(conn, "https://a/1", title=title)
+    digest_id = add_digest(conn, [item])
+    export_digest(conn, make_config(tmp_path), digest_id, logger)
+
+    base = tmp_path / "vault" / "SignalForge"
+    files = sorted(p for p in tmp_path.rglob("*") if p.is_file() and p.suffix == ".md")
+    assert [p.parent for p in files] == [base / "Daily", base / "Items"]
+    assert files[1].name.startswith(f"20260706-{item}-")
 
 
 def test_frontmatter_resists_injection_via_title(conn, tmp_path) -> None:
@@ -206,6 +284,32 @@ def test_missing_marker_writes_conflict_file_without_overwriting(conn, tmp_path)
     export_digest(conn, config, digest_id, logger)
     assert conflict.read_text() == conflict_content
     assert note.with_suffix(".conflict-2.md").exists()
+
+
+def test_note_symlink_is_not_followed_and_goes_to_conflict(conn, tmp_path, caplog) -> None:
+    # ノート自体が外への symlink なら、辿って読み書きせず、リンクも置き換えずに新版を
+    # .conflict.md に退避する(マーカー欠損と同じ fail-safe。GH#204)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    outside = tmp_path / "outside.md"
+    outside.write_text(note.read_text() + "\n外の手書き\n")  # 外のファイルもノートの形
+    outside_text = outside.read_text()
+    note.unlink()
+    note.symlink_to(outside)
+    conn.execute("UPDATE analyses SET summary = '更新された要約'")
+
+    with caplog.at_level(logging.WARNING, logger="test-obsidian"):
+        export_digest(conn, config, digest_id, logger)
+
+    assert outside.read_text() == outside_text  # 外のファイルは書き換えない
+    assert note.is_symlink()  # リンクも置き換えない
+    conflict = note.with_suffix(".conflict.md")
+    assert "更新された要約" in conflict.read_text()
+    assert "外の手書き" not in conflict.read_text()  # 外の中身を読んで取り込まない
+    assert "symlink" in caplog.text
 
 
 def test_handwriting_before_begin_marker_preserved(conn, tmp_path) -> None:
@@ -624,11 +728,11 @@ def hook_before_write(monkeypatch, note: Path, on_write) -> list[int]:
     original = obsidian_module.atomic_write
     calls: list[int] = []
 
-    def hooked(path, content, **kwargs):
-        if path == note:
+    def hooked(dir_fd, name, content, **kwargs):
+        if name == note.name:
             calls.append(len(calls) + 1)
             on_write(len(calls))
-        return original(path, content, **kwargs)
+        return original(dir_fd, name, content, **kwargs)
 
     monkeypatch.setattr(obsidian_module, "atomic_write", hooked)
     return calls
