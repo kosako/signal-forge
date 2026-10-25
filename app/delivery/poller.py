@@ -45,6 +45,7 @@ from app.delivery.surveys import (
 from app.delivery.telegram import DeliveryError, TelegramApi, escape_and_truncate, reaction_keyboard
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
+from app.export.obsidian import note_projection_date
 from app.jst import JST
 from app.normalize import (
     content_hash,
@@ -1022,9 +1023,10 @@ def _handle_dig_card_reply(
 ) -> None:
     """深掘りカード・その返事へのリプライ(GH#126 / 設計 06 §6)。
 
-    感想としては従来どおり item_notes に記録する(take の記録 GH#106 まで、朝の export で
-    Obsidian に投影する)。そのうえで質問として台帳に積み、別プロセスの `intel answer` が
-    返事を作って送る(LLM の待ちで受信を止めない)。上限を超えた日・上限 0 は記録だけ。
+    感想としては従来どおり item_notes に記録する(朝の export が Obsidian に投影するのは、
+    digest に記事メッセージとして送った item だけ。設計 04 §5)。そのうえで質問として台帳に
+    積み、別プロセスの `intel answer` が返事を作って送る(LLM の待ちで受信を止めない)。
+    上限を超えた日・上限 0 は記録だけ。
     """
     dig_result_id, item_id = thread
     message_id = message.get("message_id")
@@ -1036,7 +1038,13 @@ def _handle_dig_card_reply(
     cap = config.dig.answer_daily_cap
     if cap <= 0 or type(message_id) is not int:
         accept = False
-        notice = "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
+        # Obsidian への反映は、export が感想を投影する item のときだけ案内する。🔖 保存節にだけ
+        # 載った X ブックマークのカードなど、対象外の item への感想は item_notes に残るだけ(GH#229)
+        notice = (
+            "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
+            if note_projection_date(conn, item_id) is not None
+            else "📝 感想を記録しました"
+        )
     elif questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
         accept = False
         notice = f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません"
