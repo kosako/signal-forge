@@ -10,6 +10,9 @@ X 由来 documents の TTL 失効前に本文を材料として使うため。
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
 analyze 段が失敗して載せる記事が無い日は、空の digest を確定しない(障害の空。GH#191)。
 export・deliver は当日分を扱わず、同じ日の再走で作って配信する。
+analyze・digest・dig の段の組み立てと実行(analyze_stage・digest_stage・dig_stage)は、
+単独の CLI(`intel analyze` / `digest` / `dig`)も同じものを呼ぶ(GH#206)。段の失敗の局所化は
+run_pipeline に、CLI の表示は cli.py に残す。
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 
-from app.analysis.fallback import fallback_engine_factory, run_fallback_notice
+from app.analysis.fallback import run_fallback_notice
 from app.analysis.llm import LLMEngine
 from app.backup import backup_daily
 from app.collect import collect_all
@@ -63,6 +66,11 @@ def run_pipeline(
     """全段を直列実行し、失敗した段の名前リストを返す(空 = 全段成功。保留は digest_held)。"""
     failures = RunFailures()
 
+    def primary(_effort: str) -> LLMEngine:
+        # analyze・トレンドの予備(GH#156)が包む主は、渡された作り方のまま(テストで主を
+        # 差し替えられる。設計 00 §5)。dig は config の主を effort 可変で作る
+        return engine_factory()
+
     def stage(name: str, action: Callable[[], object]) -> None:
         try:
             action()
@@ -80,13 +88,16 @@ def run_pipeline(
     if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
-    stage("analyze", lambda: _analyze(conn, config, env, engine_factory, logger, run_id))
+    stage(
+        "analyze",
+        lambda: analyze_stage(conn, config, env, logger, run_id=run_id, primary=primary),
+    )
 
     def digest() -> None:
         try:
-            _digest(
-                conn, config, env, engine_factory, logger, run_id, force_digest,
-                hold_if_empty="analyze" in failures,
+            digest_stage(
+                conn, config, env, logger, run_id=run_id, primary=primary,
+                force=force_digest, hold_if_empty="analyze" in failures,
             )
         except DigestHeldError as e:
             # 障害の空。段の失敗にはしない(原因の analyze 段の失敗として通知する。GH#191)
@@ -114,7 +125,7 @@ def run_pipeline(
             extra={"run_id": run_id, "stage": "deliver"},
         )
     if config.dig.daily_cap > 0:  # 0 = 調査段無効(段ごと省く。x_signals と同じ流儀)
-        stage("dig", lambda: _dig(conn, config, env, logger, run_id))
+        stage("dig", lambda: dig_stage(conn, config, env, logger, run_id=run_id))
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
     stage("backup", lambda: backup_daily(conn, config, logger, run_id=run_id))
 
@@ -125,31 +136,33 @@ def run_pipeline(
     return failures
 
 
-def _digest(
+def digest_stage(
     conn: sqlite3.Connection,
     config: Config,
     env: dict[str, str],
-    engine_factory: Callable[[], LLMEngine],
     logger: logging.Logger,
-    run_id: str,
-    force_digest: bool,
     *,
+    run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
+    force: bool = False,
     hold_if_empty: bool = False,
 ) -> int | None:
     """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。
 
+    朝バッチと `intel digest` が呼ぶ(GH#206)。作った digest の id を返す(生成済みで skip なら
+    None)。primary は主のエンジンの作り方(None = config の `[llm].engine`)。
     hold_if_empty: analyze 段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
     """
+    from app.analysis.fallback import fallback_engine_factory
     from app.analysis.trend import synthesize_trend
 
     trend = None
     # digest が skip される場合(当日生成済み & not force)は synthesis しない(無駄な LLM 呼び)
-    if force_digest or not _digest_exists_today(conn):
+    if force or not _digest_exists_today(conn):
         try:
             # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
             engine = fallback_engine_factory(
-                conn, config, env, logger, stage="trend", run_id=run_id,
-                primary=lambda _effort: engine_factory(),
+                conn, config, env, logger, stage="trend", run_id=run_id, primary=primary
             )("low")
             trend = synthesize_trend(conn, engine, logger, run_id=run_id)
         except Exception as e:  # トレンドは付加機能。失敗しても digest 本体を止めない
@@ -158,7 +171,7 @@ def _digest(
                 extra={"run_id": run_id, "stage": "digest"},
             )
     return generate_digest(
-        conn, config, logger, run_id=run_id, force=force_digest, trend_markdown=trend,
+        conn, config, logger, run_id=run_id, force=force, trend_markdown=trend,
         hold_if_empty=hold_if_empty,
     )
 
@@ -198,50 +211,59 @@ def _collect_x_signals(
         collect_x_signals(conn, config, session, logger, run_id=run_id)
 
 
-def _analyze(
+def analyze_stage(
     conn: sqlite3.Connection,
     config: Config,
     env: dict[str, str],
-    engine_factory: Callable[[], LLMEngine],
     logger: logging.Logger,
-    run_id: str,
-) -> None:
+    *,
+    run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
+) -> dict[str, int]:
+    """analyze 段: 関心プロファイル → 予備つきのエンジン → 事前選別 → 本分析。件数を返す。
+
+    朝バッチと `intel analyze` が呼ぶ(GH#206)。primary は主のエンジンの作り方
+    (None = config の `[llm].engine`)。
+    """
     # プロファイル欠落・エンジン未実装は analyze 段の失敗として局所化する
     # (import をここに置くのは循環回避でなく段の失敗系に含めるため)
     from app.analysis.analyzer import analyze_selected
+    from app.analysis.fallback import fallback_engine_factory
     from app.analysis.profile import load_interest_profile
     from app.analysis.stage1 import preselect
 
-    profile = load_interest_profile(config.profile_path)
+    profile = load_interest_profile(config.profile_path)  # 欠落・不正は本分析前に fail fast
     # 主が失敗したら予備でやり直す(GH#156。予備が無効なら主のまま)
     engine = fallback_engine_factory(
-        conn, config, env, logger, stage="analyze", run_id=run_id,
-        primary=lambda _effort: engine_factory(),
+        conn, config, env, logger, stage="analyze", run_id=run_id, primary=primary
     )("low")
     result = preselect(conn, config, logger, run_id=run_id)
-    analyze_selected(
+    return analyze_selected(
         conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
     )
 
 
-def _dig(
+def dig_stage(
     conn: sqlite3.Connection,
     config: Config,
     env: dict[str, str],
     logger: logging.Logger,
-    run_id: str,
-) -> None:
+    *,
+    run_id: str | None = None,
+) -> bool:
     """dig 段(GH#105)。エンジンは effort 可変で生成する(解説 = config / 対訳 = low)。
 
-    Telegram 未設定でもノート生成は行い、カードは台帳(dig_results)に未送信で残す
-    (deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。別の実行(手動の `intel dig`
-    など)が調査段を進めていれば、待たずに何もしないで後続の段へ進む(段の失敗にしない。GH#196)。
+    朝バッチと `intel dig` が呼ぶ(GH#206)。Telegram 未設定でもノート生成は行い、カードは
+    台帳(dig_results)に未送信で残す(deliver 段の skip と同じく、欠落検知は doctor #4 の責務)。
+    別の実行(朝バッチか `intel dig`)が調査段を進めていれば、待たずに何もしないで False を返す
+    (段の失敗にしない。GH#196)。
     """
+    from app.analysis.fallback import fallback_engine_factory
     from app.analysis.llm import create_anthropic_engine
     from app.deepdive import run_dig_stage
 
     api = create_api(env) if is_telegram_configured(config, env) else None
-    run_dig_stage(
+    return run_dig_stage(
         conn,
         config,
         # 解説・対訳・指摘を受けた直し。主が失敗したら予備でやり直す(GH#156)

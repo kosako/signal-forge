@@ -600,27 +600,59 @@ def test_dig_stage_absent_when_cap_zero(conn, tmp_path) -> None:
     assert failures == []  # 段ごと省かれ、材料不足でも失敗しない
 
 
+def test_pipeline_runs_same_stages_as_cli(conn, tmp_path, monkeypatch) -> None:
+    # 朝バッチの analyze・digest・dig 段は、単独の CLI と同じ段の組み立てと実行の口を呼ぶ
+    # (GH#206)。朝バッチは run_id と、run_pipeline に渡された主の作り方を渡す
+    from app import run as run_module
+
+    calls: dict[str, dict] = {}
+
+    def spy(name, returned):
+        def stage(db, config, env, stage_logger, **kwargs):
+            calls[name] = kwargs
+            return returned
+
+        return stage
+
+    monkeypatch.setattr(
+        run_module, "analyze_stage", spy("analyze", {"analyzed": 0, "degraded": 0})
+    )
+    monkeypatch.setattr(run_module, "digest_stage", spy("digest", None))
+    monkeypatch.setattr(run_module, "dig_stage", spy("dig", True))
+    primary = ScriptedEngine(conn)
+    run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: primary, logger, "01RUNID", force_digest=True,
+    )
+    assert list(calls) == ["analyze", "digest", "dig"]
+    assert all(kwargs["run_id"] == "01RUNID" for kwargs in calls.values())
+    assert calls["analyze"]["primary"]("low") is primary
+    assert calls["digest"]["primary"]("low") is primary
+    assert (calls["digest"]["force"], calls["digest"]["hold_if_empty"]) == (True, False)
+    assert set(calls["dig"]) == {"run_id"}  # dig の主は config から effort 可変で作る
+
+
 @pytest.mark.parametrize("review", [True, False])
 def test_dig_stage_wires_review_engine_from_config(conn, tmp_path, monkeypatch, review) -> None:
     # 深掘りのレビュー(GH#153)は [dig].review のときだけ。キーは .env の dict から読む
     from app import deepdive
     from app.analysis.llm import AnthropicApiEngine, LLMUnavailableError
     from app.config import DigConfig
-    from app.run import _dig
+    from app.run import dig_stage
 
     captured: dict = {}
     monkeypatch.setattr(
         deepdive, "run_dig_stage", lambda *args, **kwargs: captured.update(kwargs)
     )
     config = Config(config_dir=tmp_path, dig=DigConfig(review=review))
-    _dig(conn, config, {"INTEL_ANTHROPIC_API_KEY": "k"}, logger, "run-1")
+    dig_stage(conn, config, {"INTEL_ANTHROPIC_API_KEY": "k"}, logger, run_id="run-1")
     factory = captured["review_engine_factory"]
     if not review:
         assert factory is None
         return
     engine = factory()
     assert isinstance(engine, AnthropicApiEngine) and engine.model == "claude-opus-5-5"
-    _dig(conn, config, {}, logger, "run-2")
+    dig_stage(conn, config, {}, logger, run_id="run-2")
     with pytest.raises(LLMUnavailableError):
         captured["review_engine_factory"]()
 
@@ -657,7 +689,7 @@ def test_fallback_answers_when_codex_fails_and_is_noticed(conn, tmp_path, monkey
     assert "analyze" not in failures
     analysis = conn.execute("SELECT engine, model, degraded FROM analyses").fetchone()
     assert tuple(analysis) == ("anthropic-api", "claude-sonnet-5-5", 0)
-    # 記事が 1 件なのでトレンドは LLM を呼ばない(配線は下の _digest のテスト)
+    # 記事が 1 件なのでトレンドは LLM を呼ばない(配線は下の digest_stage のテスト)
     ledger = conn.execute("SELECT stage, run_id FROM llm_fallback_calls").fetchall()
     assert [(row["stage"], row["run_id"]) for row in ledger] == [("analyze", "01RUNFB")]
 
@@ -738,17 +770,17 @@ def test_dig_stage_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -
     from app.analysis.fallback import FallbackEngine
     from app.analysis.llm import CodexCliEngine
     from app.config import LLMFallbackConfig
-    from app.run import _dig
+    from app.run import dig_stage
 
     captured: dict = {}
     monkeypatch.setattr(
         deepdive, "run_dig_stage", lambda *args, **kwargs: captured.update(args=args)
     )
     off = Config(config_dir=tmp_path)
-    _dig(conn, off, {}, logger, "run-1")
+    dig_stage(conn, off, {}, logger, run_id="run-1")
     assert isinstance(captured["args"][2]("medium"), CodexCliEngine)
     on = Config(config_dir=tmp_path, llm_fallback=LLMFallbackConfig(engine="anthropic-api"))
-    _dig(conn, on, {}, logger, "run-2")
+    dig_stage(conn, on, {}, logger, run_id="run-2")
     assert isinstance(captured["args"][2]("medium"), FallbackEngine)
 
 
@@ -756,7 +788,7 @@ def test_trend_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -> No
     from app.analysis import trend
     from app.analysis.fallback import FallbackEngine
     from app.config import LLMFallbackConfig
-    from app.run import _digest
+    from app.run import digest_stage
 
     engines: list = []
 
@@ -774,6 +806,9 @@ def test_trend_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -> No
             llm_fallback=LLMFallbackConfig(engine="anthropic-api"),
         ),
     ):
-        _digest(conn, config, {}, lambda: primary, logger, "run-1", True)
+        digest_stage(
+            conn, config, {}, logger, run_id="run-1", primary=lambda _effort: primary,
+            force=True,
+        )
     assert engines[0] is primary  # 予備が無効なら主のまま
     assert isinstance(engines[1], FallbackEngine) and engines[1]._primary is primary
