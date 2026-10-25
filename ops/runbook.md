@@ -305,7 +305,9 @@ Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成
    ```sh
    uv run intel x-signals --backfill --limit 100
    ```
-   最悪コスト = 3 kind × N × $0.004(既定 100 なら ≤ $1.2。GH#84)
+   最悪コスト = 3 kind × N × $0.004(既定 100 なら ≤ $1.2。GH#84)。
+   backfill は日次の取込の枠(`[x_signals].daily_read_cap`)と別枠で、同じ日の朝バッチも
+   通常どおり日次の枠まで取り込む。その日の読取は backfill のぶんだけ増える(GH#178)
 3. 以降は**朝バッチが毎日差分を自動取込**(x_signals 段)。確認は
    `sqlite3 ~/.local/share/intel/intel.db "SELECT kind, count(*) FROM x_signals GROUP BY kind"`
 

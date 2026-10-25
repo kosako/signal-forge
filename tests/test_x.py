@@ -1,3 +1,5 @@
+import logging
+import sqlite3
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -5,6 +7,7 @@ import httpx
 import pytest
 
 from app.cli import _build_connectors
+from app.collect import collect_all
 from app.config import Config, XConfig, XSearchConfig
 from app.connectors.base import FatalError, FetchResult, FetchStats, RetryableError
 from app.connectors.x import (
@@ -13,10 +16,13 @@ from app.connectors.x import (
     XRouter,
     build_x_connector,
     has_x_credentials,
+    x_reads_today,
 )
 from app.connectors.x_search import XSearchConnector
+from app.db import apply_migrations, connect
 from app.http import HttpClient
 from app.models import Source
+from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
 FULL_ENV = {k: "v" for k in
             ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
@@ -64,7 +70,7 @@ def page(tweets: list[dict], *, next_token=None, users=None) -> dict:
 
 
 def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
-                   unit_price=0.004, seen=None) -> XConnector:
+                   unit_price=0.004, seen=None, reads_used_today=0) -> XConnector:
     """pages[i] = (status, body_dict, headers)。timeline リクエストは pagination_token で
     index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。200 応答は
     max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、その
@@ -96,6 +102,7 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
         credentials=CREDS,
         daily_read_cap=daily_read_cap,
         unit_price_usd=unit_price,
+        reads_used_today=reads_used_today,
         sleep=lambda _s: None,
     )
 
@@ -131,6 +138,29 @@ def test_pagination_hard_caps_at_daily_read_cap() -> None:
     assert result.stats.api_reads == 130  # ちょうど cap。超過しない
     timeline = [r for r in seen if "timelines" in str(r.url)]
     assert parse_qs(urlsplit(str(timeline[-1].url)).query)["max_results"] == ["30"]  # 残枠
+
+
+def test_reads_used_today_leaves_only_remaining_budget() -> None:
+    # GH#178: cap は暦日の上限。同じ日の実行が読んだぶんを引いた残りだけを読む
+    seen: list[httpx.Request] = []
+    p1 = page([tweet(str(500 - i), "t") for i in range(100)], next_token="tok1")
+    result = connector_from(
+        [(200, p1, {})], daily_read_cap=130, reads_used_today=100, seen=seen
+    ).fetch(make_source(), {})
+    assert result.stats.api_reads == 30
+    timeline = [r for r in seen if "timelines" in str(r.url)]
+    assert [parse_qs(urlsplit(str(r.url)).query)["max_results"] for r in timeline] == [["30"]]
+    assert not result.budget_exhausted
+    # 使い切った日は読まず、since_id も据え置く(翌日に新しい側から取る)。読まなかった印を立て、
+    # collect にソースの成否の状態を変えさせない
+    seen.clear()
+    result = connector_from(
+        [(200, p1, {})], daily_read_cap=130, reads_used_today=130, seen=seen
+    ).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 0
+    assert [r for r in seen if "timelines" in str(r.url)] == []
+    assert result.next_cursor == {"since_id": "100"}
+    assert result.budget_exhausted
 
 
 def test_rate_limit_remaining_zero_stops() -> None:
@@ -255,6 +285,21 @@ def test_auth_error_is_fatal() -> None:
         conn.fetch(make_source(), {})
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_error_after_first_page_is_fatal_with_reads_and_cost(status) -> None:
+    # GH#178: 2 ページ目以降の 401/403 は致命の失敗のまま送出し、それまでの読取数と費用を添える
+    # (collect が台帳に残す。漏れると同じ日の再実行が日次の上限を超えて読む)
+    p1 = page([tweet(str(1000 - i), "t") for i in range(100)], next_token="tok1")
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from([(200, p1, {}), (status, {}, {})]).fetch(make_source(), {})
+    assert raised.value.api_reads == 100
+    assert raised.value.estimated_cost_usd == pytest.approx(0.4)
+    # 1 ページ目の 401/403 は読取なし(0 件)
+    with pytest.raises(FatalError, match="認証失敗") as raised:
+        connector_from([(status, {}, {})]).fetch(make_source(), {})
+    assert (raised.value.api_reads, raised.value.estimated_cost_usd) == (0, 0.0)
+
+
 def test_5xx_on_first_page_is_retryable() -> None:
     with pytest.raises(RetryableError, match="503"):
         connector_from([(503, {}, {})]).fetch(make_source(), {})
@@ -363,22 +408,223 @@ def _config(x_enabled: bool, slots: tuple[str, ...] = ()) -> Config:
     )
 
 
-def test_build_connectors_wires_x_only_when_enabled_and_keyed() -> None:
+@pytest.fixture
+def db(tmp_path: Path) -> sqlite3.Connection:
+    db_path = tmp_path / "intel.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    yield conn
+    conn.close()
+
+
+def test_build_connectors_wires_x_only_when_enabled_and_keyed(db) -> None:
     http = HttpClient()
-    assert set(_build_connectors(_config(False), FULL_ENV, http)) == {"rss"}  # X 無効
-    assert set(_build_connectors(_config(True), FULL_ENV, http)) == {"rss", "x"}  # 有効+キー
+    assert set(_build_connectors(_config(False), FULL_ENV, http, db)) == {"rss"}  # X 無効
+    assert set(_build_connectors(_config(True), FULL_ENV, http, db)) == {"rss", "x"}  # 有効+キー
     # 有効だがキー欠落 → X は載せず RSS は残る(縮退。欠落は doctor #5)
-    assert set(_build_connectors(_config(True), {}, http)) == {"rss"}
+    assert set(_build_connectors(_config(True), {}, http, db)) == {"rss"}
 
 
-def test_build_connectors_wires_search_only_with_slots() -> None:
+def test_build_connectors_wires_search_only_with_slots(db) -> None:
     http = HttpClient()
-    router = _build_connectors(_config(True), FULL_ENV, http)["x"]
+    router = _build_connectors(_config(True), FULL_ENV, http, db)["x"]
     assert isinstance(router, XRouter)
     assert router._search is None  # slots 空 = 検索無効
-    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, http)["x"]
+    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, http, db)["x"]
     assert isinstance(router._home, XConnector)
     assert isinstance(router._search, XSearchConnector)
+
+
+def add_x_source(db, name: str, config: str | None = None) -> int:
+    return db.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('x', ?, ?)", (name, config)
+    ).lastrowid
+
+
+def add_collect_run(db, source_id: int, started_at: str, reads: int, status="ok") -> None:
+    db.execute(
+        "INSERT INTO collect_runs (source_id, started_at, status, api_reads) VALUES (?, ?, ?, ?)",
+        (source_id, started_at, status, reads),
+    )
+
+
+def test_x_reads_today_sums_jst_calendar_day_per_mode(db) -> None:
+    # GH#178: 当日 = JST の暦日(UTC 15:00 が日付の境界)。部分取得のあとの失敗の読取も数える
+    home = add_x_source(db, "home")  # config NULL = home
+    explicit_home = add_x_source(db, "x:home", '{"mode": "home"}')
+    search = add_x_source(db, "x:search", '{"mode": "search"}')
+    rss = db.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')").lastrowid
+    add_collect_run(db, home, "2026-10-23T14:59:59Z", 7)  # JST 10/23 23:59:59 = 前日
+    add_collect_run(db, home, "2026-10-23T15:00:00Z", 10)  # JST 10/24 0:00 = 当日の始まり
+    add_collect_run(db, explicit_home, "2026-10-24T03:00:00Z", 2)
+    add_collect_run(db, home, "2026-10-24T05:00:00Z", 3, status="error")  # 部分取得のあとの失敗
+    add_collect_run(db, home, "2026-10-24T14:59:59Z", 20)  # JST 10/24 23:59:59 = 当日の終わり
+    add_collect_run(db, home, "2026-10-24T15:00:00Z", 40)  # JST 10/25 0:00 = 翌日
+    add_collect_run(db, search, "2026-10-24T01:00:00Z", 5)
+    add_collect_run(db, rss, "2026-10-24T01:00:00Z", 99)  # X 以外は数えない
+    assert x_reads_today(db, "2026-10-24") == {"home": 35, "search": 5}
+    assert x_reads_today(db, "2026-10-23") == {"home": 7, "search": 0}
+    assert x_reads_today(db, "2026-10-26") == {"home": 0, "search": 0}
+
+
+def test_build_connectors_passes_same_day_reads_from_ledger(db, monkeypatch) -> None:
+    # GH#178: 合成点が台帳の当日の合計を mode ごとにコネクタへ渡す(前日の読取は数えない)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
+    home = add_x_source(db, "home")
+    search = add_x_source(db, "x:search", '{"mode": "search"}')
+    add_collect_run(db, home, "2026-10-23T14:59:59Z", 130)  # JST 10/23 = 前日
+    add_collect_run(db, home, "2026-10-23T21:30:00Z", 100)  # JST 10/24 6:30
+    add_collect_run(db, search, "2026-10-23T21:30:00Z", 20)
+    router = _build_connectors(_config(True, slots=("ai",)), FULL_ENV, HttpClient(), db)["x"]
+    assert router._home._read_budget == 30  # 130 - 100
+    assert router._search._read_budget == 15  # 35 - 20
+
+
+def test_second_collect_same_day_reads_only_remaining_budget(db, monkeypatch) -> None:
+    # GH#178: 同じ日に普通に再実行しても(手動の intel run・intel collect)、日次の上限を超えて
+    # 読まない。1 回目に読んだぶんが台帳(collect_runs)に残り、2 回目はその残りだけを読む。
+    # 翌日(JST)は枠が戻る。当日と台帳の時刻は固定し、実時計に依存させない
+    add_x_source(db, "home")
+    next_id = iter(range(10_000, 0, -1))
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if urlsplit(str(request.url)).path.endswith("/users/me"):
+            return httpx.Response(200, json={"data": {"id": "me"}})
+        limit = parse_qs(urlsplit(str(request.url)).query)["max_results"][0]
+        seen.append(limit)
+        count = min(int(limit), 100)  # 毎回 100 件の新着(next_token なし = 1 ページで終わり)
+        return httpx.Response(
+            200, json=page([tweet(str(next(next_id)), "新着の投稿") for _ in range(count)])
+        )
+
+    def run_once(day: str, utc_time: str) -> None:
+        monkeypatch.setattr("app.connectors.x.today_jst", lambda: day)
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
+        router = _build_connectors(_config(True), FULL_ENV, HttpClient(), db)["x"]
+        router._home._session._client = httpx.Client(transport=httpx.MockTransport(handler))
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
+
+    run_once("2026-10-24", "2026-10-23T21:30:00Z")  # JST 10/24 6:30(朝バッチ)
+    run_once("2026-10-24", "2026-10-24T03:00:00Z")  # 同じ日の再走
+    run_once("2026-10-24", "2026-10-24T14:59:59Z")  # 同じ日の終わり
+    run_once("2026-10-25", "2026-10-24T15:00:00Z")  # 翌日の始まり
+    reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
+    assert reads == [100, 30, 0, 100]  # 当日の合計は cap(130)ちょうど。翌日は枠が戻る
+    assert seen == ["100", "30", "100"]
+
+
+def test_auth_error_after_partial_fetch_counts_reads_for_same_day_rerun(db, monkeypatch) -> None:
+    # GH#178: 途中まで読んだあとの 401 は、今までどおりソースの失敗(取得ぶんは保存せず
+    # since_id は据え置く)のまま、読取数と費用を台帳(collect_runs)に残す。認証が直ったあとの
+    # 同じ日の再実行は、その残りだけを読む(上限 130 で 100 + 30。読取が漏れると 100 + 130)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
+    source_id = add_x_source(db, "home")
+    db.execute("UPDATE sources SET cursor = ? WHERE id = ?", ('{"since_id": "1"}', source_id))
+    next_id = iter(range(10_000, 0, -1))
+    seen: list[str] = []
+
+    def handler_for(auth_fails_on_second_page: bool):
+        def handler(request: httpx.Request) -> httpx.Response:
+            split = urlsplit(str(request.url))
+            if split.path.endswith("/users/me"):
+                return httpx.Response(200, json={"data": {"id": "me"}})
+            query = parse_qs(split.query)
+            seen.append(query["max_results"][0])
+            if "pagination_token" in query:
+                return httpx.Response(401, json={})
+            count = min(int(query["max_results"][0]), 100)
+            body = page(
+                [tweet(str(next(next_id)), "新着の投稿") for _ in range(count)],
+                next_token="tok1" if auth_fails_on_second_page else None,
+            )
+            return httpx.Response(200, json=body)
+
+        return handler
+
+    def run_once(utc_time: str, *, auth_fails_on_second_page: bool) -> None:
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
+        router = _build_connectors(_config(True), FULL_ENV, HttpClient(), db)["x"]
+        router._home._session._client = httpx.Client(
+            transport=httpx.MockTransport(handler_for(auth_fails_on_second_page))
+        )
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
+
+    run_once("2026-10-23T21:30:00Z", auth_fails_on_second_page=True)  # JST 10/24 6:30
+    failed = db.execute(
+        "SELECT status, api_reads, estimated_cost_usd, error FROM collect_runs"
+    ).fetchone()
+    assert (failed["status"], failed["api_reads"]) == ("error", 100)
+    assert failed["estimated_cost_usd"] == pytest.approx(0.4)
+    assert "認証失敗" in failed["error"]
+    source = db.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE id = ?", (source_id,)
+    ).fetchone()
+    assert source["cursor"] == '{"since_id": "1"}'  # 据え置き
+    assert source["consecutive_failures"] == 1
+    assert db.execute("SELECT count(*) FROM items").fetchone()[0] == 0  # 取得ぶんは保存しない
+    assert x_reads_today(db) == {"home": 100, "search": 0}
+
+    run_once("2026-10-24T03:00:00Z", auth_fails_on_second_page=False)  # 同じ日の再走
+    reads = [r["api_reads"] for r in db.execute("SELECT api_reads FROM collect_runs ORDER BY id")]
+    assert reads == [100, 30]
+    assert seen == ["100", "30", "30"]
+
+
+def test_same_day_rerun_without_budget_keeps_source_failure_state(db, monkeypatch) -> None:
+    # GH#178: 検索の上限 35・3 スロットで、1 本目が 12 件読み、2 本目が 403 で失敗した日。
+    # 同じ日の再走は残り 23(8/8/7)で、どのスロットも要求しない。要求していないので復旧は
+    # 確かめておらず、連続失敗数・直近のエラー・成功の時刻を変えない(警告から外さない)
+    monkeypatch.setattr("app.connectors.x.today_jst", lambda: "2026-10-24")
+    source_id = add_x_source(db, "x:search", '{"mode": "search"}')
+    db.execute(
+        "UPDATE sources SET cursor = ?, last_success_at = ?, consecutive_failures = 2 WHERE id = ?",
+        ('{"since_id": "1"}', "2026-10-21T21:30:00Z", source_id),
+    )
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(urlsplit(str(request.url)).query)
+        seen.append(query["query"][0])
+        if not query["query"][0].startswith("(a)"):
+            return httpx.Response(403, json={})
+        count = int(query["max_results"][0])
+        tweets = [tweet(str(900 - i), "検索の投稿") for i in range(count)]
+        return httpx.Response(200, json=page(tweets))
+
+    def run_once(utc_time: str) -> None:
+        before = db.execute("SELECT coalesce(max(id), 0) AS id FROM collect_runs").fetchone()["id"]
+        config = _config(True, slots=("a", "b", "c"))
+        router = _build_connectors(config, FULL_ENV, HttpClient(), db)["x"]
+        router._search._session._client = httpx.Client(transport=httpx.MockTransport(handler))
+        collect_all(db, {"x": router}, logging.getLogger("test-x"))
+        db.execute("UPDATE collect_runs SET started_at = ? WHERE id > ?", (utc_time, before))
+
+    def source_state() -> tuple:
+        row = db.execute(
+            "SELECT cursor, last_success_at, last_error_at, last_error, consecutive_failures "
+            "FROM sources WHERE id = ?",
+            (source_id,),
+        ).fetchone()
+        return tuple(row)
+
+    run_once("2026-10-23T21:30:00Z")  # JST 10/24 6:30
+    assert len(seen) == 2  # a(12 件)と b(403)
+    failed = source_state()
+    assert failed[0] == '{"since_id": "1"}'
+    assert failed[1] == "2026-10-21T21:30:00Z"
+    assert "認証失敗" in failed[3]
+    assert failed[4] == 3
+    assert x_reads_today(db) == {"home": 0, "search": 12}
+
+    run_once("2026-10-24T03:00:00Z")  # 同じ日の再走
+    assert len(seen) == 2  # 残り 23 = 8/8/7 はどれも下限 10 未満。要求しない
+    assert source_state() == failed  # 失敗の状態のまま(成功で消さない)
+    runs = db.execute("SELECT status, api_reads FROM collect_runs ORDER BY id").fetchall()
+    assert [tuple(r) for r in runs] == [("error", 12), ("ok", 0)]
+    assert source_failure_alerts(db, "x", X_FAILURE_ALERT) != []  # 警告に載ったまま
 
 
 def test_build_x_connector_signs_requests() -> None:

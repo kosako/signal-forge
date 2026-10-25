@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 
-from app.connectors.base import Connector, FatalError, RawItem, RetryableError
+from app.connectors.base import Connector, FatalError, FetchStats, RawItem, RetryableError
 from app.db import insert_item_with_dedup
 from app.models import RAW_CONTENT_MAX_CHARS, Source
 from app.normalize import (
@@ -67,9 +67,11 @@ def _collect_source(
         "INSERT INTO collect_runs (source_id) VALUES (?)", (source.id,)
     ).lastrowid
 
+    fetched: FetchStats | None = None  # fetch が返したあとの失敗(保存の失敗)で台帳に残す読取
     try:
         cursor = json.loads(source.cursor) if source.cursor else {}
         result = connector.fetch(source, cursor)
+        fetched = result.stats
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
@@ -81,12 +83,13 @@ def _collect_source(
             result.moved_url,
             resolve_short,
             partial_error=partial_error,
+            budget_exhausted=result.budget_exhausted,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
         # (1本の壊れたフィード・コネクタのバグで他ソースの collect を止めない。
         # 設計 00 §6 / 02 §1 の「他ソースは必ず継続」の保証)
-        _record_failure(conn, source, run_row_id, e)
+        _record_failure(conn, source, run_row_id, e, fetched)
         log = logger.warning if isinstance(e, RetryableError | FatalError) else logger.error
         log(
             f"collect 失敗。ソースをスキップ: {_safe_error_text(e)}",
@@ -121,7 +124,9 @@ def _collect_source(
             **counts,
         },
     }
-    if partial_error is None:
+    if result.budget_exhausted:
+        logger.info("当日の読取の枠が残っていないため読まず。ソースの状態は変えない", extra=extra)
+    elif partial_error is None:
         logger.info("collect 完了", extra=extra)
     else:
         logger.warning(
@@ -139,12 +144,16 @@ def _store_result(
     resolve_short: Callable[[str], str] | None,
     *,
     partial_error: str | None,
+    budget_exhausted: bool = False,
 ) -> dict[str, int]:
     """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
     moved_url は今回の取得の恒久移転の先(無ければ NULL に戻す。GH#150)。
     partial_error は部分取得のあとの失敗の文(GH#183)。あれば items とカーソルは保存しつつ、
     ソースは失敗として数える(連続失敗の警告に載せる。成功の時刻と移転の記録は変えない)。
+    budget_exhausted は X の当日の読取の枠が残っておらず要求しなかった実行(GH#178)。カーソルだけを
+    保存し、成功の時刻・直近のエラー・連続失敗数は変えない(復旧を確かめていないので、失敗の続きを
+    成功で消さない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     # 短縮 URL の解決(HTTP の待ち・再試行)はトランザクションの前に済ませる(GH#179)。
@@ -156,7 +165,11 @@ def _store_result(
     try:
         for raw, canonical in prepared:
             counts[_store_item(conn, source, raw, canonical)] += 1
-        if partial_error is None:
+        if partial_error is None and budget_exhausted:
+            conn.execute(
+                "UPDATE sources SET cursor = ? WHERE id = ?", (json.dumps(next_cursor), source.id)
+            )
+        elif partial_error is None:
             conn.execute(
                 f"""
                 UPDATE sources
@@ -265,18 +278,36 @@ def _safe_error_text(error: Exception) -> str:
 
 
 def _record_failure(
-    conn: sqlite3.Connection, source: Source, run_row_id: int, error: Exception
+    conn: sqlite3.Connection,
+    source: Source,
+    run_row_id: int,
+    error: Exception,
+    fetched: FetchStats | None = None,
 ) -> None:
+    """ソースの失敗を記録する。取得ぶんは保存せず、カーソルも据え置く。
+
+    失敗の行にも、それまでに読んだ課金対象の件数と費用を残す(GH#178)。X の日次の読取上限は
+    台帳の当日の合計から残りを出すので、漏れると同じ日の再実行が上限を超えて読む(doctor #9 の
+    当月の費用も過少になる)。fetched = fetch は返したが保存で失敗したときの取得の統計。
+    X の部分取得のあとの認証の失敗は、それまでの読取数と費用を FatalError に添えて来る。
+    """
     message = _safe_error_text(error)
+    if fetched is not None:
+        api_reads, cost = fetched.api_reads, fetched.estimated_cost_usd
+    elif isinstance(error, FatalError):
+        api_reads, cost = error.api_reads, error.estimated_cost_usd
+    else:
+        api_reads, cost = 0, 0.0
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
             f"""
             UPDATE collect_runs
-            SET finished_at = {_NOW_UTC}, status = 'error', error = ?
+            SET finished_at = {_NOW_UTC}, status = 'error', error = ?, api_reads = ?,
+                estimated_cost_usd = ?
             WHERE id = ?
             """,
-            (message, run_row_id),
+            (message, api_reads, cost, run_row_id),
         )
         conn.execute(
             f"""

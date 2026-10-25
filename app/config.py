@@ -47,7 +47,9 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class XConfig:
     enabled: bool = False  # Day 0 ゲート(#1)通過後、config で明示 on にする
-    daily_read_cap: int = 130  # ホームTL の日次読取上限(ADR 0001 予算配分)
+    # ホームTL の日次読取上限(ADR 0001 予算配分)。JST の暦日の上限で、同じ日の実行で共有する
+    # (再走は台帳の当日の合計を引いた残りだけを読む。GH#178)
+    daily_read_cap: int = 130
     unit_price_usd: float = 0.004  # Day 0 実測(2026-07-10)。config で上書き可
     # ホームTL + 検索(+S1 の取込)の合算日次読取上限(単一ノブ。ADR 0001 予算配分)。
     # 内訳(daily_read_cap / [x_search].daily_read_cap)の合計がこれを超えると起動時エラー
@@ -74,6 +76,7 @@ class XSignalsConfig:
 
     daily_read_cap 0 = 取込無効(既定)。有効化は合算予算(combined_daily_read_cap)の
     内側での再配分 = 人間の config 変更(例: home 115 / search 35 / signals 15)。
+    上限は JST の暦日の上限で、同じ日の実行で共有する(GH#178。backfill は台帳の印で別枠)。
 
     重みは「種類の重み × 直近の重み」(ADR 0001)。直近の重みは半減期
     half_life_days の指数減衰(移動平均の実装)。intel x-insights の表示にのみ
@@ -93,7 +96,9 @@ class XSearchConfig:
     # 空 = 検索無効(コネクタを配線しない)。演算子は書いてよいが
     # `-is:retweet -is:reply` はコネクタがスロットを括弧で囲んで自動付加する(設計 02 §2)
     slots: tuple[str, ...] = ()
-    daily_read_cap: int = 35  # 検索の日次読取上限(全スロットで均等割。ADR 0001 予算配分)
+    # 検索の日次読取上限(全スロットで均等割。ADR 0001 予算配分)。暦日の上限で同じ日の実行で
+    # 共有する(GH#178)
+    daily_read_cap: int = 35
 
 
 @dataclass(frozen=True)
@@ -230,7 +235,7 @@ class AnalysisConfig:
     block_domains: tuple[str, ...] = ()  # 静的 NG(設計 03 §2 規則1)
     block_keywords: tuple[str, ...] = ()  # タイトル部分一致
     freshness_hours: int = 72  # 規則2(manual は適用外)
-    daily_llm_limit: int = 150  # 規則4
+    daily_llm_limit: int = 150  # 規則4(JST の暦日の上限。同じ日の実行で共有する。GH#178)
     batch_size: int = 15  # Stage 2 の1呼び出し件数(設計 03 §2)
     body_max_chars: int = 2000  # Stage 2 の本文切り詰め
     profile_path: str | None = None  # 未設定なら <config_dir>/interest-profile.md

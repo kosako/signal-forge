@@ -18,7 +18,19 @@ class RetryableError(Exception):
 
 
 class FatalError(Exception):
-    """401/403・410 Gone・設定不備。リトライせずスキップ、doctor 警告対象。"""
+    """401/403・410 Gone・設定不備。リトライせずスキップ、doctor 警告対象。
+
+    api_reads / estimated_cost_usd は、送出までに読んだ課金対象の件数と費用(既定 0)。
+    X の部分取得のあとの認証の失敗で添え、collect が失敗の記録(collect_runs)に残す
+    (日次の読取上限の当日の使用量と月次の費用を過少にしない。GH#178)。
+    """
+
+    def __init__(
+        self, *args: object, api_reads: int = 0, estimated_cost_usd: float = 0.0
+    ) -> None:
+        super().__init__(*args)
+        self.api_reads = api_reads
+        self.estimated_cost_usd = estimated_cost_usd
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,9 @@ class FetchResult:
     # 通信のリトライ尽きなど。GH#183・GH#182)。collect は items と next_cursor を保存しつつ、
     # ソースの失敗として記録する。None = 正常な終わり
     partial_error: Exception | None = None
+    # X の当日の読取の枠が残っておらず、読取の要求を 1 回もしなかった(GH#178)。collect は
+    # 復旧を確かめていないので、ソースの成否の状態(成功の時刻・直近のエラー・連続失敗数)を変えない
+    budget_exhausted: bool = False
 
 
 class Connector(Protocol):
