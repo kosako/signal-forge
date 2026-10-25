@@ -118,6 +118,25 @@ def export_digest(
     )
 
 
+def note_projection_date(conn: sqlite3.Connection, item_id: int) -> str | None:
+    """item への感想を Items ノートへ投影するときの digest_date。投影の対象外なら None。
+
+    追いパス(export_pending_notes)が感想を投影するのは、digest に記事メッセージとして送った
+    item だけ(台帳 digest_messages の記事の行が手がかり。--force の置換で印を付けた前の世代の
+    行も含む。GH#190)。🔖 保存節にだけ載った X ブックマークや digest に載っていない item への
+    感想は item_notes に残るが、ノートには出ない(設計 04 §5)。日付は最初に送った digest の日で、
+    実際の出力先は _item_note_target が item の既存のノートを優先して決める(GH#242)。
+    poller の受け付けの案内も、この判定で Obsidian への反映を約束するかを決める(GH#229)。
+    """
+    row = conn.execute(
+        "SELECT MIN(digests.digest_date) AS digest_date FROM digest_messages "
+        "JOIN digests ON digests.id = digest_messages.digest_id "
+        "WHERE digest_messages.item_id = ?",
+        (item_id,),
+    ).fetchone()
+    return row["digest_date"]
+
+
 def export_pending_notes(
     conn: sqlite3.Connection,
     config: Config,
@@ -127,28 +146,31 @@ def export_pending_notes(
 ) -> None:
     """未反映の感想を該当ノートへ投影する(item = GH#92 / digest = GH#96)。
 
-    感想は配信済みメッセージへのリプライでしか生まれないため、item ノート名の digest_date は
-    digest_messages → digests で解決できる(export は deliver より前段だが、感想が付く時点で
-    その item は配信済み)。--force の置換で印を付けた前の世代の行も含めるので、再選抜で外れた
-    記事の感想も投影先を失わない(GH#190)。その名前のノートが無ければ、export_digest と同じく
-    item の既存のノートへ投影する(GH#242)。digest 感想は digests.digest_date で直接 Daily を
-    特定する。
+    item 感想を投影するのは、digest に記事メッセージとして送った item だけで、item ノート名の
+    digest_date も digest_messages → digests で解決する(note_projection_date。export は deliver
+    より前段だが、記事メッセージへのリプライが付く時点でその item は配信済み)。--force の置換で
+    印を付けた前の世代の行も含めるので、再選抜で外れた記事の感想も投影先を失わない(GH#190)。
+    その名前のノートが無ければ、export_digest と同じく item の既存のノートへ投影する(GH#242)。
+    digest 感想は digests.digest_date で直接 Daily を特定する。
     再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
     """
     if config.obsidian.vault_path is None:
         raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
-    pending = conn.execute(
-        """
-        SELECT item_notes.item_id,
-               MIN(digests.digest_date) AS digest_date,
-               MAX(item_notes.id) AS max_note_id
-        FROM item_notes
-        JOIN digest_messages ON digest_messages.item_id = item_notes.item_id
-        JOIN digests ON digests.id = digest_messages.digest_id
-        WHERE item_notes.exported_at IS NULL
-        GROUP BY item_notes.item_id
-        """
-    ).fetchall()
+    pending = []
+    for entry in conn.execute(
+        "SELECT item_id, MAX(id) AS max_note_id FROM item_notes "
+        "WHERE exported_at IS NULL GROUP BY item_id"
+    ).fetchall():
+        digest_date = note_projection_date(conn, entry["item_id"])
+        if digest_date is None:  # 投影の対象外の感想は item_notes に残るだけ(設計 04 §5)
+            continue
+        pending.append(
+            {
+                "item_id": entry["item_id"],
+                "digest_date": digest_date,
+                "max_note_id": entry["max_note_id"],
+            }
+        )
     pending_digests = conn.execute(
         """
         SELECT digests.*, MAX(digest_notes.id) AS max_note_id

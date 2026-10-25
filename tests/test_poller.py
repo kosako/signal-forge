@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.config import Config, DigConfig, TelegramConfig
+from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, poll_once, run_poller
 from app.delivery.poller import (
@@ -18,6 +18,7 @@ from app.delivery.poller import (
     TRANSIENT_RETRIES,
 )
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
+from app.export import export_pending_notes
 from app.jst import JST
 from tests.test_delivery import add_digest, add_item
 
@@ -924,9 +925,8 @@ def test_reply_to_dig_card_records_note(conn, tmp_path) -> None:
     assert len(rows) == 1
     assert rows[0]["item_id"] == item_id
     assert rows[0]["note"] == "判定軸が面白い。もっと掘りたい"
-    assert api.sent == [
-        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
-    ]
+    # 記事メッセージとして送っていない item は Items ノートへの投影の対象外(GH#229)
+    assert api.sent == [(CHAT_ID, "📝 感想を記録しました")]
 
 
 class FakeWorker:
@@ -1110,18 +1110,59 @@ def test_note_and_question_are_recorded_together(conn, tmp_path, monkeypatch) ->
     assert saved_offset(conn) == "2"
 
 
-def test_card_reply_with_answers_disabled_is_note_only(conn, tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("delivered", "projected"),
+    [
+        ("article", True),  # 記事メッセージとして送った item = 追いパスが Items ノートへ投影する
+        ("superseded", True),  # --force の置換で外れた記事も、前の世代の行で投影する(GH#190)
+        ("bookmark_section", False),  # 🔖 保存節にだけ載った X ブックマーク = 投影の対象外
+    ],
+)
+def test_card_reply_with_answers_disabled_is_note_only(
+    conn, tmp_path, delivered, projected
+) -> None:
+    # GH#229: Obsidian への反映は、翌朝の export が実際に感想を投影する item のときだけ案内する
     item_id, _dig_id = add_dig_card(conn)
-    api, worker = FakeApi([[card_reply("感想", 700)]]), FakeWorker()
+    if delivered == "bookmark_section":
+        digest_id = add_digest(conn, [], bookmark_item_ids=[item_id])
+        conn.execute(  # 保存節はヘッダメッセージに載る(記事の行は無い)
+            "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, NULL, 500)",
+            (digest_id,),
+        )
+    else:
+        # 置換で外れた記事は今の台帳(item_ids)に無く、印を付けた前の世代の行だけが残る
+        digest_id = add_digest(conn, [item_id] if delivered == "article" else [])
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id, superseded_at) "
+            "VALUES (?, ?, 501, ?)",
+            (digest_id, item_id, None if delivered == "article" else "2026-10-20T00:00:00Z"),
+        )
+    conn.commit()
+    api, worker = FakeApi([[card_reply("カードへの感想", 700)]]), FakeWorker()
+    config = replace(
+        answer_config(tmp_path, cap=0),
+        obsidian=ObsidianConfig(vault_path=str(tmp_path / "vault")),
+    )
 
-    poll_once(conn, answer_config(tmp_path, cap=0), api, logger, answer_worker=worker)
+    poll_once(conn, config, api, logger, answer_worker=worker)
 
     assert conn.execute("SELECT count(*) FROM dig_questions").fetchone()[0] == 0
     assert conn.execute("SELECT item_id FROM item_notes").fetchone()[0] == item_id
-    assert api.sent == [
-        (CHAT_ID, "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します")
-    ]
+    notice = (
+        "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
+        if projected
+        else "📝 感想を記録しました"
+    )
+    assert api.sent == [(CHAT_ID, notice)]
     assert worker.kicks == 0
+
+    # 案内は翌朝の export の投影と一致する(対象外の感想は item_notes に残るだけ)
+    export_pending_notes(conn, config, logger)
+    items_dir = tmp_path / "vault" / config.obsidian.folder / "Items"
+    notes = [p for p in items_dir.glob("*.md") if "カードへの感想" in p.read_text()]
+    assert len(notes) == (1 if projected else 0)
+    exported_at = conn.execute("SELECT exported_at FROM item_notes").fetchone()[0]
+    assert (exported_at is not None) == projected
 
 
 def test_redelivered_card_reply_is_not_queued_twice(conn, tmp_path, monkeypatch) -> None:
