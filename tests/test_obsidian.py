@@ -659,6 +659,44 @@ def test_item_dropped_by_force_and_delivered_later_reuses_first_note(conn, tmp_p
     assert read_front(notes[0])["digest_date"] == "2026-07-06"
 
 
+def test_notes_on_item_dropped_by_force_project_to_first_note(conn, tmp_path) -> None:
+    # GH#190: --force の置換で外れた記事にも、置換の前のメッセージへの感想を投影する。台帳の
+    # 前の世代の行が残るので投影先を解決でき、置換の前に export した Items ノートへ書く(GH#242)
+    from dataclasses import replace
+
+    from app.config import DigestConfig
+    from app.digest import generate_digest
+    from tests.test_ranking import add_analyzed
+
+    kept = add_analyzed(conn, "https://a/kept", relevance=90)
+    dropped = add_analyzed(conn, "https://a/dropped", relevance=80)
+    config = replace(make_config(tmp_path), digest=DigestConfig(max_items=2))
+    digest_id = generate_digest(conn, config, logger)
+    export_digest(conn, config, digest_id, logger)
+    for item_id, message_id in ((None, 500), (kept, 501), (dropped, 502)):  # 配信済み
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+            (digest_id, item_id, message_id),
+        )
+    base = Path(config.obsidian.vault_path) / config.obsidian.folder
+    first_note = next((base / "Items").glob(f"*-{dropped}-*.md"))
+
+    narrowed = replace(config, digest=DigestConfig(max_items=1))
+    assert generate_digest(conn, narrowed, logger, force=True) == digest_id
+    row = conn.execute("SELECT item_ids FROM digests").fetchone()
+    assert json.loads(row["item_ids"]) == [kept]  # dropped は再選抜で外れた
+    export_digest(conn, narrowed, digest_id, logger)
+    add_note(conn, dropped, "外れる前のメッセージへの感想")  # 502 へのリプライ
+    export_pending_notes(conn, narrowed, logger)
+
+    assert "外れる前のメッセージへの感想" in first_note.read_text()
+    assert list((base / "Items").glob(f"*-{dropped}-*.md")) == [first_note]  # 別のノートを作らない
+    pending = conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+    assert pending == 0  # 反映済み
+
+
 def test_existing_duplicate_notes_are_left_in_place(conn, tmp_path) -> None:
     # GH#242: 修正前に再掲で作られた別日付のノート(重複)は動かさず統合もしない。その日を
     # export し直すと従来どおり重複のノートを書き直し、感想の追いパスは最初のノートへ

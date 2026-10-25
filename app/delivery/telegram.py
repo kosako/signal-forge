@@ -4,8 +4,9 @@
   `& < >`、属性値はさらに `"` `'`(canonical_url は外部制御可能なため属性破壊を防ぐ)
 - 構成: ヘッダ1通+アイテム最大 `digest.max_items` 通(1アイテム=1メッセージ。
   ボタンをアイテム単位に付けるため)
-- 冪等性: `digest_messages` 台帳にある message は再送しない(部分再送)。全通完了で
-  `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を記録して例外。
+- 冪等性: `digest_messages` 台帳(今の世代の行。GH#190)にある message は再送しない
+  (部分再送)。全通完了で `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を
+  記録して例外。
   同じ DB への配信は DB の隣の `<DB>.deliver.lock`(flock)で直列化する(GH#192)。送信できた
   message の記帳に失敗したら記帳だけをやり直し、それでも駄目なら message_id をログに残して
   止める(GH#225)
@@ -519,8 +520,11 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
 
 
 def _load_ledger(conn: sqlite3.Connection, digest_id: int) -> tuple[set[int], bool]:
+    # 今の世代の行だけを見る。--force の置換で印を付けた前の世代の行は、送り直しの判定に
+    # 使わない(リプライの帰属と感想の投影のために残している。GH#190)
     rows = conn.execute(
-        "SELECT item_id FROM digest_messages WHERE digest_id = ?", (digest_id,)
+        "SELECT item_id FROM digest_messages WHERE digest_id = ? AND superseded_at IS NULL",
+        (digest_id,),
     ).fetchall()
     item_ids = {row["item_id"] for row in rows if row["item_id"] is not None}
     header_sent = any(row["item_id"] is None for row in rows)
