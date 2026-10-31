@@ -32,7 +32,10 @@
   通信のリトライ尽きも同じに扱う(GH#182。例外で取得ぶんを捨てると読み取りの費用も台帳に残らない)。
   部分取得のあとの 401/403 は致命の失敗(FatalError)のまま送出し、それまでの読取数と費用を例外に
   添える(GH#178。collect が失敗の記録に残す。ホームTL と同じ)。
-  予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。
+  予算・rate limit 残 0 による打ち切りは失敗にしない(応答は正常)。ただし要求しなかったスロットが
+  残る正常な終わりは、そのスロットの成否を確かめていないので、ソースの失敗の状態も解除させない
+  (`FetchResult.skipped_slots`。GH#331。先の実行で後ろのスロットが 400 になった日に、同じ日の
+  再実行がそのスロットを要求せずに失敗を消さない)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
 """
@@ -170,6 +173,10 @@ class XSearchConnector:
             # 当日の残り枠でどのスロットも要求しなかった(GH#178)。復旧を確かめていないので
             # collect にソースの成否の状態を変えさせない(失敗の続きを成功で消さない)
             budget_exhausted=all(budget < X_SEARCH_MIN_PAGE for budget in budgets),
+            # 要求しなかったスロットが残る正常な終わり(GH#331)。そのスロットの成否は確かめて
+            # いないので、先の実行の後ろのスロットの失敗を collect に解除させない。全スロットを
+            # 要求して成功した実行だけが失敗の状態を解除する
+            skipped_slots=error is None and (unrun_slot or len(fetched) < len(self._slots)),
         )
 
     def _fetch_slot(

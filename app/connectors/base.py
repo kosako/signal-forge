@@ -67,6 +67,11 @@ class FetchResult:
     # X の当日の読取の枠が残っておらず、読取の要求を 1 回もしなかった(GH#178)。collect は
     # 復旧を確かめていないので、ソースの成否の状態(成功の時刻・直近のエラー・連続失敗数)を変えない
     budget_exhausted: bool = False
+    # X 検索で、要求しなかったスロットを残したまま正常に終わった(当日の残り枠の割り当てが下限に
+    # 届かない・rate limit 残 0 の打ち切り。GH#331)。要求しなかったスロットの成否は確かめていない
+    # ので、collect は budget_exhausted と同じくソースの成否の状態を変えない(後ろのスロットの
+    # 失敗の続きを、先のスロットの成功で消さない)。取得ぶんとカーソルは保存する
+    skipped_slots: bool = False
 
 
 class Connector(Protocol):
