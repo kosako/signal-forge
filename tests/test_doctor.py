@@ -911,6 +911,8 @@ def test_ttl_leftover_counts_raw_payload_from_cached_at(config_dir, tmp_path) ->
         ("https://x/o", {"raw_content": "x"}, "2020-01-01T00:00:00Z"),
         ("https://x/b", {"raw_content": "x", "cached_at": "not-a-date"}, now),
         ("https://x/f", {"raw_content": "x", "cached_at": "2999-01-01T00:00:00Z"}, now),
+        # 月末の 3 日を除けば、修飾子の無い strftime は 24 時をそのまま返す(purge のテスト)
+        ("https://x/h", {"raw_content": "x", "cached_at": "2026-10-28T24:30:00Z"}, now),
     )
     for url, payload, fetched_at in rows:
         conn.execute(
@@ -921,7 +923,7 @@ def test_ttl_leftover_counts_raw_payload_from_cached_at(config_dir, tmp_path) ->
     conn.close()
     result = by_number(doctor(config_dir, tmp_path), 11)
     assert result.status == "WARN"
-    assert "raw_payload 3 件" in result.detail
+    assert "raw_payload 4 件" in result.detail
 
 
 def test_ttl_leftover_counts_expired_signal_excerpts(config_dir, tmp_path) -> None:

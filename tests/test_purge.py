@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Config
+from app.config import Config, RetentionConfig
 from app.db import apply_migrations, connect
 from app.purge import purge_expired
 
@@ -108,6 +108,17 @@ def test_raw_payload_ttl_counts_from_cached_at(conn, tmp_path) -> None:
         "2999-01-01T00:00:00Z",  # 未来: そのままだと長く消されない
         "+1 day",  # 下で今の 1 日後に置き換える(近い未来も同じ)
         "2026-02-30T00:00:00Z",  # 実在しない日付
+        "2025-02-29T00:00:00Z",  # 平年の 2/29
+        "2026-00-10T00:00:00Z",  # 月の 00
+        "2026-10-00T00:00:00Z",  # 日の 00
+        "2026-13-01T00:00:00Z",
+        "2026-10-28T24:00:00Z",  # 時の 24(修飾子の無い strftime はそのまま返す)
+        "2026-10-28T24:30:00Z",
+        "2026-10-28T25:00:00Z",
+        "2026-10-28T23:60:00Z",  # 分の 60
+        "2026-10-28T23:59:60Z",  # 秒の 60
+        "2026-10-28T12:00:00.5Z",  # 小数の秒
+        "2026-10-28T12:00:00+09:00",  # 時差つき
         "2026-10-31 00:00:00",  # 形が違う
         "2026-10-31T00:00:00Z ",
         12345,
@@ -117,18 +128,45 @@ def test_raw_payload_ttl_counts_from_cached_at(conn, tmp_path) -> None:
 )
 def test_raw_payload_with_malformed_cached_at_is_purged(conn, tmp_path, cached_at) -> None:
     # 異常な cached_at は期限切れとして扱い、fetched_at が新しくても本文を消す。
-    # X の本文を長く残す向きに外さない(設計 01 §6。GH#332)
+    # X の本文を長く残す向きに外さない(設計 01 §6。GH#332)。日付の古さで消えたのでなく
+    # 異常として消えたことを見るため、TTL を十分に長くする(どの日付も TTL の内)
     if cached_at == "+1 day":
         cached_at = utc_iso(timedelta(days=1))
     item = add_item(
         conn, "https://x/m", source_id=3, fetched_days_ago=1,
         payload=json.dumps({"raw_content": "x", "cached_at": cached_at}),
     )
-    counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
+    long_ttl = RetentionConfig(cache_ttl_days=36500, x_cache_ttl_days=36500)
+    counts = purge_expired(conn, Config(config_dir=tmp_path, retention=long_ttl), logger)
     assert counts["raw_payload_nullified"] == 1
     assert conn.execute(
         "SELECT raw_payload FROM items WHERE id = ?", (item,)
     ).fetchone()["raw_payload"] is None
+
+
+def test_cached_at_with_hour_24_within_ttl_is_purged(conn, tmp_path) -> None:
+    # 既定の TTL の内の「N 日前の 24:30」も異常として消す。正規化を強いないと一致と未来の
+    # 検査を通り、TTL の間は残る(GH#332)。修飾子の無い strftime が 24 時をそのまま返すか
+    # は日付によって違う(月末の 3 日は日を繰り上げる)ため、1〜6 日前をすべて入れて
+    # 少なくとも 1 日はそのまま返る日を含める
+    bad = []
+    for days in range(1, 7):
+        day = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+        bad.append(add_item(
+            conn, f"https://x/h{days}", source_id=3, fetched_days_ago=1,
+            payload=json.dumps({"raw_content": "x", "cached_at": f"{day}T24:30:00Z"}),
+        ))
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    good = add_item(
+        conn, "https://x/g", source_id=3, fetched_days_ago=30,
+        payload=json.dumps({"raw_content": "x", "cached_at": f"{yesterday}T00:30:00Z"}),
+    )
+    purge_expired(conn, Config(config_dir=tmp_path), logger)
+    payloads = {
+        r["id"]: r["raw_payload"] for r in conn.execute("SELECT id, raw_payload FROM items")
+    }
+    assert [payloads[i] for i in bad] == [None] * 6
+    assert payloads[good] is not None
 
 
 def test_vacuum_triggered_by_nullified_rows(conn, tmp_path, monkeypatch) -> None:

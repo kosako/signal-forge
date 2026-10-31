@@ -25,14 +25,19 @@ VACUUM_THRESHOLD_ROWS = 1000
 # 初回の取込の時刻を前提にするため。purge の NULL 化と doctor #11 が同じ条件を使う。
 # cached_at が異常な値(文字列でない・"%Y-%m-%dT%H:%M:%SZ" の実在する日時でない・未来)なら
 # 起点を空文字にして期限切れとして扱う(X の本文を長く残す向きに外さない。設計 01 §6)。
-# 形の検査は strftime で正規化した値との一致で行う(不正な日付は NULL、2/30 等は繰り上がる)
+# 形の検査は、修飾子 '+0 days' で正規化を強いた strftime の値との一致で行う。修飾子が無いと
+# 時の 24("…T24:30:00Z")をそのまま返す日があり(SQLite 3.53 で月末の 3 日以外)、
+# TTL の内の不正な時刻が残る。正規化すると
+# 翌日へ繰り上がって一致しない(2/30・平年の 2/29 も繰り上がり、時の 25・分の 60・秒の 60・
+# 月日の 00 は NULL)。一致した値は正規の形なので、未来の検査は文字列の比較でよい
 RAW_PAYLOAD_EXPIRED = """
     raw_payload IS NOT NULL
     AND (
       CASE
         WHEN json_type(raw_payload, '$.cached_at') IS NULL THEN fetched_at
         WHEN json_type(raw_payload, '$.cached_at') = 'text'
-         AND strftime('%Y-%m-%dT%H:%M:%SZ', json_extract(raw_payload, '$.cached_at'))
+         AND strftime('%Y-%m-%dT%H:%M:%SZ', json_extract(raw_payload, '$.cached_at'),
+                      '+0 days')
              = json_extract(raw_payload, '$.cached_at')
          AND json_extract(raw_payload, '$.cached_at')
              <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
