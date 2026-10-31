@@ -339,7 +339,6 @@ def test_time_budget_processes_newest_first_and_defers_rest(conn, tmp_path) -> N
     )
 
     assert counts == {"ok": 2, "partial": 0, "failed": 0}
-    assert counts.deferred_ids == (oldest,)
     extracted = {r[0] for r in conn.execute("SELECT item_id FROM documents")}
     assert extracted == {newest, undated}
     cuts = conn.execute("SELECT run_id, kind, source_id, deferred FROM budget_cuts").fetchall()
@@ -349,4 +348,4 @@ def test_time_budget_processes_newest_first_and_defers_rest(conn, tmp_path) -> N
     # 次の実行で残りを処理する
     counts = extract_pending(conn, config(tmp_path), http, logger)
     assert counts == {"ok": 1, "partial": 0, "failed": 0}
-    assert counts.deferred_ids == ()
+    assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 3

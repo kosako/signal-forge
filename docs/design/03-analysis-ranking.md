@@ -27,7 +27,7 @@
 
 **X ブックマークの例外(GH#99。設計 02 §2)**: `x_signals` の bookmark 行に `item_id` で紐付く item は、規則 1(静的 NG リスト)だけを適用し、規則 2〜4(`stale` / `x_noise` / `daily_cap`)は適用しない(本人意思の保存アイテム = manual と同じ理屈。件数は x_signals の日次上限・`--backfill --limit` で有界)。日次上限の外で必ず採用し、上限はほかの item にだけ当てる。判定は帰属ソースでなく `x_signals.item_id` の紐付けで行う(RSS 等の既存 item へ合流した場合も例外になる)。
 
-extraction_status=failed の items は除外**しない**(本文なしでタイトル+メタだけを Stage 2 に渡す。PROPOSAL 準拠)。documents 行が無い item も同じく本文なし(`extraction: failed`)として渡す。ただし朝バッチ(`intel run`)で、本文抽出が段の時間の上限(設計 05 §8)で次の実行へ回した item は、規則も当てずに選ばず new のまま残す(本文なしで分析すると、次の実行で抽出する機会を失うため。GH#340)。単独の `intel analyze` は回した item を知らないので、今までどおり本文なしで渡す。LLM が正常に答えた分析は degraded に**しない**(degraded は LLM の失敗によるタイトルのみの記録で、全滅の判定(Stage 2・設計 00 §6。GH#74・GH#175)と 🎯 の行の省略(設計 04 §2・GH#90)に使うため、意味を混ぜない)。本文を読めていないことは `analyses.extraction_failed=1`(migration 021。GH#240)で別に残し、配信とノートに短く出す(設計 04 §2・§7)。
+extraction_status=failed の items は除外**しない**(本文なしでタイトル+メタだけを Stage 2 に渡す。PROPOSAL 準拠)。まだ抽出を試していない item(documents 行が無い)は、手で入れた manual を除いて選ばない。規則も日次上限も当てず、skip の理由も付けずに new のまま残し、次の本文抽出を待たせる(GH#340)。理由: 本文抽出が段の時間の上限(設計 05 §8)で回した item や、抽出の段が落ちた日の item を本文なしで分析すると、analyzed になって次の実行で抽出する機会を失う。抽出に失敗した item は documents に failed の行があるので、「まだ試していない」と区別して上のとおり本文なしで渡す。manual は受信デーモンが朝の抽出の後にも入れるので、今までどおり documents が無くても本文なしで渡す。朝バッチも単独の `intel analyze` も同じ規則で、`intel extract` を流していない記事は単独の analyze でも選ばない。抽出の段が落ちて載せる記事が無い日は、analyze 段の失敗と同じく障害の空として digest を確定しない(§6・設計 00 §6)。単独の `intel analyze` は回した item を知らないので、今までどおり本文なしで渡す。LLM が正常に答えた分析は degraded に**しない**(degraded は LLM の失敗によるタイトルのみの記録で、全滅の判定(Stage 2・設計 00 §6。GH#74・GH#175)と 🎯 の行の省略(設計 04 §2・GH#90)に使うため、意味を混ぜない)。本文を読めていないことは `analyses.extraction_failed=1`(migration 021。GH#240)で別に残し、配信とノートに短く出す(設計 04 §2・§7)。
 
 ### Stage 2: 本分析(LLM)
 
@@ -203,7 +203,7 @@ negativeペナルティ: negative ラベル 1 個につき −15
 ```
 
 - 算出した score は digest 直前に `analyses.total_score` へ UPDATE で書き戻す(生産者は app/ranking/ のみ。01 §3)。
-- digest へは score 降順で最大 `digest.max_items` 件(config、**既定 10**)。**閾値(config `ranking.min_score`、既定 40)未満は件数が余っていても載せない**(その日は少件数または「該当なし」。朝バッチの analyze 段が失敗した日の 0 件は「該当なし」として確定しない。設計 00 §6・GH#191)。理由: 10 件埋め合わせが「未読の置き換え化」リスクを直接悪化させる。
+- digest へは score 降順で最大 `digest.max_items` 件(config、**既定 10**)。**閾値(config `ranking.min_score`、既定 40)未満は件数が余っていても載せない**(その日は少件数または「該当なし」。朝バッチの analyze 段か extract 段が失敗した日の 0 件は「該当なし」として確定しない。設計 00 §6・GH#191・GH#340)。理由: 10 件埋め合わせが「未読の置き換え化」リスクを直接悪化させる。
 - PROPOSAL の「無効日3日連続なら配信5件に削減」は、この `digest.max_items` を 5 に変更して発動する(コード変更なしの運用ノブ。発動判定は週次手動レビュー)。
 - 上位 10 件中の同一ソース上限 4 件(超過は次点繰上げ)。係数・ペナルティはすべて config.toml で調整可(コード変更なしのチューニング)。
 - **🔖 保存アイテムはランキング不参加**(GH#99): `x_signals.item_id` に bookmark 紐付けのある item は候補クエリから除外し、digest の「🔖 保存」節(`digests.bookmark_item_ids`)に **must-include の別枠**として全件載せる(未掲載 = analyzed のものを保存順に。掲載で digested)。degraded 配信でも節は付ける(リンク列で分析に依存しない)。トレンド synthesis の対象からも除外(過去の任意時点の内容のため)。

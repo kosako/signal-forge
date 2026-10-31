@@ -909,6 +909,11 @@ def test_bookmark_merge_into_previous_day_skip_is_preselected(conn, tmp_path) ->
         "content_hash) VALUES (?, 'b1', ?, ?, '2026-07-13T00:00:00Z', '')",
         (home_id, canonical, canonical),
     ).lastrowid
+    conn.execute(  # 前日の朝の本文抽出(事前選別は抽出を済ませた記事を選ぶ。GH#340)
+        "INSERT INTO documents (item_id, extraction_status, expires_at) "
+        "VALUES (?, 'partial', '2999-01-01T00:00:00Z')",
+        (existing_id,),
+    )
     preselect(conn, config, logger)  # 前日の朝: 72h 超で stale
     assert status_of(conn, existing_id) == ("skipped", "stale")
 

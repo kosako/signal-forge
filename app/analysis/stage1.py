@@ -3,8 +3,9 @@
 `status='new'` の items に4規則を上から順に適用し、除外は `status='skipped'` +
 `skip_reason`(規則名)で記録する(黙って脱落させない)。
 extraction_status=failed は除外しない(本文なしでタイトル+メタだけの分析に回る。GH#240)。
-朝バッチで本文抽出が時間の上限で次の実行へ回した記事(deferred_ids)は選ばず、new のまま
-残す(本文なしで分析して抽出の機会を失わない。GH#340)。
+まだ抽出を試していない(documents の行が無い)記事は、手で入れた manual を除いて選ばず、new の
+まま次の抽出を待たせる(本文抽出の時間の上限で回した記事・抽出の段が落ちた日の記事を、本文なしで
+分析して抽出の機会を失わない。朝バッチも単独の intel analyze も同じ規則。GH#340)。
 duplicate は挿入時 dedup(設計 01 §6)で除外済みのため対象にしない。
 """
 
@@ -13,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
@@ -37,13 +37,13 @@ def preselect(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
-    deferred_ids: Collection[int] = (),
 ) -> PreselectResult:
     """4規則を適用し、件数と採用 items.id を返す。
 
     採用集合は本戻り値が正本。Stage 2 が `status='new'` を再クエリすると、
     選別後に受信デーモンが追加した manual item が規則を通らず混入するため。
-    deferred_ids は本文抽出が次の実行へ回した items.id。規則も当てず new のまま残す(GH#340)。
+    抽出を待つ記事(manual 以外で documents の行が無い)は対象にせず、規則も件数も当てない。
+    抽出に失敗した記事は documents に failed の行があるので、今までどおり本文なしで選ぶ。
     """
     rows = conn.execute(
         """
@@ -55,6 +55,8 @@ def preselect(
         FROM items
         JOIN sources ON sources.id = items.source_id
         WHERE items.status = 'new'
+          AND (sources.type = 'manual'
+               OR EXISTS (SELECT 1 FROM documents WHERE documents.item_id = items.id))
         ORDER BY items.id
         """
     ).fetchall()
@@ -62,10 +64,7 @@ def preselect(
     counts = {"selected": 0, "blocklist": 0, "stale": 0, "x_noise": 0, "daily_cap": 0}
     survivors: list[sqlite3.Row] = []
     bookmarks: list[sqlite3.Row] = []
-    deferred = set(deferred_ids)
     for row in rows:
-        if row["id"] in deferred:
-            continue
         if row["is_bookmarked"]:
             # ブックマークは本人意思の保存アイテム(GH#99)。manual と同じ理屈で
             # stale(過去ツイートが本体)・x_noise を適用しない。blocklist(明示 NG)

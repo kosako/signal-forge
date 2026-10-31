@@ -138,7 +138,8 @@ def _generate_digest(
                 # 分析の障害の空を「該当なし」として確定しない(GH#191)。下の except が
                 # ROLLBACK して送出する(--force の旧採用 item の復帰も戻す)
                 raise DigestHeldError(
-                    "analyze 段の失敗で載せる記事が無いため、当日の digest を確定しない"
+                    "分析の段(analyze・extract)の失敗で載せる記事が無いため、"
+                    "当日の digest を確定しない"
                 )
 
             # 🔖 保存節(GH#99): ランキング外の must-include 別枠。台帳(bookmark_item_ids)
