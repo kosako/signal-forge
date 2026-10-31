@@ -1463,12 +1463,15 @@ def test_dig_reply_failed_midway_applies_nothing_until_redelivered(
 ) -> None:
     # GH#181: 2 件目の反映がロック競合で失敗したら 1 件目も戻し、再配達で全部を 1 回で反映する
     # (反映済みの 1 件目をやり直して requested_at を動かすと、生成中の深掘りの
-    # compare-and-set が外れて同じ依頼を翌朝も掘ってしまう)
+    # compare-and-set が外れて同じ依頼を翌朝も掘ってしまう)。リプライの記帳も一緒に戻し、
+    # 再配達を反映済みとして捨てない(GH#335)
     from app.delivery import poller
 
     first = add_dig_candidate(conn, "https://a/1")
     second = add_dig_candidate(conn, "https://a/2")
-    api = RedeliveringApi([make_reply_update(f"{first} を観点Aで、{second} も", BACKLOG_MSG_ID)])
+    update = make_reply_update(f"{first} を観点Aで、{second} も", BACKLOG_MSG_ID)
+    update["message"]["message_id"] = 31
+    api = RedeliveringApi([update])
     real_apply_instructions = poller.apply_instructions
 
     def locked_at_second(conn, instructions):
@@ -1481,6 +1484,7 @@ def test_dig_reply_failed_midway_applies_nothing_until_redelivered(
     with pytest.raises(sqlite3.OperationalError, match="locked"):
         poll_once(conn, make_config(tmp_path), api, logger)
     assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0  # 1 件目も戻した
+    assert conn.execute("SELECT count(*) FROM dig_backlog_replies").fetchone()[0] == 0
     assert saved_offset(conn) is None
     assert api.sent == []
 
@@ -1489,6 +1493,48 @@ def test_dig_reply_failed_midway_applies_nothing_until_redelivered(
     assert [tuple(r) for r in rows] == [(first, "queued", "観点Aで"), (second, "queued", None)]
     assert len(api.sent) == 1
     assert saved_offset(conn) == "2"
+
+
+def test_redelivered_dig_reply_is_applied_once(conn, tmp_path, monkeypatch) -> None:
+    # GH#335: 指定を反映した後、offset を保存する前に止まると同じ update が再配達される。
+    # 同じリプライ(chat_id と message_id)は 1 回だけ反映し、確認の返信も二重にしない
+    # (やり直すと requested_at が動き、掘り終えた done の行も queued に戻る)。
+    # 本人が別のメッセージで同じ指定をし直したときは、新しい指定として受け付ける
+    item = add_dig_candidate(conn, "https://a/1")
+    first = make_reply_update(f"{item} を観点Aで", BACKLOG_MSG_ID, update_id=9)
+    first["message"]["message_id"] = 31
+    api = RedeliveringApi([first])
+    stop_before_saving_offset(monkeypatch)
+
+    with pytest.raises(_Stopped):
+        poll_once(conn, make_config(tmp_path), api, logger)
+    # 再起動までの間に朝の深掘りが掘り終えた
+    conn.execute(
+        "UPDATE dig_queue SET status = 'done', requested_at = '2026-07-19T00:00:00Z' "
+        "WHERE item_id = ?",
+        (item,),
+    )
+    poll_once(conn, make_config(tmp_path), api, logger)  # 再起動の後
+
+    assert api.offsets == [None, None]  # first が再配達された
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert (row["status"], row["requested_at"], row["angle"]) == (
+        "done", "2026-07-19T00:00:00Z", "観点Aで",
+    )
+    assert api.sent == [(CHAT_ID, f"🔍 {item} を登録しました(観点: 観点Aで)")]
+    assert saved_offset(conn) == "10"
+
+    again = make_reply_update(f"{item} を観点Aで", BACKLOG_MSG_ID, update_id=10)
+    again["message"]["message_id"] = 32
+    poll_once(conn, make_config(tmp_path), RedeliveringApi([again]), logger)
+
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert row["status"] == "queued"
+    assert row["requested_at"] != "2026-07-19T00:00:00Z"
+    ledger = conn.execute(
+        "SELECT chat_id, message_id FROM dig_backlog_replies ORDER BY message_id"
+    ).fetchall()
+    assert [tuple(r) for r in ledger] == [(CHAT_ID, 31), (CHAT_ID, 32)]
 
 
 def test_dig_reply_without_valid_numbers_gets_guide(conn, tmp_path) -> None:
