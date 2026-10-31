@@ -27,6 +27,7 @@ signals(kind='survey_*') … item_id NULL(日単位の回答)
 x_signals ──> items(item_id NULL 可)          (X の興味シグナル。🔖 だけ items に紐付く。GH#58・#99)
 x_signal_cursors / x_signal_runs               (シグナル取込のカーソル / 読取の実行ログ)
 dig_backlog_messages                           (未消化一覧の message_id 台帳。GH#104)
+dig_backlog_replies                            (未消化一覧へのリプライの受信の冪等キー。GH#335)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送・リプライの帰属用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
@@ -243,7 +244,7 @@ CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)の 12。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)の 13。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -338,7 +339,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `text_excerpt`(≤280字)は **TTL キャッシュのみ**(purge が `x_cache_ttl_days` で NULL 化。§6 の X 本文非保持ポリシー準拠)。恒久保存は id・著者・時刻
 - 取込コストは `x_signal_runs`(collect_runs は sources 行が前提のため独立の台帳)に記録し、doctor #9 が合算する(§9)。`backfill`(migration 023。GH#178)は `intel x-signals --backfill` の取込なら 1、通常の取込なら 0(既存の行は 0)。取込の日次の上限は同じ日(JST)の通常の取込の行の `api_reads` の合計から残りを出すので、backfill の行はそこから外す(日次の上限の外の別枠。費用の集計には入る。設計 02 §2)
 
-### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009・022。GH#104 / 設計 06 §2〜3)
+### 深掘りキュー(dig_queue / dig_backlog_messages / dig_backlog_replies・migration 009・022・026。GH#104 / 設計 06 §2〜3)
 
 夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。深掘りカードへのリプライが調べ直しの依頼なら、`intel answer` が同じ規則で upsert する(観点 = リプライの原文。GH#137)。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request` / その日の digest の上位から選んで掘った = `digest`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。上限に足りない分を digest の上位から選んだ item(設計 06 §3 の ③。GH#349)は、選ぶ時点では積まず、生成物を `dig_results` へ write-ahead するのと同じトランザクションで `source = 'digest'`・`status = 'done'` の行を足す。行を足すのは行が無いときだけで、生成中に poller などが同じ item の行を作っていたら、本人の明示の操作(`requested_at` のある指定・`passed`)は変えず、自動投入の行(`requested_at` が無い `queued`)だけを `done` にする(どちらも生成物は記帳する。設計 06 §3)。`digest` は migration 009 の CHECK(`bookmark` / `request`)に無いので、実装の PR で表を作り直す migration を足す(GH#349。未実装。別の案は設計 06 §8)。
 
@@ -347,6 +348,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)。本文の材料が無い指定は、調査段が 1 回知らせた後に NULL へ戻す(状態・観点は変えない。設計 06 §3・GH#197)
 - `backlog_op_question_id`(migration 022)= 未消化一覧への本人の最後の操作(パス・skip のボタン・指定)を反映した時点で、受け付け済みだった質問(`dig_questions.id`)の最大(質問がまだ無ければ 0)。受付の順序の印で、深掘りカードへの調べ直しの依頼は、自分の id がこれ以下なら(操作より前に受け付けた)積まない(GH#235・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、質問の id を目盛りにする。調べ直しの依頼と朝の深掘りの `done` は変えない。NULL = 未消化一覧での操作がまだない(migration 022 より前の操作を含む)
 - `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先と skip のボタンの押されたメッセージの認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
+- `dig_backlog_replies`(migration 026。GH#335)は、指定を反映したリプライの `chat_id`・`message_id` の台帳(主キーは組。message_id は chat 単位)。poller は指定を反映した後に offset を保存するので、その間に止まると同じ update が再配達される。指定をやり直すと `requested_at` が動き、生成中の深掘りの compare-and-set が外れ、掘り終えた `done` の行も `queued` に戻る。poller は記帳(`INSERT ... ON CONFLICT DO NOTHING`)と指定の反映を同じトランザクションで行い、記帳済みなら反映も確認の返信もしない(感想の migration 019 と同じ形。設計 04 §1)。本人が別のメッセージで指定し直したときは受け付ける。番号が無く案内だけを返したリプライは記帳しない
 
 ### 深掘り実行結果(dig_results・migration 010・017。GH#105 / GH#153 / 設計 06 §4〜5)
 

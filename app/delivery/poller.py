@@ -705,7 +705,7 @@ def _handle_message(
         # 未消化 🔖 一覧へのリプライ = 深掘り指定(GH#104 / 設計 06 §2)。
         # 感想ルートと同じく owner DM 限定(message_id は chat 単位のため)
         if _replied_dig_backlog(conn, message.get("reply_to_message")):
-            _handle_dig_reply(conn, text.strip(), reply, logger)
+            _handle_dig_reply(conn, text.strip(), chat_id, message, reply, logger)
             return
 
     urls = _extract_urls(text, message.get("entities")) if isinstance(text, str) else []
@@ -875,6 +875,8 @@ DIG_ACK_MAX_CHARS = 3500
 def _handle_dig_reply(
     conn: sqlite3.Connection,
     text: str,
+    chat_id: int,
+    message: dict,
     reply: Callable[[str], None],
     logger: logging.Logger,
 ) -> None:
@@ -883,7 +885,7 @@ def _handle_dig_reply(
     指定できる番号 = 未消化候補 ∪ キュー在籍(過去にキュー入りした item はパス・
     再指定のため一覧から消えていても受け付ける)。候補にない番号は本文(観点の一部)
     扱いで無視されるため、確認応答に「何が登録されたか」を必ず列挙する(黙って
-    落とさない)。
+    落とさない)。同じリプライの再配達は反映も確認応答もしない(GH#335)。
     """
     valid_ids = {row["item_id"] for row in pending_dig_items(conn)} | queue_item_ids(conn)
     instructions = parse_dig_reply(text, valid_ids)
@@ -893,14 +895,20 @@ def _handle_dig_reply(
     # 指定はまとめて 1 つのトランザクションで反映する(接続は autocommit)。途中でロック競合に
     # なったら全部を戻し、再配達で全部をやり直す(GH#181)。反映済みの指定をやり直すと
     # requested_at が動き、生成中の深掘りの compare-and-set(deepdive)が外れて同じ依頼を
-    # 翌朝も掘ってしまうため
+    # 翌朝も掘ってしまうため。反映の後、offset を保存する前に止まったときの再配達は、
+    # リプライの記帳で見分ける(記帳と反映を同じトランザクションに入れる。GH#335)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        apply_instructions(conn, instructions)
+        recorded = _record_dig_backlog_reply(conn, chat_id, message)
+        if recorded:
+            apply_instructions(conn, instructions)
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    if not recorded:
+        logger.info("反映済みの深掘り指定の再配達を破棄", extra={"stage": "poll"})
+        return
     lines = []
     for instruction in instructions:
         if instruction.action == "pass":
@@ -938,6 +946,26 @@ def _handle_dig_reply(
                 "passes": sum(1 for i in instructions if i.action == "pass"),
             },
         },
+    )
+
+
+def _record_dig_backlog_reply(conn: sqlite3.Connection, chat_id: int, message: dict) -> bool:
+    """深掘りの指定を反映するリプライを記帳し、初めて受けたなら True を返す(GH#335)。
+
+    受信したリプライの (chat_id, message_id) を冪等キーにする(migration 026 の主キー。感想の
+    _insert_note と同じ形)。message_id が int でない(Telegram は必ず付ける)ときは記帳せず、
+    初めての受信として扱う(キーなしで反映する)。
+    """
+    message_id = message.get("message_id")
+    if type(message_id) is not int:  # bool は int の派生型のため除く
+        return True
+    return (
+        conn.execute(
+            "INSERT INTO dig_backlog_replies (chat_id, message_id) VALUES (?, ?) "
+            "ON CONFLICT (chat_id, message_id) DO NOTHING",
+            (chat_id, message_id),
+        ).rowcount
+        == 1
     )
 
 

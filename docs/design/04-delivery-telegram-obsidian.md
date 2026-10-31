@@ -8,7 +8,7 @@
 
 - Bot API は **httpx 直叩き**(共通規約)。接続は **long polling 固定**、`getUpdates` の offset は SQLite の専用テーブル(`telegram_state`。DDL は 01 §3)に永続化する — デーモン再起動で取り漏らし・二重処理しないため。
   - **offset を進める条件(GH#181)**: update を 1 件処理するごとに offset を保存する。受信の内容を **DB の一時的な失敗**(ロック競合で busy_timeout を超えた `database is locked/busy`。朝バッチの VACUUM・backup と重なったとき)で保存できなかった update は offset を進めず、30s 待ってから同じ offset で取り直し、Telegram が再配達した同じ update を再処理する(後ろの update も一緒に再配達される)。同じ update が続けて失敗するときは、やり直しの上限(回数は 05 §8)を超えたところで **隔離** して進める: poller.log に WARN 1 行(update_id・update の種別・エラーの種類だけ。本文は残さない。§6 と同じ)を残し、offset を進める。それ以外の失敗(不正な形の入力・ロック以外の DB エラー・返信の送信の失敗など)は待っても直らないので、今どおりログに残して offset を進める(poison update を無限に再処理しない)。callback(§3)の書き込みの失敗(signals の INSERT・深掘りカードのボタンの `dig_questions` への記帳)は、ロック競合でも再処理の対象にしない: §3 の警告 answer(`⚠️ 記録失敗、もう一度` など)で本人にやり直しを促して処理を終え、offset を進める。answerCallbackQuery は 1 callback に 1 回しか返せないので、待って記帳し直すと、返した警告と記帳の結果が食い違うため。
-  - **再配達の冪等性**: offset は処理の後に保存するので、その間に止まる(または offset の保存がロック競合で失敗する)と同じ update が再配達される。感想(§5。`item_notes` / `digest_notes`)は受信したリプライの `chat_id`・`message_id` を一意キーにし(01 §3。GH#193)、記帳の 1 文で処理済みかを判定する(記帳済みなら記帳も返信もしない)。深掘りカードへの質問は `dig_questions` の UNIQUE(01 §7)で同じく 2 回受け付けない。signals(§3)は追記型で、重複は集計側で吸収する。
+  - **再配達の冪等性**: offset は処理の後に保存するので、その間に止まる(または offset の保存がロック競合で失敗する)と同じ update が再配達される。感想(§5。`item_notes` / `digest_notes`)は受信したリプライの `chat_id`・`message_id` を一意キーにし(01 §3。GH#193)、記帳の 1 文で処理済みかを判定する(記帳済みなら記帳も返信もしない)。深掘りカードへの質問は `dig_questions` の UNIQUE(01 §7)で同じく 2 回受け付けない。未消化一覧へのリプライ(深掘りの指定。§4)も、受信したリプライの `chat_id`・`message_id` を `dig_backlog_replies` に記帳し(01 §7。GH#335)、記帳と指定の反映を同じトランザクションで行う(記帳済みなら反映も返信もしない。本人が別のメッセージで指定し直したときは受け付ける)。signals(§3)は追記型で、重複は集計側で吸収する。
 - parse_mode は **HTML** を採用 — MarkdownV2 はエスケープ対象が多く事故りやすい。エスケープ規定: **テキストノードは `& < >` の3文字、属性値(`href` 等)はさらに `"` と `'` も**エスケープする(canonical_url は外部制御可能であり、`"` 入り URL による属性破壊を防ぐ)。
 - 本文由来の文字列(タイトル・要約・理由)は**必ず HTML エスケープ**して埋め込む。URL は LLM 出力でなく **items テーブルの正規 URL のみ**(PROPOSAL のインジェクション対策)。scheme は 01 §4 の allowlist(http/https のみ)で挿入時に保証済み。
 
@@ -135,5 +135,5 @@ reaction: null          # フェーズ2で 👍/🔖/✅/👎 を書き戻す予
 ## 8. 他コンポーネントとの境界
 
 - 入力: `digest` コンポーネントが `digests` 行(Markdown + item_ids)を確定してから本層を呼ぶ。本層は選別・要約に関与しない。
-- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `item_notes`・`digest_notes`(感想。GH#92/#96)/ `dig_backlog_messages`・`dig_queue`(深掘りの指定。GH#104)/ `dig_questions`(カードへの質問。GH#126)/ `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
+- 出力: 本層が書くのは `signals` / `telegram_state` / `digest_messages` / `item_notes`・`digest_notes`(感想。GH#92/#96)/ `dig_backlog_messages`・`dig_backlog_replies`・`dig_queue`(深掘りの指定。GH#104・GH#335)/ `dig_questions`(カードへの質問。GH#126)/ `digests.delivery_status`・`sent_at` と Vault ファイルのみ。`items` への書込は URL 投入(manual source 経由)だけ。
 - 失敗時: 配信失敗・Vault 書込失敗は設計 05 §4 の失敗通知で知らせる(朝バッチの段の失敗 = 朝バッチ失敗通知。watchdog が見るのはダイジェストの未生成・未配信と X ソースの連続失敗だけで、Vault 書込失敗は見ない)。本層は例外を握りつぶさず終了コードで返す。
