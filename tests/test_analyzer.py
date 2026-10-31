@@ -309,6 +309,36 @@ def test_single_unavailable_saves_obtained_results_and_leaves_rest_new(conn, tmp
     assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 4
 
 
+@pytest.mark.parametrize("answer", ["ok", "chunk_failure"])
+def test_save_keeps_items_that_left_new_while_waiting_for_llm(conn, tmp_path, answer) -> None:
+    # LLM を待つ間に別の経路が分析・digest を済ませた item を analyzed に戻さず、分析の行も
+    # 重ねない(GH#334)。今の状態が new のままの item だけを確定する
+    a = add_item(conn, "https://a.example/1")
+    b = add_item(conn, "https://a.example/2")
+    responses = (
+        [AnalysisBatch(results=[analysis_for(a), analysis_for(b)])]
+        if answer == "ok"
+        else [LLMError("timeout")] * 2  # チャンクの 2 試行とも失敗 → degraded 直行
+    )
+
+    class DigestedWhileWaiting(FakeEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            conn.execute("UPDATE items SET status = 'digested' WHERE id = ?", (a,))
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engine = DigestedWhileWaiting(responses)
+    if answer == "ok":
+        counts = analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
+        assert counts == {"analyzed": 1, "degraded": 0}
+    else:
+        with pytest.raises(FullDegradationError):  # 保存した b は degraded だけ(GH#74)
+            analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
+    statuses = dict(conn.execute("SELECT id, status FROM items").fetchall())
+    assert statuses == {a: "digested", b: "analyzed"}
+    analysed = [r[0] for r in conn.execute("SELECT item_id FROM analyses")]
+    assert analysed == [b]
+
+
 def test_single_unavailable_does_not_degrade_earlier_single_failure(conn, tmp_path) -> None:
     # 環境障害の前に単発再分析が一時的に失敗した項目も、degraded で確定させず new に残す
     # (再実行で分析し直せる。GH#243)

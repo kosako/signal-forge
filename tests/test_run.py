@@ -1,7 +1,11 @@
+import fcntl
 import json
 import logging
+import os
+import re
 import sqlite3
 import tarfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -812,3 +816,135 @@ def test_trend_engine_falls_back_when_enabled(conn, tmp_path, monkeypatch) -> No
         )
     assert engines[0] is primary  # 予備が無効なら主のまま
     assert isinstance(engines[1], FallbackEngine) and engines[1]._primary is primary
+
+
+_HANG_GUARD_SECONDS = 30  # 並行のテストが止まったときだけ効く上限(正否の判定には使わない)
+
+
+def test_overlapping_analyze_waits_and_keeps_daily_limit(tmp_path, caplog) -> None:
+    # GH#334: 朝バッチと intel analyze が重なっても、後の実行は先の実行を待ち、先が分析した
+    # 件数を引いた残りの枠だけを分析する(日次の上限を超えず、同じ item を 2 回 LLM に渡さない)。
+    # 先の実行を LLM の応答待ちで止め、その間に後の実行を走らせる。後の実行がロックで待ち始めた
+    # (修正前は事前選別を済ませて LLM を呼ぶ)のを合図に先の実行を進める。正否は時間に頼らない
+    from app.analysis.analyzer import ANALYZE_LOCK_SUFFIX
+    from app.run import analyze_stage
+
+    db_path = tmp_path / "intel.db"
+    setup = connect(db_path)
+    apply_migrations(setup, db_path)
+    setup.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed-a')")
+    source_id = setup.execute("SELECT id FROM sources WHERE name = 'feed-a'").fetchone()["id"]
+
+    def add_item(n: int) -> int:
+        url = f"https://a.example/{n}"
+        return setup.execute(
+            "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
+            "VALUES (?, ?, ?, '十分に長い記事タイトルのサンプル', ?)",
+            (source_id, url, url, f"sha256:{n}"),
+        ).lastrowid
+
+    first_items = [add_item(n) for n in range(2)]
+    base = make_config(tmp_path)
+    config = Config(
+        config_dir=tmp_path,
+        analysis=AnalysisConfig(profile_path=base.analysis.profile_path, daily_llm_limit=3),
+    )
+    first_in_llm = threading.Event()
+    release_first = threading.Event()
+    lock_wait = threading.Event()  # 後の実行がロックで待ち始めた
+    llm_while_held = threading.Event()  # 先の実行が止まっている間に後の実行が LLM を呼んだ
+    second_reached = threading.Event()  # 上の 2 つのどちらか(後の実行が判断の所まで来た)
+    sent: dict[str, list[int]] = {"first": [], "second": []}
+
+    class PausingEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            ids = [int(i) for i in re.findall(r'<item id="(\d+)">', prompt)]
+            name = threading.current_thread().name
+            sent[name] += ids
+            if name == "first":
+                first_in_llm.set()
+                assert release_first.wait(_HANG_GUARD_SECONDS)
+            elif not release_first.is_set():
+                llm_while_held.set()
+                second_reached.set()
+            return AnalysisBatch(
+                results=[
+                    ItemAnalysis(
+                        item_id=i, title_ja="見出し", summary="要約", relevance=90,
+                        category="課題直結", negative=[], novelty="new", topic=f"t{i}",
+                        reason="理由", implication="示唆",
+                    )
+                    for i in ids
+                ]
+            )
+
+    class LockWaitSignal(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage() == "別の分析が実行中のため、終わるのを待つ":
+                lock_wait.set()
+                second_reached.set()
+
+    results: dict[str, object] = {}
+
+    def run() -> None:
+        name = threading.current_thread().name
+        thread_conn = connect(db_path)
+        try:
+            results[name] = analyze_stage(
+                thread_conn, config, {}, logger, run_id=name,
+                primary=lambda _effort: PausingEngine(),
+            )
+        except BaseException as e:  # スレッドの例外は本体で検査する
+            results[name] = e
+        finally:
+            thread_conn.close()
+
+    first = threading.Thread(target=run, name="first", daemon=True)
+    second = threading.Thread(target=run, name="second", daemon=True)
+    signal = LockWaitSignal()
+    logger.addHandler(signal)
+    lock_path = tmp_path / ("intel.db" + ANALYZE_LOCK_SUFFIX)
+    try:
+        with caplog.at_level(logging.INFO, logger="test-run"):
+            first.start()
+            assert first_in_llm.wait(_HANG_GUARD_SECONDS)
+            # 先の実行は LLM の応答待ちの間もロックを握っている(別の fd では取れない)
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            later_items = [add_item(n) for n in range(2, 4)]  # 先の実行の後に届いた記事
+            second.start()
+            assert second_reached.wait(_HANG_GUARD_SECONDS)
+    finally:
+        # 途中の assert で抜けても先の実行を止めたままにせず、起動したスレッドの終わりを待つ
+        release_first.set()
+        for thread in (first, second):
+            if thread.ident is not None:  # 起動前のスレッドは join できない
+                thread.join(_HANG_GUARD_SECONDS)
+        logger.removeHandler(signal)
+    assert not first.is_alive() and not second.is_alive()
+
+    assert not llm_while_held.is_set()
+    assert lock_wait.is_set()
+    assert results == {
+        "first": {"analyzed": 2, "degraded": 0},
+        "second": {"analyzed": 1, "degraded": 0},  # 上限 3 − 先の 2 = 残り 1
+    }
+    assert sent["first"] == first_items
+    assert len(sent["second"]) == 1 and sent["second"][0] in later_items
+    assert setup.execute("SELECT count(*) FROM analyses").fetchone()[0] == 3
+    statuses = dict(setup.execute("SELECT id, status FROM items").fetchall())
+    assert sorted(statuses.values()) == ["analyzed", "analyzed", "analyzed", "skipped"]
+    # 両方の実行が終われば、ロックは放されている
+    fd = os.open(lock_path, os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+    setup.close()

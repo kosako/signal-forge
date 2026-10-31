@@ -8,15 +8,21 @@
   なお欠落・チャンク失敗は degraded 記録(黙って止まらない。設計 00 §6)
 - 例外(GH#74): 環境障害(LLMUnavailableError)と全滅(analyzed=0)は degraded で
   握らず段の失敗として raise する(silent full-degradation 防止。失敗通知 = 設計 05 §4)
+- 同じ DB の分析は、事前選別から保存までを DB の隣の `<DB>.analyze.lock`(flock)で直列化する
+  (analysis_lock。GH#334)。保存は今の状態が new の item だけを analyzed にする
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
 
@@ -30,6 +36,9 @@ PROMPT_VERSION = "analyze-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 RECENT_DAYS = 14
+
+# 分析の直列化のロック(GH#334)。DB の隣の `<DB>.analyze.lock`(deliver.lock・dig.lock と同じ名付け)
+ANALYZE_LOCK_SUFFIX = ".analyze.lock"
 
 # サニタイズの長さ上限(設計 03 §3.2)
 MAX_TITLE = 300
@@ -60,6 +69,42 @@ class FullDegradationError(RuntimeError):
     degraded 行は書き込み済みのため劣化配信は成立するが、「まともに分析できていない朝」を
     黙って正常系に見せないよう、run は失敗として失敗通知(設計 05 §4)に載せる。
     """
+
+
+@contextlib.contextmanager
+def analysis_lock(
+    conn: sqlite3.Connection, logger: logging.Logger, run_id: str | None
+) -> Iterator[None]:
+    """同じ DB の分析(事前選別から保存まで)をプロセス間で直列化する(GH#334)。
+
+    朝バッチの analyze 段と `intel analyze` / 手動の `intel run` が重なると、両方が同じ new の
+    行を選び、日次の上限を超えて LLM を呼ぶ。後の実行は先の実行が終わるまで待ち、その後の
+    事前選別が先の分析した件数を引いた残りの枠だけを採る。LLM の待ち(分オーダー)をまたいで
+    SQLite の書き込みのトランザクションを持つと poller の書き込みを止めるので、DB の隣の
+    専用ファイルに flock を取る(配信の _delivery_lock と同じ形。接続から DB を引き、メモリ上の
+    DB は他のプロセスと共有されないので直列化しない)。
+    """
+    db_file = next(
+        (row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), ""
+    )
+    if not db_file:
+        yield
+        return
+    db_path = Path(db_file)
+    lock_path = db_path.with_name(db_path.name + ANALYZE_LOCK_SUFFIX)
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info(
+                "別の分析が実行中のため、終わるのを待つ",
+                extra={"run_id": run_id, "stage": "analyze"},
+            )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # close で flock は解放される
 
 
 def analyze_selected(
@@ -160,32 +205,48 @@ def _analyze_chunk(
     # (別々だと途中クラッシュで status='new' のまま analyses だけ残り、再実行時に
     #  nonce 違いの input_hash で重複挿入される)
     counts = {"analyzed": 0, "degraded": 0}
+    left_new = 0
+    superseded: list[int] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
         for row in rows:
             analysis = results.get(row["id"])
+            if analysis is None and unavailable is not None:
+                # 環境障害で未解決の item は degraded にせず new のまま残す
+                # (修復後の再実行でそこだけを分析する。GH#74・GH#243)
+                left_new += 1
+                continue
+            # 選んだ時の状態(new)のままの item だけを確定する。LLM を待つ間に別の経路が
+            # 分析・digest を済ませた item を analyzed に戻さず、分析も重ねない(GH#334)
+            claimed = conn.execute(
+                "UPDATE items SET status = 'analyzed' WHERE id = ? AND status = 'new'",
+                (row["id"],),
+            ).rowcount
+            if not claimed:
+                superseded.append(row["id"])
+                continue
             if analysis is not None:
                 _insert_analysis(
                     conn, row, analysis, answered_by[row["id"]], hashes[row["id"]], run_id,
                     degraded=False,
                 )
                 counts["analyzed"] += 1
-            elif unavailable is not None:
-                # 環境障害で未解決の item は degraded にせず new のまま残す
-                # (修復後の再実行でそこだけを分析する。GH#74・GH#243)
-                continue
             else:
                 _insert_degraded(conn, row, engine, hashes.get(row["id"], chunk_hash), run_id)
                 counts["degraded"] += 1
-            conn.execute("UPDATE items SET status = 'analyzed' WHERE id = ?", (row["id"],))
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+    if superseded:
+        logger.warning(
+            f"分析の間に状態が new でなくなった {len(superseded)} 件は保存しない",
+            extra={"run_id": run_id, "stage": "analyze", "extra": {"item_ids": superseded}},
+        )
     if unavailable is not None:
         logger.warning(
             f"単発再分析で環境障害。取得済みの {counts['analyzed']} 件を保存し、"
-            f"残り {len(rows) - counts['analyzed']} 件は new のまま残す",
+            f"残り {left_new} 件は new のまま残す",
             extra={"run_id": run_id, "stage": "analyze"},
         )
         raise unavailable
