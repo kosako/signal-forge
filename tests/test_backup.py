@@ -101,6 +101,26 @@ def test_rotation_keeps_14_generations(conn, tmp_path, monkeypatch) -> None:
     assert archives == [f"intel-202606{day:02d}.tar.gz" for day in range(4, 18)]
 
 
+def test_rotation_ignores_non_daily_archives(conn, tmp_path, monkeypatch) -> None:
+    # 置き場に手で置いた intel-*.tar.gz(退避用など)は世代に数えず、消さない。日次の世代は
+    # 14 のまま残る。名前順で日次の世代より前に並ぶ名前と後に並ぶ名前の両方を置く(GH#339)
+    monkeypatch.setattr("app.backup.today_jst", lambda: "2026-06-17")
+    config = make_config(tmp_path)
+    config.backup_dir.mkdir(parents=True)
+    for day in range(1, GENERATIONS + 3):  # 16 世代分の旧ファイル(06-01〜06-16)
+        (config.backup_dir / f"intel-202606{day:02d}.tar.gz").write_bytes(b"")
+    kept = ["intel-0-pre-restore.tar.gz", "intel-manual.tar.gz"]
+    for name in kept:
+        (config.backup_dir / name).write_bytes(b"")
+
+    backup_daily(conn, config, logger, prompts_dir=make_prompts(tmp_path))
+
+    archives = sorted(p.name for p in config.backup_dir.glob("intel-*.tar.gz"))
+    assert archives == sorted(
+        kept + [f"intel-202606{day:02d}.tar.gz" for day in range(4, 18)]
+    )
+
+
 def test_backup_follows_symlinked_config_dir(conn, tmp_path) -> None:
     # 設定ディレクトリが symlink(dotfiles の管理など)でも、リンクの 1 件ではなく中身が
     # config/ に入る。中にある symlink は今までどおりリンクのまま入る(GH#279)
