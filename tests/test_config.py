@@ -405,7 +405,8 @@ def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
 
 def test_collect_and_extract_limits_defaults_and_overrides(tmp_path: Path) -> None:
     # 件数と時間の上限(GH#340)。既定は RSS 1 ソース 1 回 100 件・段ごとに 10 分
-    default = load_config(tmp_path)
+    # 設定ファイルが無いと止まる(GH#338)ので、既定値は空の config.toml で確かめる
+    default = load_config(write_config(tmp_path, ""))
     assert (default.collect.rss_max_items, default.collect.time_budget_s) == (100, 600)
     assert default.extract.time_budget_s == 600
     config = load_config(
