@@ -816,6 +816,23 @@ def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_pa
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
 
 
+def test_huge_source_name_keeps_item_within_telegram_limit(conn, tmp_path) -> None:
+    # GH#343・GH#356: sources.name は運用者が手で入れる値で長さを検証していない(README のソースの
+    # 追加)。異常に長い名前 1 件でアイテムが Telegram の 4096 字を超え、配信全体が failed に
+    # ならない(タイトルの上限と同じ考え。設計 04 §2)
+    conn.execute("UPDATE sources SET name = ? WHERE id = 2", ("長" * 5000,))
+    a = add_item(conn, "https://a/1", summary="要約。", implication="示唆。")
+    digest_id = add_digest(conn, [a])
+    recorder = ApiRecorder()
+
+    sent = deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert sent == 2
+    assert recorder.texts()[1].endswith("💡 示唆。")
+    assert ">" + "長" * 79 + "…</a>" in recorder.texts()[1]  # ソース名は 80 字で切る(GH#356)
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
+
+
 def test_header_includes_bookmark_section_with_escaped_links(conn, tmp_path) -> None:
     # 🔖 保存節(GH#99)はヘッダ 1 通に同梱。リンクは属性エスケープ・表示は上限つき
     a = add_item(conn, "https://a/1")
