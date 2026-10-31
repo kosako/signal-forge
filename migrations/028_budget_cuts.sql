@@ -24,7 +24,8 @@ CREATE INDEX ix_budget_cuts_created ON budget_cuts(created_at);
 -- 上限を使い切り、残りが進まない。使い回しを同じ記事に限るのは、短縮 URL の転送先が後で変わった
 -- とき、新しい記事を古い先との重複として捨てないため(新しい記事は解決し直す)。
 --   source_id     記事を取ったソース
---   entry_key     記事の識別子。guid(items.external_id になる値)、無ければ元の URL
+--   entry_key     記事の識別子。'guid:' + guid、無ければ 'url:' + 元の URL(種別で名前空間を
+--                 分ける。URL と同じ文字列の guid の記事が、guid の無い記事の結果を使わない)
 --   url           解決の前の短縮 URL(前後の空白は除く)。同じ記事でも URL が変われば解決し直す
 --   canonical_url 解決した先を u1 で正規化した URL(items.canonical_url と同じ形)
 --   resolved_at   解決した時刻。purge が 30 日より前の行を消す(フィードに残る期間を超えたら要らない)

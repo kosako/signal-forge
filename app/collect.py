@@ -354,6 +354,9 @@ def _prepare_rss(
         )
 
     def known_cheaply(raw: RawItem) -> bool:
+        # 取得の中の guid の重複は、解決の履歴の有無に関わらず先に見る(保存で無視される)
+        if raw.external_id is not None and raw.external_id in kept_guids:
+            return True
         if _known_without_resolution(conn, source, raw, resolve_short):
             return True
         if _needs_resolution(raw, resolve_short):
@@ -431,11 +434,15 @@ def _known_without_resolution(
     ).fetchone():
         return True
     if _needs_resolution(raw, resolve_short):
-        # 解決先は HTTP が要るので、guid の無い記事はこのソースが前に保存した元の URL で見る
-        # (guid のある記事は guid が識別子。同じ短縮 URL の新しい記事を取り込み済みとしない)。
+        # 解決先は HTTP が要るので、guid の無い記事はこのソースが前に保存した guid の無い記事の
+        # 元の URL で見る(external_id が正規化 URL の hash か、error の行の NULL)。guid のある
+        # 記事は guid が識別子なので、同じ短縮 URL でも取り込み済みとしない。逆に guid のある
+        # 記事の行の URL で、guid の無い新しい記事を取り込み済みとしない。
         # 同じ記事を前に解決した結果があれば、その先でも見る
         if raw.external_id is None and conn.execute(
-            "SELECT 1 FROM items WHERE source_id = ? AND url = ?", (source.id, raw.url)
+            "SELECT 1 FROM items WHERE source_id = ? AND url = ?"
+            " AND (external_id IS NULL OR external_id LIKE 'urlhash:%')",
+            (source.id, raw.url),
         ).fetchone():
             return True
         canonical = _resolved_before(conn, source, raw)
@@ -444,16 +451,22 @@ def _known_without_resolution(
 
 
 def _entry_key(raw: RawItem) -> str:
-    """解決の結果を使い回す記事の識別子。guid(external_id)、無ければ元の URL。"""
-    return raw.external_id if raw.external_id is not None else raw.url.strip()
+    """解決の結果を使い回す記事の識別子。`guid:` + guid、無ければ `url:` + 元の URL。
+
+    種別を付けて、guid と URL の名前空間を分ける(URL と同じ文字列の guid を持つ新しい記事が、
+    guid の無い前の記事の結果を使い回さないため)。
+    """
+    if raw.external_id is not None:
+        return "guid:" + raw.external_id
+    return "url:" + raw.url.strip()
 
 
 def _resolved_before(conn: sqlite3.Connection, source: Source, raw: RawItem) -> str | None:
     """同じソースの同じ記事を前の実行で解決した canonical_url(無ければ None)。
 
-    使い回すのは同じ記事(guid、無ければ元の URL)で、元の URL も同じときだけ。同じ短縮 URL でも
-    別の記事やほかのソースでは使わない(転送先が後で変わると、新しい記事を古い先との重複として
-    捨てるため)。
+    使い回すのは同じ記事(_entry_key。guid、無ければ元の URL)で、元の URL も同じときだけ。
+    同じ短縮 URL でも別の記事やほかのソースでは使わない(転送先が後で変わると、新しい記事を
+    古い先との重複として捨てるため)。
     """
     row = conn.execute(
         "SELECT canonical_url FROM short_url_resolutions"

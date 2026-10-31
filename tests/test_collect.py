@@ -981,7 +981,7 @@ def test_rss_cap_does_not_defer_short_urls_known_by_kept_resolution(
     add_other_source_item(conn, "https://example.com/taken")
     conn.execute(
         "INSERT INTO short_url_resolutions (source_id, entry_key, url, canonical_url) "
-        "VALUES (2, 'g2', 'https://bit.ly/tk', 'https://example.com/taken')"
+        "VALUES (2, 'guid:g2', 'https://bit.ly/tk', 'https://example.com/taken')"
     )
 
     def resolver(url: str) -> str:
@@ -1084,6 +1084,73 @@ def test_rss_cap_skips_duplicates_within_same_fetch(
     ]
     assert budget_cuts(conn) == []
     assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_rss_cap_does_not_defer_guid_duplicate_after_limit(conn: sqlite3.Connection) -> None:
+    # 上限に達した後ろの、先に残した記事と同じ guid の記事は、解決の履歴が無い短縮 URL でも
+    # 保存で無視されるので回した数に入れない(カーソルを据え置いて読み直さない)
+    def resolver(url: str) -> str:
+        raise AssertionError(f"解決しない: {url}")
+
+    entries = [dated("g1", 9, path="a"), short_entry("g1", 8, "z")]
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=1),
+    )
+    assert guids(conn) == ["g1"]
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_resolution_key_separates_guid_from_url(conn: sqlite3.Connection) -> None:
+    # 解決の結果の鍵は guid と URL で名前空間を分ける。guid の無い短縮 URL S の結果を、後で届いた
+    # guid=S・url=S の新しい記事が使い回さない(転送先が変わっていれば新しい先を取る)
+    target = {"url": "https://example.com/old-a"}
+    calls: list[str] = []
+
+    def resolver(url: str) -> str:
+        calls.append(url)
+        return target["url"]
+
+    guidless = RawItem(
+        external_id=None, url="https://bit.ly/s", title="guid の無い短縮 URL の記事のタイトル",
+        author=None, published_at=datetime(2026, 7, 1, tzinfo=UTC), raw_content="本文 1",
+        meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([guidless])}, logger, resolve_short=resolver)
+    target["url"] = "https://example.com/new-b"
+    with_guid = RawItem(
+        external_id="https://bit.ly/s", url="https://bit.ly/s",
+        title="guid のある短縮 URL の記事のタイトル", author=None,
+        published_at=datetime(2026, 7, 2, tzinfo=UTC), raw_content="本文 2", meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([with_guid])}, logger, resolve_short=resolver)
+
+    assert calls == ["https://bit.ly/s", "https://bit.ly/s"]
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
+
+
+def test_guidless_entry_not_known_by_url_of_guid_item(conn: sqlite3.Connection) -> None:
+    # このソースが前に保存した元の URL で取り込み済みとみるのは、guid の無い記事の行だけ。
+    # guid のある記事の行と同じ短縮 URL でも、guid の無い新しい記事は解決して確かめる
+    target = {"url": "https://example.com/old-a"}
+
+    def resolver(url: str) -> str:
+        return target["url"]
+
+    collect_all(
+        conn, {"rss": FakeConnector([short_entry("g1", 1, "s")])}, logger, resolve_short=resolver
+    )
+    target["url"] = "https://example.com/new-b"
+    guidless = RawItem(
+        external_id=None, url="https://bit.ly/s", title="guid の無い短縮 URL の記事のタイトル",
+        author=None, published_at=datetime(2026, 7, 2, tzinfo=UTC), raw_content="本文 2",
+        meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([guidless])}, logger, resolve_short=resolver)
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
 
 
 def test_failed_short_url_resolution_is_not_kept(conn: sqlite3.Connection) -> None:
