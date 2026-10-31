@@ -543,9 +543,12 @@ def test_main_reports_config_error_in_one_line(tmp_path, monkeypatch, capsys) ->
     # 入口(intel = app.cli:main)は設定の不備を traceback でなく 1 行で出して止める(GH#338)
     import sys
 
+    from app import logs
     from app.cli import main
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # DEFAULT_LOG_DIR は import の時点の HOME で決まるので、HOME の差し替えでは外れない
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
     monkeypatch.setattr(sys, "argv", ["intel", "doctor", "--purge", "--config-dir", str(tmp_path)])
     with pytest.raises(SystemExit) as e:
         main()
@@ -554,3 +557,4 @@ def test_main_reports_config_error_in_one_line(tmp_path, monkeypatch, capsys) ->
     assert err.startswith(f"設定エラー: {tmp_path / 'config.toml'} が存在しない")
     assert err.count("\n") == 1  # traceback を付けない
     assert not (tmp_path / "home").exists()
+    assert not (tmp_path / "logs").exists()
