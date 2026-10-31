@@ -403,6 +403,31 @@ def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
     assert config.dig.answer_daily_cap == 20
 
 
+def test_collect_and_extract_limits_defaults_and_overrides(tmp_path: Path) -> None:
+    # 件数と時間の上限(GH#340)。既定は RSS 1 ソース 1 回 100 件・段ごとに 10 分
+    # 設定ファイルが無いと止まる(GH#338)ので、既定値は空の config.toml で確かめる
+    default = load_config(write_config(tmp_path, ""))
+    assert (default.collect.rss_max_items, default.collect.time_budget_s) == (100, 600)
+    assert default.extract.time_budget_s == 600
+    config = load_config(
+        write_config(
+            tmp_path,
+            "[collect]\nrss_max_items = 30\ntime_budget_s = 300\n[extract]\ntime_budget_s = 120\n",
+        )
+    )
+    assert (config.collect.rss_max_items, config.collect.time_budget_s) == (30, 300)
+    assert config.extract.time_budget_s == 120
+
+
+@pytest.mark.parametrize(
+    "body", ["[collect]\nrss_max_items = 0\n", "[collect]\ntime_budget_s = 0\n",
+             "[extract]\ntime_budget_s = -1\n"],
+)
+def test_collect_and_extract_limits_reject_nonpositive(tmp_path: Path, body: str) -> None:
+    with pytest.raises(ConfigError, match="正の整数"):
+        load_config(write_config(tmp_path, body))
+
+
 def test_dig_answer_rejects_bad_values(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"\[dig\].answer_reasoning_effort"):
         load_config(write_config(tmp_path, "[dig]\nanswer_reasoning_effort = \"ultra\"\n"))

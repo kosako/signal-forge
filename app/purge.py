@@ -6,7 +6,9 @@
    payload の cached_at があればそれ、無ければ fetched_at(GH#332)
    (documents 起点だと documents を持たない items が漏れ、特に X の full_text の
    無期限残存は本文非保持ポリシー違反になる)
-3. 削除行+NULL 化行の合計が 1,000 行を超えた回は VACUUM(空き回収の意図)
+3. 短縮 URL の解決の結果(short_url_resolutions。GH#340)は SHORT_URL_RESOLUTION_DAYS より前の
+   行を消す(フィードに残る期間を超えたら既知の判定に要らない。消しても解決し直すだけ)
+4. 削除行+NULL 化行の合計が 1,000 行を超えた回は VACUUM(空き回収の意図)
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import sqlite3
 from app.config import Config
 
 VACUUM_THRESHOLD_ROWS = 1000
+SHORT_URL_RESOLUTION_DAYS = 30
 
 # items.raw_payload の TTL 超過の条件(パラメータは x_cache_ttl_days, cache_ttl_days)。
 # TTL の起点は本文キャッシュを得た時刻: payload の cached_at があればそれ、無ければ
@@ -84,6 +87,12 @@ def purge_expired(
         (config.retention.x_cache_ttl_days,),
     ).rowcount
 
+    resolutions_deleted = conn.execute(
+        "DELETE FROM short_url_resolutions"
+        " WHERE resolved_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' days')",
+        (SHORT_URL_RESOLUTION_DAYS,),
+    ).rowcount
+
     # 設計 01 §6 の文言は「削除行 >1,000」だが、raw_payload の NULL 化も大きな空き
     # ページを生む(X full_text 等)ため、空き回収の意図に沿って合算で判定する
     if deleted + nullified + excerpts_nullified > VACUUM_THRESHOLD_ROWS:
@@ -93,6 +102,7 @@ def purge_expired(
         "documents_deleted": deleted,
         "raw_payload_nullified": nullified,
         "x_signal_excerpts_nullified": excerpts_nullified,
+        "short_url_resolutions_deleted": resolutions_deleted,
     }
     logger.info("purge 完了", extra={"run_id": run_id, "stage": "purge", "extra": counts})
     return counts

@@ -203,7 +203,23 @@ def test_purge_is_idempotent(conn, tmp_path) -> None:
         "documents_deleted": 0,
         "raw_payload_nullified": 0,
         "x_signal_excerpts_nullified": 0,
+        "short_url_resolutions_deleted": 0,
     }
+
+
+def test_old_short_url_resolutions_deleted(conn, tmp_path) -> None:
+    # 短縮 URL の解決の結果は 30 日より前の行を消す(GH#340)。消しても次に解決し直すだけ
+    for url, days in (("https://bit.ly/old", 31), ("https://bit.ly/new", 29)):
+        conn.execute(
+            "INSERT INTO short_url_resolutions (source_id, entry_key, url, canonical_url, "
+            "resolved_at) VALUES (2, ?, ?, 'https://example.com/x', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
+            (url, url, f"-{days} days"),
+        )
+    counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
+    assert counts["short_url_resolutions_deleted"] == 1
+    rows = conn.execute("SELECT url FROM short_url_resolutions").fetchall()
+    assert [r[0] for r in rows] == ["https://bit.ly/new"]
 
 
 def test_x_signal_excerpts_nullified_by_ttl(conn, tmp_path) -> None:

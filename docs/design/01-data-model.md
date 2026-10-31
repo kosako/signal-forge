@@ -32,6 +32,8 @@ digests ──(item_ids JSON)──> items             (結合表なし。json_e
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送・リプライの帰属用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
 telegram_state                                 (getUpdates offset 等の単一行KV)
+budget_cuts ──> sources(source_id NULL 可)     (collect・extract の段の上限で打ち切った記録。GH#340)
+short_url_resolutions                          (短縮 URL の解決の結果。collect の既知の判定用。GH#340)
 schema_migrations                              (マイグレーション台帳。ランナーが管理)
 ```
 
@@ -39,7 +41,7 @@ digests↔items に KPI 用の結合表を作らない理由: 参照は表示と
 
 ## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021・024 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url・budget_cuts・short_url_resolutions)は §3 末尾・§7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -244,7 +246,7 @@ CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)の 13。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)、`budget_cuts`(collect・extract の段の上限で打ち切り、残りを次の実行へ回した記録。1 回の打ち切り = 1 行で、種類(`rss_items` / `collect_time` / `extract_time`)・RSS のときのソース・回した数・朝バッチの run_id を持つ。週 1 回のソースの健康診断が直近 7 日を読む。GH#340 / migration 028)、`short_url_resolutions`(collect が解決した短縮 URL と、その先の canonical_url。鍵はソースと記事の識別子(`guid:` + guid、無ければ `url:` + 元の URL。種別で名前空間を分け、URL と同じ文字列の guid の記事が guid の無い記事の結果を使わない)で、同じソースの同じ記事を次の実行で読み直すときだけ、解決し直さずに既知の判定と正規化に使う。新しい記事やほかのソースは同じ短縮 URL でも解決し直す(転送先が後で変わったとき、新しい記事を古い先との重複として捨てないため)。ほかのソースと同じ先の記事は保存で無視され、元の URL と記事の対応が items に残らないため。確定した正規化のエラー(解決先を分解できない等)は canonical_url を NULL で残し、次の実行は HTTP の前に error の行で取り込み済みと分かる。通信の失敗は一時的なので残さず、次の実行で解決し直す。§6 の削除ジョブが 30 日より前の行を消す。GH#340 / migration 028)の 15。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -314,7 +316,8 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 - 削除ジョブは `intel run` の backup の直前の段(段の順序の正本は設計 00 §2。単独実行は `intel doctor --purge`):
   1. `DELETE FROM documents WHERE expires_at <= now`
   2. `raw_payload` の NULL 化は **documents から独立して**行う: 本文キャッシュの取得時刻 + TTL <= now の**全行**(documents の有無・status を問わない。duplicate・skipped・抽出未実行の行も対象)の `raw_payload` を NULL 化。TTL はソース別(X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days`)。理由: documents.expires_at 起点にすると documents 行を持たない items が purge から漏れる。特に X は full_text の無期限残存が本文非保持ポリシー違反になる(恒久保存は `analyses.summary` + メタ + URL のみ)。TTL 超過残存は doctor #11 が同じ条件で検査する(設計 05 §2)。取得時刻は payload の `cached_at` があればそれ、無ければ `items.fetched_at`。`cached_at` が異常な値(文字列でない・`%Y-%m-%dT%H:%M:%SZ` の形の実在する日時でない・未来)なら、`fetched_at` が新しくても期限切れとして扱い NULL 化する(X の本文を長く残す向きに外さない)。実在する日時かは、SQLite の日時の関数で正規化を強いた値(修飾子 `'+0 days'`)との一致で見る(時の 24・2/30・平年の 2/29 は繰り上がり、時の 25・分や秒の 60・月日の 00 は NULL になって一致しない)。`cached_at` は TTL 切れの skip 済みの X の投稿をブックマークで戻し、今回の全文を書き戻したときだけ付く(書き戻した本文を古い時刻で直ちに消さないため。設計 02 §2。GH#332)。`fetched_at` は初回の取込の時刻として動かさない(週次の健康診断の新着の判定と 24h dedup が使う)
-  3. 削除行と `raw_payload` NULL 化行の合算が 1,000 行を超えた回は `VACUUM`(NULL 化も大きな空きを生むため合算で判定)。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
+  3. `short_url_resolutions` の 30 日より前の行を消す(フィードに残る期間を超えたら既知の判定に要らない。消しても次に解決し直すだけ。GH#340)。中身は URL だけで本文を含まないので、X の本文非保持ポリシーの対象ではない(短縮 URL と解決先の URL は `items.url` / `canonical_url` にも残る)
+  4. 削除行と `raw_payload` NULL 化行の合算が 1,000 行を超えた回は `VACUUM`(NULL 化も大きな空きを生むため合算で判定)。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
 
 ## 7. signals の表現(4ボタン+夜アンケート+追い掛け)
 
@@ -386,7 +389,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 
 ## 8. digests
 
-- 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。朝バッチで analyze 段が失敗し、載せる記事が無い日は行を作らない(障害の空を「該当なし」として確定すると、同じ日の再実行が skip するため。設計 00 §6・GH#191)。
+- 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。朝バッチで analyze 段か extract 段が失敗し、載せる記事が無い日は行を作らない(障害の空を「該当なし」として確定すると、同じ日の再実行が skip するため。設計 00 §6・GH#191)。
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
 - `trend_markdown`(migration 003。GH#75)= その日の「今日のトレンド」節のプレーンテキスト。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。

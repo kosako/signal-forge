@@ -315,3 +315,37 @@ def test_unusable_header_charset_falls_back_to_utf8(conn, tmp_path, label) -> No
     content = ARTICLE_HTML.encode("utf-8")
     text = fetch_text(conn, tmp_path, content, f"text/html; charset={label}")
     assert LONG_BODY in text
+
+
+def test_time_budget_processes_newest_first_and_defers_rest(conn, tmp_path) -> None:
+    # 段全体の時間の上限(GH#340)。新しい記事(公開日時、無ければ取得日時)から処理し、
+    # 上限に達したら残りは documents を作らず new のまま次の実行へ回す
+    def add(url: str, published: str | None, fetched: str) -> int:
+        item_id = add_item(conn, url=url, raw_content=ARTICLE_HTML)
+        conn.execute(
+            "UPDATE items SET published_at = ?, fetched_at = ? WHERE id = ?",
+            (published, fetched, item_id),
+        )
+        return item_id
+
+    oldest = add("https://example.com/old", "2026-10-01T00:00:00Z", "2026-10-30T00:00:00Z")
+    newest = add("https://example.com/new", "2026-10-29T00:00:00Z", "2026-10-29T00:00:00Z")
+    undated = add("https://example.com/undated", None, "2026-10-28T00:00:00Z")
+    ticks = iter([0.0, 0.0, 0.0, 600.0])  # 開始・1 件目・2 件目の前・3 件目の前(上限ちょうど)
+    http = make_http(lambda request: httpx.Response(404))
+
+    counts = extract_pending(
+        conn, config(tmp_path), http, logger, run_id="run-1", clock=lambda: next(ticks)
+    )
+
+    assert counts == {"ok": 2, "partial": 0, "failed": 0}
+    extracted = {r[0] for r in conn.execute("SELECT item_id FROM documents")}
+    assert extracted == {newest, undated}
+    cuts = conn.execute("SELECT run_id, kind, source_id, deferred FROM budget_cuts").fetchall()
+    assert [tuple(r) for r in cuts] == [("run-1", "extract_time", None, 1)]
+    assert conn.execute("SELECT status FROM items WHERE id = ?", (oldest,)).fetchone()[0] == "new"
+
+    # 次の実行で残りを処理する
+    counts = extract_pending(conn, config(tmp_path), http, logger)
+    assert counts == {"ok": 1, "partial": 0, "failed": 0}
+    assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 3

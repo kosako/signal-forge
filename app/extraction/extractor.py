@@ -7,6 +7,9 @@
 - failed も documents 行を作って黙って脱落させない(本文なしでタイトル+メタだけの分析に
   回り、配信とノートに「本文を読めていない」と出る。設計 00 §6・GH#240)
 - expires_at は挿入時に確定: ソース別 TTL(RSS/manual 30日・X 7日。設計 01 §6)
+- 段全体の時間の上限([extract].time_budget_s。GH#340): 新しい記事から処理し、次の記事に進む
+  前に確かめる。残りは documents を作らず new のまま次の実行へ回す(事前選別は documents の
+  行が無い記事を選ばないので、本文なしで分析されない。設計 03 §2)
 """
 
 from __future__ import annotations
@@ -16,12 +19,15 @@ import json
 import logging
 import re
 import sqlite3
+import time
+from collections.abc import Callable
 
 import httpx
 import trafilatura
 
 from app.config import Config
 from app.connectors.base import FatalError, RetryableError
+from app.db import record_budget_cut
 from app.http import HttpClient
 
 # これ未満の抽出結果は partial(本文の体をなしていない可能性が高く、分析品質に注意が要る)
@@ -57,20 +63,34 @@ def extract_pending(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, int]:
-    """未抽出の items を処理し、status 別件数を返す。アイテム単位でエラー隔離する。"""
+    """未抽出の items を新しい記事から処理し、status 別件数を返す。アイテム単位でエラー隔離する。"""
+    # 新しい記事 = 公開日時(無ければ取得日時)の新しい順。時間の上限で打ち切ったとき、鮮度の
+    # 規則(設計 03 §2 規則2)で落ちにくい記事の本文を先に読む
     rows = conn.execute(
         """
         SELECT items.*, sources.type AS source_type FROM items
         JOIN sources ON sources.id = items.source_id
         WHERE items.status = 'new'
           AND NOT EXISTS (SELECT 1 FROM documents WHERE documents.item_id = items.id)
-        ORDER BY items.id
+        ORDER BY coalesce(items.published_at, items.fetched_at) DESC, items.id DESC
         """
     ).fetchall()
 
     counts = {"ok": 0, "partial": 0, "failed": 0}
-    for row in rows:
+    budget_s = config.extract.time_budget_s
+    started = clock()
+    for index, row in enumerate(rows):
+        if clock() - started >= budget_s:
+            deferred = len(rows) - index
+            logger.warning(
+                f"extract の段が時間の上限({budget_s} 秒)に達した。"
+                f"残りの {deferred} 件は次の実行へ回す",
+                extra={"run_id": run_id, "stage": "extract", "extra": {"deferred": deferred}},
+            )
+            record_budget_cut(conn, "extract_time", deferred=deferred, run_id=run_id)
+            break
         try:
             status = _extract_item(conn, config, http, row)
         except Exception as e:  # 予期しない例外(壊れた raw_payload 等)も隔離して続行

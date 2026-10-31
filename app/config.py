@@ -183,6 +183,25 @@ class LLMFallbackConfig:
 
 
 @dataclass(frozen=True)
+class CollectConfig:
+    """collect の段の上限(GH#340 / 設計 02 §3・05 §8)。使い切った残りは次の実行へ回す。"""
+
+    # RSS の 1 ソース 1 回に取り込む新しい記事の上限(取り込み済みの guid は数えない)。
+    # 超えたぶんは新しい側を残し、カーソルを進めずに次の実行で取り直す
+    rss_max_items: int = 100
+    # 段全体の時間の上限(秒)。次のソースに進む前に確かめ、残りのソースは次の実行へ回す
+    time_budget_s: int = 600
+
+
+@dataclass(frozen=True)
+class ExtractConfig:
+    """本文抽出の段の上限(GH#340 / 設計 05 §8)。新しい記事から処理する。"""
+
+    # 段全体の時間の上限(秒)。次の記事に進む前に確かめ、残りは new のまま次の実行へ回す
+    time_budget_s: int = 600
+
+
+@dataclass(frozen=True)
 class RetentionConfig:
     cache_ttl_days: int = 30  # RSS/manual(設計 01 §6)
     x_cache_ttl_days: int = 7  # 確定値(Issue #2)
@@ -253,6 +272,8 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     anthropic_api: AnthropicApiConfig = field(default_factory=AnthropicApiConfig)
     llm_fallback: LLMFallbackConfig = field(default_factory=LLMFallbackConfig)
+    collect: CollectConfig = field(default_factory=CollectConfig)
+    extract: ExtractConfig = field(default_factory=ExtractConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -290,6 +311,8 @@ _SECTIONS = {
     "llm": LLMConfig,
     "anthropic_api": AnthropicApiConfig,
     "llm_fallback": LLMFallbackConfig,
+    "collect": CollectConfig,
+    "extract": ExtractConfig,
     "retention": RetentionConfig,
     "budget": BudgetConfig,
     "telegram": TelegramConfig,
@@ -472,6 +495,9 @@ def _validate(path: Path, config: Config) -> None:
         ("ranking", "max_per_source", config.ranking.max_per_source),
         ("anthropic_api", "max_tokens", config.anthropic_api.max_tokens),
         ("llm_fallback", "max_tokens", config.llm_fallback.max_tokens),
+        ("collect", "rss_max_items", config.collect.rss_max_items),
+        ("collect", "time_budget_s", config.collect.time_budget_s),
+        ("extract", "time_budget_s", config.extract.time_budget_s),
     ]
     nonnegatives = [
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),

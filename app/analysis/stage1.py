@@ -3,6 +3,9 @@
 `status='new'` の items に4規則を上から順に適用し、除外は `status='skipped'` +
 `skip_reason`(規則名)で記録する(黙って脱落させない)。
 extraction_status=failed は除外しない(本文なしでタイトル+メタだけの分析に回る。GH#240)。
+まだ抽出を試していない(documents の行が無い)記事は、手で入れた manual を除いて選ばず、new の
+まま次の抽出を待たせる(本文抽出の時間の上限で回した記事・抽出の段が落ちた日の記事を、本文なしで
+分析して抽出の機会を失わない。朝バッチも単独の intel analyze も同じ規則。GH#340)。
 duplicate は挿入時 dedup(設計 01 §6)で除外済みのため対象にしない。
 """
 
@@ -39,6 +42,8 @@ def preselect(
 
     採用集合は本戻り値が正本。Stage 2 が `status='new'` を再クエリすると、
     選別後に受信デーモンが追加した manual item が規則を通らず混入するため。
+    抽出を待つ記事(manual 以外で documents の行が無い)は対象にせず、規則も件数も当てない。
+    抽出に失敗した記事は documents に failed の行があるので、今までどおり本文なしで選ぶ。
     """
     rows = conn.execute(
         """
@@ -50,6 +55,8 @@ def preselect(
         FROM items
         JOIN sources ON sources.id = items.source_id
         WHERE items.status = 'new'
+          AND (sources.type = 'manual'
+               OR EXISTS (SELECT 1 FROM documents WHERE documents.item_id = items.id))
         ORDER BY items.id
         """
     ).fetchall()
