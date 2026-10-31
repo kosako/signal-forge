@@ -49,6 +49,9 @@ ITEM_TEXT_MAX_CHARS = 1000  # 1通の上限(概算)。超過は要約側で吸�
 # タイトルは RSS 由来で長さ未検証。異常に長い1件で Telegram の 4096 字上限を超えて
 # 配信全体が failed になるのを防ぐ(通常のタイトルはこの上限に届かない)
 TITLE_MAX_CHARS = 300
+# ソース名(sources.name)は運用者が手で入れる値で長さ未検証。タイトルと同じ理由で切る
+# (通常の名前はこの上限に届かない。GH#356)
+SOURCE_NAME_MAX_CHARS = 80
 
 # 🔖 保存節(GH#99)のタイトル上限。ヘッダ 1 通に同梱するため短めに取り、可視テキストを
 # 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
@@ -377,7 +380,8 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
     raw_title = row["title_ja"] or row["title"] or "(タイトルなし)"
     title = escape_and_truncate(raw_title.strip(), TITLE_MAX_CHARS)
     source_line = (
-        f'<a href="{escape_attr(row["canonical_url"])}">{escape_text(row["source_name"])}</a>'
+        f'<a href="{escape_attr(row["canonical_url"])}">'
+        f"{escape_and_truncate(row['source_name'], SOURCE_NAME_MAX_CHARS)}</a>"
     )
     published = _published_md(row["published_at"])
     if published:
