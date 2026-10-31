@@ -17,6 +17,12 @@ from app.export import ExportError, export_digest, export_pending_notes
 from app.export import obsidian as obsidian_module
 from app.vault_dir import VaultPathError
 from app.vault_guard import VaultGuard
+from tests.test_vault_guard import (
+    HANG_GUARD_S,
+    gate_vault_threads,
+    join_vault_threads,
+    mark_blocked,
+)
 
 logger = logging.getLogger("test-obsidian")
 
@@ -926,9 +932,11 @@ def test_new_note_created_before_write_is_not_overwritten(conn, tmp_path, monkey
 def block_first_write(monkeypatch) -> SimpleNamespace:
     """最初のノートの書き出しを、解除まで止める(vault の応答待ちの代わり)。
 
-    止まった位置に着いたら reached が立つ。解除(release)を忘れたときは 30 秒で進め、
-    timed_out に残す(テストの誤り)。
+    止まった位置に着いたら reached が立つ。VaultGuard は上限の時間でなく、ここに着いたのを
+    見てから見切る(gate_vault_threads。順序を時間に頼らない)。解除(release)を忘れたときは
+    HANG_GUARD_S で進め、timed_out に残す(テストの誤り)。
     """
+    gate_vault_threads(monkeypatch)
     blocker = SimpleNamespace(
         reached=threading.Event(), release=threading.Event(), calls=[], timed_out=[]
     )
@@ -938,7 +946,8 @@ def block_first_write(monkeypatch) -> SimpleNamespace:
         blocker.calls.append(name)
         if len(blocker.calls) == 1:
             blocker.reached.set()
-            if not blocker.release.wait(30):
+            mark_blocked()
+            if not blocker.release.wait(HANG_GUARD_S):
                 blocker.timed_out.append(True)
         return original(directory, name, *args, **kwargs)
 
@@ -949,10 +958,7 @@ def block_first_write(monkeypatch) -> SimpleNamespace:
 def finish_blocked_write(blocker: SimpleNamespace) -> list[threading.Thread]:
     """止めた書き出しを解除し、vault-io のスレッドの終わりを待つ(終わらなかったものを返す)。"""
     blocker.release.set()
-    threads = [t for t in threading.enumerate() if t.name == "vault-io"]
-    for thread in threads:
-        thread.join(5)
-    return [thread for thread in threads if thread.is_alive()]
+    return join_vault_threads()
 
 
 def add_replied_items(conn, n: int) -> tuple[int, list[int]]:
@@ -976,7 +982,7 @@ def pending_item_notes(conn) -> int:
 
 
 def test_export_stall_gives_up_and_keeps_notes_pending(conn, tmp_path, monkeypatch) -> None:
-    # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは上限の時間で見切り、
+    # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは見切り、
     # export を失敗にして先へ進む。止まった後は残りのノートで vault に触れず、感想を反映済みに
     # しない(次の実行で書く。GH#341)
     _digest_id, items = add_replied_items(conn, 2)
@@ -984,7 +990,7 @@ def test_export_stall_gives_up_and_keeps_notes_pending(conn, tmp_path, monkeypat
     blocker = block_first_write(monkeypatch)
     try:
         with pytest.raises(ExportError, match="vault が応答しない"):
-            export_pending_notes(conn, config, logger, vault=VaultGuard(timeout_s=0.05))
+            export_pending_notes(conn, config, logger, vault=VaultGuard())
         assert blocker.reached.is_set()
         assert len(blocker.calls) == 1  # 止まった後は、残りのノートで vault に触れない
         assert pending_item_notes(conn) == 2
@@ -1011,7 +1017,7 @@ def test_export_digest_stall_raises_export_error(conn, tmp_path, monkeypatch) ->
     blocker = block_first_write(monkeypatch)
     try:
         with pytest.raises(ExportError, match="vault が応答しない"):
-            export_digest(conn, config, digest_id, logger, vault=VaultGuard(timeout_s=0.05))
+            export_digest(conn, config, digest_id, logger, vault=VaultGuard())
         assert blocker.calls == [f"20260706-{item}-記事タイトル.md"]  # Daily には進まない
     finally:
         alive = finish_blocked_write(blocker)
@@ -1032,7 +1038,7 @@ def test_next_run_does_not_export_while_late_write_pending(
     blocker = block_first_write(monkeypatch)
     try:
         with pytest.raises(ExportError, match="vault が応答しない"):
-            export_pending_notes(conn, config, logger, vault=VaultGuard(timeout_s=0.05))
+            export_pending_notes(conn, config, logger, vault=VaultGuard())
         assert blocker.reached.is_set()
         add_note(conn, item, "後から届いた感想", created_at="2026-07-16T14:00:00Z")
         conn.commit()
@@ -1054,6 +1060,7 @@ def test_next_run_does_not_export_while_late_write_pending(
 def test_vault_io_runs_off_the_db_thread(conn, tmp_path, monkeypatch) -> None:
     # vault のアクセスは vault-io のスレッドで、DB の読み書きは呼び出し側のスレッドで行う
     # (見切ったスレッドが後から DB に触れない。GH#341)
+    gate_vault_threads(monkeypatch)
     _digest_id, _items = add_replied_items(conn, 1)
     config = make_config(tmp_path)
     writers: list[str] = []
