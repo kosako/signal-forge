@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -7,8 +8,16 @@ import pytest
 
 from app.analysis.stage1 import preselect
 from app.config import Config, XSignalsConfig
+from app.connectors.x_oauth2 import (
+    OAUTH2_SCOPES,
+    TOKEN_URL,
+    USERS_ME_URL,
+    XOAuth2Session,
+    XOAuth2Token,
+)
 from app.connectors.x_signals import XSignalsError, collect_x_signals, signal_reads_on
 from app.db import apply_migrations, connect
+from app.jst import today_jst
 from app.normalize import normalize_url
 
 logger = logging.getLogger("test-x-signals")
@@ -563,6 +572,93 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
     assert conn.execute("SELECT count(*) FROM x_signals").fetchone()[0] == 2
 
 
+def fail_signal_insert(conn, tweet_id: str, message: str = "boom") -> None:
+    """tweet_id のシグナルの保存を DB のエラーにする(保存の途中の sqlite3.Error の再現)。"""
+    conn.execute(
+        f"CREATE TRIGGER fail_{tweet_id} BEFORE INSERT ON x_signals "
+        f"WHEN NEW.tweet_id = '{tweet_id}' BEGIN SELECT RAISE(ABORT, '{message}'); END"
+    )
+
+
+def test_storage_failure_still_records_reads_in_ledger(conn, tmp_path) -> None:
+    # GH#330: kind の隔離の外の例外(保存の sqlite3.Error)は段の失敗として抜けるが、取得済みの
+    # 読取数と費用は failed の行で台帳に残す(漏れると同じ日の再実行が日次 cap を超えて読む)
+    fail_signal_insert(conn, "l3")
+    session = session_with(
+        [page(*[tw(f"b{i}") for i in range(5)])], [page(*[tw(f"l{i}") for i in range(5)])]
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="boom"):
+        collect_x_signals(conn, make_config(tmp_path, cap=15), session, logger, run_id="r1")
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "failed"
+    assert run["api_reads"] == 10  # bookmark 5 + 失敗したページの like 5(読取は消費済み)
+    assert run["estimated_cost_usd"] == pytest.approx(10 * 0.004)
+    assert run["new_signals"] == 5  # 保存できた bookmark だけ(like のページはロールバック)
+    assert run["run_id"] == "r1"
+    assert "like: IntegrityError: boom" in run["error"]
+    assert signal_reads_on(conn, today_jst()) == 10  # 同じ日の再実行の残りは 5
+    assert calls_to(session, "42/tweets") == []  # 後続の kind には進まない(段の失敗)
+
+
+def test_ledger_failure_does_not_hide_original_error(conn, tmp_path, caplog) -> None:
+    # GH#330: 例外の経路で台帳を書けなくても、取込の元の例外を送出する
+    fail_signal_insert(conn, "b1")
+    conn.execute(
+        "CREATE TRIGGER fail_ledger BEFORE INSERT ON x_signal_runs "
+        "BEGIN SELECT RAISE(ABORT, 'ledger'); END"
+    )
+    session = session_with([page(tw("b1"))], [])
+    with (
+        caplog.at_level(logging.ERROR, logger=logger.name),
+        pytest.raises(sqlite3.IntegrityError, match="boom"),
+    ):
+        collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert conn.execute("SELECT count(*) FROM x_signal_runs").fetchone()[0] == 0
+    assert "台帳を書けない" in caplog.text
+
+
+def test_refresh_transport_failure_mid_run_records_reads(conn, tmp_path) -> None:
+    # GH#330: 先のページの後の refresh の通信の失敗は、分類済みの OAuth のエラーとして kind 単位に
+    # 隔離され、取得済みの読取数と費用が台帳に残る(素の httpx の例外で段を抜けない)
+    clock = [datetime(2026, 7, 13, 12, 0, tzinfo=UTC)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == TOKEN_URL:
+            raise httpx.ConnectError("token の接続に失敗")
+        if url == USERS_ME_URL:
+            return httpx.Response(200, json=ME)
+        if "/bookmarks" in url:
+            clock[0] = datetime(2026, 7, 13, 14, 0, tzinfo=UTC)  # 次の要求の前に失効間近
+            return httpx.Response(200, json=page(*[tw(f"b{i}") for i in range(5)]))
+        raise AssertionError(f"refresh の失敗の後に要求した: {url}")
+
+    token = XOAuth2Token(
+        access_token="at",
+        refresh_token="rt",
+        expires_at="2026-07-13T14:00:00Z",
+        scope=" ".join(OAUTH2_SCOPES),
+    )
+    session = XOAuth2Session(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        config_dir=tmp_path,
+        client_id="cid",
+        client_secret=None,
+        token=token,
+        sleep=lambda _s: None,
+        now=lambda: clock[0],
+    )
+    totals = collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert totals == {"api_reads": 5, "new_signals": 5}
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "ok"  # bookmark は成功(like / self_rt は refresh の失敗)
+    assert run["api_reads"] == 5
+    assert run["estimated_cost_usd"] == pytest.approx(5 * 0.004)
+    assert "like: refresh 失敗" in run["error"]
+    assert "ConnectError" in run["error"]
+    assert "token の接続に失敗" not in run["error"]  # 通信の例外の文は載せない(型の名前だけ)
+
+
 # --- ブックマークの item 化(GH#99) ---
 
 
@@ -665,6 +761,38 @@ def test_bookmark_note_tweet_link_and_full_text(conn, tmp_path) -> None:
     collect_x_signals(conn, make_config(tmp_path), session, logger)
     item = item_for(conn, "b1")
     assert item["canonical_url"] == "https://blog.example.com/a"  # note 側 entities も見る
+
+
+def test_bookmark_unsplittable_link_falls_back_to_tweet_url(conn, tmp_path) -> None:
+    # GH#329: 分解できないリンク(括弧の不整合な netloc)は候補から外し、投稿の URL へ戻す。
+    # 同じページの正常な項目と後続の kind も保存する(ページのロールバックと段の離脱にしない)
+    broken = linked_tw("111", "https://[example.com/post", text="壊れたリンクの紹介")
+    session = session_with(
+        [page(broken, linked_tw("222", "https://example.com/ok"))], [page(tw("l1"))]
+    )
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = item_for(conn, "111")
+    assert item["canonical_url"] == "https://x.com/i/web/status/111"
+    assert "壊れたリンクの紹介" in item["raw_payload"]  # 投稿の全文が本文
+    assert item_for(conn, "222")["canonical_url"] == "https://example.com/ok"
+    assert [r["tweet_id"] for r in rows(conn, "like")] == ["l1"]
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "ok"
+    assert run["error"] is None
+
+
+def test_bookmark_skips_unsplittable_link_before_external_article(conn, tmp_path) -> None:
+    # GH#329: 分解できない先頭のリンクを飛ばし、後ろの外部記事を canonical に
+    tweet = tw("111")
+    tweet["entities"] = {
+        "urls": [
+            {"url": "https://t.co/a", "expanded_url": "http://[::1/broken"},
+            {"url": "https://t.co/b", "expanded_url": "https://example.com/article"},
+        ]
+    }
+    session = session_with([page(tweet)], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert item_for(conn, "111")["canonical_url"] == "https://example.com/article"
 
 
 def test_bookmark_merges_into_existing_item(conn, tmp_path) -> None:
