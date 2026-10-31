@@ -268,7 +268,10 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
 ) -> None:
     # 分析の障害で載せる記事が無い日は、空の digest を確定せず送らない。復旧後の同じ日の
     # 再実行で、回復した分析の結果を作って配信する(GH#191)
+    from dataclasses import replace
+
     from app.analysis.llm import LLMUnavailableError
+    from app.config import DigConfig
 
     class UnavailableEngine:
         name = "codex-cli"
@@ -278,8 +281,11 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
             raise LLMUnavailableError("codex 起動失敗")
 
     sent = use_fake_telegram(monkeypatch)
+    # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+    # (本物の codex)で掘ろうとする(GH#349)
+    config = replace(with_telegram(make_config(tmp_path)), dig=DigConfig(daily_cap=0))
     args = (
-        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        conn, config, {"TELEGRAM_BOT_TOKEN": "tok"},
         {"rss": StaticConnector()}, make_http(),
     )
     failures = run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN1")
@@ -450,6 +456,9 @@ def test_export_vault_stall_is_bounded_and_later_stages_run(
     # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは、export 段が見切って
     # 段の失敗にし、配信・purge・backup へ進む(GH#341)。見切るのは上限の時間でなく、止める
     # 位置に着いたのを見てから(順序を時間に頼らない)
+    from dataclasses import replace
+
+    from app.config import DigConfig
     from app.export import obsidian as obsidian_module
     from tests.test_vault_guard import (
         HANG_GUARD_S,
@@ -472,9 +481,12 @@ def test_export_vault_stall_is_bounded_and_later_stages_run(
     gate_vault_threads(monkeypatch)
     monkeypatch.setattr(obsidian_module, "_existing_item_notes", stuck_listing)
     sent = use_fake_telegram(monkeypatch)
+    # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+    # (本物の codex)で掘ろうとする(GH#349)
+    config = replace(with_telegram(make_config(tmp_path)), dig=DigConfig(daily_cap=0))
     try:
         failures = run_pipeline(
-            conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+            conn, config, {"TELEGRAM_BOT_TOKEN": "tok"},
             {"rss": StaticConnector()}, make_http(), lambda: ScriptedEngine(conn),
             logger, "01RUNID",
         )
@@ -504,7 +516,7 @@ def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> N
     import httpx
 
     from app import run as run_module
-    from app.config import TelegramConfig
+    from app.config import DigConfig, TelegramConfig
     from app.delivery import TelegramApi
 
     def fake_create_api(env):
@@ -526,6 +538,9 @@ def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> N
         analysis=base.analysis,
         storage=base.storage,
         telegram=TelegramConfig(owner_user_id=1, owner_chat_id=42),
+        # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+        # (本物の codex)で掘ろうとする(GH#349)
+        dig=DigConfig(daily_cap=0),
     )
     failures = run_pipeline(
         conn, config, {"TELEGRAM_BOT_TOKEN": "tok"}, {"rss": StaticConnector()}, make_http(),

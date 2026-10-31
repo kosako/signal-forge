@@ -37,6 +37,7 @@ from app.deepdive import (
     _looks_japanese,
     _revise_draft,
     _select_candidates,
+    _select_from_digest,
     _split_paragraphs,
     _translate_body,
     build_dig_prompt,
@@ -44,6 +45,7 @@ from app.deepdive import (
     run_dig_stage,
 )
 from app.delivery import DeliveryError
+from app.dig import DigInstruction, apply_instructions, enqueue_bookmark
 from app.extraction import extract_pending
 from app.http import HttpClient
 from app.vault_guard import VaultGuard
@@ -2047,3 +2049,249 @@ def test_revise_prompt_keeps_fences_and_does_not_rescan(conn, config, monkeypatc
     # 埋め込んだ元の指示(dig_prompt)と値は再走査しない: 本文の {{draft}} がドラフトに化けない
     assert "{{draft}}" in prompt and "{{findings}}" in prompt and "{{body}}" in prompt
     assert prompt.count("## 概要") == 2  # 元の指示の節構成 + ドラフトの本文(展開の増殖なし)
+
+
+# --- digest の上位から埋める(設計 06 §3 の ③。GH#349) ---
+
+
+def add_digest(
+    conn: sqlite3.Connection,
+    day: str,
+    item_ids: list[int],
+    *,
+    delivery_status: str = "sent",
+    bookmark_item_ids: list[int] | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, delivery_status,"
+        " bookmark_item_ids) VALUES (?, 'md', ?, ?, ?, ?)",
+        (
+            day,
+            json.dumps(item_ids),
+            len(item_ids),
+            delivery_status,
+            json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None,
+        ),
+    )
+    conn.commit()
+
+
+def queue_row(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT status, source, angle, requested_at FROM dig_queue WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+
+
+def frontmatter_of(content: str) -> dict:
+    return yaml.safe_load(content.split("---\n")[1])
+
+
+def test_digest_fills_only_the_slots_left_by_queue(conn, config) -> None:
+    # ②(キュー)で埋まらない分だけ、digest の上位を配信順に使う
+    queued = add_item(conn, "https://a.example/q")
+    top = add_item(conn, "https://a.example/d1")
+    second = add_item(conn, "https://a.example/d2")
+    third = add_item(conn, "https://a.example/d3")
+    enqueue(conn, queued)
+    add_digest(conn, "2026-07-22", [second, top, third])
+
+    selected, _ = _select_candidates(conn, config, 2, "2026-07-22")
+    assert [(c.item_id, c.from_digest) for c in selected] == [(queued, False), (second, True)]
+    selected, _ = _select_candidates(conn, config, 3, "2026-07-22")
+    assert [c.item_id for c in selected] == [queued, second, top]
+    assert queue_row(conn, second) is None  # 選ぶ時点ではキューに積まない
+
+
+def test_digest_is_not_used_when_queue_reaches_the_cap(conn, config) -> None:
+    requested = add_item(conn, "https://a.example/r")
+    auto = add_item(conn, "https://a.example/a")
+    top = add_item(conn, "https://a.example/d1")
+    enqueue(conn, requested, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    enqueue(conn, auto)
+    add_digest(conn, "2026-07-22", [top])
+
+    selected, _ = _select_candidates(conn, config, 2, "2026-07-22")
+    assert [c.item_id for c in selected] == [requested, auto]
+
+
+def test_digest_fill_counts_runs_already_done_today(conn, config) -> None:
+    # 足りない分 = 上限 − その日の実行数 − ①② の件数
+    dug = add_item(conn, "https://a.example/dug")
+    top = add_item(conn, "https://a.example/d1")
+    second = add_item(conn, "https://a.example/d2")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at,"
+        " published_at, message_id)"
+        " VALUES (?, 'n', 'カード', '2026-07-21T22:00:00Z', '2026-07-21T22:00:01Z', 900)",
+        (dug,),
+    )  # JST 2026-07-22 に 1 件実行済み
+    add_digest(conn, "2026-07-22", [top, second])
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+
+    rows = conn.execute("SELECT item_id FROM dig_results ORDER BY id").fetchall()
+    assert [row["item_id"] for row in rows] == [dug, top]
+    assert len(api.sent) == 1
+
+
+def test_digest_pick_excludes_queue_dug_and_no_material(conn, config) -> None:
+    def item(name: str, body: str | None = BODY) -> int:
+        return add_item(conn, f"https://a.example/{name}", body=body)
+
+    in_queue = {status: item(status) for status in ("queued", "passed", "done")}
+    for status, item_id in in_queue.items():
+        conn.execute(
+            "INSERT INTO dig_queue (item_id, status, source) VALUES (?, ?, 'bookmark')",
+            (item_id, status),
+        )
+    dug_before = item("dug")  # 前の日に掘った(キューの行は無い)
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at)"
+        " VALUES (?, 'n', 'カード', '2026-07-01T00:00:00Z')",
+        (dug_before,),
+    )
+    no_body = item("nobody", body=None)
+    short = item("short", body="短い")
+    ok = item("ok")
+    bookmark = item("bookmark")  # 🔖 保存節にだけ載った item
+    add_digest(
+        conn,
+        "2026-07-22",
+        [*in_queue.values(), dug_before, no_body, short, ok],
+        bookmark_item_ids=[bookmark],
+    )
+
+    picked = _select_from_digest(conn, config, 5, "2026-07-22")
+    assert [c.item_id for c in picked] == [ok]  # 除いた分で枠を使わない
+    assert picked[0].angle is None and not picked[0].requested
+
+
+@pytest.mark.parametrize(
+    ("day", "delivery_status"),
+    [
+        ("2026-07-22", "pending"),  # 配信していない
+        ("2026-07-22", "failed"),
+        ("2026-07-21", "sent"),  # 前の日の digest は見ない
+    ],
+)
+def test_digest_pick_needs_todays_sent_digest(conn, config, day, delivery_status) -> None:
+    top = add_item(conn, "https://a.example/d1")
+    add_digest(conn, day, [top], delivery_status=delivery_status)
+    assert _select_from_digest(conn, config, 2, "2026-07-22") == []
+
+
+def test_digest_pick_is_recorded_and_labelled(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    add_digest(conn, "2026-07-22", [item])
+    engines: dict[str, ScriptedEngine] = {}
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory(engines), api, logger, today="2026-07-22")
+
+    # キューの行は記帳と同時に source = 'digest'・done で足す
+    row = queue_row(conn, item)
+    assert (row["status"], row["source"], row["angle"], row["requested_at"]) == (
+        "done", "digest", None, None
+    )
+    result = conn.execute("SELECT item_id, angle, message_id FROM dig_results").fetchone()
+    assert (result["item_id"], result["angle"], result["message_id"]) == (item, None, 901)
+    # ブリーフは自動選出と同じ(観点なし)
+    ((_, prompt),) = engines["medium"].prompts
+    assert f"観点指定なし(自動選出)。{AUTO_BRIEF}。" in prompt
+    # ノートの frontmatter とカードの選出ラベル
+    note = next(deepdive_dir(config).glob("*-深掘り.md")).read_text()
+    frontmatter = frontmatter_of(note)
+    assert frontmatter["requested"] == "(観点指定なし:今日の digest の上位からの深掘り)"
+    assert frontmatter["auto_brief"] == AUTO_BRIEF
+    ((_, card),) = api.sent
+    assert card.splitlines()[2] == "🤖 自動選出(今日の digest の上位)・観点なし"
+
+    # 後で X のブックマークが付いても自動キューは掘り直さない。リプライの指定は queued に
+    # 戻すが、source は digest のまま
+    assert enqueue_bookmark(conn, item) is False
+    assert queue_row(conn, item)["status"] == "done"
+    apply_instructions(conn, [DigInstruction(item, "request", angle="続きの観点")])
+    row = queue_row(conn, item)
+    assert (row["status"], row["source"], row["angle"]) == ("queued", "digest", "続きの観点")
+
+
+def test_queue_card_label_and_requested_are_unchanged(conn, config) -> None:
+    # ② の自動選出は従来どおり 🔖 新着のラベル(③ と見分ける)
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item)
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+
+    note = next(deepdive_dir(config).glob("*-深掘り.md")).read_text()
+    assert frontmatter_of(note)["requested"] == "(観点指定なし:ブックマーク自動キューからの深掘り)"
+    assert api.sent[0][1].splitlines()[2] == "🤖 自動選出(🔖新着)・観点なし"
+
+
+@pytest.mark.parametrize(
+    ("made_during_generation", "expected"),
+    [
+        # 本人の明示の操作(指定・パス)は変えない
+        (
+            ("queued", "request", "生成中の観点", "2026-07-22T00:10:00Z"),
+            ("queued", "request", "生成中の観点", "2026-07-22T00:10:00Z"),
+        ),
+        (
+            ("passed", "request", None, None),
+            ("passed", "request", None, None),
+        ),
+        # 自動投入の行(X のブックマークの取り込み)は done にし、source は変えない
+        (
+            ("queued", "bookmark", None, None),
+            ("done", "bookmark", None, None),
+        ),
+    ],
+)
+def test_digest_pick_respects_row_made_during_generation(
+    conn, config, made_during_generation, expected
+) -> None:
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    add_digest(conn, "2026-07-22", [item])
+    status, source, angle, requested_at = made_during_generation
+
+    class RowDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if queue_row(conn, item) is None:
+                conn.execute(
+                    "INSERT INTO dig_queue (item_id, status, source, angle, requested_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (item, status, source, angle, requested_at),
+                )
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, RowDuringGeneration())
+
+    api = FakeApi()
+    assert run_dig_stage(conn, config, factory, api, logger, today="2026-07-22") is True
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["source"], row["angle"], row["requested_at"]) == expected
+    # どの場合も生成物は記帳・公開し、カードを送る
+    result = conn.execute("SELECT item_id, published_at FROM dig_results").fetchone()
+    assert result["item_id"] == item and result["published_at"] is not None
+    assert len(api.sent) == 1
+
+
+def test_failed_digest_pick_leaves_no_queue_row(conn, config) -> None:
+    # 生成に失敗した ③ の item は行が無いまま残る(同じ日の再実行でまた選ばれうる)
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    add_digest(conn, "2026-07-22", [item])
+
+    with pytest.raises(DigError, match=f"item {item}"):
+        run_dig_stage(
+            conn, config, make_factory({}, {"DigDraft"}), FakeApi(), logger, today="2026-07-22"
+        )
+
+    assert queue_row(conn, item) is None
+    assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 0
+    assert [c.item_id for c in _select_from_digest(conn, config, 2, "2026-07-22")] == [item]
