@@ -41,7 +41,7 @@ X_SIGNALS_MIN_PAGE = 5
 
 
 class ConfigError(Exception):
-    """設定の欠落・型不一致・値域外。呼び出し側は捕捉せず終了させる。"""
+    """設定の欠落・型不一致・値域外。呼び出し側は捕捉せず終了させる(CLI の入口が 1 行で出す)。"""
 
 
 @dataclass(frozen=True)
@@ -303,12 +303,17 @@ _SECTIONS = {
 def load_config(config_dir: Path) -> Config:
     """config.toml を読み込み、型・値域を検証して Config を返す。
 
-    ファイルが存在しない場合は全既定値で返す(初回セットアップ前でも
-    `intel doctor` が動く必要があるため。欠落の警告は doctor #1 の責務)。
+    ファイルが存在しない場合も ConfigError で止める。既定値で続けると、`--config-dir` の
+    誤指定や設定の消失のときに、意図と別の既定の DB を変更してしまうため(GH#338)。
+    初回セットアップ前の `intel doctor` は、呼ぶ前に存在を確かめて #1 の FAIL にし、残りの
+    検査を続ける(設計 05 §2)。未設定のキーだけが既定値になる。
     """
     path = config_dir / "config.toml"
     if not path.exists():
-        return Config(config_dir=config_dir)
+        raise ConfigError(
+            f"{path} が存在しない(--config-dir の指定と設定ファイルの置き場を確かめる。"
+            "既定の設定で既定の DB を変更しないよう、ここで止める)"
+        )
 
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))

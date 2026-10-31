@@ -77,7 +77,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
    uv sync
    ```
 
-2. `~/.config/intel/config.toml` を作る。未設定のキーは既定値になり、不明なセクションやキーを書くと読み込みが止まる。最低限、次を設定する([app/config.py](app/config.py) に全キーと既定値がある)。
+2. `~/.config/intel/config.toml` を作る。未設定のキーは既定値になり、不明なセクションやキーを書くと読み込みが止まる。ファイルが無いと、検査だけの `intel doctor` 以外のコマンドは DB に触れる前に止まる。最低限、次を設定する([app/config.py](app/config.py) に全キーと既定値がある)。
 
    ```toml
    [telegram]

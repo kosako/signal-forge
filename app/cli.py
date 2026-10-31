@@ -537,7 +537,15 @@ def doctor(
 
 
 def main() -> None:
-    app()
+    from app.config import ConfigError
+
+    try:
+        app()
+    except ConfigError as e:
+        # 設定の不備(config.toml の欠落を含む。GH#338)は traceback でなく、どのファイルの
+        # 何が悪いかを 1 行で出して止める。各コマンドは DB に接続する前に設定を読む
+        typer.echo(f"設定エラー: {e}", err=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":  # poller が `python -m app.cli answer` で起動する(GH#126)
