@@ -58,6 +58,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (24, "024_digest_messages_superseded.sql"),
         (25, "025_dig_questions_received_signal.sql"),
         (26, "026_dig_backlog_replies.sql"),
+        (27, "027_dig_queue_source_digest.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -474,4 +475,70 @@ def test_redig_migration_defaults_existing_questions_to_zero(tmp_path: Path) -> 
     assert conn.execute("SELECT redig FROM dig_questions").fetchone()["redig"] == 0
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE dig_questions SET redig = 2")
+    conn.close()
+
+
+def test_dig_queue_digest_source_migration_keeps_rows_and_rules(tmp_path: Path) -> None:
+    # GH#349(migration 027): 表を作り直しても既存の行・索引・外部キーは残り、source に digest が入る
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 26:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    for item_id in (1, 2, 3, 4):
+        conn.execute(
+            "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+            "VALUES (?, 2, ?, ?, 'sha256:x')",
+            (item_id, f"https://a/{item_id}", f"https://a/{item_id}"),
+        )
+    columns = (
+        "id, item_id, status, source, angle, requested_at, enqueued_at, updated_at,"
+        " backlog_op_question_id"
+    )
+    rows = [
+        (10, 1, "queued", "bookmark", None, None, "2026-10-01T00:00:00Z",
+         "2026-10-01T00:00:00Z", None),
+        (11, 2, "queued", "request", "観点", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z",
+         "2026-10-02T00:00:01Z", 5),
+        (12, 3, "passed", "request", "前の観点", None, "2026-10-03T00:00:00Z",
+         "2026-10-03T00:00:00Z", 0),
+    ]
+    conn.executemany(f"INSERT INTO dig_queue ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    with pytest.raises(sqlite3.IntegrityError):  # 026 までは digest を受けない(前提)
+        conn.execute("INSERT INTO dig_queue (item_id, status, source) VALUES (4, 'done', 'digest')")
+
+    assert apply_migrations(conn, db) == ["027_dig_queue_source_digest.sql"]
+
+    kept = conn.execute(f"SELECT {columns} FROM dig_queue ORDER BY id").fetchall()
+    assert [tuple(row) for row in kept] == rows
+    indexes = {row["name"]: row["unique"] for row in conn.execute("PRAGMA index_list(dig_queue)")}
+    assert indexes.get("ix_dig_queue_status") == 0
+    assert any(
+        unique and [c["name"] for c in conn.execute(f"PRAGMA index_info('{name}')")] == ["item_id"]
+        for name, unique in indexes.items()
+    )  # item_id の UNIQUE
+    (fk,) = conn.execute("PRAGMA foreign_key_list(dig_queue)").fetchall()
+    assert (fk["table"], fk["from"], fk["to"], fk["on_delete"]) == (
+        "items", "item_id", "id", "CASCADE"
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert "STRICT" in conn.execute(
+        "SELECT sql FROM sqlite_schema WHERE name = 'dig_queue'"
+    ).fetchone()["sql"]
+
+    conn.execute("INSERT INTO dig_queue (item_id, source) VALUES (4, 'digest')")
+    added = conn.execute("SELECT * FROM dig_queue WHERE item_id = 4").fetchone()
+    assert added["status"] == "queued" and added["enqueued_at"] and added["updated_at"]  # 既定値
+    with pytest.raises(sqlite3.IntegrityError):  # 経路の値は 3 つだけ
+        conn.execute("UPDATE dig_queue SET source = 'other' WHERE item_id = 4")
+    with pytest.raises(sqlite3.IntegrityError):  # 1 item 1 行のまま
+        conn.execute("INSERT INTO dig_queue (item_id, source) VALUES (4, 'bookmark')")
+    with pytest.raises(sqlite3.IntegrityError):  # items に無い item は積めない
+        conn.execute("INSERT INTO dig_queue (item_id, source) VALUES (99, 'digest')")
+    conn.execute("DELETE FROM items WHERE id = 4")  # items の削除で行も消える
+    assert conn.execute("SELECT count(*) AS n FROM dig_queue").fetchone()["n"] == 3
     conn.close()

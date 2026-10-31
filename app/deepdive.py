@@ -12,7 +12,9 @@
 
 実行制御(設計 06 §3):
 - 1 日上限 = config `[dig].daily_cap`(JST 暦日。同日再実行は残枠のみ = 冪等)
-- 優先順位: ①リプライ指定(requested_at 新しい順)②自動キューの新しい順
+- 優先順位: ①リプライ指定(requested_at 新しい順)②自動キューの新しい順 ③その日に配信した
+  digest の上位(①②で上限に足りない分だけ。GH#349)。③ はキューに積まずに選び、生成物の記帳と
+  同じトランザクションで source = 'digest'・status = 'done' の行を足す
 - 材料不足(本文抽出なし・短すぎ)は、自動選出なら skip(未消化一覧には残る)、
   リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)。報告は 1 回に
   して指定を外す(本文を取り直す経路は無く、毎朝の失敗を続けない。GH#197)
@@ -99,6 +101,7 @@ _DIG_LOCK_SUFFIX = ".dig.lock"
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
 _REQUESTED_NONE = "(観点指定なし:ブックマーク自動キューからの深掘り)"
+_REQUESTED_DIGEST = "(観点指定なし:今日の digest の上位からの深掘り)"  # 設計 06 §3 の ③
 
 # 対訳は 1 チャンクずつ生成する(1 呼び出しの出力を有界に保つ。段落境界で分割)。
 # 出力は原文の再掲(callout の引用記法つき)と訳文の両方を含み、入力のチャンクに訳文の分が
@@ -210,8 +213,9 @@ class DigCandidate:
     angle: str | None
     requested: bool  # リプライ指定(requested_at あり)
     # done 化の compare-and-set 用スナップショット(updated_at は秒解像度のため、
-    # 同一秒内の更新も検出できるよう status 以外の実値も比較する。Codex P2)
-    queue_updated_at: str
+    # 同一秒内の更新も検出できるよう status 以外の実値も比較する。Codex P2)。
+    # digest の上位から選んだ候補(from_digest)はキューの行が無いので None
+    queue_updated_at: str | None
     queue_requested_at: str | None
     title: str | None
     author: str | None
@@ -226,6 +230,8 @@ class DigCandidate:
     # 本文を取得・抽出した JST の日付(documents.extracted_at)。原文・対訳ノートの fetched に
     # 書く(深掘りした日ではない。GH#239)
     fetched_date: str | None = None
+    # その日の digest の上位から選んだ(設計 06 §3 の ③。GH#349)。キューの行は記帳のときに足す
+    from_digest: bool = False
 
 
 def run_dig_stage(
@@ -392,6 +398,8 @@ def _select_candidates(
     同日に実行済みの item は選ばない(done 直後の再指定を同日中に再実行すると
     ノート名が衝突し、カードが古いノートを指しうる。Codex P2。翌朝に掘られる =
     「夜選ぶ → 朝届く」のリズム通り)。
+    キュー(①②)で limit に足りなければ、足りない分をその日の digest の上位(③)で埋める
+    (_select_from_digest。GH#349)。
     """
     rows = conn.execute(
         """
@@ -446,7 +454,71 @@ def _select_candidates(
         elif candidate.requested:
             skipped_requested.append(candidate)
         # 材料不足の自動選出は対象外のまま(キューに残る。docstring 参照)
+    if len(selected) < limit:
+        selected.extend(_select_from_digest(conn, config, limit - len(selected), day))
     return selected, skipped_requested
+
+
+def _select_from_digest(
+    conn: sqlite3.Connection, config: Config, limit: int, day: str
+) -> list[DigCandidate]:
+    """その日に配信した digest の上位から、材料十分な item を limit 件選ぶ(設計 06 §3 の ③)。
+
+    見るのは配信済み(delivery_status = 'sent')の digests 行の item_ids(配信順 = ランキングの
+    順)だけで、🔖 保存節(bookmark_item_ids)は見ない(X のブックマークは ② の経路にある)。
+    除くのは、キューに行がある item(状態を問わない。queued で ② に選ばれなかったものは本文なし、
+    passed はパス、done は掘り済み)、台帳に行がある item(掘り済み)、材料不足の item(枠を
+    使わずに黙って次へ進む)。digest が無い・配信していない日は選ばない。選ぶ時点ではキューに
+    積まない(行は生成物の記帳と同じトランザクションで足す。_record_digest_pick)。
+    """
+    rows = conn.execute(
+        """
+        SELECT i.id AS item_id,
+               i.title, i.author, i.published_at, i.canonical_url,
+               d.extracted_text, d.language,
+               date(d.extracted_at, '+9 hours') AS fetched_date,
+               a.title_ja, a.summary
+        FROM digests g
+        JOIN json_each(g.item_ids) AS listed
+        JOIN items i ON i.id = listed.value
+        LEFT JOIN documents d ON d.item_id = i.id
+        LEFT JOIN analyses a ON a.id = (
+            SELECT max(id) FROM analyses
+            WHERE item_id = i.id AND degraded = 0
+        )
+        WHERE g.digest_date = ? AND g.delivery_status = 'sent'
+          AND NOT EXISTS (SELECT 1 FROM dig_queue q WHERE q.item_id = i.id)
+          AND NOT EXISTS (SELECT 1 FROM dig_results r WHERE r.item_id = i.id)
+        ORDER BY listed.key
+        """,
+        (day,),
+    ).fetchall()
+    selected: list[DigCandidate] = []
+    for row in rows:
+        if len(selected) >= limit:
+            break
+        if not has_material(row["extracted_text"], config):
+            continue
+        selected.append(
+            DigCandidate(
+                item_id=row["item_id"],
+                angle=None,
+                requested=False,
+                queue_updated_at=None,
+                queue_requested_at=None,
+                title=row["title"],
+                author=row["author"],
+                published_at=row["published_at"],
+                canonical_url=row["canonical_url"],
+                body=row["extracted_text"],
+                language=row["language"],
+                title_ja=row["title_ja"],
+                summary=row["summary"],
+                fetched_date=row["fetched_date"],
+                from_digest=True,
+            )
+        )
+    return selected
 
 
 def _drop_request(
@@ -573,23 +645,26 @@ def _dig_one(
                 review.cost_usd if review is not None else 0.0,
             ),
         )
-        # compare-and-set: 生成中(分オーダー)に poller がこの行を更新していたら
-        # (再指定 = queued + 新観点 / パス)、done で上書きせずユーザー操作を優先する
-        # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う。
-        # updated_at は秒解像度で同一秒内の更新を見逃すため、status / angle /
-        # requested_at の実値も比較する(全て同値の更新は意味的に no-op。Codex P2)
-        done = conn.execute(
-            "UPDATE dig_queue SET status = 'done', "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-            "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
-            "  AND angle IS ? AND requested_at IS ?",
-            (
-                candidate.item_id,
-                candidate.queue_updated_at,
-                candidate.angle,
-                candidate.queue_requested_at,
-            ),
-        ).rowcount
+        if candidate.from_digest:
+            done = _record_digest_pick(conn, candidate.item_id)
+        else:
+            # compare-and-set: 生成中(分オーダー)に poller がこの行を更新していたら
+            # (再指定 = queued + 新観点 / パス)、done で上書きせずユーザー操作を優先する
+            # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う。
+            # updated_at は秒解像度で同一秒内の更新を見逃すため、status / angle /
+            # requested_at の実値も比較する(全て同値の更新は意味的に no-op。Codex P2)
+            done = conn.execute(
+                "UPDATE dig_queue SET status = 'done', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
+                "  AND angle IS ? AND requested_at IS ?",
+                (
+                    candidate.item_id,
+                    candidate.queue_updated_at,
+                    candidate.angle,
+                    candidate.queue_requested_at,
+                ),
+            ).rowcount
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
@@ -603,6 +678,31 @@ def _dig_one(
         f"deepdive 生成 item={candidate.item_id} note={note_name}",
         extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
     )
+
+
+def _record_digest_pick(conn: sqlite3.Connection, item_id: int) -> int:
+    """digest の上位から掘った item のキューの行を記帳する(設計 06 §3 の ③)。done にしたら 1。
+
+    _dig_one の記帳のトランザクションの中で呼ぶ。行が無ければ source = 'digest'・status = 'done'
+    で足す。ON CONFLICT は item_id の UNIQUE だけに効かせる(INSERT OR IGNORE は CHECK の違反まで
+    黙って捨てるので使わない)。生成中に poller などが同じ item の行を作っていたら、本人の明示の
+    操作(requested_at のある指定・passed)は変えず、自動投入の行(requested_at の無い queued。
+    X のブックマークの取り込み)だけを done にする(掘ったばかりの item を翌朝にまた掘らない)。
+    source は先にできた行の値のまま(初回投入の経路で以後不変)。どの場合も生成物は記帳する。
+    """
+    inserted = conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source) VALUES (?, 'done', 'digest') "
+        "ON CONFLICT(item_id) DO NOTHING",
+        (item_id,),
+    ).rowcount
+    if inserted == 1:
+        return 1
+    return conn.execute(
+        "UPDATE dig_queue SET status = 'done', "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+        "WHERE item_id = ? AND status = 'queued' AND requested_at IS NULL",
+        (item_id,),
+    ).rowcount
 
 
 def _publish_pending_notes(
@@ -1346,7 +1446,8 @@ def _explainer_note(
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "requested": candidate.angle or _REQUESTED_NONE,
+        "requested": candidate.angle
+        or (_REQUESTED_DIGEST if candidate.from_digest else _REQUESTED_NONE),
         "status": "take待ち",
     }
     if not candidate.angle:
@@ -1434,6 +1535,8 @@ def _card_text(
         label = f"観点「{escape_and_truncate(candidate.angle, 300)}」"
     elif candidate.requested:
         label = "リプライ指定・観点なし"
+    elif candidate.from_digest:  # 設計 06 §3 の ③(GH#349)
+        label = "🤖 自動選出(今日の digest の上位)・観点なし"
     else:
         label = "🤖 自動選出(🔖新着)・観点なし"
     suffix = ""
