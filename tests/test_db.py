@@ -59,6 +59,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (25, "025_dig_questions_received_signal.sql"),
         (26, "026_dig_backlog_replies.sql"),
         (27, "027_dig_queue_source_digest.sql"),
+        (28, "028_budget_cuts.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -511,7 +512,8 @@ def test_dig_queue_digest_source_migration_keeps_rows_and_rules(tmp_path: Path) 
     with pytest.raises(sqlite3.IntegrityError):  # 026 までは digest を受けない(前提)
         conn.execute("INSERT INTO dig_queue (item_id, status, source) VALUES (4, 'done', 'digest')")
 
-    assert apply_migrations(conn, db) == ["027_dig_queue_source_digest.sql"]
+    # 027 の後の migration(028 以降)もまとめて当たる。027 が含まれることだけを確かめる
+    assert "027_dig_queue_source_digest.sql" in apply_migrations(conn, db)
 
     kept = conn.execute(f"SELECT {columns} FROM dig_queue ORDER BY id").fetchall()
     assert [tuple(row) for row in kept] == rows

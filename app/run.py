@@ -8,7 +8,8 @@ X 由来 documents の TTL 失効前に本文を材料として使うため。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
 段の失敗はその段で捕捉して記録し、後続の段は実行する。失敗が1つでもあれば
 呼び出し側(CLI)は非0で終了する(朝バッチ失敗通知 = 設計 05 §4 の入口)。
-analyze 段が失敗して載せる記事が無い日は、空の digest を確定しない(障害の空。GH#191)。
+analyze 段か extract 段が失敗して載せる記事が無い日は、空の digest を確定しない(障害の空。
+GH#191。extract 段が落ちた日は、事前選別が抽出を待つ記事を選ばないので空になりうる。GH#340)。
 export・deliver は当日分を扱わず、同じ日の再走で作って配信する。
 analyze・digest・dig の段の組み立てと実行(analyze_stage・digest_stage・dig_stage)は、
 単独の CLI(`intel analyze` / `digest` / `dig`)も同じものを呼ぶ(GH#206)。段の失敗の局所化は
@@ -40,7 +41,8 @@ from app.vault_guard import VaultGuard
 class RunFailures(list[str]):
     """run_pipeline の結果。失敗した段の名前の一覧(空 = 全段成功)。
 
-    digest_held: analyze 段の失敗で載せる記事が無く、当日の digest を確定しなかった(GH#191)。
+    digest_held: analyze 段か extract 段の失敗で載せる記事が無く、当日の digest を確定しなかった
+    (GH#191・GH#340)。
     digest 段が DigestHeldError を受けたときだけ立てる。当日の行の有無からは推し量らない
     (実行の途中で JST の日付が変わると、作った digest を保留と取り違えるため)。
     deliver_date: deliver 段が送ろうとした digest の日付(GH#247)。失敗通知が、日をまたいだ
@@ -84,7 +86,8 @@ def run_pipeline(
             )
 
     stage("collect", lambda: collect_all(
-        conn, connectors, logger, run_id=run_id, resolve_short=http.resolve_short_url
+        conn, connectors, logger, run_id=run_id, resolve_short=http.resolve_short_url,
+        limits=config.collect,
     ))
     if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
@@ -98,10 +101,13 @@ def run_pipeline(
         try:
             digest_stage(
                 conn, config, env, logger, run_id=run_id, primary=primary,
-                force=force_digest, hold_if_empty="analyze" in failures,
+                force=force_digest,
+                # extract 段が落ちた日も障害の空になりうる。事前選別は抽出を待つ記事を本文なしで
+                # 選ばないため(GH#340)
+                hold_if_empty="analyze" in failures or "extract" in failures,
             )
         except DigestHeldError as e:
-            # 障害の空。段の失敗にはしない(原因の analyze 段の失敗として通知する。GH#191)
+            # 障害の空。段の失敗にはしない(原因の analyze・extract 段の失敗として通知する。GH#191)
             failures.digest_held = True
             logger.warning(
                 f"{e}(復旧後に同じ日の intel run で作る)",

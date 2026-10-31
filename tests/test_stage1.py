@@ -32,12 +32,38 @@ def iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def add_item(conn, url, *, source_id=2, title="十分な長さのタイトル", published=None, payload=None):
-    return conn.execute(
+def add_item(
+    conn, url, *, source_id=2, title="十分な長さのタイトル", published=None, payload=None,
+    extracted=True,
+):
+    """new の item を足す。extracted は本文抽出を済ませた(documents に ok の行がある)こと。
+
+    事前選別は、まだ抽出を試していない記事を選ばない(manual を除く。GH#340)。
+    """
+    item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, published_at, content_hash, "
         "raw_payload) VALUES (?, ?, ?, ?, ?, 'sha256:x', ?)",
         (source_id, url, url, title, published, json.dumps(payload) if payload else None),
     ).lastrowid
+    if extracted:
+        add_document(conn, item_id, "ok")
+    return item_id
+
+
+def add_document(conn, item_id: int, status: str) -> None:
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, extraction_status, expires_at) "
+        "VALUES (?, ?, ?, '2999-01-01T00:00:00Z')",
+        (item_id, None if status == "failed" else "本文", status),
+    )
+
+
+def mark_extracted(conn) -> None:
+    """collect で入れた item の本文抽出を済ませたことにする(documents に ok の行を足す)。"""
+    for row in conn.execute(
+        "SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM documents)"
+    ).fetchall():
+        add_document(conn, row["id"], "ok")
 
 
 def make_config(tmp_path, **analysis_kwargs) -> Config:
@@ -143,6 +169,7 @@ def test_self_retweet_excluded_after_collect_in_either_order(conn, tmp_path, sel
     other = tweet("911", f"RT @x: {LONG_TEXT}", author="a1", created=created, retweeted="900")
     tweets = [mine, other] if self_first else [other, mine]
     collect_all(conn, {"x": connector_from([(200, page(tweets), {})], me_id="me")}, logger)
+    mark_extracted(conn)
 
     counts = preselect(conn, make_config(tmp_path), logger).counts
     assert counts["x_noise"] == 1
@@ -253,7 +280,7 @@ def test_analyzed_on_counts_jst_calendar_day(conn) -> None:
 
 def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
     now = iso(datetime.now(UTC))
-    item_id = add_item(conn, "https://a.example/failed", published=now)
+    item_id = add_item(conn, "https://a.example/failed", published=now, extracted=False)
     conn.execute(
         "INSERT INTO documents (item_id, extraction_status, expires_at) "
         "VALUES (?, 'failed', '2026-08-01T00:00:00Z')",
@@ -262,6 +289,35 @@ def test_failed_extraction_items_not_excluded(conn, tmp_path) -> None:
     result = preselect(conn, make_config(tmp_path), logger)
     assert result.counts["selected"] == 1  # 本文なしの分析に回る(除外しない)
     assert result.selected_ids == [item_id]
+
+
+def test_items_not_yet_extracted_wait_except_manual(conn, tmp_path) -> None:
+    # まだ抽出を試していない(documents の行が無い)記事は選ばず、new のまま次の抽出を待つ。
+    # 規則も件数も当てない(skip の理由も付けない)。手で入れた manual は今どおり選ぶ。
+    # 抽出に失敗した記事(failed の行がある)は本文なしで選ぶ(GH#340)
+    now = iso(datetime.now(UTC))
+    waiting_rss = add_item(conn, "https://a.example/wait", published=now, extracted=False)
+    waiting_x = add_item(
+        conn, "https://x.com/i/web/status/9", source_id=4, published=now, extracted=False
+    )
+    waiting_stale = add_item(  # 鮮度の規則にも掛けない(抽出の後に判定する)
+        conn, "https://a.example/old", published=iso(datetime.now(UTC) - timedelta(hours=200)),
+        extracted=False,
+    )
+    manual = add_item(conn, "https://m.example/1", source_id=1, published=now, extracted=False)
+    failed = add_item(conn, "https://a.example/failed", published=now, extracted=False)
+    add_document(conn, failed, "failed")
+    done = add_item(conn, "https://a.example/done", published=now)
+
+    result = preselect(conn, make_config(tmp_path), logger)
+
+    assert sorted(result.selected_ids) == sorted([manual, failed, done])
+    assert result.counts == {
+        "selected": 3, "blocklist": 0, "stale": 0, "x_noise": 0, "daily_cap": 0,
+    }
+    for item_id in (waiting_rss, waiting_x, waiting_stale):
+        row = conn.execute("SELECT status, skip_reason FROM items WHERE id = ?", (item_id,))
+        assert tuple(row.fetchone()) == ("new", None)
 
 
 def test_bookmark_items_bypass_stale_noise_and_cap(conn, tmp_path) -> None:

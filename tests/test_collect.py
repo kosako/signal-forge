@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.collect import collect_all
+from app.config import CollectConfig
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
 from app.connectors.x import XConnector, XCredentials
 from app.connectors.x_search import XSearchConnector
@@ -723,3 +724,503 @@ def test_unexpected_exception_also_isolated(conn: sqlite3.Connection) -> None:
     ).fetchone()
     assert run["status"] == "error"
     assert "RuntimeError" in run["error"]
+
+
+# --- 件数と時間の上限(GH#340) ---
+
+
+def dated(guid: str | None, day: int | None, *, path: str | None = None) -> RawItem:
+    """guid と公開日(2026-07 の日。None = 日時なし)を持つ RSS の entry。"""
+    marker = path or guid
+    return RawItem(
+        external_id=guid,
+        url=f"https://example.com/{marker}",
+        title=f"記事 {marker} のタイトルとして十分な長さ",
+        author=None,
+        published_at=None if day is None else datetime(2026, 7, day, tzinfo=UTC),
+        raw_content=f"記事 {marker} の本文",
+        meta={},
+    )
+
+
+def guids(conn: sqlite3.Connection) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT external_id FROM items ORDER BY id")]
+
+
+def budget_cuts(conn: sqlite3.Connection) -> list[tuple]:
+    rows = conn.execute("SELECT kind, source_id, deferred FROM budget_cuts ORDER BY id")
+    return [tuple(r) for r in rows]
+
+
+def saved_cursor(conn: sqlite3.Connection) -> dict:
+    return json.loads(conn.execute("SELECT cursor FROM sources WHERE type='rss'").fetchone()[0])
+
+
+def test_rss_cap_keeps_newest_and_retries_rest_next_run(conn: sqlite3.Connection) -> None:
+    # フィードの並びは新しい順とは限らない。新しい側を残し、残りはカーソルを進めずに次で取り直す
+    entries = [dated("g3", 3), dated("g5", 5), dated("g1", 1), dated("g4", 4), dated("g2", 2)]
+    connector = FakeConnector(entries)
+    limits = CollectConfig(rss_max_items=2)
+
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    assert guids(conn) == ["g5", "g4"]  # 保存はフィードの並び
+    assert saved_cursor(conn) == {}  # 前のカーソル(無し)のまま。304 で残りを失わない
+    assert budget_cuts(conn) == [("rss_items", 2, 3)]
+    assert conn.execute(
+        "SELECT last_success_at FROM sources WHERE type='rss'"
+    ).fetchone()[0] is not None
+
+    # 取り込み済みの guid は上限に数えないので、次の実行で残りの新しい側が入る
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    assert connector.seen_cursors[1] == {}
+    assert guids(conn) == ["g5", "g4", "g3", "g2"]
+
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    assert guids(conn) == ["g5", "g4", "g3", "g2", "g1"]
+    # 残りが上限に収まった回はカーソルを進め、打ち切りの記録も足さない
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 2
+
+
+def test_rss_cap_treats_undated_as_oldest_in_feed_order(conn: sqlite3.Connection) -> None:
+    entries = [dated("u1", None), dated("d1", 1), dated("u2", None), dated("u3", None)]
+    limits = CollectConfig(rss_max_items=3)
+    collect_all(conn, {"rss": FakeConnector(entries)}, logger, limits=limits)
+    assert guids(conn) == ["u1", "d1", "u2"]  # 日時のあるもの、次に日時なしをフィードの並びで
+
+
+def test_rss_cap_carries_over_guidless_entries(conn: sqlite3.Connection) -> None:
+    # guid の無い entry も、取り込み済みは正規化した URL で既知と分かり上限に数えない。
+    # 再実行で残りが入る(毎回同じ新しい 2 件が枠を埋めない)
+    entries = [dated(None, 1, path="a"), dated(None, 2, path="b"), dated(None, 3, path="c")]
+    limits = CollectConfig(rss_max_items=2)
+    connector = FakeConnector(entries)
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    urls = [r[0] for r in conn.execute("SELECT canonical_url FROM items ORDER BY id")]
+    assert urls == ["https://example.com/b", "https://example.com/c"]
+    assert budget_cuts(conn) == [("rss_items", 2, 1)]
+    assert saved_cursor(conn) == {}
+
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    urls = [r[0] for r in conn.execute("SELECT canonical_url FROM items ORDER BY id")]
+    assert urls == ["https://example.com/b", "https://example.com/c", "https://example.com/a"]
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 1
+
+
+def short_entry(guid: str, day: int, code: str) -> RawItem:
+    return RawItem(
+        external_id=guid, url=f"https://bit.ly/{code}", title=f"短縮 URL の記事 {code} のタイトル",
+        author=None, published_at=datetime(2026, 7, day, tzinfo=UTC),
+        raw_content=f"短縮 URL の記事 {code} の本文", meta={},
+    )
+
+
+def add_other_source_item(conn: sqlite3.Connection, canonical: str) -> None:
+    other = conn.execute(
+        "INSERT INTO sources (type, name, enabled) VALUES ('rss', 'feed-other', 0)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO items (source_id, external_id, url, canonical_url, content_hash) "
+        "VALUES (?, 'other-1', ?, ?, 'sha256:o')",
+        (other, canonical, canonical),
+    )
+
+
+def test_rss_cap_skips_entries_taken_by_other_source(conn: sqlite3.Connection) -> None:
+    # guid が新しくても、ほかのソースと同じ URL の記事は保存で無視されるので上限に数えない。
+    # 短縮 URL も解決した先がほかのソースと同じなら数えない
+    add_other_source_item(conn, "https://example.com/taken")
+    entries = [
+        dated("g1", 9, path="taken"),
+        short_entry("g2", 8, "tk"),
+        dated("g3", 3),
+        dated("g4", 2),
+    ]
+
+    def resolver(url: str) -> str:
+        return "https://example.com/taken"
+
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=2),
+    )
+    assert guids(conn) == ["other-1", "g3", "g4"]
+    assert budget_cuts(conn) == []  # 残りは無い(無視される記事で枠を埋めない)
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_collect_time_budget_applies_within_source(conn: sqlite3.Connection) -> None:
+    # 段の時間の上限は、ソースの途中の短縮 URL の解決にも当てる。処理中の 1 件は切らず、
+    # 解決した分を保存し、カーソルは進めない。最後のソースでも打ち切りを記録する
+    now = {"t": 0.0}
+    resolved: list[str] = []
+
+    def slow_resolver(url: str) -> str:
+        resolved.append(url)
+        now["t"] += 300.0
+        return f"https://example.com/long-{url.rsplit('/', 1)[-1]}"
+
+    entries = [short_entry("s1", 3, "a"), short_entry("s2", 2, "b"), short_entry("s3", 1, "c")]
+    connector = FakeConnector(entries)
+    limits = CollectConfig(time_budget_s=600)
+    collect_all(
+        conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+        clock=lambda: now["t"],
+    )
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b"]  # 2 件目の後に 600 秒
+    assert guids(conn) == ["s1", "s2"]
+    assert saved_cursor(conn) == {}
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+    assert conn.execute(
+        "SELECT last_success_at FROM sources WHERE type='rss'"
+    ).fetchone()[0] is not None
+
+    # 次の実行は、保存した 2 件を解決し直さずに残りを取る
+    now["t"] = 0.0
+    collect_all(
+        conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+        clock=lambda: now["t"],
+    )
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b", "https://bit.ly/c"]
+    assert guids(conn) == ["s1", "s2", "s3"]
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 1
+
+
+def test_collect_time_budget_within_x_source_keeps_cursor(conn: sqlite3.Connection) -> None:
+    # RSS 以外も同じ。解決した分を保存し、カーソル(X は since_id)を進めずに次の実行で読み直す
+    conn.execute("UPDATE sources SET enabled = 0 WHERE type = 'rss'")
+    conn.execute(
+        "INSERT INTO sources (type, name, cursor) VALUES ('x', 'home', '{\"since_id\": \"1\"}')"
+    )
+    now = {"t": 0.0}
+
+    def slow_resolver(url: str) -> str:
+        now["t"] += 700.0
+        return f"https://example.com/long-{url.rsplit('/', 1)[-1]}"
+
+    entries = [short_entry("t1", 2, "a"), short_entry("t2", 1, "b")]
+    collect_all(
+        conn, {"x": FakeConnector(entries, next_cursor={"since_id": "9"})}, logger,
+        resolve_short=slow_resolver, limits=CollectConfig(time_budget_s=600),
+        clock=lambda: now["t"],
+    )
+    rows = conn.execute("SELECT external_id FROM items ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["t1"]
+    cursor = conn.execute("SELECT cursor FROM sources WHERE type='x'").fetchone()[0]
+    assert json.loads(cursor) == {"since_id": "1"}
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+
+    # 次の実行は、前に解決した結果を使って解決し直さず、残りへ進む
+    now["t"] = 0.0
+    collect_all(
+        conn, {"x": FakeConnector(entries, next_cursor={"since_id": "9"})}, logger,
+        resolve_short=slow_resolver, limits=CollectConfig(time_budget_s=600),
+        clock=lambda: now["t"],
+    )
+    rows = conn.execute("SELECT external_id FROM items ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["t1", "t2"]
+    assert now["t"] == 700.0  # 解決は t2 の 1 回だけ
+    cursor = conn.execute("SELECT cursor FROM sources WHERE type='x'").fetchone()[0]
+    assert json.loads(cursor) == {"since_id": "9"}
+
+
+def test_rss_progresses_past_short_urls_taken_by_other_source(conn: sqlite3.Connection) -> None:
+    # ほかのソースと同じ先の短縮 URL は保存で無視され、元の URL と guid の対応は items に残らない。
+    # 解決の結果を残すので、次の実行は解決し直さずに除き、時間の上限の中で残りへ進む
+    # (時間の枠 2 秒・1 件の解決 1 秒。既存の記事への短縮 URL 2 件の後に新しい記事)
+    add_other_source_item(conn, "https://example.com/taken-a")
+    conn.execute(
+        "INSERT INTO items (source_id, external_id, url, canonical_url, content_hash) "
+        "VALUES ((SELECT id FROM sources WHERE name = 'feed-other'), 'other-2', "
+        "'https://example.com/taken-b', 'https://example.com/taken-b', 'sha256:o2')"
+    )
+    now = {"t": 0.0}
+    resolved: list[str] = []
+    targets = {
+        "https://bit.ly/a": "https://example.com/taken-a",
+        "https://bit.ly/b": "https://example.com/taken-b",
+        "https://bit.ly/c": "https://example.com/new-c",
+    }
+
+    def slow_resolver(url: str) -> str:
+        resolved.append(url)
+        now["t"] += 1.0
+        return targets[url]
+
+    entries = [short_entry("s1", 3, "a"), short_entry("s2", 2, "b"), short_entry("s3", 1, "c")]
+    connector = FakeConnector(entries)
+    limits = CollectConfig(time_budget_s=2)
+
+    def run() -> None:
+        now["t"] = 0.0
+        collect_all(
+            conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+            clock=lambda: now["t"],
+        )
+
+    run()
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b"]
+    assert "s3" not in guids(conn)
+    assert saved_cursor(conn) == {}
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+
+    run()
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b", "https://bit.ly/c"]
+    assert guids(conn)[-1] == "s3"
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 1
+
+
+def test_rss_cap_does_not_defer_short_urls_known_by_kept_resolution(
+    conn: sqlite3.Connection,
+) -> None:
+    # 上限で打ち切った後ろの記事も、前に解決した先がほかのソースと同じなら回した数に入れない
+    # (次の実行でも除くので、カーソルを据え置いて読み直さない)
+    add_other_source_item(conn, "https://example.com/taken")
+    conn.execute(
+        "INSERT INTO short_url_resolutions (source_id, entry_key, url, canonical_url) "
+        "VALUES (2, 'guid:g2', 'https://bit.ly/tk', 'https://example.com/taken')"
+    )
+
+    def resolver(url: str) -> str:
+        raise AssertionError(f"解決し直さない: {url}")
+
+    entries = [dated("g1", 9), short_entry("g2", 1, "tk")]
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=1),
+    )
+    assert guids(conn) == ["other-1", "g1"]
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_rss_reuses_kept_resolution_after_source_failure(conn: sqlite3.Connection) -> None:
+    # 解決の途中でソースが失敗しても、解決できた分の結果は残り、次の実行は解決し直さない
+    calls: list[str] = []
+
+    def resolver(url: str) -> str:
+        calls.append(url)
+        if url == "https://bit.ly/b" and calls.count(url) == 1:
+            raise RetryableError("一時障害")
+        return f"https://example.com/long-{url.rsplit('/', 1)[-1]}"
+
+    entries = [short_entry("s1", 2, "a"), short_entry("s2", 1, "b")]
+    collect_all(conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver)
+    assert conn.execute("SELECT count(*) FROM items WHERE source_id = 2").fetchone()[0] == 0
+
+    collect_all(conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver)
+    assert calls == ["https://bit.ly/a", "https://bit.ly/b", "https://bit.ly/b"]
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows] == ["https://example.com/long-a", "https://example.com/long-b"]
+
+
+@pytest.mark.parametrize("same_source", [True, False])
+def test_new_entry_resolves_short_url_again_after_redirect_change(
+    conn: sqlite3.Connection, same_source: bool
+) -> None:
+    # 解決の結果を使い回すのは同じソースの同じ記事だけ。短縮 URL の転送先が後で変わったら、
+    # 新しい記事(新しい guid・ほかのソース)は解決し直して新しい先を取る
+    target = {"url": "https://example.com/old-a"}
+    calls: list[str] = []
+
+    def resolver(url: str) -> str:
+        calls.append(url)
+        return target["url"]
+
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-b', '{\"url\": \"https://b\"}')"
+    )
+    first = short_entry("g1", 1, "u")
+    later = short_entry("g2" if same_source else "h1", 2, "u")
+
+    class Router:
+        source_type = "rss"
+
+        def __init__(self, by_source: dict[str, list[RawItem]]):
+            self.by_source = by_source
+
+        def fetch(self, source_row, cursor):
+            return FakeConnector(self.by_source.get(source_row.name, [])).fetch(
+                source_row, cursor
+            )
+
+    collect_all(conn, {"rss": Router({"feed-a": [first]})}, logger, resolve_short=resolver)
+    target["url"] = "https://example.com/new-b"
+    feeds = {"feed-a": [first, later]} if same_source else {"feed-a": [first], "feed-b": [later]}
+    collect_all(conn, {"rss": Router(feeds)}, logger, resolve_short=resolver)
+
+    assert calls == ["https://bit.ly/u", "https://bit.ly/u"]  # g1 は使い回し、新しい記事は解決
+    rows = conn.execute("SELECT external_id, canonical_url FROM items ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("g1", "https://example.com/old-a"),
+        (later.external_id, "https://example.com/new-b"),
+    ]
+
+
+@pytest.mark.parametrize("duplicate", ["url", "guid"])
+def test_rss_cap_skips_duplicates_within_same_fetch(
+    conn: sqlite3.Connection, duplicate: str
+) -> None:
+    # 同じ取得の中の重複(先に残した記事と同じ URL か guid)は保存で無視されるので、枠を使わない。
+    # 上限 2 件で、新しい順に「g1 → A、(g2 → A か g1 の短縮 URL)、g3 → B」なら A と B を同じ回に
+    # 入れる。同じ guid の重複は短縮 URL を解決せずに除く
+    second = dated("g2", 8, path="a") if duplicate == "url" else short_entry("g1", 8, "c")
+    entries = [dated("g1", 9, path="a"), second, dated("g3", 7, path="b")]
+
+    def resolver(url: str) -> str:
+        raise AssertionError(f"解決しない: {url}")
+
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=2),
+    )
+    rows = conn.execute("SELECT external_id, canonical_url FROM items ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("g1", "https://example.com/a"),
+        ("g3", "https://example.com/b"),
+    ]
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_rss_cap_does_not_defer_guid_duplicate_after_limit(conn: sqlite3.Connection) -> None:
+    # 上限に達した後ろの、先に残した記事と同じ guid の記事は、解決の履歴が無い短縮 URL でも
+    # 保存で無視されるので回した数に入れない(カーソルを据え置いて読み直さない)
+    def resolver(url: str) -> str:
+        raise AssertionError(f"解決しない: {url}")
+
+    entries = [dated("g1", 9, path="a"), short_entry("g1", 8, "z")]
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=1),
+    )
+    assert guids(conn) == ["g1"]
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_resolution_key_separates_guid_from_url(conn: sqlite3.Connection) -> None:
+    # 解決の結果の鍵は guid と URL で名前空間を分ける。guid の無い短縮 URL S の結果を、後で届いた
+    # guid=S・url=S の新しい記事が使い回さない(転送先が変わっていれば新しい先を取る)
+    target = {"url": "https://example.com/old-a"}
+    calls: list[str] = []
+
+    def resolver(url: str) -> str:
+        calls.append(url)
+        return target["url"]
+
+    guidless = RawItem(
+        external_id=None, url="https://bit.ly/s", title="guid の無い短縮 URL の記事のタイトル",
+        author=None, published_at=datetime(2026, 7, 1, tzinfo=UTC), raw_content="本文 1",
+        meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([guidless])}, logger, resolve_short=resolver)
+    target["url"] = "https://example.com/new-b"
+    with_guid = RawItem(
+        external_id="https://bit.ly/s", url="https://bit.ly/s",
+        title="guid のある短縮 URL の記事のタイトル", author=None,
+        published_at=datetime(2026, 7, 2, tzinfo=UTC), raw_content="本文 2", meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([with_guid])}, logger, resolve_short=resolver)
+
+    assert calls == ["https://bit.ly/s", "https://bit.ly/s"]
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
+
+
+@pytest.mark.parametrize("guid", ["g1", "urlhash:legacy"])
+def test_guidless_entry_not_known_by_url_of_guid_item(conn: sqlite3.Connection, guid) -> None:
+    # guid の無い記事を取り込み済みとみるのは、同じ記事(url: + 元の URL)を前に解決した結果が
+    # あるときだけ。guid のある記事の行と同じ短縮 URL でも、guid の無い新しい記事は解決して
+    # 確かめる。guid が合成の id と同じ形(urlhash:)でも同じ(external_id の形から推し量らない)
+    target = {"url": "https://example.com/old-a"}
+
+    def resolver(url: str) -> str:
+        return target["url"]
+
+    collect_all(
+        conn, {"rss": FakeConnector([short_entry(guid, 1, "s")])}, logger, resolve_short=resolver
+    )
+    target["url"] = "https://example.com/new-b"
+    guidless = RawItem(
+        external_id=None, url="https://bit.ly/s", title="guid の無い短縮 URL の記事のタイトル",
+        author=None, published_at=datetime(2026, 7, 2, tzinfo=UTC), raw_content="本文 2",
+        meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([guidless])}, logger, resolve_short=resolver)
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
+
+
+def test_failed_short_url_resolution_is_not_kept(conn: sqlite3.Connection) -> None:
+    # 通信の失敗は結果を残さない。今までどおりソースの失敗になり、次の実行で解決し直す
+    calls: list[str] = []
+
+    def failing_then_ok(url: str) -> str:
+        calls.append(url)
+        if len(calls) == 1:
+            raise RetryableError("一時障害")
+        return "https://example.com/long"
+
+    entries = [short_entry("s1", 1, "a")]
+    collect_all(conn, {"rss": FakeConnector(entries)}, logger, resolve_short=failing_then_ok)
+    assert conn.execute("SELECT count(*) FROM short_url_resolutions").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM items WHERE source_id = 2").fetchone()[0] == 0
+
+    collect_all(conn, {"rss": FakeConnector(entries)}, logger, resolve_short=failing_then_ok)
+    assert calls == ["https://bit.ly/a", "https://bit.ly/a"]
+    assert guids(conn) == ["s1"]
+    rows = conn.execute("SELECT url, canonical_url FROM short_url_resolutions").fetchall()
+    assert [tuple(r) for r in rows] == [("https://bit.ly/a", "https://example.com/long")]
+
+
+@pytest.mark.parametrize("guid", ["g1", None])
+def test_rss_known_entries_skip_short_url_resolution(conn: sqlite3.Connection, guid) -> None:
+    # 取り込み済みは保存の前に除くので、短縮 URL を解決し直さない。guid の無い entry は、
+    # このソースが前に保存した元の URL で取り込み済みと分かる
+    entry = RawItem(
+        external_id=guid, url="https://bit.ly/abc", title="短縮 URL の記事のタイトル",
+        author=None, published_at=None, raw_content="本文", meta={},
+    )
+    resolved: list[str] = []
+
+    def resolver(url: str) -> str:
+        resolved.append(url)
+        return "https://example.com/long"
+
+    collect_all(conn, {"rss": FakeConnector([entry])}, logger, resolve_short=resolver)
+    collect_all(conn, {"rss": FakeConnector([entry])}, logger, resolve_short=resolver)
+    assert resolved == ["https://bit.ly/abc"]
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 1
+
+
+def test_collect_time_budget_defers_rest_and_rotates(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-b', '{\"url\": \"https://b\"}')"
+    )
+    seen: list[str] = []
+
+    class Router:
+        source_type = "rss"
+
+        def fetch(self, source_row, cursor):
+            seen.append(source_row.name)
+            return FakeConnector([]).fetch(source_row, cursor)
+
+    ticks = iter([0.0, 0.0, 600.0])  # 開始・1 本目の前・2 本目の前(上限ちょうど)
+    limits = CollectConfig(time_budget_s=600)
+    collect_all(conn, {"rss": Router()}, logger, limits=limits, clock=lambda: next(ticks))
+    assert seen == ["feed-a"]
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+    # 回れなかったソースは状態を変えない(次の実行へ回すだけ)
+    rest = conn.execute(
+        "SELECT last_success_at, last_error, consecutive_failures FROM sources WHERE name='feed-b'"
+    ).fetchone()
+    assert tuple(rest) == (None, None, 0)
+
+    # 次の実行は、前回の取得が古い(取得したことが無い)ソースから回る
+    collect_all(conn, {"rss": Router()}, logger, clock=lambda: 0.0)
+    assert seen == ["feed-a", "feed-b", "feed-a"]

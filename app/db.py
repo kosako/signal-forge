@@ -215,6 +215,25 @@ def insert_item_with_dedup(
     return InsertOutcome(outcome="duplicate", item_id=item_id)
 
 
+def record_budget_cut(
+    conn: sqlite3.Connection,
+    kind: str,
+    *,
+    deferred: int,
+    run_id: str | None,
+    source_id: int | None = None,
+) -> None:
+    """段の上限で打ち切り、deferred 件を次の実行へ回したことを残す(migration 028。GH#340)。
+
+    kind は rss_items / collect_time / extract_time。週 1 回のソースの健康診断が読む。
+    トランザクションは張らない(1 行の INSERT。呼び出し側のトランザクションの外で呼ぶ)。
+    """
+    conn.execute(
+        "INSERT INTO budget_cuts (run_id, kind, source_id, deferred) VALUES (?, ?, ?, ?)",
+        (run_id, kind, source_id, deferred),
+    )
+
+
 @contextlib.contextmanager
 def _migration_lock(db_path: Path) -> Iterator[None]:
     """migration のプロセス間直列化(GH#200)。SQLite のロックは 1 トランザクションの間しか

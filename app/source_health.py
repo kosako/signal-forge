@@ -2,7 +2,8 @@
 
 - source_failure_alerts: 連続で失敗しているソース(doctor #14・watchdog・週次の健康診断が使う)
 - source_health_report: 週 1 回の健康診断の本文(poller の内蔵タイマーが日曜の夜に送る)。
-  週次レビュー(plan §6)の「ソースの棚卸し」を、人が思い出さなくても始められるようにする
+  週次レビュー(plan §6)の「ソースの棚卸し」を、人が思い出さなくても始められるようにする。
+  collect・extract の段の上限で打ち切った日(budget_cuts。GH#340)もここで知らせる
 
 読み取りだけ。ソースを止めたり config の URL を書き換えたりはしない(判断は人。設計 02 §3)。
 """
@@ -26,6 +27,7 @@ QUIET_DAYS = 14  # これだけ新しい記事が入らないソースを知ら�
 RATE_DAYS = 28  # 👍・🔖 の率を見る配信の期間(直近 4 週)
 RATE_MIN_DELIVERED = 10  # 率を出す最低の配信件数(少ないと率がぶれる)
 RATE_SHOW = 3  # 率の低い方から並べるソースの数
+CUT_DAYS = 7  # 段の上限で打ち切った日を数える期間(今日を含む直近 7 日。前の週の報告と重ねない)
 
 
 def source_failure_alerts(
@@ -71,6 +73,7 @@ def source_health_report(conn: sqlite3.Connection, config: Config, today: str) -
         f"💤 「{_one_line(row['name'])}」に {QUIET_DAYS} 日間、新しい記事が入っていない"
         for row in _quiet(conn, types, today)
     ]
+    findings += _budget_cuts(conn, config, today)
     rates = [
         f"・「{_one_line(row['name'])}」{100 * row['positive'] / row['delivered']:.0f}%"
         f"(👍・🔖 {row['positive']} / 配信 {row['delivered']})"
@@ -114,6 +117,46 @@ def _quiet(conn: sqlite3.Connection, types: list[str], today: str) -> list[sqlit
         """,
         (*types, since, since),
     ).fetchall()
+
+
+def _budget_cuts(conn: sqlite3.Connection, config: Config, today: str) -> list[str]:
+    """直近 CUT_DAYS 日に、段の上限で打ち切って残りを次の実行へ回した日(GH#340)。
+
+    日は JST の暦日で数える。上限を上げるか、ソースを減らすかの判断の材料にする。
+    """
+    since = _utc_since(today, CUT_DAYS - 1)
+    rows = conn.execute(
+        """
+        SELECT b.kind, s.name, count(DISTINCT date(b.created_at, '+9 hours')) AS days,
+               max(b.deferred) AS most
+        FROM budget_cuts b LEFT JOIN sources s ON s.id = b.source_id
+        WHERE b.created_at >= ? AND (b.source_id IS NULL OR s.enabled = 1)
+        GROUP BY b.kind, b.source_id
+        ORDER BY CASE b.kind WHEN 'collect_time' THEN 0 WHEN 'extract_time' THEN 1 ELSE 2 END,
+                 b.source_id
+        """,
+        (since,),
+    ).fetchall()
+    stages = {
+        "collect_time": ("収集", config.collect.time_budget_s, "ソース"),
+        "extract_time": ("本文抽出", config.extract.time_budget_s, "件"),
+    }
+    lines = []
+    for row in rows:
+        period = f"直近 {CUT_DAYS} 日のうち {row['days']} 日"
+        if row["kind"] in stages:
+            label, budget_s, unit = stages[row["kind"]]
+            lines.append(
+                f"⏱️ {label}の段が時間の上限({budget_s} 秒)で打ち切られた({period}。"
+                f"最も多い回は {row['most']} {unit}を次の実行へ回した)"
+            )
+        else:
+            lines.append(
+                f"📦 「{_one_line(row['name'])}」が 1 回の上限"
+                f"({config.collect.rss_max_items} 件)を超えた({period}。"
+                f"最も多い回は {row['most']} 件を次の実行へ回した)"
+            )
+    return lines
 
 
 def _lowest_rates(

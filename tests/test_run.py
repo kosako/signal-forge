@@ -696,6 +696,69 @@ def test_pipeline_runs_same_stages_as_cli(conn, tmp_path, monkeypatch) -> None:
     assert set(calls["dig"]) == {"run_id"}  # dig の主は config から effort 可変で作る
 
 
+def test_items_not_yet_extracted_are_not_analyzed(conn, tmp_path, monkeypatch) -> None:
+    # 本文抽出が時間の上限で回した(documents を作らなかった)記事は、朝バッチの analyze 段も、
+    # 後で手で流す単独の intel analyze も本文なしで分析せず、new のまま残す(GH#340)
+    from app import run as run_module
+
+    def extract_deferring_all(db, config, http, stage_logger, *, run_id=None):
+        return {"ok": 0, "partial": 0, "failed": 0}  # 上限で 1 件も処理しなかった
+
+    monkeypatch.setattr(run_module, "extract_pending", extract_deferring_all)
+    config = make_config(tmp_path)
+    assert run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    ) == []
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "new"
+    assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+
+    # 単独の intel analyze と同じ呼び方でも同じ規則
+    counts = run_module.analyze_stage(
+        conn, config, {}, logger, primary=lambda _effort: ScriptedEngine(conn)
+    )
+    assert counts["analyzed"] == 0
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "new"
+
+    # 次の実行で抽出できれば、今までどおり分析して配信に載る
+    monkeypatch.undo()
+    assert run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUN2", force_digest=True,
+    ) == []
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "digested"
+
+
+def test_extract_failure_holds_empty_digest_until_same_day_rerun(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # 抽出の段が落ちた日は、記事が本文なしで分析されず次の実行を待つ。載せる記事が無い空は
+    # 障害の空として digest を確定しない(GH#191 と同じ扱い)。同じ日の再走で作って届く(GH#340)
+    from app import run as run_module
+
+    def extract_crashing(*args, **kwargs):
+        raise RuntimeError("抽出の段の障害")
+
+    monkeypatch.setattr(run_module, "extract_pending", extract_crashing)
+    config = make_config(tmp_path)
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert list(failures) == ["extract"]
+    assert failures.digest_held is True
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "new"
+
+    monkeypatch.undo()
+    assert run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUN2",
+    ) == []
+    assert conn.execute("SELECT item_count FROM digests").fetchone()[0] == 1
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "digested"
+
+
 @pytest.mark.parametrize("review", [True, False])
 def test_dig_stage_wires_review_engine_from_config(conn, tmp_path, monkeypatch, review) -> None:
     # 深掘りのレビュー(GH#153)は [dig].review のときだけ。キーは .env の dict から読む
@@ -897,11 +960,17 @@ def test_overlapping_analyze_waits_and_keeps_daily_limit(tmp_path, caplog) -> No
 
     def add_item(n: int) -> int:
         url = f"https://a.example/{n}"
-        return setup.execute(
+        item_id = setup.execute(
             "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
             "VALUES (?, ?, ?, '十分に長い記事タイトルのサンプル', ?)",
             (source_id, url, url, f"sha256:{n}"),
         ).lastrowid
+        setup.execute(  # 本文抽出は済ませた(事前選別は抽出を待つ記事を選ばない。GH#340)
+            "INSERT INTO documents (item_id, extracted_text, extraction_status, expires_at) "
+            "VALUES (?, '本文', 'ok', '2999-01-01T00:00:00Z')",
+            (item_id,),
+        )
+        return item_id
 
     first_items = [add_item(n) for n in range(2)]
     base = make_config(tmp_path)
