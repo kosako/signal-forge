@@ -22,10 +22,24 @@ VACUUM_THRESHOLD_ROWS = 1000
 # TTL の起点は本文キャッシュを得た時刻: payload の cached_at があればそれ、無ければ
 # fetched_at(初回の取込の時刻)。cached_at は TTL 切れの item に全文を書き戻したときだけ
 # 付く(GH#332)。fetched_at を動かさないのは、新着の判定(source_health)と 24h dedup が
-# 初回の取込の時刻を前提にするため。purge の NULL 化と doctor #11 が同じ条件を使う
+# 初回の取込の時刻を前提にするため。purge の NULL 化と doctor #11 が同じ条件を使う。
+# cached_at が異常な値(文字列でない・"%Y-%m-%dT%H:%M:%SZ" の実在する日時でない・未来)なら
+# 起点を空文字にして期限切れとして扱う(X の本文を長く残す向きに外さない。設計 01 §6)。
+# 形の検査は strftime で正規化した値との一致で行う(不正な日付は NULL、2/30 等は繰り上がる)
 RAW_PAYLOAD_EXPIRED = """
     raw_payload IS NOT NULL
-    AND COALESCE(json_extract(raw_payload, '$.cached_at'), fetched_at) <= strftime(
+    AND (
+      CASE
+        WHEN json_type(raw_payload, '$.cached_at') IS NULL THEN fetched_at
+        WHEN json_type(raw_payload, '$.cached_at') = 'text'
+         AND strftime('%Y-%m-%dT%H:%M:%SZ', json_extract(raw_payload, '$.cached_at'))
+             = json_extract(raw_payload, '$.cached_at')
+         AND json_extract(raw_payload, '$.cached_at')
+             <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        THEN json_extract(raw_payload, '$.cached_at')
+        ELSE ''
+      END
+    ) <= strftime(
           '%Y-%m-%dT%H:%M:%SZ', 'now',
           '-' || (
             SELECT CASE WHEN sources.type = 'x' THEN ? ELSE ? END

@@ -1,5 +1,7 @@
+import json
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -72,12 +74,16 @@ def test_raw_payload_nullified_by_source_ttl(conn, tmp_path) -> None:
     assert payloads[dup_old] is None
 
 
+def utc_iso(delta: timedelta = timedelta()) -> str:
+    return (datetime.now(UTC) + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def test_raw_payload_ttl_counts_from_cached_at(conn, tmp_path) -> None:
     # 全文を書き戻した payload は cached_at から TTL を数える(fetched_at は初回の取込の
     # 時刻のまま。GH#332)。cached_at の無い行は従来どおり fetched_at
     revived = add_item(
         conn, "https://x/r", source_id=3, fetched_days_ago=30,
-        payload='{"raw_content": "x", "cached_at": "2999-01-01T00:00:00Z"}',
+        payload=json.dumps({"raw_content": "x", "cached_at": utc_iso()}),
     )
     revived_old = add_item(
         conn, "https://x/o", source_id=3, fetched_days_ago=30,
@@ -93,6 +99,36 @@ def test_raw_payload_ttl_counts_from_cached_at(conn, tmp_path) -> None:
     assert payloads[revived] is not None
     assert payloads[revived_old] is None
     assert payloads[plain_old] is None
+
+
+@pytest.mark.parametrize(
+    "cached_at",
+    [
+        "not-a-date",
+        "2999-01-01T00:00:00Z",  # 未来: そのままだと長く消されない
+        "+1 day",  # 下で今の 1 日後に置き換える(近い未来も同じ)
+        "2026-02-30T00:00:00Z",  # 実在しない日付
+        "2026-10-31 00:00:00",  # 形が違う
+        "2026-10-31T00:00:00Z ",
+        12345,
+        None,
+        {"at": "2026-10-31T00:00:00Z"},
+    ],
+)
+def test_raw_payload_with_malformed_cached_at_is_purged(conn, tmp_path, cached_at) -> None:
+    # 異常な cached_at は期限切れとして扱い、fetched_at が新しくても本文を消す。
+    # X の本文を長く残す向きに外さない(設計 01 §6。GH#332)
+    if cached_at == "+1 day":
+        cached_at = utc_iso(timedelta(days=1))
+    item = add_item(
+        conn, "https://x/m", source_id=3, fetched_days_ago=1,
+        payload=json.dumps({"raw_content": "x", "cached_at": cached_at}),
+    )
+    counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
+    assert counts["raw_payload_nullified"] == 1
+    assert conn.execute(
+        "SELECT raw_payload FROM items WHERE id = ?", (item,)
+    ).fetchone()["raw_payload"] is None
 
 
 def test_vacuum_triggered_by_nullified_rows(conn, tmp_path, monkeypatch) -> None:
