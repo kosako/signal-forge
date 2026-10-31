@@ -286,8 +286,13 @@ Obsidian Vault はバックアップ対象外。Daily / Items ノートの生成
    完了すると `~/.config/intel/x-oauth2-token.json`(chmod 600)が生成され、
    `@ユーザー名` が表示される。token は refresh で自動更新される(手編集しない)
 4. **確認**: `uv run intel doctor` の #13(X OAuth2 token)が PASS
-5. **無効化 / 再認可**: X の設定 → アプリ連携から revoke + token ファイル削除。
-   再認可は `intel x-auth` を再実行(refresh 失敗時も同様)
+5. **再認可**: `intel x-auth` を再実行(refresh 失敗時も同様)。取込を続けたまま
+   token を作り直すときはこちら
+6. **無効化**(取込をやめる): 先に config.toml の `[x_signals].daily_read_cap` を 0 にする
+   (§10 で再配分した枠は `[x].daily_read_cap` へ戻してよい。内訳合計は
+   `combined_daily_read_cap` 以下のまま)。そのうえで X の設定 → アプリ連携から revoke し、
+   token ファイルを削除する。cap が正のまま token を消すと、朝の x_signals 段が毎回失敗し、
+   doctor #13 も FAIL になる(cap = 0 なら段ごと省かれ、#13 は SKIP。GH#346)
 
 ## 10. X 興味シグナル取込の有効化(S1b = GH#58・設計 02 §2)
 
