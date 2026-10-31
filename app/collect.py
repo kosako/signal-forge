@@ -9,7 +9,8 @@
 - 件数と時間の上限(GH#340): RSS は 1 ソース 1 回に取り込む新しい記事を [collect].rss_max_items
   まで(新しい側を残し、カーソルを進めずに次の実行で残りを取り直す)。保存しても無視される記事
   (取り込み済み・ほかのソースと同じ URL)は数えない。段全体は [collect].time_budget_s まで。
-  次のソースと、次の短縮 URL の解決に進む前に確かめる。ソースの途中で達したら、解決した分を
+  次のソースと、次の短縮 URL の解決に進む前に確かめる。解決した結果は short_url_resolutions に
+  残し、次の実行では解決し直さない(除いた記事の解決で毎回の時間を使い切らない)。ソースの途中で達したら、解決した分を
   保存してカーソルを進めず、残りのソースとともに次の実行へ回す。ソースは前回の取得が古い順に
   回す(打ち切りで回れなかったソースが次の実行で先になる)
 """
@@ -140,7 +141,7 @@ def _collect_source(
                 conn, source, result.items, rss_max_items, resolve_short, deadline, clock
             )
         else:
-            prepared = _prepare(result.items, resolve_short, deadline, clock)
+            prepared = _prepare(conn, result.items, resolve_short, deadline, clock)
         next_cursor = result.next_cursor
         if prepared.capped or prepared.timed_out:
             # 進めると 304(X は since_id)で残りを取り直せない。今のカーソルのまま次の実行で
@@ -286,6 +287,7 @@ def _store_result(
 
 
 def _prepare(
+    conn: sqlite3.Connection,
     items: list[RawItem],
     resolve_short: Callable[[str], str] | None,
     deadline: float,
@@ -299,9 +301,15 @@ def _prepare(
     """
     prepared: list[tuple[RawItem, str | None]] = []
     for raw in items:
-        if _needs_resolution(raw, resolve_short) and clock() >= deadline:
-            return _Prepared(prepared, timed_out=True)
-        prepared.append((raw, _canonical_url(raw, resolve_short)))
+        if not _needs_resolution(raw, resolve_short):
+            prepared.append((raw, _canonical_url(raw, resolve_short)))
+            continue
+        canonical = _resolved_before(conn, raw)
+        if canonical is None:
+            if clock() >= deadline:
+                return _Prepared(prepared, timed_out=True)
+            canonical = _resolve(conn, raw, resolve_short)
+        prepared.append((raw, canonical))
     return _Prepared(prepared)
 
 
@@ -320,7 +328,8 @@ def _prepare_rss(
     数えると、上限を超えるフィードで同じ記事が毎回の枠を埋め、残りがいつまでも入らない。
     既知かは短縮 URL の解決の前に安く確かめる: guid(UNIQUE(source_id, external_id))、短縮 URL
     でない記事は正規化した URL(UNIQUE(canonical_url))、短縮 URL の記事はこのソースが前に
-    保存した元の URL。短縮 URL を解決した後も、ほかのソースと同じ URL なら除く。
+    保存した元の URL と、前に解決した結果(short_url_resolutions)。短縮 URL を解決した後も、
+    ほかのソースと同じ URL なら除く(解決の結果を残すので、次の実行では解決し直さずに除く)。
     公開日時の新しい順に見る(フィードの並びは新しい順とは限らない。日時の無い entry は古い側と
     し、その中はフィードの並び)。保存はフィードの並びに戻す。
     """
@@ -341,10 +350,12 @@ def _prepare_rss(
             position += 1
             continue
         if _needs_resolution(raw, resolve_short):
-            if clock() >= deadline:
-                timed_out = True
-                break
-            canonical = _canonical_url(raw, resolve_short)
+            canonical = _resolved_before(conn, raw)
+            if canonical is None:
+                if clock() >= deadline:
+                    timed_out = True
+                    break
+                canonical = _resolve(conn, raw, resolve_short)
             if _url_taken(conn, canonical or raw.url):  # 解決したらほかのソースと同じ URL
                 known += 1
                 position += 1
@@ -390,11 +401,41 @@ def _known_without_resolution(
     ).fetchone():
         return True
     if _needs_resolution(raw, resolve_short):
-        # 解決先は HTTP が要るので、このソースが前に保存した元の URL で見る
-        return conn.execute(
+        # 解決先は HTTP が要るので、このソースが前に保存した元の URL と、前に解決した結果で見る
+        if conn.execute(
             "SELECT 1 FROM items WHERE source_id = ? AND url = ?", (source.id, raw.url)
-        ).fetchone() is not None
+        ).fetchone():
+            return True
+        canonical = _resolved_before(conn, raw)
+        return canonical is not None and _url_taken(conn, canonical)
     return _url_taken(conn, _canonical_url(raw, None) or raw.url)
+
+
+def _resolved_before(conn: sqlite3.Connection, raw: RawItem) -> str | None:
+    """前の実行で解決した短縮 URL の canonical_url(short_url_resolutions。無ければ None)。"""
+    row = conn.execute(
+        "SELECT canonical_url FROM short_url_resolutions WHERE url = ?", (raw.url.strip(),)
+    ).fetchone()
+    return None if row is None else row["canonical_url"]
+
+
+def _resolve(
+    conn: sqlite3.Connection, raw: RawItem, resolve_short: Callable[[str], str] | None
+) -> str | None:
+    """短縮 URL を解決して正規化し、結果を残す(次の実行で解決し直さない。GH#340)。
+
+    残すのは解決できた結果だけ。UrlError(解決先が分解できない等)は None で、記事は error の行
+    になるので、次の実行は元の URL で取り込み済みと分かる。通信の失敗(Retryable / Fatal)は
+    残さずに送出し、今までどおりソースの失敗になる(次の実行で解決し直す)。
+    書き込みは 1 行の INSERT で、書き込みのトランザクションを HTTP の待ちの間は持たない(GH#179)。
+    """
+    canonical = _canonical_url(raw, resolve_short)
+    if canonical is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO short_url_resolutions (url, canonical_url) VALUES (?, ?)",
+            (raw.url.strip(), canonical),
+        )
+    return canonical
 
 
 def _url_taken(conn: sqlite3.Connection, canonical: str) -> bool:
