@@ -1,6 +1,7 @@
 """digest 生成(設計 01 §8 / 03 §6)。
 
-- 1 暦日(JST)1 行。生成済みなら skip、--force で置換(digest_date UNIQUE が冪等キー)
+- 1 暦日(JST)1 行。生成済みなら skip、--force で置換(digest_date UNIQUE が冪等キー)。
+  置換は配信と同じロック(deliver.lock)で配信と直列にする(GH#333)
 - 通常: ランキング選抜(min_score 未満は載せない。0 件なら「該当なし」)
 - degraded: 当日候補(当日に分析された候補)の分析が LLM 全滅(全件 degraded)のとき、
   当日候補をタイトルのみで最大 max_items 件(min_score は適用しない — 無配信より劣化配信。
@@ -17,6 +18,7 @@ import logging
 import sqlite3
 
 from app.config import Config
+from app.deliver_lock import delivery_lock
 from app.jst import jst_day_bounds_utc, today_jst
 from app.models import EXTRACTION_FAILED_NOTE
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
@@ -47,7 +49,40 @@ def generate_digest(
 
     trend_markdown: 「今日のトレンド」節(GH#75)。付加機能なので None 可(節を省く)。
     hold_if_empty: 分析の段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
+
+    --force は配信と同じロック(deliver.lock)を置換のトランザクションの前に取り、先の配信が
+    終わるまで待つ(GH#333)。配信は最初に読んだ記事を送り続けて最後に id だけで送信済みにする
+    ので、途中で置き換えると新しい世代が届かないまま送信済みになり、台帳にも世代が混ざる。
+    置換でない生成はロックを取らない(新しい行を足すだけで、配信中の digest の内容・配信状態・
+    台帳を変えない。生成済みなら何も変えずに skip する)。
     """
+    if not force:
+        return _generate_digest(
+            conn, config, logger, run_id=run_id, force=False,
+            trend_markdown=trend_markdown, hold_if_empty=hold_if_empty,
+        )
+    # 当日の行があるかはロックの中で読む(取る前に読むと、待つ間に変わった状態で置換しうる)
+    with delivery_lock(
+        conn, logger, run_id=run_id, stage="digest",
+        wait_message="配信が実行中のため、終わるのを待ってから置換する",
+    ):
+        return _generate_digest(
+            conn, config, logger, run_id=run_id, force=True,
+            trend_markdown=trend_markdown, hold_if_empty=hold_if_empty,
+        )
+
+
+def _generate_digest(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    *,
+    run_id: str | None,
+    force: bool,
+    trend_markdown: str | None,
+    hold_if_empty: bool,
+) -> int | None:
+    """generate_digest の本体(--force のときは delivery_lock の中で呼ぶ)。"""
     digest_date = today_jst()
     # 置換の準備(旧採用 item の復帰)から新 digest 確定までを同一トランザクションで行う。
     # existing の読みもロック取得後に行う(取得前の読みだと、並行実行時に stale な

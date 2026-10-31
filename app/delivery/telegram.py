@@ -7,7 +7,8 @@
 - 冪等性: `digest_messages` 台帳(今の世代の行。GH#190)にある message は再送しない
   (部分再送)。全通完了で `digests.delivery_status='sent'` + `sent_at`。途中失敗は 'failed' を
   記録して例外。
-  同じ DB への配信は DB の隣の `<DB>.deliver.lock`(flock)で直列化する(GH#192)。送信できた
+  同じ DB への配信は DB の隣の `<DB>.deliver.lock`(flock。app/deliver_lock.py)で直列化する
+  (GH#192)。digest の --force の置換も同じロックで配信と直列にする(GH#333)。送信できた
   message の記帳に失敗したら記帳だけをやり直し、それでも駄目なら message_id をログに残して
   止める(GH#225)
 - token は `.env` の TELEGRAM_BOT_TOKEN。URL に token が入るため、httpx の例外を
@@ -16,23 +17,20 @@
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
 import logging
-import os
 import random
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import datetime
-from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 
 from app.config import Config
+from app.deliver_lock import delivery_lock
 from app.digest.builder import BOOKMARK_SECTION_MAX
 from app.models import EXTRACTION_FAILED_NOTE
 
@@ -44,8 +42,6 @@ MAX_RETRIES = 3  # 初回 + リトライ3回(同上)
 BACKOFF_S = (1.0, 2.0, 4.0)
 LONG_POLL_S = 50  # getUpdates の long polling 秒(設計 05 §8)
 
-# 配信の直列化のロック(GH#192)。DB の隣の `<DB>.deliver.lock`(migrate.lock と同じ名付け)
-DELIVER_LOCK_SUFFIX = ".deliver.lock"
 # 送信できた message の記帳だけのやり直し(GH#225)。待ちは BACKOFF_S
 RECORD_RETRIES = 3
 
@@ -233,7 +229,12 @@ def deliver_digest(
     """
     if config.telegram.owner_chat_id is None:
         raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
-    with _delivery_lock(conn, logger, run_id):
+    # 置換(digest の --force)も同じロックを取るので、配信の途中で内容と台帳の世代が
+    # 置き換わらない(GH#333)。ロックは記帳と完了の更新(sent / failed)まで持つ
+    with delivery_lock(
+        conn, logger, run_id=run_id, stage="deliver",
+        wait_message="別の配信が実行中のため、終わるのを待つ",
+    ):
         return _deliver_locked(
             conn, config.telegram.owner_chat_id, api, digest_id, logger, run_id, sleep
         )
@@ -248,7 +249,7 @@ def _deliver_locked(
     run_id: str | None,
     sleep: Callable[[float], None],
 ) -> int:
-    """deliver_digest の本体(_delivery_lock の中で呼ぶ)。"""
+    """deliver_digest の本体(delivery_lock の中で呼ぶ)。"""
     digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     if digest is None:
         raise DeliveryError(f"digest id={digest_id} が存在しない")
@@ -578,36 +579,3 @@ def _record_message(
         f"送信済みの message_id={message_id} を台帳に記帳できない"
         f"(digest_id={digest_id}, item_id={item_id}): {type(error).__name__}"
     ) from error
-
-
-@contextlib.contextmanager
-def _delivery_lock(
-    conn: sqlite3.Connection, logger: logging.Logger, run_id: str | None
-) -> Iterator[None]:
-    """同じ DB への配信をプロセス間で直列化する(GH#192)。
-
-    ロックファイルは接続が開いている DB の隣に置く(config の db_path ではなく接続から引き、
-    同じ DB を開いた配信どうしを確実に揃える)。先の配信が終わるまで待つ。メモリ上の DB は
-    他のプロセスと共有されないので直列化しない。
-    """
-    db_file = next(
-        (row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), ""
-    )
-    if not db_file:
-        yield
-        return
-    db_path = Path(db_file)
-    lock_path = db_path.with_name(db_path.name + DELIVER_LOCK_SUFFIX)
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            logger.info(
-                "別の配信が実行中のため、終わるのを待つ",
-                extra={"run_id": run_id, "stage": "deliver"},
-            )
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)  # close で flock は解放される
