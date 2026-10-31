@@ -268,7 +268,10 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
 ) -> None:
     # 分析の障害で載せる記事が無い日は、空の digest を確定せず送らない。復旧後の同じ日の
     # 再実行で、回復した分析の結果を作って配信する(GH#191)
+    from dataclasses import replace
+
     from app.analysis.llm import LLMUnavailableError
+    from app.config import DigConfig
 
     class UnavailableEngine:
         name = "codex-cli"
@@ -278,8 +281,11 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
             raise LLMUnavailableError("codex 起動失敗")
 
     sent = use_fake_telegram(monkeypatch)
+    # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+    # (本物の codex)で掘ろうとする(GH#349)
+    config = replace(with_telegram(make_config(tmp_path)), dig=DigConfig(daily_cap=0))
     args = (
-        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        conn, config, {"TELEGRAM_BOT_TOKEN": "tok"},
         {"rss": StaticConnector()}, make_http(),
     )
     failures = run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN1")
@@ -504,7 +510,7 @@ def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> N
     import httpx
 
     from app import run as run_module
-    from app.config import TelegramConfig
+    from app.config import DigConfig, TelegramConfig
     from app.delivery import TelegramApi
 
     def fake_create_api(env):
@@ -526,6 +532,9 @@ def test_deliver_runs_when_telegram_configured(conn, tmp_path, monkeypatch) -> N
         analysis=base.analysis,
         storage=base.storage,
         telegram=TelegramConfig(owner_user_id=1, owner_chat_id=42),
+        # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+        # (本物の codex)で掘ろうとする(GH#349)
+        dig=DigConfig(daily_cap=0),
     )
     failures = run_pipeline(
         conn, config, {"TELEGRAM_BOT_TOKEN": "tok"}, {"rss": StaticConnector()}, make_http(),
