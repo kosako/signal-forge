@@ -43,9 +43,11 @@ from app.deepdive import (
     build_review_prompt,
     run_dig_stage,
 )
+from app.delivery import DeliveryError
 from app.extraction import extract_pending
 from app.http import HttpClient
 from app.vault_guard import VaultGuard
+from tests.test_delivery import telegram_text_error
 
 logger = logging.getLogger("test-deepdive")
 
@@ -159,6 +161,9 @@ class ScriptedEngine:
 
 
 class FakeApi:
+    """カードの送信を記録する。本文が Telegram の長さの制約に反すれば、TelegramApi が 400 で
+    送出するのと同じ DeliveryError を送出する(GH#343)。"""
+
     def __init__(self, fail: bool = False):
         self.sent: list[tuple[int, str]] = []
         self.markups: list[dict | None] = []
@@ -167,9 +172,21 @@ class FakeApi:
     def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
         if self._fail:
             raise RuntimeError("送信失敗")
+        error = telegram_text_error(text)
+        if error is not None:
+            raise DeliveryError(f"Telegram sendMessage が失敗: HTTP 400: {error}")
         self.sent.append((chat_id, text))
         self.markups.append(reply_markup)
         return 900 + len(self.sent)
+
+
+def test_fake_api_rejects_text_over_telegram_limit() -> None:
+    # GH#343: 模型は Telegram の 4096 字を超えるカードを送れたことにしない
+    api = FakeApi()
+    assert api.send_message(1, "あ" * 4096) == 901
+    with pytest.raises(DeliveryError, match="HTTP 400"):
+        api.send_message(1, "あ" * 4097)
+    assert len(api.sent) == 1
 
 
 def make_factory(engines: dict[str, ScriptedEngine], fail_for: set[str] | None = None):

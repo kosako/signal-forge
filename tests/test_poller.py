@@ -20,7 +20,7 @@ from app.delivery.poller import (
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
 from app.export import export_pending_notes
 from app.jst import JST
-from tests.test_delivery import add_digest, add_item
+from tests.test_delivery import add_digest, add_item, telegram_text_error
 
 logger = logging.getLogger("test-poller")
 
@@ -56,7 +56,11 @@ def make_config(tmp_path: Path, *, owner_user_id: int | None = OWNER_ID) -> Conf
 
 
 class FakeApi:
-    """poller のロジックテスト用(HTTP なし)。呼び出しを記録する。"""
+    """poller のロジックテスト用(HTTP なし)。呼び出しを記録する。
+
+    本文が Telegram の長さの制約に反すれば、TelegramApi が 400 で送出するのと同じ
+    DeliveryError を送出する(GH#343)。
+    """
 
     def __init__(self, batches: list[list[dict]] | None = None):
         self._batches = list(batches or [])
@@ -66,6 +70,9 @@ class FakeApi:
         self.sent: list[tuple[int, str]] = []
 
     def send_message(self, chat_id: int, text: str, *, reply_markup: dict | None = None) -> int:
+        error = telegram_text_error(text)
+        if error is not None:
+            raise DeliveryError(f"Telegram sendMessage が失敗: HTTP 400: {error}")
         self.sent.append((chat_id, text))
         return 900 + len(self.sent)
 
@@ -80,6 +87,15 @@ class FakeApi:
         self, chat_id: int, message_id: int, reply_markup: dict
     ) -> None:
         self.edited.append((chat_id, message_id, reply_markup))
+
+
+def test_fake_api_rejects_text_over_telegram_limit() -> None:
+    # GH#343: 模型は Telegram の 4096 字を超える本文を送れたことにしない
+    api = FakeApi()
+    assert api.send_message(CHAT_ID, "あ" * 4096) == 901
+    with pytest.raises(DeliveryError, match="HTTP 400"):
+        api.send_message(CHAT_ID, "あ" * 4097)
+    assert len(api.sent) == 1
 
 
 class RedeliveringApi(FakeApi):

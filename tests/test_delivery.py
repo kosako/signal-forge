@@ -2,6 +2,7 @@ import json
 import logging
 import sqlite3
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
@@ -74,8 +75,44 @@ def add_digest(
     ).lastrowid
 
 
+# sendMessage の本文の上限(Telegram Bot API: entity を解析した後で 1〜4096 字。設計 04 §2)
+TELEGRAM_TEXT_MAX = 4096
+
+
+class _VisibleText(HTMLParser):
+    """parse_mode=HTML の本文からタグを除き、文字参照を戻した可視テキストを集める。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def telegram_text_error(text: str) -> str | None:
+    """sendMessage の本文が Telegram の長さの制約に反すれば、その 400 の説明を返す(GH#343)。
+
+    数えるのは HTML を解析した後の可視テキスト(href の URL は数えない)。字数は UTF-16 の
+    code unit で数える(entity の offset と同じ単位。app/delivery/poller.py の entity の読み方)。
+    テストの送信の模型が持ち、上限を超える本文が配信の成功と台帳の更新まで進まないようにする。
+    """
+    parser = _VisibleText()
+    parser.feed(text)
+    parser.close()
+    visible = "".join(parser.parts)
+    if not visible.strip():
+        return "Bad Request: message text is empty"
+    if len(visible.encode("utf-16-le", "surrogatepass")) // 2 > TELEGRAM_TEXT_MAX:
+        return "Bad Request: message is too long"
+    return None
+
+
 class ApiRecorder:
-    """sendMessage への実 HTTP を MockTransport で受け、payload を記録する。"""
+    """sendMessage への実 HTTP を MockTransport で受け、payload を記録する。
+
+    本文が Telegram の長さの制約に反すれば、実 API と同じく 400 を返す(GH#343)。
+    """
 
     def __init__(self, fail_statuses: list[int] | None = None):
         self.requests: list[dict] = []
@@ -93,6 +130,10 @@ class ApiRecorder:
                                "parameters": {"retry_after": 7}},
                 )
             return httpx.Response(status, json={"ok": False, "description": f"err {status}"})
+        if request.url.path.endswith("/sendMessage"):
+            error = telegram_text_error(payload.get("text", ""))
+            if error is not None:
+                return httpx.Response(400, json={"ok": False, "description": error})
         self._next_message_id += 1
         return httpx.Response(
             200, json={"ok": True, "result": {"message_id": self._next_message_id}}
@@ -702,6 +743,76 @@ def test_huge_title_is_truncated_and_delivery_succeeds(conn, tmp_path) -> None:
     assert len(text) <= ITEM_TEXT_MAX_CHARS + 400  # タイトル上限 300 + 構造分で十分小さい
     assert "…" in text.splitlines()[0]  # タイトルが切り詰められている
     assert text.endswith("💡 示唆。")  # 示唆は残る
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("あ" * 4096, None),  # 上限ちょうどは受ける
+        ("あ" * 4097, "too long"),
+        ("<b>" + "あ" * 4096 + "</b>", None),  # タグは数えない
+        ("<b>" + "あ" * 4097 + "</b>", "too long"),
+        ('<a href="https://a/' + "x" * 5000 + '">リンク</a>', None),  # href の URL は数えない
+        ("&amp;" * 4096, None),  # 文字参照は戻した 1 字で数える
+        ("&amp;" * 4097, "too long"),
+        ("😀" * 2048, None),  # 絵文字は UTF-16 の 2 単位
+        ("😀" * 2048 + "あ", "too long"),
+        ("", "empty"),
+        ("<b> </b>", "empty"),
+    ],
+    ids=[
+        "4096-ok", "4097-long", "tag-4096-ok", "tag-4097-long", "href-not-counted",
+        "charref-4096-ok", "charref-4097-long", "emoji-4096-units-ok", "emoji-4097-units-long",
+        "empty", "blank-in-tag",
+    ],
+)
+def test_telegram_text_error_bounds(text, error) -> None:
+    # GH#343: 送信の模型が持つ sendMessage の本文の制約(HTML を解析した後で 1〜4096 字)
+    result = telegram_text_error(text)
+    if error is None:
+        assert result is None
+    else:
+        assert error in result
+
+
+def test_recorder_rejects_text_over_telegram_limit() -> None:
+    # GH#343: 模型は上限を超える本文に 400 を返す。TelegramApi は恒久の失敗として送出する
+    recorder = ApiRecorder()
+    api = recorder.api()
+
+    assert api.send_message(CHAT_ID, "あ" * 4096) == 101
+    with pytest.raises(DeliveryError, match="HTTP 400: Bad Request: message is too long"):
+        api.send_message(CHAT_ID, "あ" * 4097)
+    assert len(recorder.requests) == 2  # 400 はリトライしない
+
+
+def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_path) -> None:
+    # GH#343: ヘッダ 1 通に縮退の印・トレンド節・🔖 保存節を同梱する。どれも上限いっぱいでも
+    # 4096 字に収まる(各欄の上限の組み合わせの境界。模型が上限を超える本文を 400 にする)
+    from app.analysis.trend import TrendSummary, TrendTheme, _render
+
+    trend = _render(
+        TrendSummary(
+            themes=[
+                TrendTheme(label="ラ" * 40, summary="&<要" * 300, item_ids=[1])
+                for _ in range(10)
+            ]
+        ),
+        {1},
+    )
+    # 保存節のタイトルはエスケープ後の長さで切るので、エスケープの無い字が可視の字数の最大
+    bookmarks = [
+        add_item(conn, f"https://b/{i}?q=" + "x" * 2000, title="保" * 500) for i in range(12)
+    ]
+    digest_id = add_digest(
+        conn, [], status="degraded", trend_markdown=trend, bookmark_item_ids=bookmarks
+    )
+    recorder = ApiRecorder()
+
+    assert deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger) == 1
+    header = recorder.texts()[0]
+    assert "今日のトレンド" in header and "🔖 保存(12件)" in header
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
 
 
