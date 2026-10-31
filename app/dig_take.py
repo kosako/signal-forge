@@ -69,7 +69,7 @@ def record_takes(
         """
         SELECT q.id, q.question, date(q.created_at, '+9 hours') AS take_date,
                strftime('%Y-%m-%d %H:%M', q.created_at, '+9 hours') AS take_time,
-               r.item_id, r.note_name
+               q.received_signal_id, r.item_id, r.note_name
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'answered' AND q.kind IN ('take', 'both')
           AND q.answer_message_id IS NOT NULL AND q.take_recorded_at IS NULL
@@ -212,10 +212,14 @@ def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 
     🔖 の無いアイテム(X のブックマーク・自動キュー)は take の日にする。追い掛けで
     「いいえ」に訂正した後の take は yes を足す(未消化一覧と KPI 06 は最新の記録を見る。GH#195)。
+    take を受け付けた後の追い掛けの回答は、記録が遅れた古い take で上書きしない(GH#336)。
+    返事を作る間や vault の障害で記録が遅れても、障害の無いときと同じく本人の後の回答を残す。
+    先後は受付の時点の signals.id の最大(received_signal_id。migration 025)で見る(時刻は
+    同じ秒の先後が分からない)。印の無い行(この経路の外で作った行)は従来どおり yes を足す
     """
     latest = conn.execute(
         """
-        SELECT value FROM signals
+        SELECT id, value FROM signals
         WHERE kind = 'followup_dig' AND item_id = ?
         ORDER BY created_at DESC, id DESC LIMIT 1
         """,
@@ -223,6 +227,9 @@ def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     ).fetchone()
     if latest is not None and latest["value"] == "yes":
         return
+    mark = row["received_signal_id"]
+    if latest is not None and mark is not None and latest["id"] > mark:
+        return  # take の受付の後に本人が「いいえ」と答えた
     dig = conn.execute(
         """
         SELECT signal_date FROM signals

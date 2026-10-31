@@ -56,6 +56,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (22, "022_dig_queue_backlog_op.sql"),
         (23, "023_x_signal_runs_backfill.sql"),
         (24, "024_digest_messages_superseded.sql"),
+        (25, "025_dig_questions_received_signal.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -394,6 +395,52 @@ def test_x_signal_runs_backfill_migration_defaults_existing_runs_to_daily(tmp_pa
     assert conn.execute("SELECT backfill FROM x_signal_runs").fetchone()["backfill"] == 0
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE x_signal_runs SET backfill = 2")
+    conn.close()
+
+
+def test_received_signal_migration_marks_signals_before_existing_questions(
+    tmp_path: Path,
+) -> None:
+    # GH#336(migration 025): 既存の質問の印は、受付の時刻より前に記帳された signals の id の最大。
+    # 同じ秒の signals は受付の後とみなす(本人の追い掛けの回答を古い take で上書きしない)
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 24:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    conn.execute(
+        "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 2, 'https://a/1', 'https://a/1', 'sha256:x')"
+    )
+    conn.execute(
+        "INSERT INTO dig_results (id, item_id, note_name, card_text, message_id) "
+        "VALUES (1, 1, 'n', 'カード', 700)"
+    )
+    for signal_id, created_at in [
+        (5, "2026-10-18T12:59:59Z"), (6, "2026-10-18T13:00:00Z"), (7, "2026-10-18T13:01:00Z")
+    ]:
+        conn.execute(
+            "INSERT INTO signals (id, kind, item_id, value, signal_date, created_at) "
+            "VALUES (?, 'followup_dig', 1, 'no', '2026-10-15', ?)",
+            (signal_id, created_at),
+        )
+    for message_id, created_at in [(81, "2026-10-18T13:00:00Z"), (82, "2026-10-18T12:00:00Z")]:
+        conn.execute(
+            "INSERT INTO dig_questions (dig_result_id, question, question_message_id, created_at) "
+            "VALUES (1, '質問', ?, ?)",
+            (message_id, created_at),
+        )
+
+    apply_migrations(conn, db)
+
+    marks = conn.execute(
+        "SELECT received_signal_id FROM dig_questions ORDER BY question_message_id"
+    ).fetchall()
+    assert [row[0] for row in marks] == [5, 0]
     conn.close()
 
 

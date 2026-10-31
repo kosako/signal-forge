@@ -190,6 +190,47 @@ def test_take_after_followup_corrected_to_no_records_yes(conn, config, rows) -> 
     assert item_id not in {row["item_id"] for row in pending_dig_items(conn)}
 
 
+@pytest.mark.parametrize(
+    "no_created_at",
+    ["2026-10-18T13:00:55Z", "2026-10-18T13:05:00Z"],  # take の受付と同じ秒・後
+    ids=["same-second", "later"],
+)
+def test_retried_take_keeps_followup_no_answered_after_take(
+    conn, config, monkeypatch, no_created_at
+) -> None:
+    # GH#336: vault に書けず保留した take を後で記録するとき、take の受付の後に本人が追い掛けで
+    # 「いいえ」と答えていたら yes を足さない(障害が無ければ yes の後に no で、最後は no になる)
+    dig_id = add_dig(conn, config, note=NOTE)
+    item_id = item_of(conn, dig_id)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'dig', '2026-10-15')",
+        (item_id,),
+    )
+    answered(conn, dig_id, "結論", 941, "take")  # 受付は 2026-10-18T13:00:55Z
+    real_open = dig_take.os.open
+
+    def flaky(target, flags, *args, **kwargs):
+        if str(target).endswith(".md"):
+            raise PermissionError("vault に書けない")
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(dig_take.os, "open", flaky)
+    assert record_takes(conn, config, logger) == 0
+    conn.execute(  # take の受付の後に本人が「いいえ」と答えた
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('followup_dig', ?, 'no', '2026-10-15', ?)",
+        (item_id, no_created_at),
+    )
+    monkeypatch.setattr(dig_take.os, "open", real_open)
+
+    assert record_takes(conn, config, logger) == 1
+    assert followups(conn, item_id) == [("no", "2026-10-15")]
+    assert item_id in {row["item_id"] for row in pending_dig_items(conn)}
+    assert "結論" in note_path(config, conn, dig_id).read_text(encoding="utf-8")  # ノートには書く
+    assert not has_unrecorded_take(conn)
+
+
 def test_missing_note_still_records_followup(conn, config, caplog) -> None:
     dig_id = add_dig(conn, config, note=NOTE)
     note_path(config, conn, dig_id).unlink()  # 本人が動かした・消した

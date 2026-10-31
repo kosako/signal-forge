@@ -97,10 +97,8 @@ def add_dig(
 
 
 def ask(conn: sqlite3.Connection, dig_id: int, question: str, message_id: int) -> int:
-    question_id = conn.execute(
-        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) VALUES (?, ?, ?)",
-        (dig_id, question, message_id),
-    ).lastrowid
+    """カードへのリプライを poller と同じ経路で積む(返信先はカード。失敗の知らせではない)。"""
+    question_id = enqueue_question(conn, dig_id, question, message_id, 0)
     conn.commit()
     return question_id
 
@@ -982,6 +980,22 @@ def test_intent_failure_fails_the_question_without_answer_call(conn, config) -> 
 
 
 # --- 失敗の知らせへのリプライ(GH#236) ---
+
+
+def test_received_signal_mark_is_max_signal_id_at_receipt(conn, config) -> None:
+    # GH#336(migration 025): 受け付けた時点で記帳済みの signals.id の最大を印に残す
+    dig_id = add_dig(conn, config)
+    assert ask(conn, dig_id, "最初の質問", 950) and enqueue_request(conn, dig_id, "summary")
+    signal_id = conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', (SELECT item_id FROM dig_results WHERE id = ?), 'dig', '2026-10-18')",
+        (dig_id,),
+    ).lastrowid
+    ask(conn, dig_id, "後の質問", 951)
+    enqueue_request(conn, dig_id, "more")
+
+    marks = conn.execute("SELECT received_signal_id FROM dig_questions ORDER BY id").fetchall()
+    assert [row[0] for row in marks] == [0, 0, signal_id, signal_id]
 
 
 def reply_to_failure(conn, dig_id: int, text: str, message_id: int, failed_id: int) -> int:
