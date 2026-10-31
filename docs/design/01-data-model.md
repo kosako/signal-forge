@@ -298,11 +298,13 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 ```json
 {"raw_content": "…ソース同梱本文。無ければキー省略…",
  "meta": {"…ソース固有情報(RT種別等)。RawItem.meta をそのまま…"},
- "x": {"…X のみ: API レスポンス該当部(full_text 等)…"}}
+ "x": {"…X のみ: API レスポンス該当部(full_text 等)…"},
+ "cached_at": "…本文を書き戻した時刻(UTC ISO 8601)。通常は省略…"}
 ```
 
 - **サイズ上限**: `raw_content` は 50,000 字で切り詰めて保存(巨大な全文フィードで DB を肥大化させない。本文の正本は documents 側)。
 - **purge 対象**: raw_payload は本文キャッシュと同じ TTL で NULL 化する(下記削除ジョブ 2.)。恒久保存の対象ではない。
+- **`cached_at`**: 取込の後に本文を書き戻したときだけ付き、TTL の起点を `fetched_at` から置き換える(今はブックマークで skip を戻す経路だけ。設計 02 §2。GH#332)。
 
 ### 本文キャッシュ TTL と削除ジョブ
 
@@ -310,7 +312,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 - **削除リクエストの即時対応(Developer Agreement IV.B)**: X または投稿者から特定コンテンツの削除要求を受けたら **24時間以内**に消す義務がある(TTL では代替できない)。MVP は手動対応で、手順は本節に完結させる: 該当 item の `documents` 行 DELETE + `raw_payload` NULL 化 + Obsidian ノートの削除(X 由来は本文を置かないためメタのみ)+ `x_signals` の本文抜粋 `text_excerpt` の NULL 化(投稿 ID が `tweet_id` に一致する行を kind を問わず。like / self_rt は item を持たないので item からは辿れない。self_rt の `tweet_id` は RT 元の投稿の id。§7)。個人用途で発生確率は低く、専用コマンドは作らない。
 - 削除ジョブは `intel run` の backup の直前の段(段の順序の正本は設計 00 §2。単独実行は `intel doctor --purge`):
   1. `DELETE FROM documents WHERE expires_at <= now`
-  2. `raw_payload` の NULL 化は **documents から独立して**行う: `items.fetched_at + TTL <= now` の**全行**(documents の有無・status を問わない。duplicate・skipped・抽出未実行の行も対象)の `raw_payload` を NULL 化。TTL はソース別(X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days`)。理由: documents.expires_at 起点にすると documents 行を持たない items が purge から漏れる。特に X は full_text の無期限残存が本文非保持ポリシー違反になる(恒久保存は `analyses.summary` + メタ + URL のみ)。TTL 超過残存は doctor #11 が検査する(設計 05 §2)。`fetched_at` は本文キャッシュを得た時刻として扱い、TTL 切れの skip 済みの X の投稿をブックマークで戻すときに今回の全文を書き戻した場合は今に更新する(書き戻した本文を古い時刻で直ちに消さないため。設計 02 §2。GH#332)
+  2. `raw_payload` の NULL 化は **documents から独立して**行う: 本文キャッシュの取得時刻 + TTL <= now の**全行**(documents の有無・status を問わない。duplicate・skipped・抽出未実行の行も対象)の `raw_payload` を NULL 化。TTL はソース別(X: `x_cache_ttl_days` / RSS・manual: `cache_ttl_days`)。理由: documents.expires_at 起点にすると documents 行を持たない items が purge から漏れる。特に X は full_text の無期限残存が本文非保持ポリシー違反になる(恒久保存は `analyses.summary` + メタ + URL のみ)。TTL 超過残存は doctor #11 が同じ条件で検査する(設計 05 §2)。取得時刻は payload の `cached_at` があればそれ、無ければ `items.fetched_at`。`cached_at` は TTL 切れの skip 済みの X の投稿をブックマークで戻し、今回の全文を書き戻したときだけ付く(書き戻した本文を古い時刻で直ちに消さないため。設計 02 §2。GH#332)。`fetched_at` は初回の取込の時刻として動かさない(週次の健康診断の新着の判定と 24h dedup が使う)
   3. 削除行と `raw_payload` NULL 化行の合算が 1,000 行を超えた回は `VACUUM`(NULL 化も大きな空きを生むため合算で判定)。理由: auto_vacuum のブートストラップ順序の罠を避け、DB は高々百 MB 級なので都度 VACUUM で十分。
 
 ## 7. signals の表現(4ボタン+夜アンケート+追い掛け)

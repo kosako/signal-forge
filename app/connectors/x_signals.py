@@ -495,10 +495,11 @@ def _reactivate_skipped_item(
 
     戻した item の本文キャッシュ(raw_payload と documents)が TTL で消えていれば、
     今回取得した全文の payload を書き戻す(GH#332)。書き戻さないと抽出段が投稿の URL の
-    HTTP 取得に頼り、失敗すると本文なしで分析される。fetched_at を今に更新して TTL を
-    今から数え直す(古い fetched_at のままだと次の purge で直ちに消え、doctor #11 も
-    TTL 超過の残存と数える)。X 由来の item に限る(他のソースの TTL で X の本文を
-    残さない。設計 01 §6)。canonical_url と content_hash は変えない。
+    HTTP 取得に頼り、失敗すると本文なしで分析される。payload に cached_at(今)を付け、
+    TTL を今から数え直す(purge と doctor #11 の起点。app.purge.RAW_PAYLOAD_EXPIRED)。
+    fetched_at は初回の取込の時刻のまま動かさない(元のソースの新着の判定と 24h dedup が
+    使う)。X 由来の item に限る(他のソースの TTL で X の本文を残さない。設計 01 §6)。
+    canonical_url と content_hash も変えない。
     """
     reactivated = conn.execute(
         "UPDATE items SET status = 'new', skip_reason = NULL "
@@ -510,8 +511,8 @@ def _reactivate_skipped_item(
         return
     conn.execute(
         """
-        UPDATE items SET raw_payload = ?,
-                         fetched_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        UPDATE items SET raw_payload = json_set(
+                           ?, '$.cached_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         WHERE id = ? AND raw_payload IS NULL
           AND (SELECT type FROM sources WHERE sources.id = items.source_id) = 'x'
           AND NOT EXISTS (SELECT 1 FROM documents WHERE documents.item_id = items.id)

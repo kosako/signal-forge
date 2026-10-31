@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from app.backup import BACKUP_ARCHIVE_NAME
 from app.config import Config, ConfigError, load_config, load_env
 from app.db import MIGRATIONS_DIR, MigrationError, connect, discover_migrations, verify_ledger
-from app.purge import X_SIGNAL_EXCERPT_EXPIRED
+from app.purge import RAW_PAYLOAD_EXPIRED, X_SIGNAL_EXCERPT_EXPIRED
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VaultGuard, VaultStalled
 
@@ -820,17 +820,7 @@ def _check_ttl_leftovers(
         "WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')"
     ).fetchone()[0]
     stale_payloads = conn.execute(
-        """
-        SELECT count(*) FROM items
-        WHERE raw_payload IS NOT NULL
-          AND fetched_at <= strftime(
-                '%Y-%m-%dT%H:%M:%SZ', 'now',
-                '-' || (
-                  SELECT CASE WHEN sources.type = 'x' THEN ? ELSE ? END
-                  FROM sources WHERE sources.id = items.source_id
-                ) || ' days'
-              )
-        """,
+        f"SELECT count(*) FROM items WHERE {RAW_PAYLOAD_EXPIRED}",
         (config.retention.x_cache_ttl_days, config.retention.cache_ttl_days),
     ).fetchone()[0]
     # x_signals の本文抜粋も purge の対象(記事行を持たないシグナルの分は上の 2 つに出ない。GH#250)

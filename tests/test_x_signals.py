@@ -957,8 +957,10 @@ def test_bookmark_revive_restores_fresh_full_text_for_extraction(conn, tmp_path)
 
     item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
     assert (item["status"], item["skip_reason"]) == ("new", None)
-    assert json.loads(item["raw_payload"])["raw_content"] == long_text
-    assert item["fetched_at"] > OLD_FETCHED_AT  # TTL を今から数え直す
+    payload = json.loads(item["raw_payload"])
+    assert payload["raw_content"] == long_text
+    assert payload["cached_at"] > OLD_FETCHED_AT  # TTL を今から数え直す
+    assert item["fetched_at"] == OLD_FETCHED_AT  # 初回の取込の時刻は動かさない
     # 合流先の識別は変えない
     assert item["canonical_url"] == normalize_url("https://x.com/i/web/status/b1")
     assert item["content_hash"] == "sha256:old"
@@ -1031,6 +1033,41 @@ def test_bookmark_merge_without_revive_does_not_touch_cache(conn, tmp_path) -> N
     assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
         "skipped", None, OLD_FETCHED_AT,
     )
+
+
+def test_bookmark_revive_keeps_existing_payload(conn, tmp_path) -> None:
+    # raw_payload が残っている合流先(documents は無い)は上書きしない。抽出段は残っている
+    # 本文を使い、TTL の起点も変えない
+    existing_id = expired_skipped_x_item(conn, "b1")
+    kept = '{"raw_content": "残っている本文"}'
+    conn.execute("UPDATE items SET raw_payload = ? WHERE id = ?", (kept, existing_id))
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "new", kept, OLD_FETCHED_AT,
+    )
+
+
+def test_bookmark_revive_keeps_quiet_alert_of_original_source(conn, tmp_path) -> None:
+    # 本文の書き戻しは元のソースの新着に数えない。新着の途絶えた有効な X のソースの
+    # 「新しい記事が入っていない」は、古い投稿をブックマークで戻しても消えない(GH#332)
+    from app.config import XConfig
+    from app.source_health import source_health_report
+
+    existing_id = expired_skipped_x_item(conn, "b1")
+    conn.execute("UPDATE sources SET created_at = ? WHERE name = 'x-src'", (OLD_FETCHED_AT,))
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    assert conn.execute(
+        "SELECT raw_payload FROM items WHERE id = ?", (existing_id,)
+    ).fetchone()["raw_payload"] is not None  # 書き戻しの経路を通った
+
+    config = Config(config_dir=tmp_path, x=XConfig(enabled=True))
+    report = source_health_report(conn, config, today_jst())
+    assert "💤 「x-src」に 14 日間、新しい記事が入っていない" in report
 
 
 def test_bookmark_revive_with_link_keeps_no_text(conn, tmp_path) -> None:

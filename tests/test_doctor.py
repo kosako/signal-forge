@@ -898,6 +898,23 @@ def test_ttl_leftover_warn(config_dir, tmp_path) -> None:
     assert "documents 1 件" in result.detail
 
 
+def test_ttl_leftover_counts_raw_payload_from_cached_at(config_dir, tmp_path) -> None:
+    # purge と同じ起点: 書き戻した payload は cached_at から数える(GH#332)
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')")
+    for url, cached_at in (("https://x/r", "2999-01-01T00:00:00Z"), ("https://x/o", None)):
+        payload = '{"raw_content": "x"' + (f', "cached_at": "{cached_at}"' if cached_at else "")
+        conn.execute(
+            "INSERT INTO items (source_id, url, canonical_url, content_hash, raw_payload, "
+            "fetched_at) VALUES (2, ?, ?, 'h', ?, '2020-01-01T00:00:00Z')",
+            (url, url, payload + "}"),
+        )
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 11)
+    assert result.status == "WARN"
+    assert "raw_payload 1 件" in result.detail
+
+
 def test_ttl_leftover_counts_expired_signal_excerpts(config_dir, tmp_path) -> None:
     # 記事行を持たないシグナルの抜粋だけが残っても見逃さない(purge と同じ条件。GH#250)
     conn = connect(tmp_path / "intel.db")

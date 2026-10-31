@@ -72,6 +72,29 @@ def test_raw_payload_nullified_by_source_ttl(conn, tmp_path) -> None:
     assert payloads[dup_old] is None
 
 
+def test_raw_payload_ttl_counts_from_cached_at(conn, tmp_path) -> None:
+    # 全文を書き戻した payload は cached_at から TTL を数える(fetched_at は初回の取込の
+    # 時刻のまま。GH#332)。cached_at の無い行は従来どおり fetched_at
+    revived = add_item(
+        conn, "https://x/r", source_id=3, fetched_days_ago=30,
+        payload='{"raw_content": "x", "cached_at": "2999-01-01T00:00:00Z"}',
+    )
+    revived_old = add_item(
+        conn, "https://x/o", source_id=3, fetched_days_ago=30,
+        payload='{"raw_content": "x", "cached_at": "2020-01-01T00:00:00Z"}',
+    )
+    plain_old = add_item(conn, "https://x/p", source_id=3, fetched_days_ago=30)
+
+    counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
+    assert counts["raw_payload_nullified"] == 2
+    payloads = {
+        r["id"]: r["raw_payload"] for r in conn.execute("SELECT id, raw_payload FROM items")
+    }
+    assert payloads[revived] is not None
+    assert payloads[revived_old] is None
+    assert payloads[plain_old] is None
+
+
 def test_vacuum_triggered_by_nullified_rows(conn, tmp_path, monkeypatch) -> None:
     import app.purge as purge_module
 
