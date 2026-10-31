@@ -250,7 +250,13 @@ def _post_token(
     else:
         # public client(Native App 型)は body の client_id
         data = {**data, "client_id": client_id}
-    response = client.post(TOKEN_URL, data=data, headers=headers, timeout=HTTP_TIMEOUT)
+    try:
+        response = client.post(TOKEN_URL, data=data, headers=headers, timeout=HTTP_TIMEOUT)
+    except httpx.HTTPError as e:
+        # 通信の失敗も分類済みの例外にする(GET 側の _request_with_retry と同じ。素の httpx の
+        # 例外は取込の kind 単位の隔離を抜け、台帳の記録を飛ばす。GH#330)。要求は refresh token
+        # と client の資格情報を持つので、元の例外はつながず型の名前だけを残す
+        raise XOAuth2Error(f"token エンドポイントに接続できない: {type(e).__name__}") from None
     if response.status_code != 200:
         raise XOAuth2Error(
             f"token エンドポイント {response.status_code}: {_safe_error_detail(response)}"

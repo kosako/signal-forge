@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -114,56 +115,60 @@ def collect_x_signals(
     totals = {"api_reads": 0, "new_signals": 0}
     outcomes: dict[str, str] = {}  # 試行した kind → 'ok' | 'failed'(skip は含めない)
     errors: list[str] = []
-    for kind in KIND_ENDPOINTS:
-        if kinds is not None and kind not in kinds:
-            continue
-        if backfill:
-            remaining = backfill_limit  # kind ごとに独立の上限(日次 cap と共有しない)
-        else:
-            remaining = config.x_signals.daily_read_cap - used_today - totals["api_reads"]
-        if remaining < X_SIGNALS_MIN_PAGE:
-            logger.info(
-                f"{kind} を skip(予算残 {remaining} < {X_SIGNALS_MIN_PAGE})",
-                extra={"run_id": run_id, "stage": "x_signals"},
-            )
-            continue
-        stats = {"api_reads": 0, "new_signals": 0, "rate_limited": 0}
-        try:
-            _collect_kind(conn, session, kind, me_id, remaining, run_id, stats, backfill)
-        except (XSignalsError, XOAuth2Error, FatalError) as e:
-            # kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)
-            outcomes[kind] = "failed"
-            errors.append(f"{kind}: {e}")
-            logger.error(
-                f"x_signals {kind} 取込失敗(他 kind は継続): {e}",
-                extra={"run_id": run_id, "stage": "x_signals"},
-            )
-        else:
-            if stats["rate_limited"] and stats["api_reads"] == 0:
-                # 1件も取れずに rate limit はその kind の失敗(黙って 0 件成功にしない)
-                outcomes[kind] = "failed"
-                errors.append(f"{kind}: rate limit(取得 0)")
+    try:
+        for kind in KIND_ENDPOINTS:
+            if kinds is not None and kind not in kinds:
+                continue
+            if backfill:
+                remaining = backfill_limit  # kind ごとに独立の上限(日次 cap と共有しない)
             else:
-                outcomes[kind] = "ok"
-        finally:
-            # 途中ページ失敗でも取得済みぶんを予算・台帳に必ず計上する(過少計上で
-            # 後続 kind に予算が再配分され cap を実質超過するのを防ぐ)
-            totals["api_reads"] += stats["api_reads"]
-            totals["new_signals"] += stats["new_signals"]
-    cost = totals["api_reads"] * config.x.unit_price_usd
+                remaining = config.x_signals.daily_read_cap - used_today - totals["api_reads"]
+            if remaining < X_SIGNALS_MIN_PAGE:
+                logger.info(
+                    f"{kind} を skip(予算残 {remaining} < {X_SIGNALS_MIN_PAGE})",
+                    extra={"run_id": run_id, "stage": "x_signals"},
+                )
+                continue
+            stats = {"api_reads": 0, "new_signals": 0, "rate_limited": 0}
+            try:
+                _collect_kind(conn, session, kind, me_id, remaining, run_id, stats, backfill)
+            except (XSignalsError, XOAuth2Error, FatalError) as e:
+                # kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)
+                outcomes[kind] = "failed"
+                errors.append(f"{kind}: {e}")
+                logger.error(
+                    f"x_signals {kind} 取込失敗(他 kind は継続): {e}",
+                    extra={"run_id": run_id, "stage": "x_signals"},
+                )
+            else:
+                if stats["rate_limited"] and stats["api_reads"] == 0:
+                    # 1件も取れずに rate limit はその kind の失敗(黙って 0 件成功にしない)
+                    outcomes[kind] = "failed"
+                    errors.append(f"{kind}: rate limit(取得 0)")
+                else:
+                    outcomes[kind] = "ok"
+            finally:
+                # 途中ページ失敗でも取得済みぶんを予算・台帳に必ず計上する(過少計上で
+                # 後続 kind に予算が再配分され cap を実質超過するのを防ぐ)
+                totals["api_reads"] += stats["api_reads"]
+                totals["new_signals"] += stats["new_signals"]
+    except BaseException as e:
+        # 分類外の例外(保存の sqlite3.Error・想定外のバグなど)は今までどおり段の失敗として
+        # 抜けるが、その前に取得済みの読取数と費用を failed の行で台帳に残す(設計 02 §2。
+        # 漏れると同じ日の再実行が日次 cap を超えて読む。GH#330)。totals は kind の finally で
+        # 加算済み。台帳を書けなくても元の例外を送出する
+        errors.append(f"{kind}: {_error_text(e)}")
+        try:
+            _record_run(conn, config, totals, errors, failed=True, run_id=run_id, backfill=backfill)
+        except Exception:
+            logger.exception(
+                "x_signals の台帳を書けない(取込の元の例外を送出する)",
+                extra={"run_id": run_id, "stage": "x_signals"},
+            )
+        raise
     all_failed = bool(outcomes) and all(v == "failed" for v in outcomes.values())
-    conn.execute(
-        "INSERT INTO x_signal_runs (status, api_reads, estimated_cost_usd, new_signals, "
-        "error, run_id, backfill) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            "failed" if all_failed else "ok",
-            totals["api_reads"],
-            cost,
-            totals["new_signals"],
-            " / ".join(errors) or None,
-            run_id,
-            1 if backfill else 0,  # backfill は日次 cap の別枠(GH#178。migration 023)
-        ),
+    cost = _record_run(
+        conn, config, totals, errors, failed=all_failed, run_id=run_id, backfill=backfill
     )
     logger.info(
         "x_signals 取込完了",
@@ -176,6 +181,42 @@ def collect_x_signals(
     if all_failed:
         raise XSignalsError(" / ".join(errors))  # 全滅は段の失敗として loud に(GH#74 と同方針)
     return totals
+
+
+def _record_run(
+    conn: sqlite3.Connection,
+    config: Config,
+    totals: dict[str, int],
+    errors: list[str],
+    *,
+    failed: bool,
+    run_id: str | None,
+    backfill: bool,
+) -> float:
+    """取込 1 回の読取数・費用を x_signal_runs へ 1 行記録し、費用を返す。"""
+    cost = totals["api_reads"] * config.x.unit_price_usd
+    conn.execute(
+        "INSERT INTO x_signal_runs (status, api_reads, estimated_cost_usd, new_signals, "
+        "error, run_id, backfill) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "failed" if failed else "ok",
+            totals["api_reads"],
+            cost,
+            totals["new_signals"],
+            " / ".join(errors) or None,
+            run_id,
+            1 if backfill else 0,  # backfill は日次 cap の別枠(GH#178。migration 023)
+        ),
+    )
+    return cost
+
+
+def _error_text(error: BaseException) -> str:
+    """例外の __str__ 自体が壊れていても台帳の記録を崩さない(分類外の例外も扱うため)。"""
+    try:
+        return f"{type(error).__name__}: {error}"
+    except Exception:
+        return type(error).__name__
 
 
 def signal_reads_on(conn: sqlite3.Connection, day: str) -> int:
@@ -303,7 +344,7 @@ def _collect_kind(
                     hit_known = True
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            _rollback_page(conn)
             raise
         stats["new_signals"] += page_new
         if hit_known and not backfill:
@@ -327,6 +368,18 @@ def _collect_kind(
             "> CAST(x_signal_cursors.since_id AS INTEGER)",
             (str(max_wrapper_id),),
         )
+
+
+def _rollback_page(conn: sqlite3.Connection) -> None:
+    """ページの保存の失敗の後始末。元の例外を後始末の例外で置き換えない(GH#330)。
+
+    容量不足・I/O エラーなどでは SQLite がトランザクションを自動でロールバック済みのことが
+    あり、そこで ROLLBACK を送ると別の OperationalError になる。トランザクションが残って
+    いるときだけ戻し、ROLLBACK 自体の失敗も抑えて、呼び出し側に元の例外を送出させる。
+    """
+    if conn.in_transaction:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
 
 
 def _load_cursor(conn: sqlite3.Connection, kind: str) -> str | None:
@@ -515,7 +568,13 @@ def _first_external_link(tweet: dict) -> str | None:
         expanded = entry.get("expanded_url") or entry.get("url")
         if not expanded:
             continue
-        host = (urlsplit(expanded).hostname or "").lower()
+        try:
+            host = (urlsplit(expanded).hostname or "").lower()
+        except ValueError:
+            # 括弧の不整合な netloc などで分解できないリンクは候補から外す(外部リンクが
+            # 残らなければ投稿の URL へ戻る)。ページの保存と kind 単位の隔離を抜けさせない
+            # (GH#329。GH#186 と同じ根)
+            continue
         if host in _INTERNAL_LINK_HOSTS or host.endswith(".twimg.com"):
             continue
         return expanded

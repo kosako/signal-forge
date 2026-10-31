@@ -263,6 +263,35 @@ def test_token_endpoint_error_surfaces_status() -> None:
         )
 
 
+def test_token_endpoint_transport_error_is_classified_without_chaining() -> None:
+    # GH#330: token エンドポイントの通信の失敗も XOAuth2Error にする(素の httpx の例外は取込の
+    # kind 単位の隔離を抜ける)。要求は資格情報を持つので、元の例外の文はつながない
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("secret-in-transport-message", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(XOAuth2Error, match="ReadTimeout") as caught:
+        refresh_token_grant(
+            client, client_id="cid", client_secret="cs", refresh_token="rt",
+            fallback_scope=" ".join(OAUTH2_SCOPES),
+        )
+    assert "secret-in-transport-message" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__  # traceback に元の例外を出さない
+
+
+def test_session_refresh_transport_error_guides_reauth(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json={"data": {"username": "kosako"}})
+
+    token = make_token(expires_at="2026-07-13T11:00:00Z")  # 失効済み
+    session = make_session(tmp_path, httpx.MockTransport(handler), token)
+    with pytest.raises(XOAuth2Error, match="refresh 失敗.*ConnectError"):
+        session.get(USERS_ME_URL)
+
+
 # --- セッション(refresh・リトライ) ---
 
 
