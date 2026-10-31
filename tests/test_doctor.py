@@ -1,8 +1,10 @@
+import json
 import os
 import re
 import sqlite3
 import tarfile
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -896,6 +898,32 @@ def test_ttl_leftover_warn(config_dir, tmp_path) -> None:
     result = by_number(doctor(config_dir, tmp_path), 11)
     assert result.status == "WARN"
     assert "documents 1 件" in result.detail
+
+
+def test_ttl_leftover_counts_raw_payload_from_cached_at(config_dir, tmp_path) -> None:
+    # purge と同じ起点: 書き戻した payload は cached_at から数える(GH#332)。
+    # 異常な cached_at は fetched_at が新しくても TTL 超過に数える(purge が消す値と揃える)
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = connect(tmp_path / "intel.db")
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')")
+    rows = (
+        ("https://x/r", {"raw_content": "x", "cached_at": now}, "2020-01-01T00:00:00Z"),
+        ("https://x/o", {"raw_content": "x"}, "2020-01-01T00:00:00Z"),
+        ("https://x/b", {"raw_content": "x", "cached_at": "not-a-date"}, now),
+        ("https://x/f", {"raw_content": "x", "cached_at": "2999-01-01T00:00:00Z"}, now),
+        # 月末の 3 日を除けば、修飾子の無い strftime は 24 時をそのまま返す(purge のテスト)
+        ("https://x/h", {"raw_content": "x", "cached_at": "2026-10-28T24:30:00Z"}, now),
+    )
+    for url, payload, fetched_at in rows:
+        conn.execute(
+            "INSERT INTO items (source_id, url, canonical_url, content_hash, raw_payload, "
+            "fetched_at) VALUES (2, ?, ?, 'h', ?, ?)",
+            (url, url, json.dumps(payload), fetched_at),
+        )
+    conn.close()
+    result = by_number(doctor(config_dir, tmp_path), 11)
+    assert result.status == "WARN"
+    assert "raw_payload 4 件" in result.detail
 
 
 def test_ttl_leftover_counts_expired_signal_excerpts(config_dir, tmp_path) -> None:

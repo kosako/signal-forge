@@ -1,3 +1,4 @@
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime
@@ -916,6 +917,175 @@ def test_bookmark_merge_into_previous_day_skip_is_preselected(conn, tmp_path) ->
 
     assert item_for(conn, "b1")["id"] == existing_id
     assert existing_id in preselect(conn, config, logger).selected_ids
+
+
+OLD_FETCHED_AT = "2026-01-01T00:00:00Z"  # 本文キャッシュの TTL(既定 7 日)を十分に過ぎた時刻
+
+
+def expired_skipped_x_item(conn, tweet_id: str, *, source_type: str = "x") -> int:
+    """TTL の purge で raw_payload を失い、前日以前に stale で skip 済みの投稿の item。"""
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (type, name) VALUES (?, ?)",
+        (source_type, f"{source_type}-src"),
+    )
+    source_id = conn.execute(
+        "SELECT id FROM sources WHERE name = ?", (f"{source_type}-src",)
+    ).fetchone()["id"]
+    canonical = normalize_url(f"https://x.com/i/web/status/{tweet_id}")
+    return conn.execute(
+        "INSERT INTO items (source_id, external_id, url, canonical_url, content_hash, "
+        "status, skip_reason, raw_payload, fetched_at) "
+        "VALUES (?, ?, ?, ?, 'sha256:old', 'skipped', 'stale', NULL, ?)",
+        (source_id, tweet_id, canonical, canonical, OLD_FETCHED_AT),
+    ).lastrowid
+
+
+def test_bookmark_revive_restores_fresh_full_text_for_extraction(conn, tmp_path) -> None:
+    # GH#332: TTL 切れで本文を失った skip 済みの投稿をブックマークで戻すとき、今回取得した
+    # 全文を本文キャッシュへ書き戻す。抽出段は投稿の URL の HTTP 取得に頼らず全文を使い、
+    # 書き戻した本文は古い fetched_at のせいで次の purge に直ちに消されない
+    from app.extraction import extract_pending
+    from app.http import HttpClient
+    from app.purge import purge_expired
+
+    config = make_config(tmp_path)
+    existing_id = expired_skipped_x_item(conn, "b1")
+    long_text = "長文の学びの段落。" * 80
+    tweet = tw("b1", text="切り詰め")
+    tweet["note_tweet"] = {"text": long_text}
+    collect_x_signals(conn, config, session_with([page(tweet)], []), logger)
+
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["skip_reason"]) == ("new", None)
+    payload = json.loads(item["raw_payload"])
+    assert payload["raw_content"] == long_text
+    assert payload["cached_at"] > OLD_FETCHED_AT  # TTL を今から数え直す
+    assert item["fetched_at"] == OLD_FETCHED_AT  # 初回の取込の時刻は動かさない
+    # 合流先の識別は変えない
+    assert item["canonical_url"] == normalize_url("https://x.com/i/web/status/b1")
+    assert item["content_hash"] == "sha256:old"
+
+    purge_expired(conn, config, logger)
+    assert conn.execute(
+        "SELECT raw_payload FROM items WHERE id = ?", (existing_id,)
+    ).fetchone()["raw_payload"] is not None
+
+    calls: list[str] = []
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(500)
+
+    http = HttpClient(
+        transport=httpx.MockTransport(unreachable),
+        resolve_host=lambda host: ["93.184.216.34"],
+        sleep=lambda _s: None,
+    )
+    counts = extract_pending(conn, config, http, logger)
+    assert counts["ok"] == 1
+    assert calls == []
+    doc = conn.execute(
+        "SELECT extracted_text FROM documents WHERE item_id = ?", (existing_id,)
+    ).fetchone()
+    assert "長文の学びの段落" in doc["extracted_text"]
+
+
+def test_bookmark_revive_does_not_restore_text_into_non_x_item(conn, tmp_path) -> None:
+    # X の本文は X の TTL でしか持たない(設計 01 §6)。他のソースの TTL で残さないため、
+    # X 由来でない合流先には書き戻さない(status だけ戻す。GH#176 の挙動のまま)
+    existing_id = expired_skipped_x_item(conn, "b1", source_type="rss")
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "new", None, OLD_FETCHED_AT,
+    )
+
+
+def test_bookmark_revive_keeps_live_cache(conn, tmp_path) -> None:
+    # 本文キャッシュが残っている合流先(documents が TTL 内)には書き戻さない
+    existing_id = expired_skipped_x_item(conn, "b1")
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, extraction_status, expires_at) "
+        "VALUES (?, '残っている本文', 'ok', '2999-01-01T00:00:00Z')",
+        (existing_id,),
+    )
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "new", None, OLD_FETCHED_AT,
+    )
+
+
+def test_bookmark_merge_without_revive_does_not_touch_cache(conn, tmp_path) -> None:
+    # skip を戻さない合流(blocklist)では本文を書き戻さない(分析の対象に戻らないため)
+    existing_id = expired_skipped_x_item(conn, "b1")
+    conn.execute(
+        "UPDATE items SET skip_reason = 'blocklist' WHERE id = ?", (existing_id,)
+    )
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "skipped", None, OLD_FETCHED_AT,
+    )
+
+
+def test_bookmark_revive_keeps_existing_payload(conn, tmp_path) -> None:
+    # raw_payload が残っている合流先(documents は無い)は上書きしない。抽出段は残っている
+    # 本文を使い、TTL の起点も変えない
+    existing_id = expired_skipped_x_item(conn, "b1")
+    kept = '{"raw_content": "残っている本文"}'
+    conn.execute("UPDATE items SET raw_payload = ? WHERE id = ?", (kept, existing_id))
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "new", kept, OLD_FETCHED_AT,
+    )
+
+
+def test_bookmark_revive_keeps_quiet_alert_of_original_source(conn, tmp_path) -> None:
+    # 本文の書き戻しは元のソースの新着に数えない。新着の途絶えた有効な X のソースの
+    # 「新しい記事が入っていない」は、古い投稿をブックマークで戻しても消えない(GH#332)
+    from app.config import XConfig
+    from app.source_health import source_health_report
+
+    existing_id = expired_skipped_x_item(conn, "b1")
+    conn.execute("UPDATE sources SET created_at = ? WHERE name = 'x-src'", (OLD_FETCHED_AT,))
+    collect_x_signals(
+        conn, make_config(tmp_path), session_with([page(tw("b1", text="全文"))], []), logger
+    )
+    assert conn.execute(
+        "SELECT raw_payload FROM items WHERE id = ?", (existing_id,)
+    ).fetchone()["raw_payload"] is not None  # 書き戻しの経路を通った
+
+    config = Config(config_dir=tmp_path, x=XConfig(enabled=True))
+    report = source_health_report(conn, config, today_jst())
+    assert "💤 「x-src」に 14 日間、新しい記事が入っていない" in report
+
+
+def test_bookmark_revive_with_link_keeps_no_text(conn, tmp_path) -> None:
+    # リンク付きのブックマークは記事が本体で、投稿の本文を raw_content に持たない(設計 02)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'x-src')")
+    source_id = conn.execute("SELECT id FROM sources WHERE name='x-src'").fetchone()["id"]
+    existing_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash, status, "
+        "skip_reason, fetched_at) VALUES (?, 'https://example.com/post', "
+        "'https://example.com/post', '', 'skipped', 'stale', ?)",
+        (source_id, OLD_FETCHED_AT),
+    ).lastrowid
+    session = session_with([page(linked_tw("b1", "https://example.com/post"))], [])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    item = conn.execute("SELECT * FROM items WHERE id = ?", (existing_id,)).fetchone()
+    assert (item["status"], item["raw_payload"], item["fetched_at"]) == (
+        "new", None, OLD_FETCHED_AT,
+    )
 
 
 def test_backfill_relinks_known_signal_without_item(conn, tmp_path) -> None:
