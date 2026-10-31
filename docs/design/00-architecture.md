@@ -69,6 +69,7 @@ app/
   normalize.py    # canonical_url の正規化(u1)と content_hash(h1)。設計 01 §4〜5
   logs.py         # JSON Lines のログ(設計 05 §3)
   jst.py          # 日本時間(JST)と今日の暦日(複数の段が使う。GH#113)
+  deliver_lock.py # 配信のロック(`<DB>.deliver.lock`。配信と digest の --force の置換が共有する。GH#333)
   prompting.py    # プロンプトの sanitize と単一パスのテンプレート置換(分析・トレンド・深掘り・
                   #   返事が共通に使う。設計 03 §3.2・GH#113)
   vault_guard.py  # vault へのアクセスに時間の上限を付ける(返事・take の記録・深掘りのノートの
@@ -104,7 +105,7 @@ tests/
 
 依存方向の規則(理由: 差し替え点を外周に置き、正本ロジックを守る):
 
-- `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。`cli.py` と `run.py` はどちらも合成の層で、単独の CLI の analyze / digest / dig は段の組み立てと実行を `run.py` から呼ぶ(朝バッチとずれないため。GH#206)。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`prompting.py`・`vault_guard.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
+- `cli.py`(と朝バッチの `run.py`)→ 各処理モジュール → 共通の層 の一方向。`cli.py` と `run.py` はどちらも合成の層で、単独の CLI の analyze / digest / dig は段の組み立てと実行を `run.py` から呼ぶ(朝バッチとずれないため。GH#206)。共通の層は `db.py`/`models.py`/`config.py` と、どの段からも使う小さな部品(`jst.py`・`deliver_lock.py`・`prompting.py`・`vault_guard.py`・`normalize.py`・`http.py`・`logs.py`)。処理モジュール同士は直接 import しない(データの受け渡しは DB 経由。RSS 等の `raw_content` も `items.raw_payload`(設計 01 §6 の JSON 形)経由で extraction に渡す)。複数の段が使う定数や処理は、特定の段の module に置かず共通の層に置く(GH#113)。
 - 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
   - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う。`analysis/fallback.py`(予備への切り替え。§5)は LLMEngine を作る側(cli・run)が使う
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)

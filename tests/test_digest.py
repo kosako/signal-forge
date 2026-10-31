@@ -147,6 +147,137 @@ def test_force_replace_then_deliver_resends_all(conn, tmp_path) -> None:
     assert row["delivery_status"] == "sent"
 
 
+def test_force_replace_waits_for_running_delivery(conn, tmp_path, caplog, fixed_today) -> None:
+    # GH#333: 配信の途中に --force の置換を重ねても、置換は配信の終わりを待つ。待たないと、
+    # 配信は先に読んだ旧い記事を送り続けて最後に id だけで sent にし、新しい世代が届かない。
+    # flock は開いたファイルごとに効くので、同じプロセスの 2 スレッド(別々の接続)で
+    # 2 プロセスを模す。正否は時間に頼らない(上限は止まったときに suite を止めないためだけ)
+    import fcntl
+    import os
+    import threading
+
+    import httpx
+
+    from app.config import TelegramConfig
+    from app.delivery import TelegramApi, deliver_digest
+    from tests.test_delivery import ApiRecorder
+
+    hang_guard = 10
+    a = add_analyzed(conn, "https://a/1", relevance=90)
+    b = add_analyzed(conn, "https://a/2", relevance=80)
+    # 初回の生成と置換は別々に today_jst() を呼ぶ。その間に JST の日付が変わると、置換が別の日の
+    # 新規生成になって検査が崩れるので、暦日を固定する(SF-333-001)
+    set_analyzed_at(conn, TODAY_AT, a, b)
+    tg = TelegramConfig(owner_chat_id=777)
+    first_config = Config(config_dir=tmp_path, digest=DigestConfig(max_items=1), telegram=tg)
+    wider = Config(config_dir=tmp_path, digest=DigestConfig(max_items=2), telegram=tg)
+    digest_id = generate_digest(conn, first_config, logger)  # [a]
+    db_path = tmp_path / "intel.db"
+    lock_path = tmp_path / "intel.db.deliver.lock"
+
+    recorder = ApiRecorder()
+    guard = threading.Lock()
+    first_send = threading.Event()  # 配信が 1 通目(ヘッダ)を送り始めた
+    release = threading.Event()  # 配信の 1 通目を返す
+    lock_wait = threading.Event()  # 置換がロックで待ち始めた
+    replace_done = threading.Event()  # 置換が終わった(ロックが無ければ配信の途中で終わる)
+    second_reached = threading.Event()  # 上の 2 つのどちらか
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with guard:
+            response = recorder.handler(request)
+            count = len(recorder.requests)
+        if count == 1:
+            first_send.set()
+            release.wait(timeout=hang_guard)
+        return response
+
+    class LockWaitSignal(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage() == "配信が実行中のため、終わるのを待ってから置換する":
+                lock_wait.set()
+                second_reached.set()
+
+    results: dict[str, object] = {}
+
+    def run_deliver() -> None:
+        thread_conn = connect(db_path)
+        api = TelegramApi(
+            "test-token", transport=httpx.MockTransport(handler), sleep=lambda _s: None
+        )
+        try:
+            results["deliver"] = deliver_digest(thread_conn, wider, api, digest_id, logger)
+        except BaseException as e:  # スレッドの例外は本体で検査する
+            results["deliver"] = e
+        finally:
+            thread_conn.close()
+
+    def run_replace() -> None:
+        thread_conn = connect(db_path)
+        try:
+            results["replace"] = generate_digest(thread_conn, wider, logger, force=True)
+        except BaseException as e:
+            results["replace"] = e
+        finally:
+            thread_conn.close()
+            replace_done.set()
+            second_reached.set()
+
+    def lock_is_free() -> bool:
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    delivering = threading.Thread(target=run_deliver, daemon=True)
+    replacing = threading.Thread(target=run_replace, daemon=True)
+    signal = LockWaitSignal()
+    logger.addHandler(signal)
+    with caplog.at_level(logging.INFO, logger="test-digest"):
+        delivering.start()
+        try:
+            assert first_send.wait(timeout=hang_guard)
+            assert not lock_is_free()  # 配信が送信の途中でロックを持っている
+            replacing.start()
+            assert second_reached.wait(timeout=hang_guard)
+            # 置換は配信のロックで止まり、配信中の digest をまだ置き換えていない
+            assert lock_wait.is_set()
+            assert not replace_done.is_set()
+            row = conn.execute("SELECT item_ids FROM digests").fetchone()
+            assert json.loads(row["item_ids"]) == [a]
+        finally:  # 検査が落ちてもスレッドを残さない
+            release.set()
+            delivering.join(timeout=hang_guard)
+            if replacing.ident is not None:
+                replacing.join(timeout=hang_guard)
+            logger.removeHandler(signal)
+    assert not delivering.is_alive() and not replacing.is_alive()
+    assert lock_is_free()
+
+    # 先の配信は旧い世代(ヘッダ + a)を送り終え、その後に置換が世代を切り替えた
+    assert results == {"deliver": 2, "replace": digest_id}
+    row = conn.execute("SELECT item_ids, delivery_status, sent_at FROM digests").fetchone()
+    assert json.loads(row["item_ids"]) == [a, b]
+    assert row["delivery_status"] == "pending"  # 新しい世代は未送信のまま(sent にならない)
+    assert row["sent_at"] is None
+
+    # 置換の後の配信は新しい世代を全部送る(設計 04 §2)
+    assert deliver_digest(conn, wider, recorder.api(), digest_id, logger) == 3
+    ledger = conn.execute(
+        "SELECT item_id, message_id, superseded_at IS NOT NULL AS superseded "
+        "FROM digest_messages ORDER BY id"
+    ).fetchall()
+    assert [tuple(r) for r in ledger] == [
+        (None, 101, 1), (a, 102, 1),  # 前の世代(置換の印つき。混ざらない)
+        (None, 103, 0), (a, 104, 0), (b, 105, 0),  # 今の世代
+    ]
+    assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
+
+
 def test_no_qualified_items_produces_empty_ok_digest(conn, tmp_path) -> None:
     add_analyzed(conn, "https://a/1", relevance=10)  # min_score 未満
     digest_id = generate_digest(conn, make_config(tmp_path), logger)
