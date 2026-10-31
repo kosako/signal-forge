@@ -456,6 +456,9 @@ def test_export_vault_stall_is_bounded_and_later_stages_run(
     # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは、export 段が見切って
     # 段の失敗にし、配信・purge・backup へ進む(GH#341)。見切るのは上限の時間でなく、止める
     # 位置に着いたのを見てから(順序を時間に頼らない)
+    from dataclasses import replace
+
+    from app.config import DigConfig
     from app.export import obsidian as obsidian_module
     from tests.test_vault_guard import (
         HANG_GUARD_S,
@@ -478,9 +481,12 @@ def test_export_vault_stall_is_bounded_and_later_stages_run(
     gate_vault_threads(monkeypatch)
     monkeypatch.setattr(obsidian_module, "_existing_item_notes", stuck_listing)
     sent = use_fake_telegram(monkeypatch)
+    # 調査段はこのテストの対象外。止めないと、配信した digest の上位を config のエンジン
+    # (本物の codex)で掘ろうとする(GH#349)
+    config = replace(with_telegram(make_config(tmp_path)), dig=DigConfig(daily_cap=0))
     try:
         failures = run_pipeline(
-            conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+            conn, config, {"TELEGRAM_BOT_TOKEN": "tok"},
             {"rss": StaticConnector()}, make_http(), lambda: ScriptedEngine(conn),
             logger, "01RUNID",
         )
