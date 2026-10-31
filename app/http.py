@@ -6,7 +6,8 @@
 - リトライ: 2回・指数バックオフ(1s→4s)+ jitter。429 は Retry-After 尊重(30s まで。より長い
   待ちを求められたら待たずに失敗)。恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)
 - 本文はストリーミングで受け、受信量(展開前)か展開後が 10 MiB を超えたら読むのをやめて失敗に
-  する。展開は少しずつ行い、上限の検査の前に巨大に展開しない(GH#203)
+  する。展開は少しずつ行い、上限の検査の前に巨大に展開しない(GH#203)。短縮 URL の展開は
+  転送を各ホップのヘッダで判定し、本文は読まない(GH#328)
 - SSRF ガード: DNS 解決後の接続先 IP が global でなければ拒否(is_global を基本にした
   allowlist 方式。private/loopback/link-local に加え shared address space 100.64.0.0/10 等
   のブラックリスト漏れも遮断)。リダイレクトは自動追跡せず各ホップで再検査する。
@@ -207,11 +208,26 @@ class HttpClient:
         本文の上限(ResponseTooLargeError)と全体の期限(FetchDeadlineError)の超過は
         リトライせずに送出する(GH#203)。
         """
+        return self._fetch(url, headers, read_body=True)
+
+    def resolve_short_url(self, url: str) -> str:
+        """既知短縮 URL の最終 URL 解決(u1 手順1 の resolver。設計 01 §4)。
+
+        転送の判定は各ホップの応答のヘッダだけで行い、本文は読まない(最終の URL しか使わない)。
+        転送先が本文の上限を超える PDF などでも、URL は解決できる。各ホップの接続先の検証・
+        リトライ・全体の期限は get と同じ(GH#328)。
+        """
+        return self._fetch(url, None, read_body=False).final_url
+
+    def _fetch(
+        self, url: str, headers: dict[str, str] | None, *, read_body: bool
+    ) -> FetchedResponse:
+        """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。"""
         deadline = self._clock() + FETCH_DEADLINE_S
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             try:
-                fetched = self._follow_redirects(url, headers, deadline)
+                fetched = self._follow_redirects(url, headers, deadline, read_body=read_body)
             except (httpx.TransportError, httpx.TimeoutException, DnsResolutionError) as e:
                 # スリープ復帰直後などの一時的な名前解決の失敗も、transport エラーと
                 # 同じ回数・バックオフで再試行する(GH#188)
@@ -265,18 +281,14 @@ class HttpClient:
             raise FetchDeadlineError(f"取得の期限({FETCH_DEADLINE_S}s)を超過: {url}")
         return remaining
 
-    def resolve_short_url(self, url: str) -> str:
-        """既知短縮 URL の最終 URL 解決(u1 手順1 の resolver。設計 01 §4)。"""
-        return self.get(url).final_url
-
     def _follow_redirects(
-        self, url: str, headers: dict[str, str] | None, deadline: float
+        self, url: str, headers: dict[str, str] | None, deadline: float, *, read_body: bool
     ) -> FetchedResponse:
         current = url
         permanently_moved = False
         for _ in range(MAX_REDIRECTS + 1):
             pinned_ip = self._check_target(current, deadline)  # 期限を過ぎていれば先へ進まない
-            response = self._get_pinned(current, pinned_ip, headers, deadline)
+            response = self._get_pinned(current, pinned_ip, headers, deadline, read_body=read_body)
             if response.status_code not in _REDIRECT_STATUSES:
                 return FetchedResponse(
                     response=response, final_url=current, permanently_moved=permanently_moved
@@ -291,13 +303,20 @@ class HttpClient:
         raise FatalError(f"リダイレクトが {MAX_REDIRECTS} 回を超過(ループ疑い): {url}")
 
     def _get_pinned(
-        self, url: str, ip: str, headers: dict[str, str] | None, deadline: float
+        self,
+        url: str,
+        ip: str,
+        headers: dict[str, str] | None,
+        deadline: float,
+        *,
+        read_body: bool,
     ) -> httpx.Response:
         """URL ホストを検証済み IP に書き換えて GET する(DNS rebinding 対策)。
 
         Host ヘッダと SNI(sni_hostname)に元ホスト名を残すため、サーバ側からは
         通常のリクエストに見える。証明書検証も元ホスト名に対して行われる。
         本文はストリーミングで受け、受信量と期限を検査しながら読む(GH#203)。
+        read_body が偽なら本文を読まずに接続を閉じる(短縮 URL の解決。GH#328)。
         """
         split = urlsplit(url)
         host = split.hostname
@@ -337,7 +356,8 @@ class HttpClient:
             with self._client.stream(
                 "GET", pinned_url, headers=request_headers, extensions=extensions, timeout=timeout
             ) as response:
-                self._read_body(response, url, deadline)
+                if read_body:
+                    self._read_body(response, url, deadline)
         except httpx.TransportError as e:
             if guard.expired:
                 raise FetchDeadlineError(f"取得の期限({FETCH_DEADLINE_S}s)を超過: {url}") from e

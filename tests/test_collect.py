@@ -514,6 +514,40 @@ def test_short_url_redirecting_to_unsplittable_url_recorded_as_error(
     assert source["consecutive_failures"] == 0
 
 
+def test_short_url_to_oversized_target_does_not_abort_source(conn: sqlite3.Connection) -> None:
+    # 短縮 URL の転送先の本文が取得の上限を超えても、URL は解決して保存し、同じソースの
+    # 他の記事とカーソルも保存する(転送先の本文は読まない。GH#328)
+    class EndlessBody(httpx.SyncByteStream):
+        def __iter__(self):
+            while True:
+                yield b"x" * (1024 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["host"] == "t.co":
+            return httpx.Response(301, headers={"location": "https://example.com/big.pdf"})
+        return httpx.Response(200, stream=EndlessBody())
+
+    http = HttpClient(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["93.184.216.34"],
+        sleep=lambda _s: None,
+    )
+    connector = FakeConnector([item("https://t.co/pdf"), item("https://example.com/ok")])
+    collect_all(conn, {"rss": connector}, logger, resolve_short=http.resolve_short_url)
+    rows = {
+        r["url"]: (r["canonical_url"], r["status"]) for r in conn.execute("SELECT * FROM items")
+    }
+    assert rows == {
+        "https://t.co/pdf": ("https://example.com/big.pdf", "new"),
+        "https://example.com/ok": ("https://example.com/ok", "new"),
+    }
+    source = conn.execute(
+        "SELECT cursor, consecutive_failures FROM sources WHERE type='rss'"
+    ).fetchone()
+    assert json.loads(source["cursor"]) == {"etag": "e1", "last_modified": None}
+    assert source["consecutive_failures"] == 0
+
+
 def test_short_url_resolved_without_holding_write_lock(
     conn: sqlite3.Connection, tmp_path: Path
 ) -> None:
