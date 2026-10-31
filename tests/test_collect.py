@@ -226,15 +226,18 @@ def test_search_rerun_skipping_failed_slot_keeps_source_failure(
         "VALUES ('x', 'x:search', '{\"mode\": \"search\"}', '2026-10-20T21:30:00Z')"
     )
     broken = {"c": True}
+    # 同じ日の再実行だけが返す新しい投稿(先の実行の id と重ならない)。その実行の取得ぶんが
+    # 保存されたことを、次の実行の前に確かめるため
+    rerun = {"on": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
         slot = request.url.params["query"][1]  # "(a) -is:retweet -is:reply" の a
         if slot == "c" and broken["c"]:
             return httpx.Response(400, json={})
-        base = {"a": 500, "b": 700, "c": 900}[slot]
+        base = {"a": 500, "b": 700, "c": 900}[slot] + (50 if rerun["on"] else 0)
         return httpx.Response(200, json={
             "data": [
-                {"id": str(base - i), "text": f"{slot} の投稿 {i}", "author_id": "a1",
+                {"id": str(base - i), "text": f"{slot} の投稿 {base - i}", "author_id": "a1",
                  "created_at": "2026-10-21T09:00:00.000Z"}
                 for i in range(3)
             ],
@@ -259,6 +262,15 @@ def test_search_rerun_skipping_failed_slot_keeps_source_failure(
             "WHERE type='x'"
         ).fetchone()
 
+    def stored() -> set[str]:
+        return {
+            row["external_id"]
+            for row in conn.execute(
+                "SELECT external_id FROM items WHERE source_id = "
+                "(SELECT id FROM sources WHERE type='x')"
+            )
+        }
+
     def last_run() -> sqlite3.Row:
         return conn.execute(
             "SELECT status, api_reads FROM collect_runs WHERE source_id = "
@@ -270,10 +282,16 @@ def test_search_rerun_skipping_failed_slot_keeps_source_failure(
     failed = state()
     assert failed["consecutive_failures"] == 1
     assert "400" in failed["last_error"]
+    assert stored() == {"500", "499", "498", "700", "699", "698"}
 
     # 同じ日の再実行(先の 6 件を引いた残り 29 → 10/10/9)。c は要求しない
+    rerun["on"] = True
     collect_all(conn, {"rss": FakeConnector([]), "x": search(6)}, logger)
+    rerun["on"] = False
     assert (last_run()["status"], last_run()["api_reads"]) == ("ok", 6)
+    # 要求しなかったスロットがある実行も、取れた投稿は保存する(この実行だけが返した id)
+    assert {"550", "549", "548", "750", "749", "748"} <= stored()
+    assert len(stored()) == 12
     assert tuple(state()) == tuple(failed)  # 成功の時刻も直近のエラーも連続失敗数も変えない
     assert len(source_failure_alerts(conn, "x", 1)) == 1
 
@@ -285,10 +303,8 @@ def test_search_rerun_skipping_failed_slot_keeps_source_failure(
     assert recovered["consecutive_failures"] == 0
     assert recovered["last_error"] is None
     assert recovered["last_success_at"] != "2026-10-20T21:30:00Z"
-    # 3 回で取れた投稿はすべて保存されている(要求しなかったスロットがある実行の取得ぶんも捨てない)
-    assert conn.execute(
-        "SELECT count(*) FROM items WHERE source_id = (SELECT id FROM sources WHERE type='x')"
-    ).fetchone()[0] == 9
+    assert {"900", "899", "898"} <= stored()  # c の投稿も取れた
+    assert len(stored()) == 15
 
 
 def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:
