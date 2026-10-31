@@ -509,3 +509,48 @@ def test_run_failure_notice_tells_whether_digest_was_held(
     result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
     assert result.exit_code == 1
     assert passed == [digest_held]
+
+
+# config.toml を読む全コマンド(検査だけの doctor を除く)。DB・外部・設定の置き場に書くか、
+# 既定の DB を読む(GH#338)
+_CONFIG_REQUIRED = [
+    ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["answer"],
+    ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"],
+    ["doctor", "--purge"], ["doctor", "--cost"],
+]
+
+
+@pytest.mark.parametrize("args", _CONFIG_REQUIRED, ids=" ".join)
+def test_commands_stop_before_db_when_config_toml_is_missing(tmp_path, monkeypatch, args) -> None:
+    # --config-dir の誤指定や設定の消失で、既定の設定のまま既定の DB を変更しない(GH#338)
+    from app import logs
+    from app.config import ConfigError
+
+    home = tmp_path / "home"  # 既定の DB(~/.local/share/intel/intel.db)を本物の HOME から外す
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    conf = tmp_path / "conf"
+    conf.mkdir()  # 置き場はあるが config.toml が無い
+    result = runner.invoke(app, [*args, "--config-dir", str(conf)])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ConfigError)
+    assert str(conf / "config.toml") in str(result.exception)  # 探した path を出す
+    assert not home.exists()  # 既定の DB も、DB の隣のロックも作らない
+    assert not (tmp_path / "logs").exists()
+
+
+def test_main_reports_config_error_in_one_line(tmp_path, monkeypatch, capsys) -> None:
+    # 入口(intel = app.cli:main)は設定の不備を traceback でなく 1 行で出して止める(GH#338)
+    import sys
+
+    from app.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(sys, "argv", ["intel", "doctor", "--purge", "--config-dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        main()
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"設定エラー: {tmp_path / 'config.toml'} が存在しない")
+    assert err.count("\n") == 1  # traceback を付けない
+    assert not (tmp_path / "home").exists()

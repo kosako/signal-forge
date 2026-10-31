@@ -47,7 +47,7 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 
 | # | 項目 | 判定 |
 |---|------|------|
-| 1 | config.toml 存在・スキーマ検証(Pydantic) | FAIL |
+| 1 | config.toml 存在・スキーマ検証(Pydantic)。無いときは FAIL にして残りの検査を続け、config に依存する項目は既定の設定で別の DB を診断せず「検査不可」にする。ファイルが無くても動くのは検査だけの `intel doctor` で、`--purge` / `--cost` を含むほかのコマンドは DB に接続する前に設定のエラーで止まる(GH#338) | FAIL |
 | 2 | `.env` のパーミッション(600 以外は FAIL)・必須キー存在(Claude API を使う設定なら `INTEL_ANTHROPIC_API_KEY` も: 深掘りのレビュー `[dig].review` を使い深掘りが有効なとき(GH#153)と、予備 `[llm_fallback].engine = anthropic-api` のとき(GH#156)。無くても本体は動くが、レビュー・予備が毎回失敗するため) | FAIL |
 | 3 | SQLite 接続+マイグレーション適用状態(未適用番号の検出と、台帳の不整合 = ファイルに無い適用済み番号・filename の不一致の検出。不整合は CLI 起動時の自動適用が拒否して run・poll が起動できないため、起動時と同じ検査を使う。GH#252) | FAIL |
 | 4 | Telegram: `getMe` 成功+allowlist(user_id/chat_id)設定済み | FAIL |

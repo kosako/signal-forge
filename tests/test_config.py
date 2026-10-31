@@ -11,8 +11,22 @@ def write_config(tmp_path: Path, body: str) -> Path:
     return tmp_path
 
 
-def test_missing_file_returns_defaults(tmp_path: Path) -> None:
-    config = load_config(tmp_path)
+def empty_config(tmp_path: Path) -> Path:
+    """空の config.toml だけを置いた別の設定ディレクトリ(全キーが既定値になる)。"""
+    config_dir = tmp_path / "empty"
+    config_dir.mkdir()
+    return write_config(config_dir, "")
+
+
+def test_missing_file_fails_with_searched_path(tmp_path: Path) -> None:
+    # 既定値で続けると、--config-dir の誤指定や設定の消失で既定の DB を変更する(GH#338)
+    with pytest.raises(ConfigError, match="config.toml が存在しない") as e:
+        load_config(tmp_path / "nowhere")
+    assert str(tmp_path / "nowhere" / "config.toml") in str(e.value)
+
+
+def test_empty_file_returns_defaults(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, ""))
     assert isinstance(config, Config)
     assert config.digest.max_items == 10
     assert config.retention.cache_ttl_days == 30
@@ -49,7 +63,7 @@ def test_x_search_parse_and_defaults(tmp_path: Path) -> None:
     assert config.x_search.slots == ("ai agents", "llm")
     assert config.x_search.daily_read_cap == 35
     assert config.x.combined_daily_read_cap == 165
-    assert load_config(tmp_path.joinpath("nx")).x_search.slots == ()  # 既定 = 検索無効
+    assert load_config(empty_config(tmp_path)).x_search.slots == ()  # 既定 = 検索無効
 
 
 def test_x_search_slots_validation(tmp_path: Path) -> None:
@@ -282,8 +296,9 @@ def test_x_oauth2_parse_and_defaults(tmp_path: Path) -> None:
     assert config.x_oauth2.client_id == "cid"
     assert config.x_oauth2.callback_port == 9000
     # 既定: 未設定 = S1 未セットアップ(x-auth 側で fail fast)
-    assert load_config(tmp_path / "nowhere").x_oauth2.client_id is None
-    assert load_config(tmp_path / "nowhere").x_oauth2.callback_port == 8791
+    default = load_config(empty_config(tmp_path)).x_oauth2
+    assert default.client_id is None
+    assert default.callback_port == 8791
 
 
 def test_x_oauth2_validation(tmp_path: Path) -> None:
@@ -326,7 +341,7 @@ def test_obsidian_folder_accepts_relative_path(tmp_path: Path, folder: str) -> N
 
 def test_x_signals_cap_counts_toward_combined_budget(tmp_path: Path) -> None:
     # S1b 取込も合算予算の単一ノブの内側(ADR 0001)。既定 0 は挙動不変
-    assert load_config(tmp_path / "nowhere").x_signals.daily_read_cap == 0
+    assert load_config(empty_config(tmp_path)).x_signals.daily_read_cap == 0
     config = load_config(write_config(tmp_path, "[x_signals]\ndaily_read_cap = 35\n"))
     assert config.x_signals.daily_read_cap == 35  # 130 + 35 = 165 ちょうどは OK
     with pytest.raises(ConfigError, match="combined_daily_read_cap"):
@@ -378,7 +393,7 @@ def test_float_settings_reject_non_finite(tmp_path: Path, bad: str) -> None:
 
 
 def test_dig_defaults_and_overrides(tmp_path: Path) -> None:
-    assert load_config(tmp_path).dig.daily_cap == 2  # 設計 06 §3 の既定
+    assert load_config(write_config(tmp_path, "")).dig.daily_cap == 2  # 設計 06 §3 の既定
     config = load_config(
         write_config(tmp_path, "[dig]\ndaily_cap = 0\nreasoning_effort = \"high\"\n")
     )
@@ -407,7 +422,7 @@ def test_dig_rejects_bad_values(tmp_path: Path) -> None:
 
 
 def test_anthropic_api_defaults_and_overrides(tmp_path: Path) -> None:
-    default = load_config(tmp_path).anthropic_api
+    default = load_config(write_config(tmp_path, "")).anthropic_api
     assert (default.model, default.effort) == ("claude-opus-5-5", "medium")
     assert default.max_tokens == 16_000
     assert (default.input_usd_per_mtok, default.output_usd_per_mtok) == (4.0, 20.0)
@@ -438,7 +453,7 @@ def test_anthropic_api_rejects_bad_values(tmp_path: Path, body: str, match: str)
 
 
 def test_dig_review_defaults_and_validation(tmp_path: Path) -> None:
-    default = load_config(tmp_path).dig
+    default = load_config(write_config(tmp_path, "")).dig
     assert (default.review, default.review_monthly_cap_usd) == (False, 10.0)
     write_config(tmp_path, "[dig]\nreview = true\nreview_monthly_cap_usd = 3\n")
     config = load_config(tmp_path).dig
@@ -450,7 +465,7 @@ def test_dig_review_defaults_and_validation(tmp_path: Path) -> None:
 
 
 def test_llm_fallback_defaults_and_overrides(tmp_path: Path) -> None:
-    default = load_config(tmp_path).llm_fallback
+    default = load_config(write_config(tmp_path, "")).llm_fallback
     assert (default.engine, default.model, default.max_tokens) == ("", "claude-sonnet-5-5", 16_000)
     assert (default.input_usd_per_mtok, default.output_usd_per_mtok) == (2.0, 10.0)
     assert default.monthly_cap_usd == 10.0
