@@ -1155,6 +1155,83 @@ def test_guidless_entry_not_known_by_url_of_guid_item(conn: sqlite3.Connection, 
     assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
 
 
+def test_rss_progresses_past_short_urls_with_normalization_errors(
+    conn: sqlite3.Connection,
+) -> None:
+    # 確定した正規化のエラー(解決先を分解できない)も同じ記事の結果として残し、再実行では HTTP の
+    # 前に error の行で取り込み済みと分かる(時間の枠 2 秒・1 件の解決 1 秒。新しい順に不正な
+    # 短縮 URL 2 件(guid なし)と正常な短縮 URL 1 件)
+    now = {"t": 0.0}
+    calls: list[str] = []
+
+    def slow_resolver(url: str) -> str:
+        calls.append(url)
+        now["t"] += 1.0
+        if "bad" in url:
+            raise ValueError("解決先を分解できない")
+        return "https://example.com/good"
+
+    def guidless(code: str, day: int) -> RawItem:
+        return RawItem(
+            external_id=None, url=f"https://bit.ly/{code}", title=f"記事 {code} のタイトル",
+            author=None, published_at=datetime(2026, 7, day, tzinfo=UTC),
+            raw_content=f"記事 {code} の本文", meta={},
+        )
+
+    connector = FakeConnector([guidless("bad1", 3), guidless("bad2", 2), guidless("ok", 1)])
+    limits = CollectConfig(time_budget_s=2)
+
+    def run() -> None:
+        now["t"] = 0.0
+        collect_all(
+            conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+            clock=lambda: now["t"],
+        )
+
+    run()
+    rows = conn.execute("SELECT url, status FROM items WHERE source_id = 2 ORDER BY id")
+    assert [tuple(r) for r in rows] == [
+        ("https://bit.ly/bad1", "error"), ("https://bit.ly/bad2", "error"),
+    ]
+    assert saved_cursor(conn) == {}
+
+    run()
+    assert calls == ["https://bit.ly/bad1", "https://bit.ly/bad2", "https://bit.ly/ok"]
+    rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
+    assert [r[0] for r in rows][-1] == "https://example.com/good"
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    kept = conn.execute(
+        "SELECT entry_key, canonical_url FROM short_url_resolutions ORDER BY entry_key"
+    ).fetchall()
+    assert [tuple(r) for r in kept] == [
+        ("url:https://bit.ly/bad1", None),
+        ("url:https://bit.ly/bad2", None),
+        ("url:https://bit.ly/ok", "https://example.com/good"),
+    ]
+
+
+def test_rss_cap_does_not_defer_entries_with_kept_normalization_error(
+    conn: sqlite3.Connection,
+) -> None:
+    # 上限で打ち切った後ろの、確定した正規化のエラーを残した記事も、error の行で取り込み済みと
+    # 分かれば回した数に入れない(カーソルを据え置いて毎回読み直さない)
+    def resolver(url: str) -> str:
+        raise ValueError("解決先を分解できない")
+
+    bad = RawItem(
+        external_id=None, url="https://bit.ly/bad", title="不正な短縮 URL の記事のタイトル",
+        author=None, published_at=datetime(2026, 7, 1, tzinfo=UTC), raw_content="本文",
+        meta={},
+    )
+    collect_all(conn, {"rss": FakeConnector([bad])}, logger, resolve_short=resolver)
+    collect_all(
+        conn, {"rss": FakeConnector([dated("g1", 9), bad])}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=1),
+    )
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
 def test_failed_short_url_resolution_is_not_kept(conn: sqlite3.Connection) -> None:
     # 通信の失敗は結果を残さない。今までどおりソースの失敗になり、次の実行で解決し直す
     calls: list[str] = []

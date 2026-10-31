@@ -27,14 +27,16 @@ CREATE INDEX ix_budget_cuts_created ON budget_cuts(created_at);
 --   entry_key     記事の識別子。'guid:' + guid、無ければ 'url:' + 元の URL(種別で名前空間を
 --                 分ける。URL と同じ文字列の guid の記事が、guid の無い記事の結果を使わない)
 --   url           解決の前の短縮 URL(前後の空白は除く)。同じ記事でも URL が変われば解決し直す
---   canonical_url 解決した先を u1 で正規化した URL(items.canonical_url と同じ形)
+--   canonical_url 解決した先を u1 で正規化した URL(items.canonical_url と同じ形)。NULL は確定した
+--                 正規化のエラー(解決先を分解できない等。記事は error の行になり、次の実行は
+--                 HTTP の前にその行で取り込み済みと分かる)
 --   resolved_at   解決した時刻。purge が 30 日より前の行を消す(フィードに残る期間を超えたら要らない)
--- 解決できなかった URL(通信の失敗・解決先が分解できない)は残さない。
+-- 通信の失敗(一時的)は残さず、次の実行で解決し直す。
 CREATE TABLE short_url_resolutions (
   source_id     INTEGER NOT NULL REFERENCES sources(id),
   entry_key     TEXT    NOT NULL,
   url           TEXT    NOT NULL,
-  canonical_url TEXT    NOT NULL,
+  canonical_url TEXT,
   resolved_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   PRIMARY KEY (source_id, entry_key)
 ) STRICT;
