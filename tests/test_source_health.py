@@ -176,6 +176,50 @@ def test_quiet_boundary_is_jst_midnight_14_days_ago(conn, tmp_path, last_fetched
     assert ("💤 「feed」" in report) is quiet
 
 
+def add_cut(conn, kind: str, created_at: str, deferred: int, source_id=None) -> None:
+    conn.execute(
+        "INSERT INTO budget_cuts (created_at, kind, source_id, deferred) VALUES (?, ?, ?, ?)",
+        (created_at, kind, source_id, deferred),
+    )
+
+
+def test_report_lists_budget_cut_days_of_last_7_days(conn, tmp_path) -> None:
+    # 段の上限で打ち切った日(GH#340)。2026-10-25(JST)を含む直近 7 日 = 2026-10-19 00:00 JST
+    # (2026-10-18T15:00:00Z)から。日は JST の暦日で数える
+    add_cut(conn, "collect_time", "2026-10-18T14:59:59Z", 9)  # 期間の前(数えない)
+    add_cut(conn, "collect_time", "2026-10-18T15:00:00Z", 3)  # JST 10-19
+    add_cut(conn, "collect_time", "2026-10-20T22:00:00Z", 5)  # JST 10-21
+    add_cut(conn, "extract_time", "2026-10-24T21:00:00Z", 40)  # JST 10-25
+    big = add_source(conn, "feed-big")
+    add_cut(conn, "rss_items", "2026-10-23T20:00:00Z", 12, big)  # JST 10-24 の朝
+    add_cut(conn, "rss_items", "2026-10-24T01:00:00Z", 30, big)  # 同じ JST 10-24
+    off = add_source(conn, "feed-off", enabled=0)  # 人が止めたソースは知らせない
+    add_cut(conn, "rss_items", "2026-10-24T01:00:00Z", 7, off)
+
+    report = source_health_report(conn, config(tmp_path), TODAY)
+
+    assert (
+        "⏱️ 収集の段が時間の上限(600 秒)で打ち切られた(直近 7 日のうち 2 日。"
+        "最も多い回は 5 ソースを次の実行へ回した)"
+    ) in report
+    assert (
+        "⏱️ 本文抽出の段が時間の上限(600 秒)で打ち切られた(直近 7 日のうち 1 日。"
+        "最も多い回は 40 件を次の実行へ回した)"
+    ) in report
+    assert (
+        "📦 「feed-big」が 1 回の上限(100 件)を超えた(直近 7 日のうち 1 日。"
+        "最も多い回は 30 件を次の実行へ回した)"
+    ) in report
+    assert "feed-off" not in report
+    assert "✅" not in report
+
+
+def test_report_without_budget_cuts_has_no_cut_lines(conn, tmp_path) -> None:
+    add_cut(conn, "extract_time", "2026-10-18T14:59:59Z", 9)  # 先週のぶんは載せない
+    report = source_health_report(conn, config(tmp_path), TODAY)
+    assert "⏱️" not in report and "📦" not in report
+
+
 @pytest.mark.parametrize(
     ("digest_date", "counted"), [("2026-09-28", True), ("2026-09-27", False)]
 )

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 from app.analysis.fallback import run_fallback_notice
 from app.analysis.llm import LLMEngine
@@ -84,14 +84,24 @@ def run_pipeline(
             )
 
     stage("collect", lambda: collect_all(
-        conn, connectors, logger, run_id=run_id, resolve_short=http.resolve_short_url
+        conn, connectors, logger, run_id=run_id, resolve_short=http.resolve_short_url,
+        limits=config.collect,
     ))
     if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
-    stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
+    # 本文抽出が時間の上限で次の実行へ回した記事は、analyze 段が本文なしで分析しない(GH#340)
+    deferred: list[int] = []
+    stage(
+        "extract",
+        lambda: deferred.extend(
+            extract_pending(conn, config, http, logger, run_id=run_id).deferred_ids
+        ),
+    )
     stage(
         "analyze",
-        lambda: analyze_stage(conn, config, env, logger, run_id=run_id, primary=primary),
+        lambda: analyze_stage(
+            conn, config, env, logger, run_id=run_id, primary=primary, deferred_ids=deferred
+        ),
     )
 
     def digest() -> None:
@@ -220,12 +230,14 @@ def analyze_stage(
     *,
     run_id: str | None = None,
     primary: Callable[[str], LLMEngine] | None = None,
+    deferred_ids: Collection[int] = (),
 ) -> dict[str, int]:
     """analyze 段: 関心プロファイル → 予備つきのエンジン → 事前選別 → 本分析。件数を返す。
 
     朝バッチと `intel analyze` が呼ぶ(GH#206)。primary は主のエンジンの作り方
     (None = config の `[llm].engine`)。事前選別から保存までは同じ DB の分析どうしで直列化し、
-    後の実行は先の実行を待ってから残りの枠を選ぶ(GH#334)。
+    後の実行は先の実行を待ってから残りの枠を選ぶ(GH#334)。deferred_ids は同じ朝バッチの
+    本文抽出が次の実行へ回した items.id(事前選別が選ばない。GH#340)。
     """
     # プロファイル欠落・エンジン未実装は analyze 段の失敗として局所化する
     # (import をここに置くのは循環回避でなく段の失敗系に含めるため)
@@ -240,7 +252,7 @@ def analyze_stage(
         conn, config, env, logger, stage="analyze", run_id=run_id, primary=primary
     )("low")
     with analysis_lock(conn, logger, run_id):
-        result = preselect(conn, config, logger, run_id=run_id)
+        result = preselect(conn, config, logger, run_id=run_id, deferred_ids=deferred_ids)
         return analyze_selected(
             conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
         )

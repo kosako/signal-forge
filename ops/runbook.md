@@ -425,6 +425,10 @@ sqlite3 -readonly -header -column "$db" \
   ```sh
   sqlite3 "$db" "UPDATE sources SET enabled = 0 WHERE id = <id>;"
   ```
+- **段の上限で打ち切った(⏱️・📦。GH#340)**: 残りは次の実行へ回るので、毎日でなければ何もしなくてよい。
+  ⏱️ が毎日続くなら、`morning.log` の WARN で遅いソースを探して止めるか、`config.toml` の
+  `[collect].time_budget_s` / `[extract].time_budget_s`(秒。既定 600)を上げる。📦 が続くフィードは、
+  1 回に取り込む新しい記事の上限 `[collect].rss_max_items`(既定 100)を上げるか、ソースを見直す。
 - 新しい RSS を足すときも同じ表に行を入れる。SQL は引用符付きのヒアドキュメントで渡す(シェルに
   展開させない)。名前や URL に `'` が含まれるときは `''` と重ねる。
   ```sh

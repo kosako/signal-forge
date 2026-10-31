@@ -6,6 +6,10 @@
   (途中クラッシュ → カーソル未更新 → 次回重複取得 → UNIQUE で吸収)
 - 外部 I/O(短縮 URL の解決)は書き込みのトランザクションの前に済ませる(GH#179)
 - ソース単位のエラー隔離: 1ソースの失敗で他ソースを止めない
+- 件数と時間の上限(GH#340): RSS は 1 ソース 1 回に取り込む新しい記事を [collect].rss_max_items
+  まで(新しい側を残し、カーソルを進めずに次の実行で残りを取り直す)。段全体は
+  [collect].time_budget_s まで(次のソースに進む前に確かめ、残りのソースは次の実行へ回す)。
+  ソースは前回の取得が古い順に回す(打ち切りで回れなかったソースが次の実行で先になる)
 """
 
 from __future__ import annotations
@@ -14,10 +18,12 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 
+from app.config import CollectConfig
 from app.connectors.base import Connector, FatalError, FetchStats, RawItem, RetryableError
-from app.db import insert_item_with_dedup
+from app.db import insert_item_with_dedup, record_budget_cut
 from app.models import RAW_CONTENT_MAX_CHARS, Source
 from app.normalize import (
     UrlError,
@@ -37,11 +43,30 @@ def collect_all(
     *,
     run_id: str | None = None,
     resolve_short: Callable[[str], str] | None = None,
+    limits: CollectConfig | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
+    """有効なソースを順に取り込む。limits は件数と時間の上限(None = 既定の [collect])。"""
+    limits = limits or CollectConfig()
+    # 前回の取得(collect_runs の最後の行)が古い順。取得したことの無いソースが先、同じなら id 順。
+    # 時間の上限で回れなかったソースが次の実行で先になる(毎回 id 順だと後ろのソースが飢える)
     rows = conn.execute(
-        "SELECT * FROM sources WHERE enabled = 1 AND type <> 'manual' ORDER BY id"
+        """
+        SELECT * FROM sources WHERE enabled = 1 AND type <> 'manual'
+        ORDER BY (SELECT max(id) FROM collect_runs WHERE collect_runs.source_id = sources.id), id
+        """
     ).fetchall()
-    for row in rows:
+    started = clock()
+    for index, row in enumerate(rows):
+        if clock() - started >= limits.time_budget_s:
+            deferred = len(rows) - index
+            logger.warning(
+                f"collect の段が時間の上限({limits.time_budget_s} 秒)に達した。"
+                f"残りの {deferred} ソースは次の実行へ回す",
+                extra={"run_id": run_id, "stage": "collect", "extra": {"deferred": deferred}},
+            )
+            record_budget_cut(conn, "collect_time", deferred=deferred, run_id=run_id)
+            return
         source = Source.from_row(row)
         connector = connectors.get(source.type)
         if connector is None:
@@ -50,7 +75,15 @@ def collect_all(
                 extra={"run_id": run_id, "stage": "collect", "source_id": source.id},
             )
             continue
-        _collect_source(conn, source, connector, logger, run_id=run_id, resolve_short=resolve_short)
+        _collect_source(
+            conn,
+            source,
+            connector,
+            logger,
+            run_id=run_id,
+            resolve_short=resolve_short,
+            rss_max_items=limits.rss_max_items,
+        )
 
 
 def _collect_source(
@@ -61,6 +94,7 @@ def _collect_source(
     *,
     run_id: str | None,
     resolve_short: Callable[[str], str] | None,
+    rss_max_items: int,
 ) -> None:
     log_ctx = {"run_id": run_id, "stage": "collect", "source_id": source.id}
     run_row_id = conn.execute(
@@ -75,11 +109,18 @@ def _collect_source(
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
+        items, next_cursor, known, deferred = result.items, result.next_cursor, 0, 0
+        if source.type == "rss":
+            items, known, deferred = _cap_rss_items(conn, source, items, rss_max_items)
+            if deferred:
+                # 進めると 304 で残りを取り直せない。今のカーソルのまま次の実行で全件を読み直し、
+                # 取り込んだぶんは既知として数えずに残りを取る
+                next_cursor = cursor
         counts = _store_result(
             conn,
             source,
-            result.items,
-            result.next_cursor,
+            items,
+            next_cursor,
             result.moved_url,
             resolve_short,
             partial_error=partial_error,
@@ -98,6 +139,17 @@ def _collect_source(
             exc_info=not isinstance(e, RetryableError | FatalError),
         )
         return
+
+    counts["ignored"] += known  # 保存の前に除いた取り込み済みの guid(INSERT OR IGNORE と同じ結果)
+    if deferred:
+        logger.warning(
+            f"RSS の 1 回の上限({rss_max_items} 件)を超えた。新しい側を取り込み、"
+            f"残りの {deferred} 件は次の実行へ回す",
+            extra={**log_ctx, "extra": {"deferred": deferred}},
+        )
+        record_budget_cut(
+            conn, "rss_items", deferred=deferred, run_id=run_id, source_id=source.id
+        )
 
     # 部分取得のあとの失敗も run は error で残す。読み取りの費用は掛かっているので件数・費用は
     # 記録する(doctor #9 の当月の集計に入れる。GH#183)
@@ -203,6 +255,39 @@ def _store_result(
         conn.execute("ROLLBACK")
         raise
     return counts
+
+
+def _cap_rss_items(
+    conn: sqlite3.Connection, source: Source, items: list[RawItem], limit: int
+) -> tuple[list[RawItem], int, int]:
+    """RSS の新しい記事を limit 件までに絞る。(残す items, 既知の件数, 次の実行へ回す件数)。
+
+    取り込み済みの guid(UNIQUE(source_id, external_id) にある)は保存しても無視されるので、
+    短縮 URL の解決の前に除き、上限にも数えない(数えると、上限を超えるフィードで同じ記事が
+    毎回の枠を埋め、残りが取り込まれない)。guid の無い entry は既知かを安く判定できないので
+    新しい記事として数える。超えたら公開日時の新しい側を残す(フィードの並びは新しい順とは
+    限らない)。日時の無い entry は古い側とし、その中はフィードの並びを保つ。
+    """
+    fresh: list[tuple[int, RawItem]] = []
+    known = 0
+    for index, raw in enumerate(items):
+        if raw.external_id is not None and conn.execute(
+            "SELECT 1 FROM items WHERE source_id = ? AND external_id = ?",
+            (source.id, raw.external_id),
+        ).fetchone():
+            known += 1
+        else:
+            fresh.append((index, raw))
+    if len(fresh) <= limit:
+        return [raw for _, raw in fresh], known, 0
+    # 安定ソートなので、同じ日時・日時の無い entry どうしはフィードの並びのまま
+    newest = sorted(
+        fresh,
+        key=lambda pair: (pair[1].published_at is not None, pair[1].published_at or 0),
+        reverse=True,
+    )[:limit]
+    kept = sorted(newest, key=lambda pair: pair[0])  # 保存はフィードの並びに戻す
+    return [raw for _, raw in kept], known, len(fresh) - limit
 
 
 def _canonical_url(raw: RawItem, resolve_short: Callable[[str], str] | None) -> str | None:

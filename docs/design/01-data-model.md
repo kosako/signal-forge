@@ -32,6 +32,7 @@ digests ──(item_ids JSON)──> items             (結合表なし。json_e
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送・リプライの帰属用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
 telegram_state                                 (getUpdates offset 等の単一行KV)
+budget_cuts ──> sources(source_id NULL 可)     (collect・extract の段の上限で打ち切った記録。GH#340)
 schema_migrations                              (マイグレーション台帳。ランナーが管理)
 ```
 
@@ -39,7 +40,7 @@ digests↔items に KPI 用の結合表を作らない理由: 参照は表示と
 
 ## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021・024 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url)は §7・§8・設計 02 §3 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url・budget_cuts)は §3 末尾・§7・§8・設計 02 §3 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -244,7 +245,7 @@ CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)の 13。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)、`budget_cuts`(collect・extract の段の上限で打ち切り、残りを次の実行へ回した記録。1 回の打ち切り = 1 行で、種類(`rss_items` / `collect_time` / `extract_time`)・RSS のときのソース・回した数・朝バッチの run_id を持つ。週 1 回のソースの健康診断が直近 7 日を読む。GH#340 / migration 025)の 14。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 

@@ -27,7 +27,7 @@
 
 **X ブックマークの例外(GH#99。設計 02 §2)**: `x_signals` の bookmark 行に `item_id` で紐付く item は、規則 1(静的 NG リスト)だけを適用し、規則 2〜4(`stale` / `x_noise` / `daily_cap`)は適用しない(本人意思の保存アイテム = manual と同じ理屈。件数は x_signals の日次上限・`--backfill --limit` で有界)。日次上限の外で必ず採用し、上限はほかの item にだけ当てる。判定は帰属ソースでなく `x_signals.item_id` の紐付けで行う(RSS 等の既存 item へ合流した場合も例外になる)。
 
-extraction_status=failed の items は除外**しない**(本文なしでタイトル+メタだけを Stage 2 に渡す。PROPOSAL 準拠)。documents 行が無い item も同じく本文なし(`extraction: failed`)として渡す。LLM が正常に答えた分析は degraded に**しない**(degraded は LLM の失敗によるタイトルのみの記録で、全滅の判定(Stage 2・設計 00 §6。GH#74・GH#175)と 🎯 の行の省略(設計 04 §2・GH#90)に使うため、意味を混ぜない)。本文を読めていないことは `analyses.extraction_failed=1`(migration 021。GH#240)で別に残し、配信とノートに短く出す(設計 04 §2・§7)。
+extraction_status=failed の items は除外**しない**(本文なしでタイトル+メタだけを Stage 2 に渡す。PROPOSAL 準拠)。documents 行が無い item も同じく本文なし(`extraction: failed`)として渡す。ただし朝バッチ(`intel run`)で、本文抽出が段の時間の上限(設計 05 §8)で次の実行へ回した item は、規則も当てずに選ばず new のまま残す(本文なしで分析すると、次の実行で抽出する機会を失うため。GH#340)。単独の `intel analyze` は回した item を知らないので、今までどおり本文なしで渡す。LLM が正常に答えた分析は degraded に**しない**(degraded は LLM の失敗によるタイトルのみの記録で、全滅の判定(Stage 2・設計 00 §6。GH#74・GH#175)と 🎯 の行の省略(設計 04 §2・GH#90)に使うため、意味を混ぜない)。本文を読めていないことは `analyses.extraction_failed=1`(migration 021。GH#240)で別に残し、配信とノートに短く出す(設計 04 §2・§7)。
 
 ### Stage 2: 本分析(LLM)
 

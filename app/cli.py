@@ -76,6 +76,7 @@ def collect(
         _build_connectors(config, env, http, conn),
         logger,
         resolve_short=http.resolve_short_url,
+        limits=config.collect,
     )
 
 

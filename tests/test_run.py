@@ -696,6 +696,37 @@ def test_pipeline_runs_same_stages_as_cli(conn, tmp_path, monkeypatch) -> None:
     assert set(calls["dig"]) == {"run_id"}  # dig の主は config から effort 可変で作る
 
 
+def test_items_deferred_by_extract_budget_are_not_analyzed(conn, tmp_path, monkeypatch) -> None:
+    # 本文抽出が時間の上限で次の実行へ回した記事は、同じ朝バッチの analyze 段が本文なしで
+    # 分析せず new のまま残す(次の実行の抽出の後に分析する。GH#340)
+    from app import run as run_module
+    from app.extraction.extractor import ExtractCounts
+
+    def extract_deferring_all(db, config, http, stage_logger, *, run_id=None):
+        counts = ExtractCounts(ok=0, partial=0, failed=0)
+        counts.deferred_ids = tuple(
+            r[0] for r in db.execute("SELECT id FROM items WHERE status = 'new'")
+        )
+        return counts
+
+    monkeypatch.setattr(run_module, "extract_pending", extract_deferring_all)
+    failures = run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUNID",
+    )
+    assert failures == []
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "new"
+    assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 0
+
+    # 次の実行で抽出できれば、今までどおり分析して配信に載る
+    monkeypatch.undo()
+    assert run_pipeline(
+        conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http(),
+        lambda: ScriptedEngine(conn), logger, "01RUN2", force_digest=True,
+    ) == []
+    assert conn.execute("SELECT status FROM items").fetchone()[0] == "digested"
+
+
 @pytest.mark.parametrize("review", [True, False])
 def test_dig_stage_wires_review_engine_from_config(conn, tmp_path, monkeypatch, review) -> None:
     # 深掘りのレビュー(GH#153)は [dig].review のときだけ。キーは .env の dict から読む
