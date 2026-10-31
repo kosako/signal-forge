@@ -473,42 +473,65 @@ def _link_bookmark_item(
     ).fetchone()
     if row is None or row["item_id"] is not None:
         return  # 行が無い(INSERT 直後なので想定外)/ 紐付け済み
-    item_id = _itemize_bookmark(conn, source_id, tweet, users)
+    item_id, raw_payload = _itemize_bookmark(conn, source_id, tweet, users)
     conn.execute(
         "UPDATE x_signals SET item_id = ? WHERE kind = 'bookmark' AND tweet_id = ?",
         (item_id, str(tweet["id"])),
     )
-    _reactivate_skipped_item(conn, item_id)
+    _reactivate_skipped_item(conn, item_id, raw_payload)
     if enqueue:
         enqueue_bookmark(conn, item_id)
 
 
-def _reactivate_skipped_item(conn: sqlite3.Connection, item_id: int) -> None:
+def _reactivate_skipped_item(
+    conn: sqlite3.Connection, item_id: int, raw_payload: str | None
+) -> None:
     """ブックマークに適用しない規則で skip 済みの合流先を new に戻す(GH#176)。
 
     前日以前に stale / x_noise / daily_cap で skipped になった既存 item へ合流すると、
     事前選別(new だけが対象)にも保存節(analyzed / digested だけが対象)にも載らない。
     new に戻し、以後の事前選別でブックマークとして扱わせる(設計 02: ブックマークには
     blocklist だけを適用する)。blocklist(明示 NG)による skip は戻さない。
+
+    戻した item の本文キャッシュ(raw_payload と documents)が TTL で消えていれば、
+    今回取得した全文の payload を書き戻す(GH#332)。書き戻さないと抽出段が投稿の URL の
+    HTTP 取得に頼り、失敗すると本文なしで分析される。fetched_at を今に更新して TTL を
+    今から数え直す(古い fetched_at のままだと次の purge で直ちに消え、doctor #11 も
+    TTL 超過の残存と数える)。X 由来の item に限る(他のソースの TTL で X の本文を
+    残さない。設計 01 §6)。canonical_url と content_hash は変えない。
     """
-    conn.execute(
+    reactivated = conn.execute(
         "UPDATE items SET status = 'new', skip_reason = NULL "
         "WHERE id = ? AND status = 'skipped' "
         "AND skip_reason IN ('stale', 'x_noise', 'daily_cap')",
         (item_id,),
+    ).rowcount
+    if not reactivated or raw_payload is None:
+        return
+    conn.execute(
+        """
+        UPDATE items SET raw_payload = ?,
+                         fetched_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE id = ? AND raw_payload IS NULL
+          AND (SELECT type FROM sources WHERE sources.id = items.source_id) = 'x'
+          AND NOT EXISTS (SELECT 1 FROM documents WHERE documents.item_id = items.id)
+        """,
+        (raw_payload, item_id),
     )
 
 
 def _itemize_bookmark(
     conn: sqlite3.Connection, source_id: int, tweet: dict, users: dict[str, str]
-) -> int:
-    """ブックマークを保存アイテムとして items へ登録し、live な item id を返す。
+) -> tuple[int, str | None]:
+    """ブックマークを保存アイテムとして items へ登録し、(live な item id, 全文の payload) を返す。
 
     - 外部リンク付き: 先頭の外部リンクを canonical に。本文はリンク先記事が本体のため
       raw_content は持たず extract 段に取得させる(ツイート文は x_signals.text_excerpt
       に TTL キャッシュ済み)
     - リンクなし: ツイート URL を canonical に、全文(note_tweet 優先)を raw_content に
     - canonical / (source, external_id) の既存行・dedup 親がある場合はそこへ合流する
+    - 全文の payload は raw_content を持つとき(リンクなし)だけ返す(合流先の skip を
+      戻すときの本文の書き戻しに使う。GH#332)。リンク付きは None
     """
     tweet_url = f"https://x.com/i/web/status/{tweet['id']}"  # normalize_url が status id で統一
     link = _first_external_link(tweet)
@@ -526,6 +549,7 @@ def _itemize_bookmark(
     payload: dict[str, object] = {"meta": {"bookmark": True}}
     if raw_content:
         payload["raw_content"] = raw_content[:RAW_CONTENT_MAX_CHARS]
+    raw_payload = json.dumps(payload, ensure_ascii=False)
     author_id = tweet.get("author_id")
     outcome = insert_item_with_dedup(
         conn,
@@ -536,7 +560,7 @@ def _itemize_bookmark(
         title=None,  # tweet に title はない(表示は analyze の title_ja が担う)
         author=users.get(author_id),
         published_at=_iso_created_at(tweet.get("created_at")),
-        raw_payload=json.dumps(payload, ensure_ascii=False),
+        raw_payload=raw_payload,
         content_hash=content_hash(normalized_text),
         dedup_eligible=is_dedup_eligible(normalized_text),
     )
@@ -552,7 +576,7 @@ def _itemize_bookmark(
         if existing is None:  # UNIQUE 衝突源は上の2つのみ(構造上到達しない)
             raise XSignalsError(f"bookmark item の既存行が引けない: {canonical}")
         item_id = existing["id"]
-    return _resolve_live_item(conn, item_id)
+    return _resolve_live_item(conn, item_id), (raw_payload if raw_content else None)
 
 
 def _first_external_link(tweet: dict) -> str | None:
