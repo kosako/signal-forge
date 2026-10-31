@@ -1,10 +1,9 @@
 import base64
-import contextlib
 import hashlib
 import os
 import stat
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
@@ -586,15 +585,21 @@ def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
 ) -> None:
     # 朝バッチ・doctor の refresh が token エンドポイントとの往復中(ロック保持中)に x-auth の
     # callback が届いても、再認可の交換・保存は refresh の保存の後に行う。最後に残る token は
-    # 再認可のもの(古い認可の refresh の結果で上書きされない)
-    from app.connectors import x_oauth2
+    # 再認可のもの(古い認可の refresh の結果で上書きされない)。
+    # GH#344: refresh を止めたまま、再認可が自分の fd の flock で実際に阻まれたことを確かめてから
+    # refresh を進める(再認可がロックを取らずに交換へ進む回帰も、同じ合図で拾って落とす)
+    import fcntl
+
+    from app.connectors.x_oauth2 import LOCK_FILENAME
 
     save_token(tmp_path, make_token())  # 古い認可の token(rt-1)
     order: list[str] = []  # token エンドポイントが応答した順
     errors: list[BaseException] = []
+    reauth_events: list[str] = []
     refresh_in_flight = threading.Event()
     release_refresh = threading.Event()
-    reauth_reached = threading.Event()  # 再認可がロックを求めた(求めずに進めば完了した)
+    reauth_progressed = threading.Event()  # 再認可が flock で阻まれた・交換に進んだ・終わった
+    real_flock = fcntl.flock
 
     def batch_handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == TOKEN_URL:
@@ -607,19 +612,29 @@ def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
         return httpx.Response(200, json={"data": {"username": "kosako"}})
 
     def reauth_handler(request: httpx.Request) -> httpx.Response:
+        if not release_refresh.is_set():
+            reauth_events.append("exchange")  # ロックを素通りした(refresh はまだ往復の途中)
+            reauth_progressed.set()
         order.append("reauth")
         return httpx.Response(200, json=token_response(9))  # 再認可の token(rt-9)
 
-    real_lock = x_oauth2._token_lock
+    def observed_flock(fd: int, operation: int) -> None:
+        if threading.current_thread().name != "reauth" or operation != fcntl.LOCK_EX:
+            real_flock(fd, operation)
+            return
+        # 再認可が使う fd そのもので、先に非ブロッキングで試す。阻まれたら、ここからの
+        # ブロッキングの取得は refresh の解放まで返らない(refresh は合図の後まで止まっている)
+        try:
+            real_flock(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            reauth_events.append("blocked")
+            reauth_progressed.set()
+            real_flock(fd, operation)
+        else:
+            reauth_events.append("acquired")  # refresh がロックを持っていない
+            reauth_progressed.set()
 
-    @contextlib.contextmanager
-    def observed_lock(config_dir: Path) -> Iterator[None]:
-        if threading.current_thread().name == "reauth":
-            reauth_reached.set()  # ここから先は refresh の保存を待つ
-        with real_lock(config_dir):
-            yield
-
-    monkeypatch.setattr(x_oauth2, "_token_lock", observed_lock)
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
     expired = make_token(expires_at="2026-07-13T11:00:00Z")
     session = make_session(tmp_path, httpx.MockTransport(batch_handler), expired)
 
@@ -645,22 +660,43 @@ def test_reauth_during_inflight_refresh_leaves_reauth_token_last(
         except BaseException as e:
             errors.append(e)
         finally:
-            reauth_reached.set()
+            reauth_progressed.set()  # 失敗で抜けても本体を待たせない(events で落ちる)
 
     batch_thread = threading.Thread(target=batch)
     reauth_thread = threading.Thread(target=reauth, name="reauth")
     batch_thread.start()
     try:
         assert refresh_in_flight.wait(timeout=10)
+        # refresh が往復の途中にいる間、別の fd からはロックを取れない(実際に排他している)
+        assert _token_lock_is_held(tmp_path / LOCK_FILENAME, real_flock)
         reauth_thread.start()
-        assert reauth_reached.wait(timeout=10)
+        assert reauth_progressed.wait(timeout=10)
+        assert reauth_events == ["blocked"]  # refresh を進める前に、再認可は flock で待っている
     finally:
         release_refresh.set()
-    batch_thread.join(timeout=10)
-    reauth_thread.join(timeout=10)
+        batch_thread.join(timeout=10)
+        if reauth_thread.ident is not None:  # 起動前のスレッドは join できない
+            reauth_thread.join(timeout=10)
+    assert not batch_thread.is_alive() and not reauth_thread.is_alive()
     assert errors == []
+    assert reauth_events == ["blocked"]
     assert order == ["refresh", "reauth"]  # 交換は refresh の往復と保存が終わってから
     assert load_token(tmp_path).refresh_token == "rt-9"  # 再認可の token が残る
+    assert not _token_lock_is_held(tmp_path / LOCK_FILENAME, real_flock)
+
+
+def _token_lock_is_held(lock_path: Path, flock: Callable[[int, int], None]) -> bool:
+    """独立した fd で非ブロッキングの排他ロックを試し、他が持っているかを返す(取れたらすぐ放す)。"""
+    import fcntl
+
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # close で flock は解放される
+    return False
 
 
 def test_reauth_does_not_hold_lock_while_waiting_for_browser(
