@@ -57,6 +57,14 @@ def test_poller_plist_contract() -> None:
     assert "StartCalendarInterval" not in plist
 
 
+def test_codex_dir_comes_before_uv_dir_in_path() -> None:
+    # uv と同じ dir に別の版の codex があっても、導入の手順で選んだ codex(と node)が先に見つかる。
+    # 両方のジョブが codex を名前で起動するので、どちらの PATH も同じ並び(GH#347)
+    for job in LAUNCHD_JOBS:
+        dirs = load_plist(job)["EnvironmentVariables"]["PATH"].split(":")
+        assert dirs.index("/opt/homebrew/codex-bin") < dirs.index("/opt/homebrew/bin")
+
+
 def test_no_secrets_in_plists() -> None:
     for job in LAUNCHD_JOBS:
         text = plist_text_without_comments(job)  # コメントは説明用語を含むため除外
