@@ -673,6 +673,39 @@ def test_resolve_short_url_returns_final() -> None:
     )
 
 
+def test_resolve_short_url_does_not_read_bodies() -> None:
+    # 転送はヘッダで判定し、転送の応答・転送先の本文は読まない。転送先が上限を超える PDF
+    # などでも URL は解決できる(GH#328)
+    redirect_body = ChunkStream(b"x" * (1024 * 1024), count=None)
+    final_body = ChunkStream(b"x" * (1024 * 1024), count=None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("host", "").startswith("example.com"):
+            return httpx.Response(
+                301, headers={"location": "https://cdn.example/big.pdf"}, stream=redirect_body
+            )
+        return httpx.Response(200, stream=final_body)
+
+    assert (
+        make_client(handler).resolve_short_url("https://example.com/x")
+        == "https://cdn.example/big.pdf"
+    )
+    assert redirect_body.sent == 0
+    assert final_body.sent == 0
+
+
+def test_resolve_short_url_rechecks_each_hop() -> None:
+    # 本文を読まなくても、各ホップの接続先の検証は get と同じに行う(GH#328)
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("host", "").startswith("example.com"):
+            return httpx.Response(302, headers={"location": "http://internal.example/admin"})
+        return httpx.Response(200)
+
+    client = make_client(handler, hosts={"internal.example": ["192.168.0.10"]})
+    with pytest.raises(SsrfBlockedError):
+        client.resolve_short_url("https://example.com/short")
+
+
 def test_connection_pinned_to_validated_ip() -> None:
     # DNS rebinding 対策: 実接続は検証済み IP 宛て、Host ヘッダ+SNI は元ホスト名
     seen: list[httpx.Request] = []
