@@ -242,7 +242,13 @@ for suffix in "" "-wal" "-shm"; do
 done
 mv "${RESTORE_DIR}/intel.db" "${DB_PATH}"
 
-# 5. 健全性確認 → 問題なければ launchd を再 bootstrap(§2)
+# 5. 今のコードより古いバックアップ(後から足した migration が入っていない)なら、ここで当てる。
+#    検査だけの doctor(フラグなし)は migration を当てず、未適用があると #3 が FAIL になる
+#    (README のセットアップの 5 と同じ)。--cost は migration を当て、当月コストを表示するだけ。
+#    当てる前に DB の隣に .bak を取る(設計 01 §10)。未適用が無ければ何もしない
+uv run intel doctor --cost
+
+# 6. 健全性確認(#3 が「適用済み」になること) → 問題なければ launchd を再 bootstrap(§2)
 uv run intel doctor
 ```
 
