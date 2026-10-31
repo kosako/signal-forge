@@ -325,6 +325,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 | `followup_dig` | `yes` / `no`(深掘りした?) | 必須(🔖済みアイテム。take の記録では 🔖 の無い深掘りアイテムも) | 🔖 の reaction と同じ日(そのアイテムを配信した digest_date。KPI 06 の帰属)。**MVP で送信・記録する**(🔖 を押した翌日の夜に追い掛け1通。押した日は reaction の created_at を JST に直した日付で決め、配信日の signal_date では決めない。過去の digest に後から付けた 🔖 も追い掛けるため。GH#226。設計 04 §4。フェーズ2境界の「50%深掘り」判定に必要)。深掘りカードへの take(GH#106)でも `yes` を記録する。🔖 の無いアイテムは take の日(KPI 06 の分子には入れない) |
 
 - 同一アイテムへの再タップは行を追加し、**集計は created_at 最新の行を採用**(同じ秒は id の大きい方。未消化 🔖 一覧が見る `followup_dig` も最新の行。GH#195)。理由: 上書きせず履歴を残すと、👍校正(遅延スポットチェック)の乖離分析材料になる。
+- 日次 KPI(👍∨🔖 ≥3)の手動の集計は、正本の `scripts/kpi/01-daily-kpi.sql` を使う(一覧と使い方は `docs/project/kpi-queries.md`)。母集団は配信済みの digest で、反応ゼロの配信日も無効日として行に出る。反応は item × 日の最新の行(上の再タップの規則のとおり、同じ秒は id の大きい方)を採用する。ここに SQL の例を複製しない(正本とずれるため。GH#342)。
 - 受信デーモンは callback の `from.id` を allowlist 照合してから書き込む(認可は設計 04 Telegram の責務。本テーブルは認可済みデータのみ格納)。
 ### X 興味シグナル(x_signals・migration 004 + 007。GH#58 S1b / ADR 0001 / GH#99)
 
@@ -336,22 +337,6 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `observed_at` = 初回観測時刻。`bookmarked_at` 等を API が提供しないため、**直近性の代理**とする(cold start の --backfill 一括取込分は「直近」として扱えない制約を含む)
 - `text_excerpt`(≤280字)は **TTL キャッシュのみ**(purge が `x_cache_ttl_days` で NULL 化。§6 の X 本文非保持ポリシー準拠)。恒久保存は id・著者・時刻
 - 取込コストは `x_signal_runs`(collect_runs は sources 行が前提のため独立の台帳)に記録し、doctor #9 が合算する(§9)。`backfill`(migration 023。GH#178)は `intel x-signals --backfill` の取込なら 1、通常の取込なら 0(既存の行は 0)。取込の日次の上限は同じ日(JST)の通常の取込の行の `api_reads` の合計から残りを出すので、backfill の行はそこから外す(日次の上限の外の別枠。費用の集計には入る。設計 02 §2)
-
-- 日次 KPI(👍∨🔖 ≥3)の集計クエリ例(手動):
-
-```sql
-WITH latest AS (
-  SELECT item_id, value, signal_date,
-         row_number() OVER (PARTITION BY item_id, signal_date
-                            ORDER BY created_at DESC) AS rn
-  FROM signals WHERE kind = 'reaction')
-SELECT signal_date,
-       sum(value IN ('useful','dig'))                AS positive,
-       count(*)                                      AS reacted,
-       (SELECT item_count FROM digests d
-         WHERE d.digest_date = latest.signal_date)   AS delivered  -- 反応率の分母
-FROM latest WHERE rn = 1 GROUP BY signal_date;
-```
 
 ### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009・022。GH#104 / 設計 06 §2〜3)
 
