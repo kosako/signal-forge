@@ -74,6 +74,12 @@ for name in com.intel.morning com.intel.poller; do
   GEN_PATH="$(plutil -extract EnvironmentVariables.PATH raw -o - "${TMP_DIR}/${name}.plist")" || exit 1
   env -i PATH="${GEN_PATH}" HOME="${HOME}" codex --version >/dev/null \
     || { echo "${name}: 生成した PATH で codex を起動できない(codex と node の dir を確認)"; exit 1; }
+  # 生成した PATH で、上で選んだ codex(と npm 版なら node)に解決されること。uv の dir など PATH の
+  # 前の側に別の版の codex があると、起動できても違う版が動く(GH#347)
+  [ "$(env -i PATH="${GEN_PATH}" /bin/sh -c 'command -v codex')" = "${CODEX_BIN}" ] \
+    || { echo "${name}: 生成した PATH の codex が ${CODEX_BIN} でない(PATH の前の側の別の版を確認)"; exit 1; }
+  [ -z "${NODE_BIN}" ] || [ "$(env -i PATH="${GEN_PATH}" /bin/sh -c 'command -v node')" = "${NODE_BIN}" ] \
+    || { echo "${name}: 生成した PATH の node が ${NODE_BIN} でない(PATH の前の側の別の版を確認)"; exit 1; }
   cp "${TMP_DIR}/${name}.plist" "${HOME}/Library/LaunchAgents/${name}.plist" || exit 1
 done
 rm -rf "${TMP_DIR}"
