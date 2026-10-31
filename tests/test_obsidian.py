@@ -4,7 +4,9 @@ import os
 import signal
 import sqlite3
 import stat
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -14,6 +16,7 @@ from app.db import apply_migrations, connect
 from app.export import ExportError, export_digest, export_pending_notes
 from app.export import obsidian as obsidian_module
 from app.vault_dir import VaultPathError
+from app.vault_guard import VaultGuard
 
 logger = logging.getLogger("test-obsidian")
 
@@ -915,3 +918,152 @@ def test_new_note_created_before_write_is_not_overwritten(conn, tmp_path, monkey
     assert calls == [1]
     assert note.read_text() == "同期で先に届いた手書きノート"
     assert note.with_suffix(".conflict.md").exists()
+
+
+# --- vault が応答しないときの上限と、遅れた書き込みのロック(GH#341) ---
+
+
+def block_first_write(monkeypatch) -> SimpleNamespace:
+    """最初のノートの書き出しを、解除まで止める(vault の応答待ちの代わり)。
+
+    止まった位置に着いたら reached が立つ。解除(release)を忘れたときは 30 秒で進め、
+    timed_out に残す(テストの誤り)。
+    """
+    blocker = SimpleNamespace(
+        reached=threading.Event(), release=threading.Event(), calls=[], timed_out=[]
+    )
+    original = obsidian_module._write_note
+
+    def blocking(directory, name, *args, **kwargs):
+        blocker.calls.append(name)
+        if len(blocker.calls) == 1:
+            blocker.reached.set()
+            if not blocker.release.wait(30):
+                blocker.timed_out.append(True)
+        return original(directory, name, *args, **kwargs)
+
+    monkeypatch.setattr(obsidian_module, "_write_note", blocking)
+    return blocker
+
+
+def finish_blocked_write(blocker: SimpleNamespace) -> list[threading.Thread]:
+    """止めた書き出しを解除し、vault-io のスレッドの終わりを待つ(終わらなかったものを返す)。"""
+    blocker.release.set()
+    threads = [t for t in threading.enumerate() if t.name == "vault-io"]
+    for thread in threads:
+        thread.join(5)
+    return [thread for thread in threads if thread.is_alive()]
+
+
+def add_replied_items(conn, n: int) -> tuple[int, list[int]]:
+    """記事メッセージとして送り、感想が付いた item を n 件作る(追いパスの対象)。"""
+    items = [add_digested(conn, f"https://a/{i}", title=f"記事{i}") for i in range(n)]
+    digest_id = add_digest(conn, items)
+    for i, item in enumerate(items):
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+            (digest_id, item, 500 + i),
+        )
+        add_note(conn, item, f"記事{i}への感想")
+    conn.commit()
+    return digest_id, items
+
+
+def pending_item_notes(conn) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM item_notes WHERE exported_at IS NULL"
+    ).fetchone()[0]
+
+
+def test_export_stall_gives_up_and_keeps_notes_pending(conn, tmp_path, monkeypatch) -> None:
+    # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは上限の時間で見切り、
+    # export を失敗にして先へ進む。止まった後は残りのノートで vault に触れず、感想を反映済みに
+    # しない(次の実行で書く。GH#341)
+    _digest_id, items = add_replied_items(conn, 2)
+    config = make_config(tmp_path)
+    blocker = block_first_write(monkeypatch)
+    try:
+        with pytest.raises(ExportError, match="vault が応答しない"):
+            export_pending_notes(conn, config, logger, vault=VaultGuard(timeout_s=0.05))
+        assert blocker.reached.is_set()
+        assert len(blocker.calls) == 1  # 止まった後は、残りのノートで vault に触れない
+        assert pending_item_notes(conn) == 2
+    finally:
+        alive = finish_blocked_write(blocker)
+    assert alive == [] and blocker.timed_out == []
+
+    # 次の実行は、止まったぶんを含めて全部を書き、反映済みにする
+    export_pending_notes(conn, config, logger)
+    assert pending_item_notes(conn) == 0
+    texts = [
+        note.read_text()
+        for note in sorted((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    ]
+    assert len(texts) == 2
+    assert "記事0への感想" in texts[0] and "記事1への感想" in texts[1]
+
+
+def test_export_digest_stall_raises_export_error(conn, tmp_path, monkeypatch) -> None:
+    # その日の digest の export も同じ上限で見切る(Daily は同じ日の再走で書く。GH#341)
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    blocker = block_first_write(monkeypatch)
+    try:
+        with pytest.raises(ExportError, match="vault が応答しない"):
+            export_digest(conn, config, digest_id, logger, vault=VaultGuard(timeout_s=0.05))
+        assert blocker.calls == [f"20260706-{item}-記事タイトル.md"]  # Daily には進まない
+    finally:
+        alive = finish_blocked_write(blocker)
+    assert alive == [] and blocker.timed_out == []
+
+    export_digest(conn, config, digest_id, logger)
+    assert (tmp_path / "vault" / "SignalForge" / "Daily" / "2026-07-06.md").exists()
+
+
+def test_next_run_does_not_export_while_late_write_pending(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # 見切ったスレッドは後から古い内容で書き終えうる。それが終わるまで別の実行は export しない
+    # (新しい感想を投影して反映済みにしたノートを、遅れた書き込みで置き換えさせない。GH#341)
+    monkeypatch.setattr(obsidian_module, "_EXPORT_LOCK_WAIT_S", 0.05)
+    _digest_id, (item,) = add_replied_items(conn, 1)
+    config = make_config(tmp_path)
+    blocker = block_first_write(monkeypatch)
+    try:
+        with pytest.raises(ExportError, match="vault が応答しない"):
+            export_pending_notes(conn, config, logger, vault=VaultGuard(timeout_s=0.05))
+        assert blocker.reached.is_set()
+        add_note(conn, item, "後から届いた感想", created_at="2026-07-16T14:00:00Z")
+        conn.commit()
+        with pytest.raises(ExportError, match="別の実行の export が終わっていない"):
+            export_pending_notes(conn, config, logger)
+        assert pending_item_notes(conn) == 2
+    finally:
+        alive = finish_blocked_write(blocker)  # 遅れた書き込み(後の感想を含まない)が終わる
+    assert alive == [] and blocker.timed_out == []
+
+    # 止まったスレッドが書き終えたら、次の実行は後の感想も含めて書き、反映済みにする
+    export_pending_notes(conn, config, logger)
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    text = note.read_text()
+    assert "記事0への感想" in text and "後から届いた感想" in text
+    assert pending_item_notes(conn) == 0
+
+
+def test_vault_io_runs_off_the_db_thread(conn, tmp_path, monkeypatch) -> None:
+    # vault のアクセスは vault-io のスレッドで、DB の読み書きは呼び出し側のスレッドで行う
+    # (見切ったスレッドが後から DB に触れない。GH#341)
+    _digest_id, _items = add_replied_items(conn, 1)
+    config = make_config(tmp_path)
+    writers: list[str] = []
+    original = obsidian_module._write_note
+
+    def recording(*args, **kwargs):
+        writers.append(threading.current_thread().name)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(obsidian_module, "_write_note", recording)
+    export_pending_notes(conn, config, logger)
+    assert writers == ["vault-io"]
+    assert pending_item_notes(conn) == 0
