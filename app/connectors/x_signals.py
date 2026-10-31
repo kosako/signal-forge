@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -343,7 +344,7 @@ def _collect_kind(
                     hit_known = True
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            _rollback_page(conn)
             raise
         stats["new_signals"] += page_new
         if hit_known and not backfill:
@@ -367,6 +368,18 @@ def _collect_kind(
             "> CAST(x_signal_cursors.since_id AS INTEGER)",
             (str(max_wrapper_id),),
         )
+
+
+def _rollback_page(conn: sqlite3.Connection) -> None:
+    """ページの保存の失敗の後始末。元の例外を後始末の例外で置き換えない(GH#330)。
+
+    容量不足・I/O エラーなどでは SQLite がトランザクションを自動でロールバック済みのことが
+    あり、そこで ROLLBACK を送ると別の OperationalError になる。トランザクションが残って
+    いるときだけ戻し、ROLLBACK 自体の失敗も抑えて、呼び出し側に元の例外を送出させる。
+    """
+    if conn.in_transaction:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
 
 
 def _load_cursor(conn: sqlite3.Connection, kind: str) -> str | None:

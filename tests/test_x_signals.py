@@ -572,18 +572,23 @@ def test_rerun_is_idempotent(conn, tmp_path) -> None:
     assert conn.execute("SELECT count(*) FROM x_signals").fetchone()[0] == 2
 
 
-def fail_signal_insert(conn, tweet_id: str, message: str = "boom") -> None:
-    """tweet_id のシグナルの保存を DB のエラーにする(保存の途中の sqlite3.Error の再現)。"""
+def fail_signal_insert(conn, tweet_id: str, message: str = "boom", action: str = "ABORT") -> None:
+    """tweet_id のシグナルの保存を DB のエラーにする(保存の途中の sqlite3.Error の再現)。
+
+    action='ROLLBACK' は SQLite がトランザクションを自動で戻す失敗(容量不足・I/O エラー等)の再現。
+    """
     conn.execute(
         f"CREATE TRIGGER fail_{tweet_id} BEFORE INSERT ON x_signals "
-        f"WHEN NEW.tweet_id = '{tweet_id}' BEGIN SELECT RAISE(ABORT, '{message}'); END"
+        f"WHEN NEW.tweet_id = '{tweet_id}' BEGIN SELECT RAISE({action}, '{message}'); END"
     )
 
 
-def test_storage_failure_still_records_reads_in_ledger(conn, tmp_path) -> None:
+@pytest.mark.parametrize("action", ["ABORT", "ROLLBACK"])
+def test_storage_failure_still_records_reads_in_ledger(conn, tmp_path, action) -> None:
     # GH#330: kind の隔離の外の例外(保存の sqlite3.Error)は段の失敗として抜けるが、取得済みの
-    # 読取数と費用は failed の行で台帳に残す(漏れると同じ日の再実行が日次 cap を超えて読む)
-    fail_signal_insert(conn, "l3")
+    # 読取数と費用は failed の行で台帳に残す(漏れると同じ日の再実行が日次 cap を超えて読む)。
+    # SQLite が自動でロールバック済みでも、後始末の ROLLBACK の例外で元の例外を置き換えない
+    fail_signal_insert(conn, "l3", action=action)
     session = session_with(
         [page(*[tw(f"b{i}") for i in range(5)])], [page(*[tw(f"l{i}") for i in range(5)])]
     )
@@ -595,9 +600,38 @@ def test_storage_failure_still_records_reads_in_ledger(conn, tmp_path) -> None:
     assert run["estimated_cost_usd"] == pytest.approx(10 * 0.004)
     assert run["new_signals"] == 5  # 保存できた bookmark だけ(like のページはロールバック)
     assert run["run_id"] == "r1"
-    assert "like: IntegrityError: boom" in run["error"]
+    assert run["error"] == "like: IntegrityError: boom"
     assert signal_reads_on(conn, today_jst()) == 10  # 同じ日の再実行の残りは 5
     assert calls_to(session, "42/tweets") == []  # 後続の kind には進まない(段の失敗)
+    assert rows(conn, "like") == []  # like のページは残らない
+
+
+class RollbackFails:
+    """ROLLBACK を送ると、戻した上で OperationalError を出す接続(後始末の失敗の再現)。"""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def execute(self, sql: str, *args):
+        if sql == "ROLLBACK":
+            self._conn.execute("ROLLBACK")
+            raise sqlite3.OperationalError("rollback failed")
+        return self._conn.execute(sql, *args)
+
+
+def test_rollback_failure_keeps_original_error(conn, tmp_path) -> None:
+    # GH#330: ページの ROLLBACK 自体が失敗しても、元の保存のエラーを送出し台帳に残す
+    fail_signal_insert(conn, "l1")
+    session = session_with([], [page(*[tw(f"l{i}") for i in range(5)])])
+    with pytest.raises(sqlite3.IntegrityError, match="boom"):
+        collect_x_signals(RollbackFails(conn), make_config(tmp_path), session, logger)
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "failed"
+    assert run["api_reads"] == 5
+    assert run["error"] == "like: IntegrityError: boom"
 
 
 def test_ledger_failure_does_not_hide_original_error(conn, tmp_path, caplog) -> None:
