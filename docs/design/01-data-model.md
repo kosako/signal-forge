@@ -340,13 +340,13 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 
 ### 深掘りキュー(dig_queue / dig_backlog_messages・migration 009・022。GH#104 / 設計 06 §2〜3)
 
-夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。深掘りカードへのリプライが調べ直しの依頼なら、`intel answer` が同じ規則で upsert する(観点 = リプライの原文。GH#137)。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。
+夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。深掘りカードへのリプライが調べ直しの依頼なら、`intel answer` が同じ規則で upsert する(観点 = リプライの原文。GH#137)。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request` / その日の digest の上位から選んで掘った = `digest`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。上限に足りない分を digest の上位から選んだ item(設計 06 §3 の ③。GH#349)は、選ぶ時点では積まず、生成物を `dig_results` へ write-ahead するのと同じトランザクションで `source = 'digest'`・`status = 'done'` の行を足す。行を足すのは行が無いときだけで、生成中に poller などが同じ item の行を作っていたら、本人の明示の操作(`requested_at` のある指定・`passed`)は変えず、自動投入の行(`requested_at` が無い `queued`)だけを `done` にする(どちらも生成物は記帳する。設計 06 §3)。`digest` は migration 009 の CHECK(`bookmark` / `request`)に無いので、実装の PR で表を作り直す migration を足す(GH#349。未実装。別の案は設計 06 §8)。
 
 - `item_id` UNIQUE(1 item 1 行。状態遷移で履歴を持たない — 観点は最新だけあれば調査に足りる)、items へ ON DELETE CASCADE
-- `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
+- `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない。リプライのパスと、一覧の skip のボタン(設計 06 §2・GH#349)が付ける)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
 - `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)。本文の材料が無い指定は、調査段が 1 回知らせた後に NULL へ戻す(状態・観点は変えない。設計 06 §3・GH#197)
-- `backlog_op_question_id`(migration 022)= 未消化一覧への本人の最後の操作(パス・指定)を反映した時点で、受け付け済みだった質問(`dig_questions.id`)の最大(質問がまだ無ければ 0)。受付の順序の印で、深掘りカードへの調べ直しの依頼は、自分の id がこれ以下なら(操作より前に受け付けた)積まない(GH#235・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、質問の id を目盛りにする。調べ直しの依頼と朝の深掘りの `done` は変えない。NULL = 未消化一覧での操作がまだない(migration 022 より前の操作を含む)
-- `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先の認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
+- `backlog_op_question_id`(migration 022)= 未消化一覧への本人の最後の操作(パス・skip のボタン・指定)を反映した時点で、受け付け済みだった質問(`dig_questions.id`)の最大(質問がまだ無ければ 0)。受付の順序の印で、深掘りカードへの調べ直しの依頼は、自分の id がこれ以下なら(操作より前に受け付けた)積まない(GH#235・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、質問の id を目盛りにする。調べ直しの依頼と朝の深掘りの `done` は変えない。NULL = 未消化一覧での操作がまだない(migration 022 より前の操作を含む)
+- `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先と skip のボタンの押されたメッセージの認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
 
 ### 深掘り実行結果(dig_results・migration 010・017。GH#105 / GH#153 / 設計 06 §4〜5)
 
@@ -359,7 +359,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `note_markdown` / `source_note_markdown` = 公開までの本文一時保持。公開時に NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。既存ファイルは公開時に上書きしない(公開済みノートの take 保護)
 - `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(公開済みの行だけ次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
 - `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
-- キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる)
+- キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる。digest の上位から選んだ item(キューの行が無い)は、行が無いときだけ足し、生成中にできた行は上の `dig_queue` の規則で扱う。GH#349)
 - `review_status` / `review_findings` / `review_cost_usd`(migration 017。GH#153)= 別系統の AI のレビューの結果。`review_status` NULL = レビューしていない(無効・017 より前の行)/ `clean` = 指摘なし / `revised` = 指摘あり → 書き手が 1 回直した / `revise_failed` = 直すのに失敗(本文は直す前のまま)/ `failed` = レビュー自体が失敗(未レビュー)/ `skipped` = 月の上限額に達して省いた、またはドラフトを予備の Claude が書いたので省いた(レビュー役と同じ系統。GH#180。どちらかはカード・ノートの記録の文言で分かる)。`review_findings` は指摘の JSON 配列(`clean` は空配列、`failed`・`skipped` は NULL)で、本文列と違い公開後も残す(続けるかを決める材料)。`review_cost_usd` はやり直しの分を含む API 費用の見積もりで、月の上限の判定と doctor #9 に使う(どちらも UTC の暦月)。応答の usage を受け取れず費用が分からなかった呼び出しは、課金されうる最大の額の見積もりを実額と同じ列に合算する(GH#323。設計 06 §4)
 
 ### 深掘りカードへの質問と返事(dig_questions・migration 011〜015・020。GH#126 / GH#141 / GH#137 / GH#236 / ADR 0005 / 設計 06 §6)
