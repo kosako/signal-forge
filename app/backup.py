@@ -5,7 +5,7 @@
   prompts/(git 管理だが世代の一貫性のため)/ 設定ディレクトリの外の関心プロファイル
   ([analysis].profile_path で外に置いた場合だけ profile/ に。GH#199)
 - tar.gz は 600 を強制(.env の secrets が同梱されるため。doctor #10 が検査)
-- 日次14世代。同日の再実行は当日世代を置換(冪等)
+- 日次14世代。同日の再実行は当日世代を置換(冪等)。世代に数えて消すのは日次の世代名だけ(GH#339)
 - ~/Backups/intel/ をクラウド同期対象外に置く確認は運用(runbook)の責務
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import tarfile
 import tempfile
@@ -22,6 +23,9 @@ from app.config import Config
 from app.jst import today_jst
 
 GENERATIONS = 14
+# 日次の世代名 intel-YYYYMMDD.tar.gz(backup_daily が作る名前)。世代の削除と doctor #10 が
+# 同じ判定を使い、置き場に手で置いた別名の intel-*.tar.gz を世代に数えず、消さない(GH#253・GH#339)
+BACKUP_ARCHIVE_NAME = re.compile(r"intel-\d{8}\.tar\.gz")
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
@@ -144,7 +148,10 @@ def _add_profile_if_outside(
 
 
 def _rotate(backup_dir: Path) -> list[str]:
-    archives = sorted(backup_dir.glob("intel-*.tar.gz"))
+    # 日次の世代だけを数えて消す。名前が日付なので名前順 = 古い順
+    archives = sorted(
+        p for p in backup_dir.glob("intel-*.tar.gz") if BACKUP_ARCHIVE_NAME.fullmatch(p.name)
+    )
     excess = archives[:-GENERATIONS] if len(archives) > GENERATIONS else []
     for path in excess:
         path.unlink()

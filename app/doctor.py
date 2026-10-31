@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import calendar
 import os
-import re
 import secrets
 import sqlite3
 import subprocess
@@ -24,6 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from app.backup import BACKUP_ARCHIVE_NAME
 from app.config import Config, ConfigError, load_config, load_env
 from app.db import MIGRATIONS_DIR, MigrationError, connect, discover_migrations, verify_ledger
 from app.purge import X_SIGNAL_EXCERPT_EXPIRED
@@ -31,9 +31,6 @@ from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VaultGuard, VaultStalled
 
 BACKUP_STALE_HOURS = 48
-# 生成側(app/backup.py の backup_daily)が作る世代名 intel-YYYYMMDD.tar.gz。置き場にある
-# 別用途の tar.gz を最新世代と取り違えて、欠落や古さを隠さない(GH#253)
-BACKUP_ARCHIVE_NAME = re.compile(r"intel-\d{8}\.tar\.gz")
 LAUNCHD_JOBS = ("com.intel.morning", "com.intel.poller")  # 設計 05 §1
 
 # X コネクタ(plan #15)が要求する .env キー(scripts/day0_x_probe.py と同一)
@@ -785,6 +782,8 @@ def _check_backup(config: Config | None) -> CheckResult:
     if config is None:
         return CheckResult(10, "バックアップ", "WARN", _CONFIG_UNAVAILABLE)
     backup_dir = config.backup_dir
+    # 世代は生成側(app/backup.py)と同じ名前の判定で数える。置き場にある別用途の tar.gz を
+    # 最新世代と取り違えて、欠落や古さを隠さない(GH#253)
     archives = (
         sorted(p for p in backup_dir.glob("*.tar.gz") if BACKUP_ARCHIVE_NAME.fullmatch(p.name))
         if backup_dir.exists()
