@@ -223,11 +223,12 @@ def analyze_stage(
     """analyze 段: 関心プロファイル → 予備つきのエンジン → 事前選別 → 本分析。件数を返す。
 
     朝バッチと `intel analyze` が呼ぶ(GH#206)。primary は主のエンジンの作り方
-    (None = config の `[llm].engine`)。
+    (None = config の `[llm].engine`)。事前選別から保存までは同じ DB の分析どうしで直列化し、
+    後の実行は先の実行を待ってから残りの枠を選ぶ(GH#334)。
     """
     # プロファイル欠落・エンジン未実装は analyze 段の失敗として局所化する
     # (import をここに置くのは循環回避でなく段の失敗系に含めるため)
-    from app.analysis.analyzer import analyze_selected
+    from app.analysis.analyzer import analysis_lock, analyze_selected
     from app.analysis.fallback import fallback_engine_factory
     from app.analysis.profile import load_interest_profile
     from app.analysis.stage1 import preselect
@@ -237,10 +238,11 @@ def analyze_stage(
     engine = fallback_engine_factory(
         conn, config, env, logger, stage="analyze", run_id=run_id, primary=primary
     )("low")
-    result = preselect(conn, config, logger, run_id=run_id)
-    return analyze_selected(
-        conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
-    )
+    with analysis_lock(conn, logger, run_id):
+        result = preselect(conn, config, logger, run_id=run_id)
+        return analyze_selected(
+            conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
+        )
 
 
 def dig_stage(
