@@ -362,7 +362,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる。digest の上位から選んだ item(キューの行が無い)は、行が無いときだけ足し、生成中にできた行は上の `dig_queue` の規則で扱う。GH#349)
 - `review_status` / `review_findings` / `review_cost_usd`(migration 017。GH#153)= 別系統の AI のレビューの結果。`review_status` NULL = レビューしていない(無効・017 より前の行)/ `clean` = 指摘なし / `revised` = 指摘あり → 書き手が 1 回直した / `revise_failed` = 直すのに失敗(本文は直す前のまま)/ `failed` = レビュー自体が失敗(未レビュー)/ `skipped` = 月の上限額に達して省いた、またはドラフトを予備の Claude が書いたので省いた(レビュー役と同じ系統。GH#180。どちらかはカード・ノートの記録の文言で分かる)。`review_findings` は指摘の JSON 配列(`clean` は空配列、`failed`・`skipped` は NULL)で、本文列と違い公開後も残す(続けるかを決める材料)。`review_cost_usd` はやり直しの分を含む API 費用の見積もりで、月の上限の判定と doctor #9 に使う(どちらも UTC の暦月)。応答の usage を受け取れず費用が分からなかった呼び出しは、課金されうる最大の額の見積もりを実額と同じ列に合算する(GH#323。設計 06 §4)
 
-### 深掘りカードへの質問と返事(dig_questions・migration 011〜015・020。GH#126 / GH#141 / GH#137 / GH#236 / ADR 0005 / 設計 06 §6)
+### 深掘りカードへの質問と返事(dig_questions・migration 011〜015・020・025。GH#126 / GH#141 / GH#137 / GH#236 / GH#336 / ADR 0005 / 設計 06 §6)
 
 概要カードへのリプライ(質問・感想)と、それへの返事の台帳(1 リプライ = 1 行)。返事は
 **write-ahead** で作る: 答え(または失敗)を先に記帳し(`status` を `answered` / `failed` へ)、
@@ -374,6 +374,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `request`(migration 014)= カードのボタンの種類(`summary` = 📝 要約 / `more` = 📖 詳しく。NULL = 本人のリプライ)。`question` には決まった依頼文が入る。`request` が NULL ⇔ `question_message_id` がある(CHECK)。同じカードの同じボタンは 1 行だけ(部分 UNIQUE。再配達・二重押しで 2 回作らない)。NOT NULL を外すため、migration 014 で表を作り直した
 - `kind` = LLM がリプライを分けた結果(`question` / `take` / `both`)。返事を作る呼び出しとは別の、本人の入力だけを渡す意図の判定の呼び出しが返す(外部由来の材料が判定を動かせないように。GH#245)。take の記録(GH#106)がこれを使う。ボタンからの依頼は判定を呼ばずに `question`
 - `take_recorded_at`(migration 013)= take(`take` / `both`)を解説ノートと `followup_dig` に記録した時刻。NULL = 未記録で、次の `intel answer` が記録し直す(設計 06 §6)
+- `received_signal_id`(migration 025)= 質問を受け付けた時点で記帳済みだった `signals.id` の最大(signals がまだ無ければ 0)。受付の順序の印で、take の記録は、最新の `followup_dig` の id がこれより大きければ(take の受付の後の追い掛けの回答)`yes` を足さない(GH#336・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、signals の id を目盛りにする(`signals` の行は消さないので id は記帳の順に増える)。migration 025 より前の行は、受付の時刻より前に記帳された signals の id の最大で埋めた(同じ秒の signals は受付の後とみなす)
 - `redig`(migration 015)= 1 なら、意図の判定(GH#245)が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった・質問を受け付けた後に本人がそのアイテムをパス・指定し直していた(GH#235)・元記事の本文が保存の期間を過ぎて材料が無い(返事の末尾に理由が付く。GH#197))
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
 - `retry_of`(migration 020)= 失敗の知らせへのリプライなら、答えられなかった元の質問の id(GH#236)。poller が返信先の message_id(失敗の行の `answer_message_id`)から引いて積む。返事の材料に元の質問を添える(やり直しも失敗していれば最初の質問まで辿る。最初の質問は必ず渡し、途中のやり直しは直近の分だけで合わせて 5 件まで。元がボタンからの依頼なら材料もボタンと同じ元記事の本文)。NULL = カード・返事へのリプライ、ボタンからの依頼

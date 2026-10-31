@@ -83,6 +83,9 @@ REQUESTS = {
 }
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+# 受付の順序の印(GH#336。migration 025)。質問を受け付けた時点で記帳済みの signals.id の最大。
+# take の記録が、受付の後の追い掛けの回答を古い take で上書きしないための照合に使う
+_RECEIVED_SIGNAL_MARK = "(SELECT coalesce(max(id), 0) FROM signals)"
 
 # (返信先 = 質問の message_id, プレーンテキスト) -> 送った message_id
 SendReply = Callable[[int, str], int]
@@ -123,9 +126,11 @@ def enqueue_question(
     リプライなら、答えられなかった元の質問に結び付ける(retry_of。GH#236)。
     """
     return conn.execute(
-        "INSERT INTO dig_questions (dig_result_id, question, question_message_id, retry_of) "
+        "INSERT INTO dig_questions "
+        "(dig_result_id, question, question_message_id, retry_of, received_signal_id) "
         "VALUES (?, ?, ?, (SELECT id FROM dig_questions "
-        "WHERE dig_result_id = ? AND answer_message_id = ? AND status = 'failed'))",
+        "WHERE dig_result_id = ? AND answer_message_id = ? AND status = 'failed'), "
+        f"{_RECEIVED_SIGNAL_MARK})",
         (dig_result_id, question, question_message_id, dig_result_id, replied_message_id),
     ).lastrowid
 
@@ -134,7 +139,9 @@ def enqueue_request(conn: sqlite3.Connection, dig_result_id: int, request: str) 
     """カードのボタンからの依頼を台帳に積む(GH#141)。同じカードの同じボタンが既にあれば
     積まずに False を返す(再配達・二重押し。migration 014 の部分 UNIQUE)。"""
     cursor = conn.execute(
-        "INSERT OR IGNORE INTO dig_questions (dig_result_id, question, request) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO dig_questions "
+        "(dig_result_id, question, request, received_signal_id) "
+        f"VALUES (?, ?, ?, {_RECEIVED_SIGNAL_MARK})",
         (dig_result_id, REQUESTS[request], request),
     )
     return cursor.rowcount == 1
