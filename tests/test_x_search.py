@@ -14,10 +14,15 @@ from app.models import Source
 CREDS = XCredentials(
     api_key="ck", api_secret="cs", access_token="at", access_token_secret="ats"
 )
-# 小さい id("900" 等)の snowflake 時刻 = 基準時刻。既定の時計をここに置き、既存テストの
-# since_id を「新しい」扱いにする(7 日窓の判定は実時刻の id を使うテストで別に検証する)
+# 小さい id("900" 等)の snowflake 時刻 = 基準時刻
 SNOWFLAKE_EPOCH = datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=UTC)
+# connector_from の既定の時計。基準時刻の 1 時間後に置き、小さい id の since_id を「新しい」
+# 扱いにしつつ、その start_time(基準時刻の秒)を end_time(この 30 秒前)より前に保つ(GH#343。
+# 基準時刻そのものに置くと start_time が end_time より後の、API が 400 を返す要求になる)。
+# 7 日窓の判定は実時刻の id を使うテストで別に検証する
+DEFAULT_NOW = SNOWFLAKE_EPOCH + timedelta(hours=1)
 NOW = datetime(2026, 10, 17, 13, 49, tzinfo=UTC)
+X_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def snowflake_at(when: datetime) -> str:
@@ -65,13 +70,36 @@ def mixes_id_and_time(query: dict[str, list[str]]) -> bool:
     )
 
 
+def invalid_time_window(query: dict[str, list[str]], requested: datetime) -> bool:
+    """search/recent の時刻の範囲の制約。違反した要求に API は 400 を返す(GH#343)。
+
+    - end_time は要求の時刻より 10 秒以上前(無ければ API は要求の 30 秒前を上限にする)
+    - start_time は直近 7 日の中
+    - start_time は end_time より前(同じ時刻も受け付けない)
+
+    テストの模型も同じ制約を持ち、時刻の範囲が逆転した要求で成功系のテストが通らないようにする。
+    """
+    if "end_time" in query:
+        end = datetime.strptime(query["end_time"][0], X_TIME_FORMAT).replace(tzinfo=UTC)
+        if end > requested - timedelta(seconds=10):
+            return True
+    else:
+        end = requested - timedelta(seconds=30)
+    if "start_time" not in query:
+        return False
+    start = datetime.strptime(query["start_time"][0], X_TIME_FORMAT).replace(tzinfo=UTC)
+    return start < requested - timedelta(days=7) or start >= end
+
+
 def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
-                   unit_price=0.004, seen=None, now=SNOWFLAKE_EPOCH,
+                   unit_price=0.004, seen=None, now=DEFAULT_NOW,
                    reads_used_today=0) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
     200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
-    そのページの要求で送出する(通信の失敗。GH#182)。id と時刻の併用は 400(GH#319)。"""
+    そのページの要求で送出する(通信の失敗。GH#182)。id と時刻の併用は 400(GH#319)。
+    時刻の範囲の違反(逆転・同値・7 日窓の外・end_time が新しすぎる)も 400(GH#343)。
+    要求の時刻は now(この模型では時計は進まない)。"""
     token_index: dict[str, int] = {}
     for series in pages.values():
         for i, (_s, body, _h) in enumerate(series):
@@ -87,7 +115,7 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         # 演算子の自動付加: スロットを括弧で囲んでから除外句を付ける(GH#230)
         assert raw_query.startswith("(") and raw_query.endswith(f") {X_SEARCH_QUERY_SUFFIX}")
         slot = raw_query.removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
-        if mixes_id_and_time(query):
+        if mixes_id_and_time(query) or invalid_time_window(query, now):
             return httpx.Response(400, json={})
         token = query.get("next_token", [None])[0]
         status, body, headers = pages[slot][0 if token is None else token_index[token]]
@@ -473,9 +501,9 @@ class SearchServer:
 
     時計は start から始まり、要求に応えるたびに gap 進む(コネクタの時計も now で共有する)。
     end_time が無ければ要求の 30 秒前より前を返し(API の既定)、あれば end_time より前
-    (end_time は含まない)を返す。end_time が要求の 10 秒前より新しければ 400(API の制約)。
-    start_time があればその時刻から(start_time は含む)を返す。since_id か until_id を
-    start_time か end_time と一緒に受けたら 400(API の制約。GH#319)。
+    (end_time は含まない)を返す。start_time があればその時刻から(start_time は含む)を返す。
+    時刻の範囲の違反(invalid_time_window。GH#343)と、since_id か until_id を start_time か
+    end_time と一緒に受けた要求(GH#319)は 400(API の制約)。
     新しい順・since_id より新しいものだけ・max_results まで。
     """
 
@@ -492,21 +520,15 @@ class SearchServer:
         self._clock += self._gap  # 次の要求までに経つ時間
         query = parse_qs(urlsplit(str(request.url)).query)
         slot = query["query"][0].removeprefix("(").removesuffix(f") {X_SEARCH_QUERY_SUFFIX}")
-        if mixes_id_and_time(query):
+        if mixes_id_and_time(query) or invalid_time_window(query, requested):
             return httpx.Response(400, json={})
         if "end_time" in query:
-            until = datetime.strptime(query["end_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=UTC
-            )
-            if until > requested - timedelta(seconds=10):
-                return httpx.Response(400, json={})
+            until = datetime.strptime(query["end_time"][0], X_TIME_FORMAT).replace(tzinfo=UTC)
         else:
             until = requested - timedelta(seconds=30)
         start = SNOWFLAKE_EPOCH
         if "start_time" in query:
-            start = datetime.strptime(query["start_time"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=UTC
-            )
+            start = datetime.strptime(query["start_time"][0], X_TIME_FORMAT).replace(tzinfo=UTC)
         since = int(query.get("since_id", ["0"])[0])
         ids = sorted(
             (int(snowflake_at(at)) for s, at in self._posts if s == slot and start <= at < until),
@@ -571,6 +593,76 @@ def test_watermark_second_is_reread_and_cursor_advances() -> None:
         snowflake_at(same_second),
     ]
     assert result.next_cursor == {"since_id": snowflake_at(new)}
+
+
+def _x_time(when: datetime) -> list[str]:
+    return [when.strftime(X_TIME_FORMAT)]
+
+
+@pytest.mark.parametrize(
+    ("query", "invalid"),
+    [
+        ({}, False),
+        ({"end_time": _x_time(NOW - timedelta(seconds=10))}, False),  # 10 秒前ちょうどは受ける
+        ({"end_time": _x_time(NOW - timedelta(seconds=9))}, True),
+        (
+            {
+                "start_time": _x_time(NOW - timedelta(days=7)),  # 7 日窓の端ちょうどは受ける
+                "end_time": _x_time(NOW - timedelta(seconds=30)),
+            },
+            False,
+        ),
+        (
+            {
+                "start_time": _x_time(NOW - timedelta(days=7, seconds=1)),
+                "end_time": _x_time(NOW - timedelta(seconds=30)),
+            },
+            True,
+        ),
+        # end_time が無ければ、要求の 30 秒前(API の既定の上限)と比べる
+        ({"start_time": _x_time(NOW - timedelta(seconds=31))}, False),
+        ({"start_time": _x_time(NOW - timedelta(seconds=30))}, True),
+    ],
+)
+def test_invalid_time_window_bounds(query, invalid) -> None:
+    # GH#343: 模型が持つ search/recent の時刻の制約の境界(値は API の仕様から独立に書く)
+    assert invalid_time_window(query, NOW) is invalid
+
+
+@pytest.mark.parametrize(
+    ("mark_offset", "accepted"),
+    [
+        (timedelta(seconds=-1), True),  # start_time が end_time の 1 秒前 = 受け付ける
+        (timedelta(0), False),  # 同じ時刻 = 400
+        (timedelta(seconds=1), False),  # 逆転 = 400
+    ],
+)
+@pytest.mark.parametrize("model", ["pages", "server"])
+def test_fakes_reject_start_time_not_before_end_time(model, mark_offset, accepted) -> None:
+    # GH#343: search/recent は start_time が end_time より前であることを求め、満たさない要求を
+    # 400 で拒む。両方の模型が逆転と同値を 400 にし、壊れた時刻の範囲で成功系のテストが通らない
+    # ことを確かめる。本番の watermark は前回の end_time より前の投稿なので、この境界に届くのは
+    # 時計が戻ったときだけ
+    end_time = NOW - timedelta(seconds=30)  # 実行の開始の 30 秒前(GH#184)
+    since = {"since_id": snowflake_at(end_time + mark_offset)}
+    if model == "pages":
+        connector = connector_from({"ai": [(200, page([]), {})]}, slots=("ai",), now=NOW)
+    else:
+        server = SearchServer([], start=NOW, gap=timedelta(seconds=60))
+        connector = XSearchConnector(
+            client=httpx.Client(transport=httpx.MockTransport(server.handle)),
+            credentials=CREDS,
+            slots=("ai",),
+            daily_read_cap=20,
+            unit_price_usd=0.004,
+            sleep=lambda _s: None,
+            now=server.now,
+        )
+    if accepted:
+        assert connector.fetch(make_source(), since).partial_error is None
+    else:
+        with pytest.raises(FatalError, match="400"):
+            connector.fetch(make_source(), since)
 
 
 def test_auth_error_is_fatal() -> None:
