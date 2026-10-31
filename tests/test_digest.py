@@ -147,7 +147,7 @@ def test_force_replace_then_deliver_resends_all(conn, tmp_path) -> None:
     assert row["delivery_status"] == "sent"
 
 
-def test_force_replace_waits_for_running_delivery(conn, tmp_path, caplog) -> None:
+def test_force_replace_waits_for_running_delivery(conn, tmp_path, caplog, fixed_today) -> None:
     # GH#333: 配信の途中に --force の置換を重ねても、置換は配信の終わりを待つ。待たないと、
     # 配信は先に読んだ旧い記事を送り続けて最後に id だけで sent にし、新しい世代が届かない。
     # flock は開いたファイルごとに効くので、同じプロセスの 2 スレッド(別々の接続)で
@@ -165,6 +165,9 @@ def test_force_replace_waits_for_running_delivery(conn, tmp_path, caplog) -> Non
     hang_guard = 10
     a = add_analyzed(conn, "https://a/1", relevance=90)
     b = add_analyzed(conn, "https://a/2", relevance=80)
+    # 初回の生成と置換は別々に today_jst() を呼ぶ。その間に JST の日付が変わると、置換が別の日の
+    # 新規生成になって検査が崩れるので、暦日を固定する(SF-333-001)
+    set_analyzed_at(conn, TODAY_AT, a, b)
     tg = TelegramConfig(owner_chat_id=777)
     first_config = Config(config_dir=tmp_path, digest=DigestConfig(max_items=1), telegram=tg)
     wider = Config(config_dir=tmp_path, digest=DigestConfig(max_items=2), telegram=tg)
