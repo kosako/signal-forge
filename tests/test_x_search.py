@@ -324,6 +324,32 @@ def test_rate_limit_zero_stops_remaining_slots_and_keeps_cursor() -> None:
     # 未実行スロット(b)の当日ぶんを watermark の背後に隠さない → カーソル据え置き
     assert result.next_cursor == {"since_id": "100"}
     assert result.partial_error is None  # 応答は正常。ソースの失敗にはしない(GH#183)
+    assert result.skipped_slots  # 要求しなかった b の失敗の続きを消させない(GH#331)
+
+
+def test_rate_limit_zero_on_last_slot_is_not_skipped() -> None:
+    # GH#331: 最後のスロットで rate limit 残 0 になった実行は、全スロットを要求して成功している。
+    # 要求しなかったスロットは無いので、collect が失敗の状態を解除してよい
+    pages = {
+        "a": [(200, page([tweet("500")]), {})],
+        "b": [(200, page([tweet("600")], next_token="tok1"), {"x-rate-limit-remaining": "0"})],
+    }
+    result = connector_from(pages, slots=("a", "b")).fetch(make_source(), {"since_id": "100"})
+    assert result.stats.api_reads == 2
+    assert result.partial_error is None
+    assert not result.skipped_slots
+
+
+def test_partial_error_is_not_skipped_slots() -> None:
+    # 部分取得のあとの失敗は失敗として数える(GH#183)。要求しなかったスロットの印は立てない
+    pages = {
+        "a": [(200, page([tweet("500")]), {})],
+        "b": [(400, {}, {})],
+        "c": [(200, page([tweet("900")]), {})],
+    }
+    result = connector_from(pages, slots=("a", "b", "c")).fetch(make_source(), {})
+    assert result.partial_error is not None
+    assert not result.skipped_slots
 
 
 def test_first_page_429_with_zero_total_raises() -> None:
@@ -428,6 +454,7 @@ def test_budget_cut_is_normal_and_advances_cursor() -> None:
     assert result.stats.api_reads == 20  # 10/10 で両スロットとも予算に届いた
     assert result.partial_error is None
     assert result.next_cursor == {"since_id": "700"}
+    assert not result.skipped_slots  # 全スロットを要求して成功した(GH#331)
 
 
 def test_reads_used_today_splits_only_remaining_budget() -> None:
@@ -474,6 +501,8 @@ def test_slot_left_below_min_page_by_remaining_budget_keeps_cursor() -> None:
     assert result.partial_error is None  # 予算による打ち切りは失敗にしない
     assert result.next_cursor == {"since_id": "100"}
     assert not result.budget_exhausted  # 要求したスロットがある(成否はその応答で決まる)
+    # GH#331: 要求しなかったスロットの成否は確かめていない。collect に失敗の状態を解除させない
+    assert result.skipped_slots
 
 
 def test_all_requests_share_end_time_before_run_start() -> None:

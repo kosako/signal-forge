@@ -84,6 +84,7 @@ def _collect_source(
             resolve_short,
             partial_error=partial_error,
             budget_exhausted=result.budget_exhausted,
+            skipped_slots=result.skipped_slots,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
@@ -126,6 +127,11 @@ def _collect_source(
     }
     if result.budget_exhausted:
         logger.info("当日の読取の枠が残っていないため読まず。ソースの状態は変えない", extra=extra)
+    elif partial_error is None and result.skipped_slots:
+        logger.info(
+            "collect 完了。要求しなかったスロットがあるため、ソースの成否の状態は変えない",
+            extra=extra,
+        )
     elif partial_error is None:
         logger.info("collect 完了", extra=extra)
     else:
@@ -145,6 +151,7 @@ def _store_result(
     *,
     partial_error: str | None,
     budget_exhausted: bool = False,
+    skipped_slots: bool = False,
 ) -> dict[str, int]:
     """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
@@ -153,7 +160,9 @@ def _store_result(
     ソースは失敗として数える(連続失敗の警告に載せる。成功の時刻と移転の記録は変えない)。
     budget_exhausted は X の当日の読取の枠が残っておらず要求しなかった実行(GH#178)。カーソルだけを
     保存し、成功の時刻・直近のエラー・連続失敗数は変えない(復旧を確かめていないので、失敗の続きを
-    成功で消さない)。
+    成功で消さない)。skipped_slots は X 検索で要求しなかったスロットを残した正常な終わり(GH#331)。
+    items とカーソルを保存し、ソースの成否の状態は budget_exhausted と同じく変えない(要求しなかった
+    スロットの失敗の続きを、ほかのスロットの成功で消さない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     # 短縮 URL の解決(HTTP の待ち・再試行)はトランザクションの前に済ませる(GH#179)。
@@ -165,7 +174,7 @@ def _store_result(
     try:
         for raw, canonical in prepared:
             counts[_store_item(conn, source, raw, canonical)] += 1
-        if partial_error is None and budget_exhausted:
+        if partial_error is None and (budget_exhausted or skipped_slots):
             conn.execute(
                 "UPDATE sources SET cursor = ? WHERE id = ?", (json.dumps(next_cursor), source.id)
             )

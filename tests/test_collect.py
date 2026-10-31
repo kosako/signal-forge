@@ -10,6 +10,7 @@ import pytest
 from app.collect import collect_all
 from app.connectors.base import FatalError, FetchResult, FetchStats, RawItem, RetryableError
 from app.connectors.x import XConnector, XCredentials
+from app.connectors.x_search import XSearchConnector
 from app.db import apply_migrations, connect
 from app.http import HttpClient
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
@@ -211,6 +212,83 @@ def test_x_home_transport_failure_on_second_page_keeps_first_page_and_cost(
     assert source["last_success_at"] == "2026-10-20T21:30:00Z"
     assert "RetryableError" in source["last_error"]
     assert source["consecutive_failures"] == 1
+
+
+def test_search_rerun_skipping_failed_slot_keeps_source_failure(
+    conn: sqlite3.Connection,
+) -> None:
+    # GH#331: 上限 35・3 スロットで先の 2 スロットが計 6 件を読み、最後が 400 になった日。同じ日の
+    # 再実行は残り 29 を 10/10/9 に分け、最後のスロットを要求しない。その実行が正常に終わっても、
+    # 最後のスロットの成否は確かめていないので、ソースの失敗の状態を消さない(doctor・watchdog・
+    # 週次の健康診断に残す)。全スロットを要求して成功した実行だけが失敗の状態を解除する
+    conn.execute(
+        "INSERT INTO sources (type, name, config, last_success_at) "
+        "VALUES ('x', 'x:search', '{\"mode\": \"search\"}', '2026-10-20T21:30:00Z')"
+    )
+    broken = {"c": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        slot = request.url.params["query"][1]  # "(a) -is:retweet -is:reply" の a
+        if slot == "c" and broken["c"]:
+            return httpx.Response(400, json={})
+        base = {"a": 500, "b": 700, "c": 900}[slot]
+        return httpx.Response(200, json={
+            "data": [
+                {"id": str(base - i), "text": f"{slot} の投稿 {i}", "author_id": "a1",
+                 "created_at": "2026-10-21T09:00:00.000Z"}
+                for i in range(3)
+            ],
+        })
+
+    def search(reads_used_today: int) -> XSearchConnector:
+        return XSearchConnector(
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            credentials=XCredentials(
+                api_key="ck", api_secret="cs", access_token="at", access_token_secret="ats"
+            ),
+            slots=("a", "b", "c"),
+            daily_read_cap=35,
+            unit_price_usd=0.004,
+            reads_used_today=reads_used_today,
+            sleep=lambda _s: None,
+        )
+
+    def state() -> sqlite3.Row:
+        return conn.execute(
+            "SELECT last_success_at, last_error, consecutive_failures FROM sources "
+            "WHERE type='x'"
+        ).fetchone()
+
+    def last_run() -> sqlite3.Row:
+        return conn.execute(
+            "SELECT status, api_reads FROM collect_runs WHERE source_id = "
+            "(SELECT id FROM sources WHERE type='x') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    collect_all(conn, {"rss": FakeConnector([]), "x": search(0)}, logger)
+    assert (last_run()["status"], last_run()["api_reads"]) == ("error", 6)
+    failed = state()
+    assert failed["consecutive_failures"] == 1
+    assert "400" in failed["last_error"]
+
+    # 同じ日の再実行(先の 6 件を引いた残り 29 → 10/10/9)。c は要求しない
+    collect_all(conn, {"rss": FakeConnector([]), "x": search(6)}, logger)
+    assert (last_run()["status"], last_run()["api_reads"]) == ("ok", 6)
+    assert tuple(state()) == tuple(failed)  # 成功の時刻も直近のエラーも連続失敗数も変えない
+    assert len(source_failure_alerts(conn, "x", 1)) == 1
+
+    # 翌日(残り 35 → 12/12/11)。全スロットを要求して成功したので失敗の状態を解除する
+    broken["c"] = False
+    collect_all(conn, {"rss": FakeConnector([]), "x": search(0)}, logger)
+    assert last_run()["status"] == "ok"
+    recovered = state()
+    assert recovered["consecutive_failures"] == 0
+    assert recovered["last_error"] is None
+    assert recovered["last_success_at"] != "2026-10-20T21:30:00Z"
+    # 3 回で取れた投稿はすべて保存されている(要求しなかったスロットがある実行の取得ぶんも捨てない)
+    assert conn.execute(
+        "SELECT count(*) FROM items WHERE source_id = (SELECT id FROM sources WHERE type='x')"
+    ).fetchone()[0] == 9
 
 
 def test_items_inserted_and_cursor_saved(conn: sqlite3.Connection) -> None:
