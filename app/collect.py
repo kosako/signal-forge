@@ -329,8 +329,9 @@ def _prepare_rss(
     保存しても無視される記事(取り込み済み・ほかのソースと同じ URL)は除き、上限にも数えない。
     数えると、上限を超えるフィードで同じ記事が毎回の枠を埋め、残りがいつまでも入らない。
     既知かは短縮 URL の解決の前に安く確かめる: guid(UNIQUE(source_id, external_id))、短縮 URL
-    でない記事は正規化した URL(UNIQUE(canonical_url))、短縮 URL の記事はこのソースが前に
-    保存した元の URL(guid の無い記事だけ)と、同じ記事を前に解決した結果(short_url_resolutions)。
+    でない記事は正規化した URL(UNIQUE(canonical_url))、短縮 URL の記事は同じ記事を前に解決した
+    結果(short_url_resolutions。種別つきの鍵)の先。items の元の URL や external_id の形からは
+    推し量らない。
     短縮 URL を解決した後も、ほかのソースと同じ URL なら除く(解決の結果を残すので、次の実行では
     解決し直さずに除く)。同じ取得の中の重複(先に残した記事と同じ canonical_url か guid)も、
     保存で無視されるので除き、枠を使わせない。
@@ -434,17 +435,10 @@ def _known_without_resolution(
     ).fetchone():
         return True
     if _needs_resolution(raw, resolve_short):
-        # 解決先は HTTP が要るので、guid の無い記事はこのソースが前に保存した guid の無い記事の
-        # 元の URL で見る(external_id が正規化 URL の hash か、error の行の NULL)。guid のある
-        # 記事は guid が識別子なので、同じ短縮 URL でも取り込み済みとしない。逆に guid のある
-        # 記事の行の URL で、guid の無い新しい記事を取り込み済みとしない。
-        # 同じ記事を前に解決した結果があれば、その先でも見る
-        if raw.external_id is None and conn.execute(
-            "SELECT 1 FROM items WHERE source_id = ? AND url = ?"
-            " AND (external_id IS NULL OR external_id LIKE 'urlhash:%')",
-            (source.id, raw.url),
-        ).fetchone():
-            return True
+        # 解決先は HTTP が要るので、同じソースの同じ記事を前に解決した結果(種別つきの鍵。
+        # guid の無い記事は url: + 元の URL)の先が items にあるかで見る。items の元の URL や
+        # external_id の形からは推し量らない(本物の guid が合成の id と同じ形でありうるため)。
+        # 結果が無い(この仕組みより前に保存した記事・purge の後)ときは解決し直す
         canonical = _resolved_before(conn, source, raw)
         return canonical is not None and _url_taken(conn, canonical)
     return _url_taken(conn, _canonical_url(raw, None) or raw.url)
@@ -485,8 +479,9 @@ def _resolve(
     """短縮 URL を解決して正規化し、結果を残す(同じ記事の再試行で解決し直さない。GH#340)。
 
     残すのは解決できた結果だけ。UrlError(解決先が分解できない等)は None で、記事は error の行
-    になるので、次の実行は元の URL で取り込み済みと分かる。通信の失敗(Retryable / Fatal)は
-    残さずに送出し、今までどおりソースの失敗になる(次の実行で解決し直す)。
+    になる(guid のある記事は次の実行で guid で取り込み済みと分かる。guid の無い記事は解決し直す。
+    1 件の HTTP で、段の時間の上限の内側)。通信の失敗(Retryable / Fatal)は残さずに送出し、
+    今までどおりソースの失敗になる(次の実行で解決し直す)。
     書き込みは 1 行の INSERT で、書き込みのトランザクションを HTTP の待ちの間は持たない(GH#179)。
     """
     canonical = _canonical_url(raw, resolve_short)

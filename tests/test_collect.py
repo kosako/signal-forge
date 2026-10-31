@@ -1131,16 +1131,18 @@ def test_resolution_key_separates_guid_from_url(conn: sqlite3.Connection) -> Non
     assert [r[0] for r in rows] == ["https://example.com/old-a", "https://example.com/new-b"]
 
 
-def test_guidless_entry_not_known_by_url_of_guid_item(conn: sqlite3.Connection) -> None:
-    # このソースが前に保存した元の URL で取り込み済みとみるのは、guid の無い記事の行だけ。
-    # guid のある記事の行と同じ短縮 URL でも、guid の無い新しい記事は解決して確かめる
+@pytest.mark.parametrize("guid", ["g1", "urlhash:legacy"])
+def test_guidless_entry_not_known_by_url_of_guid_item(conn: sqlite3.Connection, guid) -> None:
+    # guid の無い記事を取り込み済みとみるのは、同じ記事(url: + 元の URL)を前に解決した結果が
+    # あるときだけ。guid のある記事の行と同じ短縮 URL でも、guid の無い新しい記事は解決して
+    # 確かめる。guid が合成の id と同じ形(urlhash:)でも同じ(external_id の形から推し量らない)
     target = {"url": "https://example.com/old-a"}
 
     def resolver(url: str) -> str:
         return target["url"]
 
     collect_all(
-        conn, {"rss": FakeConnector([short_entry("g1", 1, "s")])}, logger, resolve_short=resolver
+        conn, {"rss": FakeConnector([short_entry(guid, 1, "s")])}, logger, resolve_short=resolver
     )
     target["url"] = "https://example.com/new-b"
     guidless = RawItem(
