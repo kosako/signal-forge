@@ -10,7 +10,8 @@
   まで(新しい側を残し、カーソルを進めずに次の実行で残りを取り直す)。保存しても無視される記事
   (取り込み済み・ほかのソースと同じ URL)は数えない。段全体は [collect].time_budget_s まで。
   次のソースと、次の短縮 URL の解決に進む前に確かめる。解決した結果は short_url_resolutions に
-  残し、次の実行では解決し直さない(除いた記事の解決で毎回の時間を使い切らない)。ソースの途中で達したら、解決した分を
+  残し、同じソースの同じ記事を次の実行で読み直すときは解決し直さない(除いた記事の解決で毎回の
+  時間を使い切らない)。新しい記事は解決し直す(転送先が変わっていれば新しい先を取る)ソースの途中で達したら、解決した分を
   保存してカーソルを進めず、残りのソースとともに次の実行へ回す。ソースは前回の取得が古い順に
   回す(打ち切りで回れなかったソースが次の実行で先になる)
 """
@@ -141,7 +142,7 @@ def _collect_source(
                 conn, source, result.items, rss_max_items, resolve_short, deadline, clock
             )
         else:
-            prepared = _prepare(conn, result.items, resolve_short, deadline, clock)
+            prepared = _prepare(conn, source, result.items, resolve_short, deadline, clock)
         next_cursor = result.next_cursor
         if prepared.capped or prepared.timed_out:
             # 進めると 304(X は since_id)で残りを取り直せない。今のカーソルのまま次の実行で
@@ -288,6 +289,7 @@ def _store_result(
 
 def _prepare(
     conn: sqlite3.Connection,
+    source: Source,
     items: list[RawItem],
     resolve_short: Callable[[str], str] | None,
     deadline: float,
@@ -304,11 +306,11 @@ def _prepare(
         if not _needs_resolution(raw, resolve_short):
             prepared.append((raw, _canonical_url(raw, resolve_short)))
             continue
-        canonical = _resolved_before(conn, raw)
+        canonical = _resolved_before(conn, source, raw)
         if canonical is None:
             if clock() >= deadline:
                 return _Prepared(prepared, timed_out=True)
-            canonical = _resolve(conn, raw, resolve_short)
+            canonical = _resolve(conn, source, raw, resolve_short)
         prepared.append((raw, canonical))
     return _Prepared(prepared)
 
@@ -328,8 +330,10 @@ def _prepare_rss(
     数えると、上限を超えるフィードで同じ記事が毎回の枠を埋め、残りがいつまでも入らない。
     既知かは短縮 URL の解決の前に安く確かめる: guid(UNIQUE(source_id, external_id))、短縮 URL
     でない記事は正規化した URL(UNIQUE(canonical_url))、短縮 URL の記事はこのソースが前に
-    保存した元の URL と、前に解決した結果(short_url_resolutions)。短縮 URL を解決した後も、
-    ほかのソースと同じ URL なら除く(解決の結果を残すので、次の実行では解決し直さずに除く)。
+    保存した元の URL(guid の無い記事だけ)と、同じ記事を前に解決した結果(short_url_resolutions)。
+    短縮 URL を解決した後も、ほかのソースと同じ URL なら除く(解決の結果を残すので、次の実行では
+    解決し直さずに除く)。同じ取得の中の重複(先に残した記事と同じ canonical_url か guid)も、
+    保存で無視されるので除き、枠を使わせない。
     公開日時の新しい順に見る(フィードの並びは新しい順とは限らない。日時の無い entry は古い側と
     し、その中はフィードの並び)。保存はフィードの並びに戻す。
     """
@@ -340,35 +344,61 @@ def _prepare_rss(
         reverse=True,
     )
     kept: list[tuple[int, RawItem, str | None]] = []
+    # 先に残した記事の canonical_url と guid(同じ取得の中の重複は保存で無視される)
+    kept_urls: set[str] = set()
+    kept_guids: set[str] = set()
+
+    def duplicate_in_batch(raw: RawItem, canonical: str | None) -> bool:
+        return (canonical or raw.url) in kept_urls or (
+            raw.external_id is not None and raw.external_id in kept_guids
+        )
+
+    def known_cheaply(raw: RawItem) -> bool:
+        if _known_without_resolution(conn, source, raw, resolve_short):
+            return True
+        if _needs_resolution(raw, resolve_short):
+            canonical = _resolved_before(conn, source, raw)
+            return canonical is not None and duplicate_in_batch(raw, canonical)
+        return duplicate_in_batch(raw, _canonical_url(raw, None))
+
     known = 0
     timed_out = False
     position = 0  # 次に見る ordered の位置。打ち切ったら、そこから後ろを次の実行へ回す
     while position < len(ordered) and len(kept) < limit:
         index, raw = ordered[position]
+        if raw.external_id is not None and raw.external_id in kept_guids:
+            known += 1
+            position += 1
+            continue
         if _known_without_resolution(conn, source, raw, resolve_short):
             known += 1
             position += 1
             continue
         if _needs_resolution(raw, resolve_short):
-            canonical = _resolved_before(conn, raw)
+            canonical = _resolved_before(conn, source, raw)
             if canonical is None:
                 if clock() >= deadline:
                     timed_out = True
                     break
-                canonical = _resolve(conn, raw, resolve_short)
+                canonical = _resolve(conn, source, raw, resolve_short)
             if _url_taken(conn, canonical or raw.url):  # 解決したらほかのソースと同じ URL
                 known += 1
                 position += 1
                 continue
         else:
             canonical = _canonical_url(raw, None)
+        if duplicate_in_batch(raw, canonical):
+            known += 1
+            position += 1
+            continue
         kept.append((index, raw, canonical))
+        kept_urls.add(canonical or raw.url)
+        if raw.external_id is not None:
+            kept_guids.add(raw.external_id)
         position += 1
     # 打ち切った後ろのうち、安く既知と分かるものは回した数に入れない(次の実行でも除く)
     rest = [raw for _, raw in ordered[position:]]
-    deferred = sum(
-        not _known_without_resolution(conn, source, raw, resolve_short) for raw in rest
-    )
+    deferred = sum(not known_cheaply(raw) for raw in rest)
     kept.sort(key=lambda entry: entry[0])
     return _Prepared(
         [(raw, canonical) for _, raw, canonical in kept],
@@ -401,28 +431,45 @@ def _known_without_resolution(
     ).fetchone():
         return True
     if _needs_resolution(raw, resolve_short):
-        # 解決先は HTTP が要るので、このソースが前に保存した元の URL と、前に解決した結果で見る
-        if conn.execute(
+        # 解決先は HTTP が要るので、guid の無い記事はこのソースが前に保存した元の URL で見る
+        # (guid のある記事は guid が識別子。同じ短縮 URL の新しい記事を取り込み済みとしない)。
+        # 同じ記事を前に解決した結果があれば、その先でも見る
+        if raw.external_id is None and conn.execute(
             "SELECT 1 FROM items WHERE source_id = ? AND url = ?", (source.id, raw.url)
         ).fetchone():
             return True
-        canonical = _resolved_before(conn, raw)
+        canonical = _resolved_before(conn, source, raw)
         return canonical is not None and _url_taken(conn, canonical)
     return _url_taken(conn, _canonical_url(raw, None) or raw.url)
 
 
-def _resolved_before(conn: sqlite3.Connection, raw: RawItem) -> str | None:
-    """前の実行で解決した短縮 URL の canonical_url(short_url_resolutions。無ければ None)。"""
+def _entry_key(raw: RawItem) -> str:
+    """解決の結果を使い回す記事の識別子。guid(external_id)、無ければ元の URL。"""
+    return raw.external_id if raw.external_id is not None else raw.url.strip()
+
+
+def _resolved_before(conn: sqlite3.Connection, source: Source, raw: RawItem) -> str | None:
+    """同じソースの同じ記事を前の実行で解決した canonical_url(無ければ None)。
+
+    使い回すのは同じ記事(guid、無ければ元の URL)で、元の URL も同じときだけ。同じ短縮 URL でも
+    別の記事やほかのソースでは使わない(転送先が後で変わると、新しい記事を古い先との重複として
+    捨てるため)。
+    """
     row = conn.execute(
-        "SELECT canonical_url FROM short_url_resolutions WHERE url = ?", (raw.url.strip(),)
+        "SELECT canonical_url FROM short_url_resolutions"
+        " WHERE source_id = ? AND entry_key = ? AND url = ?",
+        (source.id, _entry_key(raw), raw.url.strip()),
     ).fetchone()
     return None if row is None else row["canonical_url"]
 
 
 def _resolve(
-    conn: sqlite3.Connection, raw: RawItem, resolve_short: Callable[[str], str] | None
+    conn: sqlite3.Connection,
+    source: Source,
+    raw: RawItem,
+    resolve_short: Callable[[str], str] | None,
 ) -> str | None:
-    """短縮 URL を解決して正規化し、結果を残す(次の実行で解決し直さない。GH#340)。
+    """短縮 URL を解決して正規化し、結果を残す(同じ記事の再試行で解決し直さない。GH#340)。
 
     残すのは解決できた結果だけ。UrlError(解決先が分解できない等)は None で、記事は error の行
     になるので、次の実行は元の URL で取り込み済みと分かる。通信の失敗(Retryable / Fatal)は
@@ -432,8 +479,9 @@ def _resolve(
     canonical = _canonical_url(raw, resolve_short)
     if canonical is not None:
         conn.execute(
-            "INSERT OR REPLACE INTO short_url_resolutions (url, canonical_url) VALUES (?, ?)",
-            (raw.url.strip(), canonical),
+            "INSERT OR REPLACE INTO short_url_resolutions"
+            " (source_id, entry_key, url, canonical_url) VALUES (?, ?, ?, ?)",
+            (source.id, _entry_key(raw), raw.url.strip(), canonical),
         )
     return canonical
 

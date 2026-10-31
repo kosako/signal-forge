@@ -980,8 +980,8 @@ def test_rss_cap_does_not_defer_short_urls_known_by_kept_resolution(
     # (次の実行でも除くので、カーソルを据え置いて読み直さない)
     add_other_source_item(conn, "https://example.com/taken")
     conn.execute(
-        "INSERT INTO short_url_resolutions (url, canonical_url) "
-        "VALUES ('https://bit.ly/tk', 'https://example.com/taken')"
+        "INSERT INTO short_url_resolutions (source_id, entry_key, url, canonical_url) "
+        "VALUES (2, 'g2', 'https://bit.ly/tk', 'https://example.com/taken')"
     )
 
     def resolver(url: str) -> str:
@@ -1015,6 +1015,75 @@ def test_rss_reuses_kept_resolution_after_source_failure(conn: sqlite3.Connectio
     assert calls == ["https://bit.ly/a", "https://bit.ly/b", "https://bit.ly/b"]
     rows = conn.execute("SELECT canonical_url FROM items WHERE source_id = 2 ORDER BY id")
     assert [r[0] for r in rows] == ["https://example.com/long-a", "https://example.com/long-b"]
+
+
+@pytest.mark.parametrize("same_source", [True, False])
+def test_new_entry_resolves_short_url_again_after_redirect_change(
+    conn: sqlite3.Connection, same_source: bool
+) -> None:
+    # 解決の結果を使い回すのは同じソースの同じ記事だけ。短縮 URL の転送先が後で変わったら、
+    # 新しい記事(新しい guid・ほかのソース)は解決し直して新しい先を取る
+    target = {"url": "https://example.com/old-a"}
+    calls: list[str] = []
+
+    def resolver(url: str) -> str:
+        calls.append(url)
+        return target["url"]
+
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-b', '{\"url\": \"https://b\"}')"
+    )
+    first = short_entry("g1", 1, "u")
+    later = short_entry("g2" if same_source else "h1", 2, "u")
+
+    class Router:
+        source_type = "rss"
+
+        def __init__(self, by_source: dict[str, list[RawItem]]):
+            self.by_source = by_source
+
+        def fetch(self, source_row, cursor):
+            return FakeConnector(self.by_source.get(source_row.name, [])).fetch(
+                source_row, cursor
+            )
+
+    collect_all(conn, {"rss": Router({"feed-a": [first]})}, logger, resolve_short=resolver)
+    target["url"] = "https://example.com/new-b"
+    feeds = {"feed-a": [first, later]} if same_source else {"feed-a": [first], "feed-b": [later]}
+    collect_all(conn, {"rss": Router(feeds)}, logger, resolve_short=resolver)
+
+    assert calls == ["https://bit.ly/u", "https://bit.ly/u"]  # g1 は使い回し、新しい記事は解決
+    rows = conn.execute("SELECT external_id, canonical_url FROM items ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("g1", "https://example.com/old-a"),
+        (later.external_id, "https://example.com/new-b"),
+    ]
+
+
+@pytest.mark.parametrize("duplicate", ["url", "guid"])
+def test_rss_cap_skips_duplicates_within_same_fetch(
+    conn: sqlite3.Connection, duplicate: str
+) -> None:
+    # 同じ取得の中の重複(先に残した記事と同じ URL か guid)は保存で無視されるので、枠を使わない。
+    # 上限 2 件で、新しい順に「g1 → A、(g2 → A か g1 の短縮 URL)、g3 → B」なら A と B を同じ回に
+    # 入れる。同じ guid の重複は短縮 URL を解決せずに除く
+    second = dated("g2", 8, path="a") if duplicate == "url" else short_entry("g1", 8, "c")
+    entries = [dated("g1", 9, path="a"), second, dated("g3", 7, path="b")]
+
+    def resolver(url: str) -> str:
+        raise AssertionError(f"解決しない: {url}")
+
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=2),
+    )
+    rows = conn.execute("SELECT external_id, canonical_url FROM items ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("g1", "https://example.com/a"),
+        ("g3", "https://example.com/b"),
+    ]
+    assert budget_cuts(conn) == []
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
 
 
 def test_failed_short_url_resolution_is_not_kept(conn: sqlite3.Connection) -> None:

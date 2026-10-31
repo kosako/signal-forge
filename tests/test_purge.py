@@ -211,9 +211,10 @@ def test_old_short_url_resolutions_deleted(conn, tmp_path) -> None:
     # 短縮 URL の解決の結果は 30 日より前の行を消す(GH#340)。消しても次に解決し直すだけ
     for url, days in (("https://bit.ly/old", 31), ("https://bit.ly/new", 29)):
         conn.execute(
-            "INSERT INTO short_url_resolutions (url, canonical_url, resolved_at) "
-            "VALUES (?, 'https://example.com/x', strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
-            (url, f"-{days} days"),
+            "INSERT INTO short_url_resolutions (source_id, entry_key, url, canonical_url, "
+            "resolved_at) VALUES (2, ?, ?, 'https://example.com/x', "
+            "strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
+            (url, url, f"-{days} days"),
         )
     counts = purge_expired(conn, Config(config_dir=tmp_path), logger)
     assert counts["short_url_resolutions_deleted"] == 1

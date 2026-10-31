@@ -19,16 +19,23 @@ CREATE TABLE budget_cuts (
 CREATE INDEX ix_budget_cuts_created ON budget_cuts(created_at);
 
 -- 短縮 URL の解決の結果(GH#340)。collect が短縮 URL(u1 手順1。設計 01 §4)を解決したら残し、
--- 次の実行では解決し直さずに既知の判定と正規化に使う。ほかのソースと同じ先の記事は保存で
--- 無視されるので、結果を残さないと毎回の解決で段の時間の上限を使い切り、残りが進まない。
---   url           解決の前の短縮 URL(記事の元の URL。前後の空白は除く)
+-- 同じソースの同じ記事を次の実行で読み直すときは、解決し直さずに既知の判定と正規化に使う。
+-- ほかのソースと同じ先の記事は保存で無視されるので、結果を残さないと毎回の解決で段の時間の
+-- 上限を使い切り、残りが進まない。使い回しを同じ記事に限るのは、短縮 URL の転送先が後で変わった
+-- とき、新しい記事を古い先との重複として捨てないため(新しい記事は解決し直す)。
+--   source_id     記事を取ったソース
+--   entry_key     記事の識別子。guid(items.external_id になる値)、無ければ元の URL
+--   url           解決の前の短縮 URL(前後の空白は除く)。同じ記事でも URL が変われば解決し直す
 --   canonical_url 解決した先を u1 で正規化した URL(items.canonical_url と同じ形)
 --   resolved_at   解決した時刻。purge が 30 日より前の行を消す(フィードに残る期間を超えたら要らない)
 -- 解決できなかった URL(通信の失敗・解決先が分解できない)は残さない。
 CREATE TABLE short_url_resolutions (
-  url           TEXT    NOT NULL PRIMARY KEY,
+  source_id     INTEGER NOT NULL REFERENCES sources(id),
+  entry_key     TEXT    NOT NULL,
+  url           TEXT    NOT NULL,
   canonical_url TEXT    NOT NULL,
-  resolved_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  resolved_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (source_id, entry_key)
 ) STRICT;
 
 CREATE INDEX ix_short_url_resolutions_resolved ON short_url_resolutions(resolved_at);
