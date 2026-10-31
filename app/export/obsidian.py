@@ -9,6 +9,9 @@
 - 読み書きは vault の実体から 1 段ずつ symlink を辿らずに開いたフォルダの中で行う(途中の
   フォルダが外への symlink なら書かない。ノートが symlink なら辿らずに新版を退避する。GH#204)
 - X 由来は抜粋を出力しない(恒久保存層に本文を置かない。Issue #2 の確定ポリシー)
+- vault へのアクセス(フォルダを開く・一覧・ノートの読み書き)は 1 回ごとに時間の上限を付け、
+  DB の読み書きは呼び出し側のスレッドに残す(macOS のプライバシーの確認待ちで朝バッチの後続の
+  段を止めない。見切ったスレッドの遅れた書き込みは export のロックで別の実行と重ねない。GH#341)
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -37,6 +40,7 @@ from app.vault_dir import (
     folder_dir,
     open_regular,
 )
+from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled, VaultWriteLock
 
 GENERATED_BEGIN = "<!-- GENERATED:BEGIN -->"
 GENERATED_END = "<!-- GENERATED:END -->"
@@ -51,6 +55,12 @@ _ITEM_NOTE_FILE = re.compile(r"\d{8}-\d+-.*\.md")
 # ユーザー所有キー: 生成側は初期値を置くだけで、再生成時に上書きしない(設計 04 §7)
 _USER_OWNED_KEYS = ("reaction",)
 
+# export の書き込みのロック(GH#341)。DB の隣の `<DB>.export.lock`(deliver.lock と同じ名付け)
+EXPORT_LOCK_SUFFIX = ".export.lock"
+# 別の実行のロックを待つ上限。ふだんの export は 1 秒もかからず、超えるのは見切ったスレッドが
+# 残っているとき(vault が応答しないまま)なので、vault の上限と同じ長さで諦める
+_EXPORT_LOCK_WAIT_S = VAULT_TIMEOUT_S
+
 
 class ExportError(Exception):
     """Vault 未設定・書込不能。watchdog 通知対象(設計 04 §8)。"""
@@ -63,13 +73,18 @@ def export_digest(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
+    # vault へのアクセスの時間の上限(GH#341。None = 既定の上限。朝バッチは追いパスと共有する)
+    vault: VaultGuard | None = None,
 ) -> None:
+    """その日の digest の Daily ノートと、載せた item の Items ノートを書く。
+
+    vault が応答しなければ、上限の時間で見切って ExportError にする(書けなかったノートは
+    同じ日の `intel run` の再走で書く。GH#341)。
+    """
     if config.obsidian.vault_path is None:
         raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
     daily_dir = folder_dir(config, "Daily")
     items_dir = folder_dir(config, "Items")
-    daily_dir.ensure()
-    items_dir.ensure()
 
     digest = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
     if digest is None:
@@ -77,34 +92,42 @@ def export_digest(
     # 🔖 保存節の item(GH#99)も配信 item と同様に Items ノート化する(=「保存」の実体)
     item_ids = _digest_item_ids(digest)
     rows = _load_items(conn, item_ids) if item_ids else []
-    # 既にある Items ノートを item ごとに使う(後日の保存節への再掲で別日付を作らない。GH#242)
-    existing_notes = _existing_item_notes(items_dir)
 
-    wikilinks = []
-    conflicts = 0
-    for row in rows:
-        note_name, note_date = _item_note_target(existing_notes, row, digest["digest_date"])
-        wikilinks.append(f"[[{note_name}]]")
-        if not _write_note(
-            items_dir,
-            f"{note_name}.md",
-            _item_frontmatter(row, note_date),
-            _item_generated_body(row, _load_notes(conn, row["item_id"])),
-            logger=logger,
-            run_id=run_id,
+    # ノートの読み書きは vault-io のスレッドで、ノートの内容の組み立て(DB)はこのスレッドで行う
+    with _export_vault(conn, vault or VaultGuard()) as io:
+        # 既にある Items ノートを item ごとに使う(後日の保存節への再掲で別日付を作らない。GH#242)
+        existing_notes = io.call(partial(_prepare_dirs, items_dir, daily_dir))
+        wikilinks = []
+        conflicts = 0
+        for row in rows:
+            note_name, note_date = _item_note_target(existing_notes, row, digest["digest_date"])
+            wikilinks.append(f"[[{note_name}]]")
+            if not io.call(
+                partial(
+                    _write_note,
+                    items_dir,
+                    f"{note_name}.md",
+                    _item_frontmatter(row, note_date),
+                    _item_generated_body(row, _load_notes(conn, row["item_id"])),
+                    logger=logger,
+                    run_id=run_id,
+                )
+            ):
+                conflicts += 1
+
+        daily_front, daily_body = _daily_note_content(conn, digest, wikilinks)
+        if not io.call(
+            partial(
+                _write_note,
+                daily_dir,
+                f"{digest['digest_date']}.md",
+                daily_front,
+                daily_body,
+                logger=logger,
+                run_id=run_id,
+            )
         ):
             conflicts += 1
-
-    daily_front, daily_body = _daily_note_content(conn, digest, wikilinks)
-    if not _write_note(
-        daily_dir,
-        f"{digest['digest_date']}.md",
-        daily_front,
-        daily_body,
-        logger=logger,
-        run_id=run_id,
-    ):
-        conflicts += 1
 
     if conflicts:
         logger.warning(
@@ -143,6 +166,8 @@ def export_pending_notes(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
+    # vault へのアクセスの時間の上限(GH#341。None = 既定の上限)
+    vault: VaultGuard | None = None,
 ) -> None:
     """未反映の感想を該当ノートへ投影する(item = GH#92 / digest = GH#96)。
 
@@ -153,6 +178,8 @@ def export_pending_notes(
     その名前のノートが無ければ、export_digest と同じく item の既存のノートへ投影する(GH#242)。
     digest 感想は digests.digest_date で直接 Daily を特定する。
     再描画は GENERATED 領域のみ = 手書き領域は既存契約どおり保全。
+    vault が応答しなければ、上限の時間で見切って ExportError にする。書けたノートの感想だけを
+    反映済みにし、残りは次の実行で書く(GH#341)。
     """
     if config.obsidian.vault_path is None:
         raise ExportError("[obsidian].vault_path が未設定(宿題 H4)。export できない")
@@ -183,64 +210,71 @@ def export_pending_notes(
     if not pending and not pending_digests:
         return
     items_dir = folder_dir(config, "Items")
-    items_dir.ensure()
-    existing_notes = _existing_item_notes(items_dir)
-    conflicts = 0
-    for entry in pending:
-        rows = _load_items(conn, [entry["item_id"]])
-        if not rows:
-            # 分析行が無い item は投影できない(通常経路では起きない)。翌 run で再試行
-            logger.warning(
-                "感想の投影先 item が解決できない",
-                extra={"run_id": run_id, "stage": "export", "item_id": entry["item_id"]},
-            )
-            continue
-        row = rows[0]
-        note_name, note_date = _item_note_target(existing_notes, row, entry["digest_date"])
-        # 新しく作るノートも、下の Daily の wikilink の再計算で同じ出力先として扱う
-        existing_notes.setdefault(note_name[8:], [note_name])
-        if not _write_note(
-            items_dir,
-            f"{note_name}.md",
-            _item_frontmatter(row, note_date),
-            _item_generated_body(row, _load_notes(conn, row["item_id"])),
-            logger=logger,
-            run_id=run_id,
-        ):
-            # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
-            # (立てると DB とノートが恒久不一致になる。Codex must)
-            conflicts += 1
-            continue
-        # 書込成功ぶんだけ反映済みに(export 中に届いた新規感想は翌 run が拾う)
-        conn.execute(
-            "UPDATE item_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-            "WHERE item_id = ? AND exported_at IS NULL AND id <= ?",
-            (entry["item_id"], entry["max_note_id"]),
-        )
-        conn.commit()
     daily_dir = folder_dir(config, "Daily")
-    daily_dir.ensure()
-    for digest in pending_digests:
-        front, body = _daily_note_content(
-            conn, digest, _daily_wikilinks(conn, digest, existing_notes)
-        )
-        if not _write_note(
-            daily_dir,
-            f"{digest['digest_date']}.md",
-            front,
-            body,
-            logger=logger,
-            run_id=run_id,
-        ):
-            # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
-            conflicts += 1
-            continue
-        conn.execute(
-            "UPDATE digest_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-            "WHERE digest_id = ? AND exported_at IS NULL AND id <= ?",
-            (digest["id"], digest["max_note_id"]),
-        )
-        conn.commit()
+    conflicts = 0
+    # ノートの読み書きは vault-io のスレッドで、反映済みの記帳(DB)はこのスレッドで行う
+    with _export_vault(conn, vault or VaultGuard()) as io:
+        existing_notes = io.call(partial(_prepare_dirs, items_dir))
+        for entry in pending:
+            rows = _load_items(conn, [entry["item_id"]])
+            if not rows:
+                # 分析行が無い item は投影できない(通常経路では起きない)。翌 run で再試行
+                logger.warning(
+                    "感想の投影先 item が解決できない",
+                    extra={"run_id": run_id, "stage": "export", "item_id": entry["item_id"]},
+                )
+                continue
+            row = rows[0]
+            note_name, note_date = _item_note_target(existing_notes, row, entry["digest_date"])
+            # 新しく作るノートも、下の Daily の wikilink の再計算で同じ出力先として扱う
+            existing_notes.setdefault(note_name[8:], [note_name])
+            if not io.call(
+                partial(
+                    _write_note,
+                    items_dir,
+                    f"{note_name}.md",
+                    _item_frontmatter(row, note_date),
+                    _item_generated_body(row, _load_notes(conn, row["item_id"])),
+                    logger=logger,
+                    run_id=run_id,
+                )
+            ):
+                # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
+                # (立てると DB とノートが恒久不一致になる。Codex must)
+                conflicts += 1
+                continue
+            # 書込成功ぶんだけ反映済みに(export 中に届いた新規感想は翌 run が拾う)
+            conn.execute(
+                "UPDATE item_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE item_id = ? AND exported_at IS NULL AND id <= ?",
+                (entry["item_id"], entry["max_note_id"]),
+            )
+            conn.commit()
+        io.call(daily_dir.ensure)
+        for digest in pending_digests:
+            front, body = _daily_note_content(
+                conn, digest, _daily_wikilinks(conn, digest, existing_notes)
+            )
+            if not io.call(
+                partial(
+                    _write_note,
+                    daily_dir,
+                    f"{digest['digest_date']}.md",
+                    front,
+                    body,
+                    logger=logger,
+                    run_id=run_id,
+                )
+            ):
+                # conflict 退避 = 正本ノートは未更新。exported_at を立てず翌 run で再試行する
+                conflicts += 1
+                continue
+            conn.execute(
+                "UPDATE digest_notes SET exported_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE digest_id = ? AND exported_at IS NULL AND id <= ?",
+                (digest["id"], digest["max_note_id"]),
+            )
+            conn.commit()
     if conflicts:
         logger.warning(
             f"GENERATED マーカー欠損または読み取り後の変更のため {conflicts} 件を "
@@ -255,6 +289,76 @@ def export_pending_notes(
             "extra": {"items": len(pending), "digests": len(pending_digests)},
         },
     )
+
+
+# --- vault へのアクセス(時間の上限とロック。GH#341) ---
+
+
+class _ExportVault:
+    """export の vault へのアクセスを、時間の上限つきで export のロックの中で行う窓口。"""
+
+    def __init__(self, vault: VaultGuard, lock: VaultWriteLock) -> None:
+        self._vault = vault
+        self._lock = lock
+
+    def call[T](self, fn: Callable[[], T]) -> T:
+        """fn を vault-io のスレッドで実行する(fn は DB に触れない)。"""
+        return self._lock.call(self._vault, fn)
+
+
+@contextlib.contextmanager
+def _export_vault(conn: sqlite3.Connection, vault: VaultGuard) -> Iterator[_ExportVault]:
+    """export のロックを取り、vault へのアクセスの窓口を渡す(GH#341)。
+
+    vault が応答しないまま見切ったスレッドは中断できず、後から書き終えうる。別の実行(手動の
+    `intel run` など)が新しい感想を投影して反映済みにしたノートを、遅れた書き込みが古い内容で
+    置き換えないよう、見切ったときはそのスレッドが終わるまでロックを握る(プロセスが終われば
+    外れる)。ロックを取れない・見切ったときは ExportError にする(朝バッチの段の失敗)。
+    ロックは接続が開いている DB の隣に置く。呼ぶ前の DB の操作は読み取りだけで、待つ間に
+    SQLite の書き込みのトランザクションを持たない。
+    """
+    if vault.stalled:  # この実行の前のアクセスが止まったまま(自分が残したロックを待たない)
+        raise ExportError(_stalled_message("この実行の前の vault へのアクセスが止まったまま"))
+    lock = VaultWriteLock.acquire(_export_lock_path(conn), _EXPORT_LOCK_WAIT_S)
+    if lock is None:
+        raise ExportError(
+            "別の実行の export が終わっていない(vault が応答しないまま止まっている可能性)ので、"
+            "この実行では export しない(書けなかったノートは同じ日の再走で、感想の投影は次の"
+            "実行で書く。runbook §11)"
+        )
+    try:
+        yield _ExportVault(vault, lock)
+    except VaultStalled as e:
+        raise ExportError(_stalled_message(str(e))) from e
+    finally:
+        # 見切ったスレッドがまだ書いているなら、それが終わるまで(またはプロセスの終了まで)握る
+        lock.leave()
+
+
+def _stalled_message(reason: str) -> str:
+    return (
+        "vault が応答しないので、この実行では export を止める(書けなかったノートは同じ日の"
+        f"再走で、感想の投影は次の実行で書く。runbook §11): {reason}"
+    )
+
+
+def _export_lock_path(conn: sqlite3.Connection) -> Path | None:
+    """この接続の DB の隣のロックファイル(メモリ上の DB は別の実行と共有しないので None)。"""
+    db_file = next(
+        (row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), ""
+    )
+    if not db_file:
+        return None
+    db_path = Path(db_file)
+    return db_path.with_name(db_path.name + EXPORT_LOCK_SUFFIX)
+
+
+def _prepare_dirs(items_dir: VaultDir, *others: VaultDir) -> dict[str, list[str]]:
+    """出力先のフォルダを(無ければ)作り、Items の既存のノートを返す(vault-io のスレッドで動く)。"""
+    for directory in others:
+        directory.ensure()
+    items_dir.ensure()
+    return _existing_item_notes(items_dir)
 
 
 # --- ノート内容の構築 ---

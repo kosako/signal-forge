@@ -444,6 +444,51 @@ def test_export_failure_reported_but_purge_runs(conn, tmp_path, ttl_documents) -
     assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
 
 
+def test_export_vault_stall_is_bounded_and_later_stages_run(
+    conn, tmp_path, monkeypatch, ttl_documents
+) -> None:
+    # vault が応答しない(macOS のプライバシーの確認待ちなど)ときは、export 段が見切って
+    # 段の失敗にし、配信・purge・backup へ進む(GH#341)。見切るのは上限の時間でなく、止める
+    # 位置に着いたのを見てから(順序を時間に頼らない)
+    from app.export import obsidian as obsidian_module
+    from tests.test_vault_guard import (
+        HANG_GUARD_S,
+        gate_vault_threads,
+        join_vault_threads,
+        mark_blocked,
+    )
+
+    reached = threading.Event()
+    release = threading.Event()
+    timed_out: list[bool] = []
+
+    def stuck_listing(items_dir):  # Items の一覧(フォルダの準備の後)で止まる
+        reached.set()
+        mark_blocked()
+        if not release.wait(HANG_GUARD_S):
+            timed_out.append(True)
+        return {}
+
+    gate_vault_threads(monkeypatch)
+    monkeypatch.setattr(obsidian_module, "_existing_item_notes", stuck_listing)
+    sent = use_fake_telegram(monkeypatch)
+    try:
+        failures = run_pipeline(
+            conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+            {"rss": StaticConnector()}, make_http(), lambda: ScriptedEngine(conn),
+            logger, "01RUNID",
+        )
+        assert reached.is_set()
+        assert failures == ["export"]
+        assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
+        assert sent
+        assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
+    finally:
+        release.set()
+        alive = join_vault_threads()
+    assert alive == [] and timed_out == []
+
+
 def test_deliver_skipped_when_telegram_unconfigured(conn, tmp_path) -> None:
     config = make_config(tmp_path)
     failures = run_pipeline(

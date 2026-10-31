@@ -34,6 +34,7 @@ from app.extraction import extract_pending
 from app.http import HttpClient
 from app.jst import today_jst
 from app.purge import purge_expired
+from app.vault_guard import VaultGuard
 
 
 class RunFailures(list[str]):
@@ -291,11 +292,13 @@ def _export_today(
     held: bool = False,
 ) -> None:
     # digest 段が skip(生成済み)でも当日分を export する(再実行の冪等性)。
-    # 障害で当日の digest を確定しなかった日(GH#191)は当日分が無いので書かない
+    # 障害で当日の digest を確定しなかった日(GH#191)は当日分が無いので書かない。
+    # vault が応答しなければ上限の時間で見切って段の失敗にし、後続の段へ進む(GH#341)
+    vault = VaultGuard()
     if not held:
-        export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id)
+        export_digest(conn, config, _today_digest_id(conn), logger, run_id=run_id, vault=vault)
     # 既配信 item に付いた感想(Telegram リプライ)を該当ノートへ投影(GH#92)
-    export_pending_notes(conn, config, logger, run_id=run_id)
+    export_pending_notes(conn, config, logger, run_id=run_id, vault=vault)
 
 
 def _deliver_today(
