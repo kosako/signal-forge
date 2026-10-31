@@ -41,13 +41,17 @@ class FakeClock:
 
 
 class ChunkStream(httpx.SyncByteStream):
-    """本文を chunk ごとに返す応答。count が None なら終わらない。受信のたびに on_chunk を呼ぶ。"""
+    """本文を chunk ごとに返す応答。count が None なら終わらない。受信のたびに on_chunk を呼ぶ。
+
+    応答が閉じられたかを closed に記録する(未読の応答の解放の検査用。GH#328)。
+    """
 
     def __init__(self, chunk: bytes, count: int | None = None, on_chunk=None) -> None:
         self.chunk = chunk
         self.count = count
         self.on_chunk = on_chunk
         self.sent = 0
+        self.closed = False
 
     def __iter__(self):
         while self.count is None or self.sent < self.count:
@@ -55,6 +59,9 @@ class ChunkStream(httpx.SyncByteStream):
             if self.on_chunk is not None:
                 self.on_chunk()
             yield self.chunk
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def make_client(handler, hosts=None, sleeps=None, clock=None):
@@ -674,8 +681,8 @@ def test_resolve_short_url_returns_final() -> None:
 
 
 def test_resolve_short_url_does_not_read_bodies() -> None:
-    # 転送はヘッダで判定し、転送の応答・転送先の本文は読まない。転送先が上限を超える PDF
-    # などでも URL は解決できる(GH#328)
+    # 転送はヘッダで判定し、転送の応答・転送先の本文は読まずに閉じる。転送先が上限を超える
+    # PDF などでも URL は解決できる(GH#328)
     redirect_body = ChunkStream(b"x" * (1024 * 1024), count=None)
     final_body = ChunkStream(b"x" * (1024 * 1024), count=None)
 
@@ -692,18 +699,28 @@ def test_resolve_short_url_does_not_read_bodies() -> None:
     )
     assert redirect_body.sent == 0
     assert final_body.sent == 0
+    assert redirect_body.closed  # 未読の応答も接続ごと解放する
+    assert final_body.closed
 
 
 def test_resolve_short_url_rechecks_each_hop() -> None:
-    # 本文を読まなくても、各ホップの接続先の検証は get と同じに行う(GH#328)
+    # 本文を読まなくても、各ホップの接続先の検証は get と同じに行う。拒んだときも、直前の
+    # 転送の応答は読まずに閉じてある(GH#328)
+    redirect_body = ChunkStream(b"x" * (1024 * 1024), count=None)
+    requested: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.headers.get("host", "").startswith("example.com"):
-            return httpx.Response(302, headers={"location": "http://internal.example/admin"})
-        return httpx.Response(200)
+        requested.append(request.headers["host"])
+        return httpx.Response(
+            302, headers={"location": "http://internal.example/admin"}, stream=redirect_body
+        )
 
     client = make_client(handler, hosts={"internal.example": ["192.168.0.10"]})
     with pytest.raises(SsrfBlockedError):
         client.resolve_short_url("https://example.com/short")
+    assert requested == ["example.com"]  # 拒んだ転送先へは接続しない
+    assert redirect_body.sent == 0
+    assert redirect_body.closed
 
 
 def test_connection_pinned_to_validated_ip() -> None:
