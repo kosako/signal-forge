@@ -1,7 +1,8 @@
-import contextlib
+import fcntl
+import os
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -219,18 +220,21 @@ def test_concurrent_apply_runs_each_migration_once(
 ) -> None:
     # GH#200: 2 つの起動が重なっても、同じ migration を 2 回流さずに両方が成功する。
     # 先の方を「未適用を確定した後・適用の前」(.bak の取得)で止め、その間に後の方を走らせる。
-    # 後の方が排他を待ちに入る(修正前は台帳を読んで .bak まで進む)のを合図に先の方を進める。
+    # GH#344: 先の方を止めたまま、後の方が自分の fd の flock で実際に阻まれたことを確かめてから
+    # 先の方を進める(後の方がロックを取らずに .bak へ進む回帰も、同じ合図で拾って落とす)。
     # 正否は時間に頼らない(上限は止まったときに suite を止めないためだけのもの)
     from app import db
 
     db_path = tmp_path / "intel.db"
+    lock_path = db_path.with_name(db_path.name + ".migrate.lock")
     connect(db_path).close()
     first_paused = threading.Event()
-    second_arrived = threading.Event()
+    second_progressed = threading.Event()  # 後の方が flock で阻まれた、または .bak まで進んだ
     resume_first = threading.Event()
     backups: list[str] = []
+    second_events: list[str] = []
     results: dict[str, object] = {}
-    real_backup, real_lock = db._backup, db._migration_lock
+    real_backup, real_flock = db._backup, fcntl.flock
 
     def paused_backup(conn: sqlite3.Connection, path: Path) -> None:
         name = threading.current_thread().name
@@ -239,18 +243,28 @@ def test_concurrent_apply_runs_each_migration_once(
             first_paused.set()
             assert resume_first.wait(_HANG_GUARD_SECONDS)
         else:
-            second_arrived.set()
+            second_events.append("backup")  # ロックを素通りした(先の方はまだ .bak の前)
+            second_progressed.set()
         real_backup(conn, path)
 
-    @contextlib.contextmanager
-    def observed_lock(path: Path) -> Iterator[None]:
-        if threading.current_thread().name == "second":
-            second_arrived.set()
-        with real_lock(path):
-            yield
+    def observed_flock(fd: int, operation: int) -> None:
+        if threading.current_thread().name != "second" or operation != fcntl.LOCK_EX:
+            real_flock(fd, operation)
+            return
+        # 後の方が使う fd そのもので、先に非ブロッキングで試す。阻まれたら、ここからの
+        # ブロッキングの取得は先の方の解放まで返らない(先の方は合図の後まで止まっている)
+        try:
+            real_flock(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            second_events.append("blocked")
+            second_progressed.set()
+            real_flock(fd, operation)
+        else:
+            second_events.append("acquired")  # 先の方がロックを持っていない
+            second_progressed.set()
 
     monkeypatch.setattr(db, "_backup", paused_backup)
-    monkeypatch.setattr(db, "_migration_lock", observed_lock)
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
 
     def run() -> None:
         name = threading.current_thread().name
@@ -267,8 +281,11 @@ def test_concurrent_apply_runs_each_migration_once(
     try:
         first.start()
         assert first_paused.wait(_HANG_GUARD_SECONDS)
+        # 先の方が止まっている間、別の fd からはロックを取れない(実際に排他している)
+        assert _flock_is_held(lock_path, real_flock)
         second.start()
-        assert second_arrived.wait(_HANG_GUARD_SECONDS)
+        assert second_progressed.wait(_HANG_GUARD_SECONDS)
+        assert second_events == ["blocked"]  # 先の方を進める前に、後の方は flock で待っている
     finally:
         # 途中の assert で抜けても先の方を止めたままにせず、起動したスレッドの終わりを待つ
         resume_first.set()
@@ -280,11 +297,25 @@ def test_concurrent_apply_runs_each_migration_once(
     all_files = [m.filename for m in discover_migrations(MIGRATIONS_DIR)]
     assert results == {"first": all_files, "second": []}  # 後の方は台帳を読み直して何もしない
     assert backups == ["first"]  # .bak は先の方の適用前の 1 回だけ(後の方が上書きしない)
+    assert second_events == ["blocked"]
+    assert not _flock_is_held(lock_path, real_flock)  # 両方が終わればロックは残らない
     conn = connect(db_path)
     ledger = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
     versions = [row[0] for row in ledger]
     assert versions == list(range(1, len(all_files) + 1))
     conn.close()
+
+
+def _flock_is_held(lock_path: Path, flock: Callable[[int, int], None]) -> bool:
+    """独立した fd で非ブロッキングの排他ロックを試し、他が持っているかを返す(取れたらすぐ放す)。"""
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # close で flock は解放される
+    return False
 
 
 def _copy_real_migrations(other: Path) -> int:
