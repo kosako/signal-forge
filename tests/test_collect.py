@@ -789,20 +789,136 @@ def test_rss_cap_treats_undated_as_oldest_in_feed_order(conn: sqlite3.Connection
     assert guids(conn) == ["u1", "d1", "u2"]  # 日時のあるもの、次に日時なしをフィードの並びで
 
 
-def test_rss_cap_counts_guidless_entries_as_new(conn: sqlite3.Connection) -> None:
-    # guid の無い entry は既知かを安く判定できないので、新しい記事として上限に数える
+def test_rss_cap_carries_over_guidless_entries(conn: sqlite3.Connection) -> None:
+    # guid の無い entry も、取り込み済みは正規化した URL で既知と分かり上限に数えない。
+    # 再実行で残りが入る(毎回同じ新しい 2 件が枠を埋めない)
     entries = [dated(None, 1, path="a"), dated(None, 2, path="b"), dated(None, 3, path="c")]
     limits = CollectConfig(rss_max_items=2)
-    collect_all(conn, {"rss": FakeConnector(entries)}, logger, limits=limits)
+    connector = FakeConnector(entries)
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
     urls = [r[0] for r in conn.execute("SELECT canonical_url FROM items ORDER BY id")]
     assert urls == ["https://example.com/b", "https://example.com/c"]
     assert budget_cuts(conn) == [("rss_items", 2, 1)]
+    assert saved_cursor(conn) == {}
+
+    collect_all(conn, {"rss": connector}, logger, limits=limits)
+    urls = [r[0] for r in conn.execute("SELECT canonical_url FROM items ORDER BY id")]
+    assert urls == ["https://example.com/b", "https://example.com/c", "https://example.com/a"]
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 1
 
 
-def test_rss_known_guids_skip_short_url_resolution(conn: sqlite3.Connection) -> None:
-    # 取り込み済みの guid は保存の前に除くので、短縮 URL を解決し直さない
+def short_entry(guid: str, day: int, code: str) -> RawItem:
+    return RawItem(
+        external_id=guid, url=f"https://bit.ly/{code}", title=f"短縮 URL の記事 {code} のタイトル",
+        author=None, published_at=datetime(2026, 7, day, tzinfo=UTC),
+        raw_content=f"短縮 URL の記事 {code} の本文", meta={},
+    )
+
+
+def add_other_source_item(conn: sqlite3.Connection, canonical: str) -> None:
+    other = conn.execute(
+        "INSERT INTO sources (type, name, enabled) VALUES ('rss', 'feed-other', 0)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO items (source_id, external_id, url, canonical_url, content_hash) "
+        "VALUES (?, 'other-1', ?, ?, 'sha256:o')",
+        (other, canonical, canonical),
+    )
+
+
+def test_rss_cap_skips_entries_taken_by_other_source(conn: sqlite3.Connection) -> None:
+    # guid が新しくても、ほかのソースと同じ URL の記事は保存で無視されるので上限に数えない。
+    # 短縮 URL も解決した先がほかのソースと同じなら数えない
+    add_other_source_item(conn, "https://example.com/taken")
+    entries = [
+        dated("g1", 9, path="taken"),
+        short_entry("g2", 8, "tk"),
+        dated("g3", 3),
+        dated("g4", 2),
+    ]
+
+    def resolver(url: str) -> str:
+        return "https://example.com/taken"
+
+    collect_all(
+        conn, {"rss": FakeConnector(entries)}, logger, resolve_short=resolver,
+        limits=CollectConfig(rss_max_items=2),
+    )
+    assert guids(conn) == ["other-1", "g3", "g4"]
+    assert budget_cuts(conn) == []  # 残りは無い(無視される記事で枠を埋めない)
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+
+
+def test_collect_time_budget_applies_within_source(conn: sqlite3.Connection) -> None:
+    # 段の時間の上限は、ソースの途中の短縮 URL の解決にも当てる。処理中の 1 件は切らず、
+    # 解決した分を保存し、カーソルは進めない。最後のソースでも打ち切りを記録する
+    now = {"t": 0.0}
+    resolved: list[str] = []
+
+    def slow_resolver(url: str) -> str:
+        resolved.append(url)
+        now["t"] += 300.0
+        return f"https://example.com/long-{url.rsplit('/', 1)[-1]}"
+
+    entries = [short_entry("s1", 3, "a"), short_entry("s2", 2, "b"), short_entry("s3", 1, "c")]
+    connector = FakeConnector(entries)
+    limits = CollectConfig(time_budget_s=600)
+    collect_all(
+        conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+        clock=lambda: now["t"],
+    )
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b"]  # 2 件目の後に 600 秒
+    assert guids(conn) == ["s1", "s2"]
+    assert saved_cursor(conn) == {}
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+    assert conn.execute(
+        "SELECT last_success_at FROM sources WHERE type='rss'"
+    ).fetchone()[0] is not None
+
+    # 次の実行は、保存した 2 件を解決し直さずに残りを取る
+    now["t"] = 0.0
+    collect_all(
+        conn, {"rss": connector}, logger, resolve_short=slow_resolver, limits=limits,
+        clock=lambda: now["t"],
+    )
+    assert resolved == ["https://bit.ly/a", "https://bit.ly/b", "https://bit.ly/c"]
+    assert guids(conn) == ["s1", "s2", "s3"]
+    assert saved_cursor(conn) == {"etag": "e1", "last_modified": None}
+    assert len(budget_cuts(conn)) == 1
+
+
+def test_collect_time_budget_within_x_source_keeps_cursor(conn: sqlite3.Connection) -> None:
+    # RSS 以外も同じ。解決した分を保存し、カーソル(X は since_id)を進めずに次の実行で読み直す
+    conn.execute("UPDATE sources SET enabled = 0 WHERE type = 'rss'")
+    conn.execute(
+        "INSERT INTO sources (type, name, cursor) VALUES ('x', 'home', '{\"since_id\": \"1\"}')"
+    )
+    now = {"t": 0.0}
+
+    def slow_resolver(url: str) -> str:
+        now["t"] += 700.0
+        return f"https://example.com/long-{url.rsplit('/', 1)[-1]}"
+
+    entries = [short_entry("t1", 2, "a"), short_entry("t2", 1, "b")]
+    collect_all(
+        conn, {"x": FakeConnector(entries, next_cursor={"since_id": "9"})}, logger,
+        resolve_short=slow_resolver, limits=CollectConfig(time_budget_s=600),
+        clock=lambda: now["t"],
+    )
+    rows = conn.execute("SELECT external_id FROM items ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["t1"]
+    cursor = conn.execute("SELECT cursor FROM sources WHERE type='x'").fetchone()[0]
+    assert json.loads(cursor) == {"since_id": "1"}
+    assert budget_cuts(conn) == [("collect_time", None, 1)]
+
+
+@pytest.mark.parametrize("guid", ["g1", None])
+def test_rss_known_entries_skip_short_url_resolution(conn: sqlite3.Connection, guid) -> None:
+    # 取り込み済みは保存の前に除くので、短縮 URL を解決し直さない。guid の無い entry は、
+    # このソースが前に保存した元の URL で取り込み済みと分かる
     entry = RawItem(
-        external_id="g1", url="https://bit.ly/abc", title="短縮 URL の記事のタイトル",
+        external_id=guid, url="https://bit.ly/abc", title="短縮 URL の記事のタイトル",
         author=None, published_at=None, raw_content="本文", meta={},
     )
     resolved: list[str] = []

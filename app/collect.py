@@ -7,9 +7,11 @@
 - 外部 I/O(短縮 URL の解決)は書き込みのトランザクションの前に済ませる(GH#179)
 - ソース単位のエラー隔離: 1ソースの失敗で他ソースを止めない
 - 件数と時間の上限(GH#340): RSS は 1 ソース 1 回に取り込む新しい記事を [collect].rss_max_items
-  まで(新しい側を残し、カーソルを進めずに次の実行で残りを取り直す)。段全体は
-  [collect].time_budget_s まで(次のソースに進む前に確かめ、残りのソースは次の実行へ回す)。
-  ソースは前回の取得が古い順に回す(打ち切りで回れなかったソースが次の実行で先になる)
+  まで(新しい側を残し、カーソルを進めずに次の実行で残りを取り直す)。保存しても無視される記事
+  (取り込み済み・ほかのソースと同じ URL)は数えない。段全体は [collect].time_budget_s まで。
+  次のソースと、次の短縮 URL の解決に進む前に確かめる。ソースの途中で達したら、解決した分を
+  保存してカーソルを進めず、残りのソースとともに次の実行へ回す。ソースは前回の取得が古い順に
+  回す(打ち切りで回れなかったソースが次の実行で先になる)
 """
 
 from __future__ import annotations
@@ -20,12 +22,15 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from app.config import CollectConfig
 from app.connectors.base import Connector, FatalError, FetchStats, RawItem, RetryableError
 from app.db import insert_item_with_dedup, record_budget_cut
 from app.models import RAW_CONTENT_MAX_CHARS, Source
 from app.normalize import (
+    SHORT_URL_HOSTS,
     UrlError,
     content_hash,
     is_dedup_eligible,
@@ -34,6 +39,16 @@ from app.normalize import (
 )
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """保存の前の準備(短縮 URL の解決を済ませた記事と、上限で次の実行へ回した数)。"""
+
+    items: list[tuple[RawItem, str | None]]  # (記事, canonical_url。正規化できなければ None)
+    known: int = 0  # 保存しても無視されるので除いた記事(取り込み済み・ほかのソースと同じ URL)
+    capped: int = 0  # RSS の件数の上限で次の実行へ回した記事
+    timed_out: bool = False  # 段の時間の上限に達し、解決していない記事を次の実行へ回した
 
 
 def collect_all(
@@ -56,16 +71,19 @@ def collect_all(
         ORDER BY (SELECT max(id) FROM collect_runs WHERE collect_runs.source_id = sources.id), id
         """
     ).fetchall()
-    started = clock()
+    deadline = clock() + limits.time_budget_s
+
+    def cut(deferred: int) -> None:
+        logger.warning(
+            f"collect の段が時間の上限({limits.time_budget_s} 秒)に達した。"
+            f"残りの {deferred} ソースは次の実行へ回す",
+            extra={"run_id": run_id, "stage": "collect", "extra": {"deferred": deferred}},
+        )
+        record_budget_cut(conn, "collect_time", deferred=deferred, run_id=run_id)
+
     for index, row in enumerate(rows):
-        if clock() - started >= limits.time_budget_s:
-            deferred = len(rows) - index
-            logger.warning(
-                f"collect の段が時間の上限({limits.time_budget_s} 秒)に達した。"
-                f"残りの {deferred} ソースは次の実行へ回す",
-                extra={"run_id": run_id, "stage": "collect", "extra": {"deferred": deferred}},
-            )
-            record_budget_cut(conn, "collect_time", deferred=deferred, run_id=run_id)
+        if clock() >= deadline:
+            cut(len(rows) - index)
             return
         source = Source.from_row(row)
         connector = connectors.get(source.type)
@@ -75,7 +93,7 @@ def collect_all(
                 extra={"run_id": run_id, "stage": "collect", "source_id": source.id},
             )
             continue
-        _collect_source(
+        timed_out = _collect_source(
             conn,
             source,
             connector,
@@ -83,7 +101,12 @@ def collect_all(
             run_id=run_id,
             resolve_short=resolve_short,
             rss_max_items=limits.rss_max_items,
+            deadline=deadline,
+            clock=clock,
         )
+        if timed_out:  # ソースの途中で達した。そのソースの残りも次の実行へ回す
+            cut(len(rows) - index)
+            return
 
 
 def _collect_source(
@@ -95,7 +118,10 @@ def _collect_source(
     run_id: str | None,
     resolve_short: Callable[[str], str] | None,
     rss_max_items: int,
-) -> None:
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。"""
     log_ctx = {"run_id": run_id, "stage": "collect", "source_id": source.id}
     run_row_id = conn.execute(
         "INSERT INTO collect_runs (source_id) VALUES (?)", (source.id,)
@@ -109,20 +135,23 @@ def _collect_source(
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
-        items, next_cursor, known, deferred = result.items, result.next_cursor, 0, 0
         if source.type == "rss":
-            items, known, deferred = _cap_rss_items(conn, source, items, rss_max_items)
-            if deferred:
-                # 進めると 304 で残りを取り直せない。今のカーソルのまま次の実行で全件を読み直し、
-                # 取り込んだぶんは既知として数えずに残りを取る
-                next_cursor = cursor
+            prepared = _prepare_rss(
+                conn, source, result.items, rss_max_items, resolve_short, deadline, clock
+            )
+        else:
+            prepared = _prepare(result.items, resolve_short, deadline, clock)
+        next_cursor = result.next_cursor
+        if prepared.capped or prepared.timed_out:
+            # 進めると 304(X は since_id)で残りを取り直せない。今のカーソルのまま次の実行で
+            # 読み直し、保存したぶんは既知として除いて残りを取る(重複は UNIQUE で吸収。設計 02 §1)
+            next_cursor = cursor
         counts = _store_result(
             conn,
             source,
-            items,
+            prepared.items,
             next_cursor,
             result.moved_url,
-            resolve_short,
             partial_error=partial_error,
             budget_exhausted=result.budget_exhausted,
             skipped_slots=result.skipped_slots,
@@ -138,17 +167,17 @@ def _collect_source(
             extra=log_ctx,
             exc_info=not isinstance(e, RetryableError | FatalError),
         )
-        return
+        return False
 
-    counts["ignored"] += known  # 保存の前に除いた取り込み済みの guid(INSERT OR IGNORE と同じ結果)
-    if deferred:
+    counts["ignored"] += prepared.known  # 保存の前に除いた(INSERT OR IGNORE と同じ結果)
+    if prepared.capped:
         logger.warning(
             f"RSS の 1 回の上限({rss_max_items} 件)を超えた。新しい側を取り込み、"
-            f"残りの {deferred} 件は次の実行へ回す",
-            extra={**log_ctx, "extra": {"deferred": deferred}},
+            f"残りの {prepared.capped} 件は次の実行へ回す",
+            extra={**log_ctx, "extra": {"deferred": prepared.capped}},
         )
         record_budget_cut(
-            conn, "rss_items", deferred=deferred, run_id=run_id, source_id=source.id
+            conn, "rss_items", deferred=prepared.capped, run_id=run_id, source_id=source.id
         )
 
     # 部分取得のあとの失敗も run は error で残す。読み取りの費用は掛かっているので件数・費用は
@@ -191,21 +220,25 @@ def _collect_source(
             f"collect は部分取得のあと失敗。取得ぶんは保存し失敗として記録: {partial_error}",
             extra=extra,
         )
+    return prepared.timed_out
 
 
 def _store_result(
     conn: sqlite3.Connection,
     source: Source,
-    items: list[RawItem],
+    prepared: list[tuple[RawItem, str | None]],
     next_cursor: dict,
     moved_url: str | None,
-    resolve_short: Callable[[str], str] | None,
     *,
     partial_error: str | None,
     budget_exhausted: bool = False,
     skipped_slots: bool = False,
 ) -> dict[str, int]:
-    """全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
+    """準備した全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
+
+    prepared は (記事, canonical_url) の列。短縮 URL の解決(HTTP の待ち・再試行)は準備の段で
+    トランザクションの前に済ませてある(GH#179)。書き込みロックを持ったまま待つと、並行する
+    受信デーモンの記帳が busy_timeout を超えて失敗しうるため。
 
     moved_url は今回の取得の恒久移転の先(無ければ NULL に戻す。GH#150)。
     partial_error は部分取得のあとの失敗の文(GH#183)。あれば items とカーソルは保存しつつ、
@@ -217,11 +250,6 @@ def _store_result(
     スロットの失敗の続きを、ほかのスロットの成功で消さない)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
-    # 短縮 URL の解決(HTTP の待ち・再試行)はトランザクションの前に済ませる(GH#179)。
-    # 書き込みロックを持ったまま待つと、並行する受信デーモンの記帳が busy_timeout を超えて
-    # 失敗しうる。解決が UrlError 以外で失敗したときは、今までどおりソースの失敗になる
-    # (何も保存せず、カーソルも進めない)
-    prepared = [(raw, _canonical_url(raw, resolve_short)) for raw in items]
     conn.execute("BEGIN IMMEDIATE")
     try:
         for raw, canonical in prepared:
@@ -257,37 +285,126 @@ def _store_result(
     return counts
 
 
-def _cap_rss_items(
-    conn: sqlite3.Connection, source: Source, items: list[RawItem], limit: int
-) -> tuple[list[RawItem], int, int]:
-    """RSS の新しい記事を limit 件までに絞る。(残す items, 既知の件数, 次の実行へ回す件数)。
+def _prepare(
+    items: list[RawItem],
+    resolve_short: Callable[[str], str] | None,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _Prepared:
+    """記事を並びのまま正規化する。短縮 URL の解決の前に段の時間の上限を確かめる。
 
-    取り込み済みの guid(UNIQUE(source_id, external_id) にある)は保存しても無視されるので、
-    短縮 URL の解決の前に除き、上限にも数えない(数えると、上限を超えるフィードで同じ記事が
-    毎回の枠を埋め、残りが取り込まれない)。guid の無い entry は既知かを安く判定できないので
-    新しい記事として数える。超えたら公開日時の新しい側を残す(フィードの並びは新しい順とは
-    限らない)。日時の無い entry は古い側とし、その中はフィードの並びを保つ。
+    上限に達したら、解決した記事までを返して残りを次の実行へ回す(処理中の 1 件は切らない。
+    1 件の解決は共通 HTTP クライアントの 60 秒まで。設計 05 §8)。解決が UrlError 以外で失敗した
+    ときは、今までどおりソースの失敗になる(何も保存せず、カーソルも進めない)。
     """
-    fresh: list[tuple[int, RawItem]] = []
-    known = 0
-    for index, raw in enumerate(items):
-        if raw.external_id is not None and conn.execute(
-            "SELECT 1 FROM items WHERE source_id = ? AND external_id = ?",
-            (source.id, raw.external_id),
-        ).fetchone():
-            known += 1
-        else:
-            fresh.append((index, raw))
-    if len(fresh) <= limit:
-        return [raw for _, raw in fresh], known, 0
+    prepared: list[tuple[RawItem, str | None]] = []
+    for raw in items:
+        if _needs_resolution(raw, resolve_short) and clock() >= deadline:
+            return _Prepared(prepared, timed_out=True)
+        prepared.append((raw, _canonical_url(raw, resolve_short)))
+    return _Prepared(prepared)
+
+
+def _prepare_rss(
+    conn: sqlite3.Connection,
+    source: Source,
+    items: list[RawItem],
+    limit: int,
+    resolve_short: Callable[[str], str] | None,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _Prepared:
+    """RSS の記事を、保存すると新しい行になるものだけ limit 件まで、新しい側から準備する。
+
+    保存しても無視される記事(取り込み済み・ほかのソースと同じ URL)は除き、上限にも数えない。
+    数えると、上限を超えるフィードで同じ記事が毎回の枠を埋め、残りがいつまでも入らない。
+    既知かは短縮 URL の解決の前に安く確かめる: guid(UNIQUE(source_id, external_id))、短縮 URL
+    でない記事は正規化した URL(UNIQUE(canonical_url))、短縮 URL の記事はこのソースが前に
+    保存した元の URL。短縮 URL を解決した後も、ほかのソースと同じ URL なら除く。
+    公開日時の新しい順に見る(フィードの並びは新しい順とは限らない。日時の無い entry は古い側と
+    し、その中はフィードの並び)。保存はフィードの並びに戻す。
+    """
     # 安定ソートなので、同じ日時・日時の無い entry どうしはフィードの並びのまま
-    newest = sorted(
-        fresh,
+    ordered = sorted(
+        enumerate(items),
         key=lambda pair: (pair[1].published_at is not None, pair[1].published_at or 0),
         reverse=True,
-    )[:limit]
-    kept = sorted(newest, key=lambda pair: pair[0])  # 保存はフィードの並びに戻す
-    return [raw for _, raw in kept], known, len(fresh) - limit
+    )
+    kept: list[tuple[int, RawItem, str | None]] = []
+    known = 0
+    timed_out = False
+    position = 0  # 次に見る ordered の位置。打ち切ったら、そこから後ろを次の実行へ回す
+    while position < len(ordered) and len(kept) < limit:
+        index, raw = ordered[position]
+        if _known_without_resolution(conn, source, raw, resolve_short):
+            known += 1
+            position += 1
+            continue
+        if _needs_resolution(raw, resolve_short):
+            if clock() >= deadline:
+                timed_out = True
+                break
+            canonical = _canonical_url(raw, resolve_short)
+            if _url_taken(conn, canonical or raw.url):  # 解決したらほかのソースと同じ URL
+                known += 1
+                position += 1
+                continue
+        else:
+            canonical = _canonical_url(raw, None)
+        kept.append((index, raw, canonical))
+        position += 1
+    # 打ち切った後ろのうち、安く既知と分かるものは回した数に入れない(次の実行でも除く)
+    rest = [raw for _, raw in ordered[position:]]
+    deferred = sum(
+        not _known_without_resolution(conn, source, raw, resolve_short) for raw in rest
+    )
+    kept.sort(key=lambda entry: entry[0])
+    return _Prepared(
+        [(raw, canonical) for _, raw, canonical in kept],
+        known=known + len(rest) - deferred,
+        capped=0 if timed_out else deferred,
+        timed_out=timed_out and deferred > 0,
+    )
+
+
+def _needs_resolution(raw: RawItem, resolve_short: Callable[[str], str] | None) -> bool:
+    """正規化に短縮 URL の解決(HTTP)が要る記事か(u1 手順1。設計 01 §4)。"""
+    if resolve_short is None:
+        return False
+    try:
+        return urlsplit(raw.url.strip()).hostname in SHORT_URL_HOSTS
+    except ValueError:
+        return False  # 分解できない URL は解決せずに error の行になる
+
+
+def _known_without_resolution(
+    conn: sqlite3.Connection,
+    source: Source,
+    raw: RawItem,
+    resolve_short: Callable[[str], str] | None,
+) -> bool:
+    """短縮 URL を解決せずに、保存しても無視されると分かる記事か(取り込み済みなど)。"""
+    if raw.external_id is not None and conn.execute(
+        "SELECT 1 FROM items WHERE source_id = ? AND external_id = ?",
+        (source.id, raw.external_id),
+    ).fetchone():
+        return True
+    if _needs_resolution(raw, resolve_short):
+        # 解決先は HTTP が要るので、このソースが前に保存した元の URL で見る
+        return conn.execute(
+            "SELECT 1 FROM items WHERE source_id = ? AND url = ?", (source.id, raw.url)
+        ).fetchone() is not None
+    return _url_taken(conn, _canonical_url(raw, None) or raw.url)
+
+
+def _url_taken(conn: sqlite3.Connection, canonical: str) -> bool:
+    """canonical_url がすでにある(UNIQUE なので保存しても無視される)。
+
+    正規化できない URL は error の行が生の URL を canonical_url に使う(_store_item)。
+    """
+    return conn.execute(
+        "SELECT 1 FROM items WHERE canonical_url = ?", (canonical,)
+    ).fetchone() is not None
 
 
 def _canonical_url(raw: RawItem, resolve_short: Callable[[str], str] | None) -> str | None:
