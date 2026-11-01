@@ -82,7 +82,7 @@ from app.delivery.telegram import (
 )
 from app.dig import DigCandidate, has_material, select_from_queue
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
-from app.jst import JST, today_jst
+from app.jst import today_jst
 from app.prompting import fill_template, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
@@ -296,9 +296,10 @@ def _run_dig_stage_locked(
     vault: VaultGuard | None,
 ) -> None:
     """run_dig_stage の本体(_dig_lock の中で呼ぶ)。"""
-    day = today or datetime.now(JST).strftime("%Y-%m-%d")
-    # 段の初めの実時計の暦日。候補の無い朝の知らせの印を、送れた日へ進めるのに使う(GH#349)
+    # 段の初めの実時計の暦日。候補の無い朝の知らせの印を、送れた日へ進めるのに使う(GH#349)。
+    # 注入しないときの day も同じ値にする(別々に読むと、その間に 0 時を越えて食い違う)
     started_on = today_jst()
+    day = today or started_on
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
     material_requests: list[DigCandidate] = []

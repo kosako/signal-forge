@@ -2466,6 +2466,19 @@ def test_no_candidate_notice_marks_the_day_after_midnight_before_send(
     assert len(api.sent) == 1  # 越えた先の朝の実行は送らない
 
 
+def test_no_candidate_notice_uses_one_clock_read_for_the_day(conn, config, monkeypatch) -> None:
+    # 日を注入しない実行(朝バッチ・intel dig)は、段の日と印を進める基準を同じ読み取りから
+    # 取る。別々に読むと、その間に 0 時を越えたとき印が前の日のまま残る(GH#349)
+    monkeypatch.setattr("app.deepdive.today_jst", lambda: "2030-01-02")
+    api = FakeApi()
+    run_dig_stage(conn, config, make_factory({}), api, logger)
+    assert api.sent == [(10, NOTICE_NO_DIGEST)]
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) == "2030-01-02"
+
+    run_dig_stage(conn, config, make_factory({}), api, logger)
+    assert len(api.sent) == 1  # 同じ日の次の実行は送らない
+
+
 def test_no_candidate_notice_failure_is_logged_and_retried(conn, config, caplog) -> None:
     # 送れなかった知らせは段の失敗にせず、印も付けない。同じ日の次の実行が知らせ直す
     with caplog.at_level(logging.ERROR, logger="test-deepdive"):
