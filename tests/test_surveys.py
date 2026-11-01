@@ -1419,3 +1419,91 @@ def test_next_morning_plan_matches_morning_queue_selection(conn, tmp_path) -> No
     assert [c.item_id for c in morning] == [requested, auto, top]  # 朝は ③ で埋める
     assert [c.item_id for c in skipped] == [no_body]
     assert next_morning_plan(conn, config_with_cap(tmp_path, 0), day) == []
+
+
+def test_dig_backlog_splits_many_plan_rows_into_messages(conn, tmp_path) -> None:
+    # 予定の行に上限は無い(daily_cap に上限が無い)。1 通に収まらなければ行の単位で分け、
+    # 全部の予定を載せ、どの 1 通も台帳に残してリプライを受け付ける。追い掛けも届く
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    planned = []
+    for i in range(60):
+        item = add_item(conn, f"https://a/plan-{i}?" + "q" * 300, title="長い題" * 60 + str(i))
+        add_body(conn, item)
+        add_queue(conn, item, enqueued_at=f"2026-07-01T00:{i:02d}:00Z")
+        planned.append(item)
+    followup = add_item(conn, "https://a/followup", title="追い掛けの記事")
+    add_dig_reaction(conn, followup, yesterday)
+    config = config_with_cap(tmp_path, 60)
+
+    api = FakeApi()  # Telegram の長さの制約に反する本文は DeliveryError(GH#343)
+    run_due_timers(conn, config, api, logger, now)
+
+    texts = [t for _, t in api.sent]
+    positions = [i for i, t in enumerate(texts) if "未消化の深掘り候補" in t]
+    assert len(positions) >= 2
+    backlog = [texts[i] for i in positions]
+    assert backlog[0].startswith("🔖 未消化の深掘り候補(61件)\n")
+    assert all(t.startswith("🔖 未消化の深掘り候補(続き)\n") for t in backlog[1:])
+    joined = "\n".join(backlog)
+    for item in planned:
+        assert sum(line.startswith(f"{item}. 🗓 明朝 ") for line in joined.splitlines()) == 1
+    assert all("↩️ " not in t for t in backlog[:-1])  # 案内と注記は最後の 1 通
+    assert "↩️ " in backlog[-1]
+    assert "入れ替わることがあります" in backlog[-1]
+    recorded = {row["message_id"] for row in conn.execute("SELECT * FROM dig_backlog_messages")}
+    assert recorded == {900 + i + 1 for i in positions}
+    assert any("深掘りした?" in t for t in texts[positions[-1] + 1 :])  # 追い掛けは一覧の後
+
+    reply = FakeApi([[make_reply_update(f"{planned[0]} はパス", 900 + positions[0] + 1)]])
+    poll_once(conn, config, reply, logger)
+    status = conn.execute(
+        "SELECT status FROM dig_queue WHERE item_id = ?", (planned[0],)
+    ).fetchone()["status"]
+    assert status == "passed"
+
+
+def test_dig_backlog_send_failure_does_not_skip_followups(conn, tmp_path) -> None:
+    # 一覧の送信に失敗しても追い掛けは送り、失敗は最後に投げ直す(内蔵タイマーの失敗として残る)
+    from app.delivery import send_evening_survey
+
+    class BacklogFailingApi(FakeApi):
+        def send_message(self, chat_id, text, *, reply_markup=None):
+            if "未消化の深掘り候補" in text:
+                raise DeliveryError("Telegram sendMessage が失敗: HTTP 400")
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    now = jst_now("21:30")
+    item = add_item(conn, "https://a/followup", title="追い掛けの記事")
+    add_dig_reaction(conn, item, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    api = BacklogFailingApi()
+
+    with pytest.raises(DeliveryError):
+        send_evening_survey(conn, config_with_cap(tmp_path, 2), api, logger, now)
+
+    assert any("深掘りした?" in t for _, t in api.sent)
+    assert conn.execute("SELECT count(*) AS n FROM dig_backlog_messages").fetchone()["n"] == 0
+
+
+def test_dig_backlog_plans_item_dug_today_and_requested_again(conn, tmp_path) -> None:
+    # 夜の予定は翌朝の暦日で選ぶ。今日掘って指定し直した item は、今日の日付で選ぶと同日の
+    # 実行済みとして外れるが、翌朝には掘るので予定に出す(GH#349)
+    from app.delivery import send_evening_survey
+
+    now = datetime(2026, 7, 22, 21, 30, tzinfo=JST)
+    item = add_item(conn, "https://a/redig", title="今日掘った記事")
+    add_body(conn, item)
+    add_queue(conn, item, requested_at="2026-07-22T11:00:00Z")  # 夜 20:00 JST に指定し直した
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at,"
+        " published_at, message_id)"
+        " VALUES (?, 'n', 'カード', '2026-07-21T22:00:00Z', '2026-07-21T22:00:01Z', 800)",
+        (item,),
+    )  # created_at は UTC。+9h で JST 2026-07-22 の朝 = 今日の実行
+    api = FakeApi()
+
+    send_evening_survey(conn, config_with_cap(tmp_path, 2), api, logger, now)
+
+    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    assert backlog_line(backlog, item).startswith(f"{item}. 🗓 明朝 ")

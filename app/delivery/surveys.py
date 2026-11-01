@@ -20,9 +20,12 @@ from app.config import Config
 from app.delivery.state import get_state, set_state
 from app.delivery.telegram import (
     TITLE_MAX_CHARS,
+    DeliveryError,
     TelegramApi,
     escape_and_truncate,
     escape_attr,
+    pack_lines,
+    visible_length,
 )
 from app.dig import DigCandidate, DigState, dig_states, next_morning_plan
 from app.jst import JST, jst_day_bounds_utc, today_jst
@@ -38,6 +41,10 @@ READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4
 # 未消化 🔖 一覧(GH#88)。可視テキストを 4096 字制限に収める(URL は href 側で不算入)
 DIG_BACKLOG_MAX_ITEMS = 15
 DIG_BACKLOG_TITLE_MAX_CHARS = 80
+# 1 通の可視の長さの上限(Telegram の 4096 字に余裕を残す)。明朝の予定の行は上限 15 件に
+# 数えないので、超えたら行の単位で次の 1 通に分ける(GH#349)
+DIG_BACKLOG_TEXT_MAX_CHARS = 4000
+DIG_BACKLOG_CONTINUED = "🔖 未消化の深掘り候補(続き)"
 # 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
 DIG_STATE_MARKS: dict[DigState, str] = {
     "planned": "🗓 明朝",
@@ -163,11 +170,20 @@ def send_evening_survey(
     backlog = pending_dig_items(conn)
     # 明朝の予定(GH#349)。夜の時点のキューを朝の選定と同じ規則で並べる(読むだけ)
     plan = next_morning_plan(conn, config, (now + timedelta(days=1)).strftime("%Y-%m-%d"))
-    backlog_text = _dig_backlog_message(conn, config, backlog, plan)
-    if backlog_text is not None:  # 0件で予定も無い日は送らない(GH#88・GH#349)
-        message_id = api.send_message(chat_id, backlog_text)
+    backlog_failure: DeliveryError | None = None
+    # 0件で予定も無い日は送らない(GH#88・GH#349)。長ければ行の単位で複数通に分ける(GH#349)
+    for text in _dig_backlog_message(conn, config, backlog, plan):
+        try:
+            message_id = api.send_message(chat_id, text)
+        except DeliveryError as e:
+            # 一覧の失敗で追い掛けを止めない。送れた分は台帳に残っている。失敗は追い掛けの
+            # 後に投げ直し、内蔵タイマーの失敗として残す(夜アンケートは送信前に記録済みなので
+            # 一覧は送り直さない。モジュールの docstring)
+            backlog_failure = e
+            break
         # リプライ先の認識用台帳(GH#104)。過去の一覧へのリプライも有効にするため
-        # 蓄積する(REPLACE は getUpdates 再配達等での同一 id 再送に対する冪等)
+        # 蓄積する(REPLACE は getUpdates 再配達等での同一 id 再送に対する冪等)。複数通に
+        # 分けたときは、どの 1 通へのリプライも指定として受け付ける
         conn.execute(
             "INSERT OR REPLACE INTO dig_backlog_messages (message_id, sent_date) "
             "VALUES (?, ?)",
@@ -192,6 +208,8 @@ def send_evening_survey(
             },
         },
     )
+    if backlog_failure is not None:
+        raise backlog_failure
 
 
 def _linked_title(row: Mapping, budget: int) -> str:
@@ -207,8 +225,8 @@ def _dig_backlog_message(
     config: Config,
     backlog: list[sqlite3.Row],
     plan: Sequence[DigCandidate],
-) -> str | None:
-    """未消化一覧の本文。None = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
+) -> list[str]:
+    """未消化一覧の本文(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
 
     `[dig].daily_cap = 0`(深掘りの段が止まっている)なら印も予定も出さず、今までの一覧のまま
     にする(GH#349。設計 06 §2)。予定の行は先頭に置いて上限(DIG_BACKLOG_MAX_ITEMS)に数えず、
@@ -216,9 +234,9 @@ def _dig_backlog_message(
     キューにあるので、一覧へのリプライで指定できる(poller の valid_ids は queue_item_ids を含む)。
     """
     if config.dig.daily_cap <= 0:
-        return _dig_backlog_text(backlog) if backlog else None
+        return _dig_backlog_text(backlog) if backlog else []
     if not backlog and not plan:
-        return None
+        return []
     by_id = {row["item_id"]: row for row in backlog}
     planned_ids = {candidate.item_id for candidate in plan}
     plan_rows: list[Mapping] = [
@@ -247,8 +265,8 @@ def _dig_backlog_text(
     plan_rows: Sequence[Mapping] = (),
     states: Mapping[int, DigState | None] | None = None,
     digest_fill: int = 0,
-) -> str:
-    """未消化 🔖 一覧(1通)。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
+) -> list[str]:
+    """未消化 🔖 一覧。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
 
     番号は item id(GH#104)。表示位置の連番だと日ごとに変わり、リプライ指定
     「3664 を◯◯の観点で」が翌日以降の一覧や記憶と食い違うため、安定な id を使う。
@@ -256,6 +274,9 @@ def _dig_backlog_text(
     先頭に 🗓 明朝 で置き、上限に数えない。rows は予定を除いた残りの行。digest_fill は
     予定が翌日の上限に足りない件数(明朝の digest の上位から埋める分)。既定の引数では
     今までの一覧のまま(`[dig].daily_cap = 0`)。
+    予定の行には上限が無い(`[dig].daily_cap` に上限が無い)ので、可視の長さが 1 通の上限
+    (DIG_BACKLOG_TEXT_MAX_CHARS)を超えるときは行の単位で複数通に分ける。見出しは 1 通目、
+    注記とリプライの案内は最後の 1 通に置き、2 通目以降には続きの見出しを付ける(GH#349)。
     """
     states = states or {}
     lines = [f"🔖 未消化の深掘り候補({len(plan_rows) + len(rows)}件)"]
@@ -279,16 +300,21 @@ def _dig_backlog_text(
         notes.append("🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります")
     if digest_fill > 0:
         notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
-    if notes:
-        lines.append("")
-        lines += notes
     example_id = (plan_rows or rows)[0]["item_id"]
-    lines.append("")
-    lines.append(
+    hint = (
         f"↩️ このメッセージへのリプライで指定: 「{example_id} を◯◯の観点で」= "
         f"朝の深掘りに登録 / 「{example_id} はパス」= 深掘り対象から外す"
     )
-    return "\n".join(lines)
+    # 注記とリプライの案内は、空行で区切った 1 つの塊として最後の 1 通に置く
+    lines.append("\n".join(["", *(notes + [""] if notes else []), hint]))
+    messages = pack_lines(
+        lines,
+        DIG_BACKLOG_TEXT_MAX_CHARS - visible_length(DIG_BACKLOG_CONTINUED) - 1,
+        measure=visible_length,
+    )
+    # 注記の塊が 2 通目以降の頭に来たときは、先頭の空行を続きの見出しで置き換える
+    continued = [message.removeprefix("\n") for message in messages[1:]]
+    return messages[:1] + [f"{DIG_BACKLOG_CONTINUED}\n{message}" for message in continued]
 
 
 def notify_run_failure(

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import random
@@ -427,6 +428,46 @@ def escape_and_truncate(raw: str, budget: int) -> str:
         parts.append(piece)
         used += len(piece)
     return "".join(parts) + "…"
+
+
+_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def visible_length(html_text: str) -> int:
+    """parse_mode=HTML の本文が Telegram で数えられる長さ(タグを除き entity を戻した可視の
+    テキストの UTF-16 の code unit 数。href の URL は数えない)。
+
+    本モジュールが組み立てる本文(escape_text・escape_attr を通した値と固定のタグ)が前提。
+    属性値の < > は escape 済みなので、タグの範囲を > で閉じてよい。
+    """
+    visible = html.unescape(_TAG_RE.sub("", html_text))
+    return len(visible.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def pack_lines(
+    lines: list[str], budget: int, *, measure: Callable[[str], int] = len
+) -> list[str]:
+    """行を改行でつなぎ、1 通が budget を超えないように分ける(行の途中では切らない)。
+
+    1 行が budget を超えないことは呼び出し側が保証する(観点を切り詰めて組み立てる)。
+    measure は 1 通の長さの数え方(既定は文字数。可視の長さで数えるなら visible_length)。
+    深掘り指定の確認返信(GH#228)と未消化一覧(GH#349)が使う。
+    """
+    messages: list[str] = []
+    current = ""
+    used = 0
+    for line in lines:
+        size = measure(line)
+        if current and used + 1 + size > budget:
+            messages.append(current)
+            current, used = line, size
+        elif current:
+            current, used = f"{current}\n{line}", used + 1 + size
+        else:
+            current, used = line, size
+    if current:
+        messages.append(current)
+    return messages
 
 
 def _published_md(published_at: str | None) -> str | None:

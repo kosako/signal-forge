@@ -42,7 +42,13 @@ from app.delivery.surveys import (
     run_due_timers,
     survey_deadline,
 )
-from app.delivery.telegram import DeliveryError, TelegramApi, escape_and_truncate, reaction_keyboard
+from app.delivery.telegram import (
+    DeliveryError,
+    TelegramApi,
+    escape_and_truncate,
+    pack_lines,
+    reaction_keyboard,
+)
 from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.export.obsidian import note_projection_date
@@ -935,7 +941,7 @@ def _handle_dig_reply(
             )
         else:
             lines.append(f"🔍 {instruction.item_id} を登録しました(観点なし)")
-    for message in _pack_lines(lines, DIG_ACK_MAX_CHARS):
+    for message in pack_lines(lines, DIG_ACK_MAX_CHARS):
         reply(message)
     logger.info(
         "深掘り指定を記録",
@@ -967,24 +973,6 @@ def _record_dig_backlog_reply(conn: sqlite3.Connection, chat_id: int, message: d
         ).rowcount
         == 1
     )
-
-
-def _pack_lines(lines: list[str], budget: int) -> list[str]:
-    """行を改行でつなぎ、1 通が budget 字を超えないように分ける(行の途中では切らない)。
-
-    1 行が budget を超えないことは呼び出し側が保証する(観点を切り詰めて組み立てる)。
-    """
-    messages: list[str] = []
-    current = ""
-    for line in lines:
-        if current and len(current) + 1 + len(line) > budget:
-            messages.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        messages.append(current)
-    return messages
 
 
 def _replied_dig_backlog(conn: sqlite3.Connection, replied: object) -> bool:
