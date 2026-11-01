@@ -369,7 +369,7 @@ def test_no_candidate_notice_is_sent_once_and_is_not_a_stage_failure(
     texts = [dict(httpx.QueryParams(r.content.decode()))["text"] for r in sent]
     assert texts == [
         "🔎 今朝の深掘りはありません。今日のダイジェストが配信されていないため、"
-        "上位から選べませんでした。\n今夜の未消化一覧へのリプライで指定できます"
+        "上位から選べませんでした。\n今夜、未消化一覧が届いたら、そのリプライで指定できます"
     ]
 
     assert run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN2") == ["analyze"]
