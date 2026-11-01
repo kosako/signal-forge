@@ -2421,6 +2421,26 @@ def test_no_candidate_notice_is_sent_once_a_day(conn, config) -> None:
     assert api.sent == [(10, NOTICE_NO_DIGEST)] * 2
 
 
+def test_no_candidate_notice_marks_the_day_it_was_sent(conn, config, monkeypatch) -> None:
+    # 23:59 に始めた実行が、送信の試し直しで 0 時を越えてから送れた。印は送れた日にし、
+    # その朝の実行がもう 1 通送らない(実時計の日付の進みだけ、注入した日を進める)
+    clock = {"today": "2026-11-01"}
+    monkeypatch.setattr("app.deepdive.today_jst", lambda: clock["today"])
+
+    class MidnightApi(FakeApi):
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
+            clock["today"] = "2026-11-02"  # 送信の間に JST の 0 時を越える
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    api = MidnightApi()
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == [(10, NOTICE_NO_DIGEST)]
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) == "2026-07-23"
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+    assert len(api.sent) == 1  # 越えた先の朝の実行は送らない
+
+
 def test_no_candidate_notice_failure_is_logged_and_retried(conn, config, caplog) -> None:
     # 送れなかった知らせは段の失敗にせず、印も付けない。同じ日の次の実行が知らせ直す
     with caplog.at_level(logging.ERROR, logger="test-deepdive"):

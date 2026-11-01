@@ -56,7 +56,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -82,7 +82,7 @@ from app.delivery.telegram import (
 )
 from app.dig import DigCandidate, has_material, select_from_queue
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
-from app.jst import JST
+from app.jst import JST, today_jst
 from app.prompting import fill_template, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
@@ -410,8 +410,17 @@ def _notify_no_candidates(
         if sent_today:
             return
         reason = _NO_CANDIDATE_NONE if _digest_delivered(conn, day) else _NO_CANDIDATE_NO_DIGEST
+        before = today_jst()
         api.send_message(config.telegram.owner_chat_id, f"{reason}。\n{_NO_CANDIDATE_GUIDE}")
-        set_state(conn, STATE_NO_CANDIDATE_NOTIFIED, day)
+        # 印は送れた時点の暦日にする。段の初めの day のままだと、23:59 に始めた実行が送信の
+        # 試し直しで 0 時を越えたとき、前の日の印になり、その朝の実行がもう 1 通送る。
+        # day は注入できる(テスト)ので、送信の間に進んだ日数だけ day を進める
+        elapsed = date.fromisoformat(today_jst()) - date.fromisoformat(before)
+        set_state(
+            conn,
+            STATE_NO_CANDIDATE_NOTIFIED,
+            (date.fromisoformat(day) + elapsed).isoformat(),
+        )
     except Exception as e:
         logger.error(
             f"候補の無い朝の知らせを送れなかった: {type(e).__name__}",
