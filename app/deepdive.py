@@ -39,6 +39,11 @@
 カード送信(message_id)を台帳から再開する。どこで中断しても再実行は同一生成物の
 続きだけを行い、ノートとカードの生成元が食い違わない。既存ノートは上書きしない
 (_publish_note。公開済みノートに書かれた take を守る)。
+
+ノートの本文(LLM の解説・対訳と、抽出本文の保全コピー)は untrusted なので、外部の画像の
+埋め込みをリンクに変え、生の HTML を escape してから台帳に記帳する(開いただけで外部を読みに
+行かない。GH#377。app/export/neutralize.py)。公開の直前にも同じ直しをかける(直しより前に記帳
+した未公開の本文のため)。frontmatter は YAML シリアライザが作るので対象外。
 """
 
 from __future__ import annotations
@@ -81,6 +86,7 @@ from app.delivery.telegram import (
     escape_text,
 )
 from app.dig import DigCandidate, has_material, select_from_queue
+from app.export.neutralize import neutralize_markdown, neutralize_note
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import today_jst
 from app.prompting import fill_template, sanitize, sanitize_body
@@ -832,13 +838,17 @@ def _publish_pending_notes(
 def _publish_row_notes(
     config: Config, row: sqlite3.Row, logger: logging.Logger, run_id: str | None
 ) -> None:
-    """台帳の 1 行のノート(解説・原文/対訳)を書き出す(vault-io のスレッドで動く。DB に触れない)。"""
+    """台帳の 1 行のノート(解説・原文/対訳)を書き出す(vault-io のスレッドで動く。DB に触れない)。
+
+    本文は書き出す直前にも、外部の埋め込みと生の HTML を直す(GH#377)。この直しより前に
+    台帳へ記帳した未公開の本文も、直してから公開するため(組み立てで直した本文は変わらない)。
+    """
     deepdive_dir = _deepdive_dir(config)
     if row["note_markdown"] is not None:  # NULL = 旧経路の公開済み残骸は再書出不能
         _publish_note(
             deepdive_dir,
             f"{row['note_name']}.md",
-            row["note_markdown"],
+            neutralize_note(row["note_markdown"]),
             logger,
             run_id,
         )
@@ -846,7 +856,7 @@ def _publish_row_notes(
         _publish_note(
             deepdive_dir,
             f"{row['source_note_name']}.md",
-            row["source_note_markdown"],
+            neutralize_note(row["source_note_markdown"]),
             logger,
             run_id,
         )
@@ -1507,12 +1517,10 @@ def _explainer_note(
         frontmatter["review"] = review.status  # 別 AI のレビューの結果(GH#153)
     body = draft.note_markdown.strip()
     review_block = f"\n\n{_review_callout(review)}" if review is not None else "\n"
-    return (
-        render_frontmatter(frontmatter)
-        + "\n"
-        + body
-        + review_block
-        + "\n---\n\n(この下は手書きメモ・take 領域)\n"
+    # LLM の本文とレビューの指摘は untrusted。本文の側をまとめて直す(GH#377。テンプレートの
+    # 部分は直す対象の形を含まないので変わらない)
+    return render_frontmatter(frontmatter) + neutralize_markdown(
+        "\n" + body + review_block + "\n---\n\n(この下は手書きメモ・take 領域)\n"
     )
 
 
@@ -1528,9 +1536,9 @@ def _source_note_ja(candidate: DigCandidate, explainer_note_name: str) -> str:
         "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための保全コピー(抽出テキスト)",
     }
-    return (
-        render_frontmatter(frontmatter)
-        + f"\n> [!info] 抽出テキストの保全コピーです。解説は [[{explainer_note_name}]] へ。\n\n"
+    # 抽出本文は untrusted(GH#377)
+    return render_frontmatter(frontmatter) + neutralize_markdown(
+        f"\n> [!info] 抽出テキストの保全コピーです。解説は [[{explainer_note_name}]] へ。\n\n"
         + (candidate.body or "")
         + "\n"
     )
@@ -1554,9 +1562,9 @@ def _source_note_translated(
         "fetched": candidate.fetched_date or "",  # 本文の取得日(GH#239)
         "note": "私的利用のための全訳。日本語が地の文、原文は節ごとの折りたたみ内",
     }
-    return (
-        render_frontmatter(frontmatter)
-        + f"\n> [!info] 全訳(私的利用)。解説と検証は [[{explainer_note_name}]] へ。"
+    # 対訳は LLM の出力で、原文の節も含む(GH#377)
+    return render_frontmatter(frontmatter) + neutralize_markdown(
+        f"\n> [!info] 全訳(私的利用)。解説と検証は [[{explainer_note_name}]] へ。"
         "原文は各節の折りたたみを開くと読めます。\n\n"
         + translation
         + "\n"

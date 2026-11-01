@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import stat
@@ -1074,3 +1075,76 @@ def test_vault_io_runs_off_the_db_thread(conn, tmp_path, monkeypatch) -> None:
     export_pending_notes(conn, config, logger)
     assert writers == ["vault-io"]
     assert pending_item_notes(conn) == 0
+
+
+# --- 外部の埋め込みと生の HTML(GH#377) ---
+
+
+def generated_part(text: str) -> str:
+    return text.split("<!-- GENERATED:BEGIN -->\n", 1)[1].split("\n<!-- GENERATED:END -->", 1)[0]
+
+
+def assert_no_remote_embed(generated: str) -> None:
+    """インラインのコードの外に、外部の画像の埋め込みと生のタグが残っていない。"""
+    outside_code = re.sub(r"`[^`\n]*`", "", generated)
+    assert "![" not in outside_code.replace("\\![", "")
+    assert re.search(r"<[A-Za-z/!?]", outside_code) is None
+
+
+def test_items_and_daily_notes_have_no_remote_embed(conn, tmp_path) -> None:
+    item = add_digested(
+        conn, "https://a/1", title="<b>原題</b>",
+        body='抜粋 <img src="https://img.example/x.png"> ![図](https://img.example/y.png)',
+    )
+    conn.execute(
+        "UPDATE analyses SET summary = ?, recommendation_reason = ?, implication = ?",
+        (
+            "要約 ![図](https://img.example/a.png) と [記事](https://a/1)",
+            '<iframe src="https://img.example/f"></iframe>',
+            "<video src=\"https://img.example/v.mp4\"></video> と `<style>`",
+        ),
+    )
+    digest_id = add_digest(conn, [item])
+    conn.execute(
+        "UPDATE digests SET markdown = ? WHERE id = ?",
+        ("# ダイジェスト\n\n## 1. <img src=https://img.example/t.png>\n"
+         "![図](https://img.example/d.png)\n- URL: https://a/1", digest_id),
+    )
+    add_digest_note(conn, digest_id, "感想 <img src=https://img.example/n.png>")
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    text = note.read_text()
+    generated = generated_part(text)
+    assert_no_remote_embed(generated)
+    assert "\\![図](https://img.example/a.png) と [記事](https://a/1)" in generated
+    assert '&lt;img src="https://img.example/x.png">' in generated  # 抜粋も直す
+    assert "&lt;iframe" in generated
+    assert "`<style>`" in generated  # インラインのコードの中は触らない
+    assert read_front(note)["title"] == "<b>原題</b>"  # frontmatter は YAML の値のまま
+
+    daily = (tmp_path / "vault" / "SignalForge" / "Daily" / "2026-07-06.md").read_text()
+    daily_generated = generated_part(daily)
+    assert_no_remote_embed(daily_generated)
+    assert "## 1. &lt;img src=https://img.example/t.png>" in daily_generated
+    assert "\\![図](https://img.example/d.png)" in daily_generated
+    assert "- URL: https://a/1" in daily_generated  # 裸の URL はそのまま
+
+
+def test_handwritten_area_is_not_rewritten(conn, tmp_path) -> None:
+    # 手書きの領域は本人のもの。再生成で直す対象にしない
+    item = add_digested(conn, "https://a/1")
+    digest_id = add_digest(conn, [item])
+    config = make_config(tmp_path)
+    export_digest(conn, config, digest_id, logger)
+    note = next((tmp_path / "vault" / "SignalForge" / "Items").glob("*.md"))
+    handwritten = "\n手書き ![自分の図](https://img.example/me.png) <u>下線</u>\n"
+    note.write_text(note.read_text() + handwritten)
+
+    conn.execute("UPDATE analyses SET summary = '更新 <img src=https://img.example/u.png>'")
+    export_digest(conn, config, digest_id, logger)
+
+    text = note.read_text()
+    assert text.endswith(handwritten)
+    assert "更新 &lt;img src=https://img.example/u.png>" in text
