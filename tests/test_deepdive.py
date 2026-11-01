@@ -2662,3 +2662,83 @@ def test_no_candidate_notice_not_sent_while_another_dig_runs(conn, config, tmp_p
         ran = run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
     assert ran is False
     assert api.sent == []
+
+
+# --- ノートの外部の埋め込みと生の HTML(GH#377) ---
+
+UNTRUSTED_MARKDOWN = (
+    "## 概要\n\n図 ![図](https://img.example/a.png) と <img src=\"https://img.example/b.png\">\n"
+    "<iframe src=\"https://img.example/f\"></iframe>\n\n"
+    "```html\n<video src=\"https://img.example/v.mp4\"></video>\n```\n\n"
+    "参照 ![r][ref] と [リンク](https://blog.example/)\n\nタグの名前は `<audio>`\n\n"
+    "[ref]: https://img.example/c.png"
+)
+
+
+def assert_no_remote_embed(note: str) -> None:
+    """コードの外に、外部の画像の埋め込みと生のタグが残っていない(GH#377)。"""
+    outside_fence = re.sub(r"```html\n.*?\n```", "", note, flags=re.S)
+    outside_code = re.sub(r"`[^`\n]*`", "", outside_fence)
+    assert "![" not in outside_code.replace("\\![", "")
+    assert re.search(r"<[A-Za-z/!?]", outside_code) is None
+
+
+class EmbeddingEngine(ScriptedEngine):
+    """LLM の出力に埋め込みと HTML が混ざる(untrusted な本文の影響下)。"""
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        result = super().complete_structured(prompt, schema, timeout_s)
+        if schema is DigDraft:
+            return result.model_copy(update={"note_markdown": UNTRUSTED_MARKDOWN})
+        return TranslationChunk(
+            markdown=f"## 対訳\n\n> [!quote]- 原文(英語)\n> <img src=x>\n\n{UNTRUSTED_MARKDOWN}"
+        )
+
+
+def test_explainer_and_translation_notes_have_no_remote_embed(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", language="en")
+    enqueue(conn, item)
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, EmbeddingEngine())
+
+    run_dig_stage(conn, config, factory, FakeApi(), logger, today="2026-07-22")
+
+    explainer = next(deepdive_dir(config).glob("*深掘り.md")).read_text()
+    translation = next(deepdive_dir(config).glob("*対訳*.md")).read_text()
+    for note in (explainer, translation):
+        assert_no_remote_embed(note)
+        assert "[画像: 図](https://img.example/a.png)" in note  # 押せば開けるリンクに
+        assert "&lt;iframe" in note  # 生のタグは文字として見える
+        assert "[リンク](https://blog.example/)" in note  # ふつうのリンクはそのまま
+        assert '```html\n<video src="https://img.example/v.mp4"></video>\n```' in note
+        assert "`<audio>`" in note  # コードの中は描画されないので触らない
+    # frontmatter はテンプレートのまま(YAML シリアライザの出力)
+    assert frontmatter_of(explainer)["title"] == "日本語見出し"
+    assert "(この下は手書きメモ・take 領域)" in explainer
+
+
+def test_source_copy_of_extracted_body_has_no_remote_embed(conn, config) -> None:
+    body = "日本語の本文です。" * 30 + "\n\n<img src=\"https://img.example/t.png\">\n" + (
+        "![図](https://img.example/a.png) <object data=\"https://img.example/o\"></object>"
+    )
+    item = add_item(conn, "https://ja.example/記事", title="<b>題</b>", body=body, language="ja")
+    enqueue(conn, item)
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+
+    source = next(deepdive_dir(config).glob("*原文*.md")).read_text()
+    assert_no_remote_embed(source.split("---\n", 2)[2])
+    assert "&lt;img src=\"https://img.example/t.png\">" in source
+    assert "[画像: 図](https://img.example/a.png)" in source
+    # frontmatter の題は YAML の値で、本文の直しの対象外
+    assert frontmatter_of(source)["title"] == "原文:<b>題</b>"
+
+
+def test_review_callout_findings_have_no_remote_embed(conn, config) -> None:
+    findings = [finding(problem='<img src="https://img.example/p.png"> と ![x](https://img.example/q.png)')]
+    _row, note, _card, _engines = run_with_review(conn, config, ReviewEngine(findings))
+    assert_no_remote_embed(note)
+    assert '&lt;img src="https://img.example/p.png">' in note
+    assert "[画像: x](https://img.example/q.png)" in note

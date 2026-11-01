@@ -9,6 +9,8 @@
 - 読み書きは vault の実体から 1 段ずつ symlink を辿らずに開いたフォルダの中で行う(途中の
   フォルダが外への symlink なら書かない。ノートが symlink なら辿らずに新版を退避する。GH#204)
 - X 由来は抜粋を出力しない(恒久保存層に本文を置かない。Issue #2 の確定ポリシー)
+- GENERATED 領域に書く内容(要約・抜粋など untrusted な文を含む)は、画像の埋め込みを
+  リンクに変え、生の HTML を escape してから書く(開いただけで外部を読みに行かない。GH#377)
 - vault へのアクセス(フォルダを開く・一覧・ノートの読み書き)は 1 回ごとに時間の上限を付け、
   DB の読み書きは呼び出し側のスレッドに残す(macOS のプライバシーの確認待ちで朝バッチの後続の
   段を止めない。見切ったスレッドの遅れた書き込みは export のロックで別の実行と重ねない。GH#341)
@@ -30,6 +32,7 @@ from pathlib import Path
 import yaml
 
 from app.config import Config
+from app.export.neutralize import neutralize_markdown
 from app.jst import JST
 from app.models import EXTRACTION_FAILED_NOTE
 from app.vault_dir import (
@@ -545,8 +548,12 @@ def _write_note(
       残る(保証の範囲は設計 04 §7)
     - 読み書きは vault の実体から symlink を辿らずに開いたフォルダの中で行う(GH#204)。
       ノートが symlink・通常のファイルでなければ、辿らず触れずに新版を .conflict に退避する
+    - GENERATED の内容は、外部の画像の埋め込みをリンクに変え、生の HTML を escape して書く
+      (GH#377。app/export/neutralize.py)
     """
-    generated_body = _strip_markers(generated_body)
+    # マーカーを除いてから、埋め込みと生の HTML を直す(GH#377)。frontmatter と GENERATED の
+    # 外(手書きの領域)には触れない
+    generated_body = neutralize_markdown(_strip_markers(generated_body))
     fresh = _render(frontmatter, generated_body)
     with directory.opened() as dir_fd:
         for _attempt in range(2):  # 初回 + 読み直しての 1 回
