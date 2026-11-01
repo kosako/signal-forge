@@ -480,15 +480,23 @@ def run(
         # 朝バッチ失敗通知(設計 05 §4)。通知の失敗は notify 側でログのみに握る
         from app.delivery import create_api, is_telegram_configured, notify_run_failure
 
+        notified = False
         if is_telegram_configured(config, env):
             try:
-                notify_run_failure(
+                notified = notify_run_failure(
                     conn, config, create_api(env), failures, run_id, logger,
                     digest_held=failures.digest_held,  # GH#191
                     deliver_date=failures.deliver_date,  # GH#247
                 )
             except Exception as e:  # create_api の設定不備等でも終了コードを汚さない
                 logger.error(f"失敗通知を送れない: {e}", extra={"run_id": run_id, "stage": "run"})
+        if notified:
+            # 材料不足のリプライ指定は、この通知を送れた後に外す(GH#337)。送れなかった日は
+            # 指定のまま残し、次の朝の実行がもう一度知らせてから外す
+            from app.deepdive import release_material_request
+
+            for candidate in failures.material_requests:
+                release_material_request(conn, candidate, logger, run_id)
         typer.echo(f"失敗した段: {', '.join(failures)}(run_id={run_id})", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"run 完了(run_id={run_id})")

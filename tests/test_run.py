@@ -614,6 +614,11 @@ def test_dig_stage_failure_is_isolated(conn, tmp_path, ttl_documents) -> None:
     assert "dig" in failures
     assert "purge" not in failures and "backup" not in failures
     assert_purged_then_backed_up(conn, tmp_path, ttl_documents)
+    # 指定は段の中で外さず、失敗の通知を送れた後に外す候補として返す(GH#337)
+    assert [c.item_id for c in failures.material_requests] == [item_id]
+    assert conn.execute(
+        "SELECT requested_at FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()["requested_at"] == "2026-07-21T00:00:00Z"
 
 
 def test_dig_stage_yields_without_failure_while_another_dig_runs(conn, tmp_path) -> None:

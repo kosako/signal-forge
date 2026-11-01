@@ -511,6 +511,89 @@ def test_run_failure_notice_tells_whether_digest_was_held(
     assert passed == [digest_held]
 
 
+def _material_request(tmp_path):
+    """材料不足のリプライ指定を 1 件積み、dig 段の選定と同じ候補(compare-and-set の写し)を返す。"""
+    from app.config import Config
+    from app.db import apply_migrations, connect
+    from app.deepdive import _select_candidates
+
+    db_path = tmp_path / "intel.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    conn.execute(
+        "INSERT INTO sources (type, name, config) VALUES ('rss', 'feed-a', '{\"url\": \"https://a\"}')"
+    )
+    item_id = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, content_hash) "
+        "VALUES (1, 'https://q/1', 'https://q/1', 'sha256:q')"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, angle, requested_at) "
+        "VALUES (?, 'queued', 'request', '観点', '2026-07-21T00:00:00Z')",
+        (item_id,),
+    )
+    _, skipped = _select_candidates(conn, Config(config_dir=tmp_path), 2, "2026-07-22")
+    assert [c.item_id for c in skipped] == [item_id]
+    return conn, item_id, skipped
+
+
+@pytest.mark.parametrize(
+    ("case", "released"),
+    [
+        ("sent", True),
+        ("already_notified", False),  # 今日は通知済み。次の朝に知らせてから外す
+        ("send_failed", False),
+        ("telegram_unset", False),
+        ("respecified", False),  # 選定の後に本人が指定し直した。本人の操作を残す
+    ],
+)
+def test_run_releases_material_request_only_after_failure_notice_is_sent(
+    tmp_path, monkeypatch, case, released
+) -> None:
+    # 材料不足のリプライ指定は、失敗の通知をこの実行で送れた後にだけ外す(GH#337)。送れなかった
+    # ときは指定のまま残し、次の朝の実行がもう一度知らせてから外す(知らせ漏れを作らない)
+    from app import delivery, logs, run
+    from app.delivery.state import set_state
+    from app.delivery.surveys import STATE_RUN_FAILURE_NOTIFIED
+    from app.delivery.telegram import DeliveryError
+    from app.jst import today_jst
+    from tests.test_poller import FakeApi
+
+    class FailingApi(FakeApi):
+        def send_message(self, chat_id, text, *, reply_markup=None):
+            raise DeliveryError("送信失敗")
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=case != "telegram_unset")
+    conn, item_id, candidates = _material_request(tmp_path)
+    if case == "already_notified":
+        set_state(conn, STATE_RUN_FAILURE_NOTIFIED, today_jst())
+    if case == "respecified":
+        conn.execute(
+            "UPDATE dig_queue SET angle = '新しい観点', requested_at = '2026-07-21T21:00:00Z' "
+            "WHERE item_id = ?",
+            (item_id,),
+        )
+    failures = run.RunFailures(["dig"])
+    failures.material_requests = tuple(candidates)
+    api = FailingApi() if case == "send_failed" else FakeApi()
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: failures)
+    monkeypatch.setattr(run, "notify_llm_fallback", lambda *args: None)
+    monkeypatch.setattr(delivery, "create_api", lambda env: api)
+
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1  # 段の失敗のまま(外せたかで終了コードを変えない)
+    assert len(api.sent) == (1 if case in ("sent", "respecified") else 0)
+    requested_at = conn.execute(
+        "SELECT requested_at FROM dig_queue WHERE item_id = ?", (item_id,)
+    ).fetchone()["requested_at"]
+    if released:
+        assert requested_at is None
+    else:
+        assert requested_at is not None
+    conn.close()
+
+
 # config.toml を読む全コマンド(検査だけの doctor を除く)。DB・外部・設定の置き場に書くか、
 # 既定の DB を読む(GH#338)
 _CONFIG_REQUIRED = [

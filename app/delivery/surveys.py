@@ -217,8 +217,11 @@ def notify_run_failure(
     *,
     digest_held: bool = False,
     deliver_date: str | None = None,
-) -> None:
+) -> bool:
     """朝バッチ失敗通知(設計 05 §4)。同一種別1日1通。通知自体の失敗はログのみ。
+
+    この呼び出しで送れたときだけ True(今日は通知済み・送信の失敗は False)。材料不足の
+    リプライ指定は、送れたときだけ外す(GH#337)。
 
     digest_held: 分析の障害で当日の digest を確定しなかった(GH#191)。同じ 1 通で、
     復旧したら同じ日の再走で届くことを知らせる。
@@ -227,7 +230,7 @@ def notify_run_failure(
     """
     today = today_jst()
     if get_state(conn, STATE_RUN_FAILURE_NOTIFIED) == today:
-        return
+        return False
     guide = (
         "分析の障害で今日のダイジェストを作れませんでした。"
         "復旧したら今日のうちに `intel run` で再走すれば届きます"
@@ -246,6 +249,8 @@ def notify_run_failure(
     except Exception as e:
         # 通知の失敗で run の終了コードを汚さない(フォールバック経路は作らない)
         logger.error(f"失敗通知の送信に失敗: {type(e).__name__}: {e}", extra={"stage": "run"})
+        return False
+    return True
 
 
 def _followup_targets(conn: sqlite3.Connection, dig_date: str) -> list[sqlite3.Row]:

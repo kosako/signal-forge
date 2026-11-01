@@ -17,7 +17,8 @@
   同じトランザクションで source = 'digest'・status = 'done' の行を足す
 - 材料不足(本文抽出なし・短すぎ)は、自動選出なら skip(未消化一覧には残る)、
   リプライ指定なら段の失敗として loud に報告する(明示依頼を黙って放置しない)。報告は 1 回に
-  して指定を外す(本文を取り直す経路は無く、毎朝の失敗を続けない。GH#197)
+  して指定を外す(本文を取り直す経路は無く、毎朝の失敗を続けない。GH#197)。外すのは朝バッチが
+  失敗の通知を送れた後(release_material_request。GH#337)
 - 同じ台帳を使う実行(朝バッチの dig 段と `intel dig`)は 1 つずつ。候補の選定から公開・送信までを
   ロックで囲み、後から来た方は待たずに何もしない(朝バッチを止めない。GH#196)
 
@@ -51,7 +52,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -153,7 +154,18 @@ _ASCII_QUOTE_RE = re.compile(r'"[^"\n]*"')
 
 
 class DigError(Exception):
-    """調査段の失敗(材料不足の明示指定・全件失敗など)。"""
+    """調査段の失敗(材料不足の明示指定・全件失敗など)。
+
+    material_requests: 材料不足で掘れなかったリプライ指定(GH#337)。指定を外すのは、朝バッチが
+    失敗の通知を送れた後(release_material_request)。段の中で外すと、通知までに止まったときに
+    指定だけが消えて本人に届かないため。
+    """
+
+    def __init__(
+        self, message: str, *, material_requests: Sequence[DigCandidate] = ()
+    ) -> None:
+        super().__init__(message)
+        self.material_requests: tuple[DigCandidate, ...] = tuple(material_requests)
 
 
 class DigDraft(BaseModel):
@@ -298,19 +310,17 @@ def _run_dig_stage_locked(
     day = today or datetime.now(JST).strftime("%Y-%m-%d")
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
+    material_requests: list[DigCandidate] = []
 
     if remaining > 0:
         selected, skipped_requested = _select_candidates(conn, config, remaining, day)
-        for candidate in skipped_requested:
-            dropped = _drop_request(conn, candidate, logger, run_id)
-            failures.append(
-                f"item {candidate.item_id}: リプライ指定だが本文の抽出材料がない"
-                + (
-                    "(指定を外した。次の朝からは知らせない)"
-                    if dropped
-                    else "(パスするか手動対応)"
-                )
-            )
+        # 材料不足の指定は、ここでは外さない。失敗の通知を送れた後に朝バッチが外す(GH#337)
+        material_requests = skipped_requested
+        failures.extend(
+            f"item {candidate.item_id}: リプライ指定だが本文の抽出材料がない"
+            "(失敗の通知を送った後に指定を外す)"
+            for candidate in skipped_requested
+        )
         for candidate in selected:
             try:
                 _dig_one(
@@ -356,7 +366,10 @@ def _run_dig_stage_locked(
             )
 
     if failures:
-        raise DigError(f"調査段で {len(failures)} 件失敗: " + " / ".join(failures))
+        raise DigError(
+            f"調査段で {len(failures)} 件失敗: " + " / ".join(failures),
+            material_requests=material_requests,
+        )
 
 
 def _digs_on(conn: sqlite3.Connection, day: str) -> int:
@@ -521,7 +534,7 @@ def _select_from_digest(
     return selected
 
 
-def _drop_request(
+def release_material_request(
     conn: sqlite3.Connection,
     candidate: DigCandidate,
     logger: logging.Logger,
@@ -529,15 +542,21 @@ def _drop_request(
 ) -> bool:
     """材料不足のリプライ指定を、知らせた後に自動キューの扱いへ戻す(GH#197)。外せたら True。
 
+    呼ぶのは朝バッチの失敗の通知を送れた後だけ(GH#337)。調査段の中で外すと、通知までの間
+    (他の件の深掘り・公開・送信は分オーダー)に止まったとき、指定だけが消えて本人に届かない。
+    送れなかった日(今日は通知済み・Telegram 未設定・送信の失敗)は呼ばず、指定のまま残して
+    次の朝にもう一度知らせる。送った後・外す前に止まると 1 回多く知らせうる(知らせ漏れは作らない)。
+
     requested_at を外すだけで、status(queued)・観点・source・受付の順序の印
     (backlog_op_question_id。本人の未消化一覧への操作ではない)は変えない。本文を取り直す
     経路は無いので、指定のまま残すと毎朝同じ失敗を知らせ続ける。材料不足の自動選出と同じく
     静かに残り、本人が指定し直せばまた 1 回知らせる。選定の後に poller が更新していたら
     (再指定・パス)、本人の操作を優先して変えない(done 化と同じ compare-and-set)。
-    DB の失敗は item 単位に閉じ(ERROR を残して False)、他の件の深掘りと公開・送信を止めない。
+    DB の失敗は item 単位に閉じ(WARNING を残して False)、他の件の解除を止めない。
     """
+    log_extra = {"run_id": run_id, "stage": "dig", "item_id": candidate.item_id}
     try:
-        return (
+        released = (
             conn.execute(
                 "UPDATE dig_queue SET requested_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
@@ -553,11 +572,25 @@ def _drop_request(
             == 1
         )
     except sqlite3.Error as e:
-        logger.error(
-            f"材料不足の指定を外せなかった item={candidate.item_id}: {type(e).__name__}: {e}",
-            extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
+        logger.warning(
+            f"材料不足の指定を外せなかった item={candidate.item_id}: {type(e).__name__}: {e}"
+            "(指定のまま残し、次の朝にもう一度知らせる)",
+            extra=log_extra,
         )
         return False
+    if released:
+        logger.info(
+            f"材料不足の指定を外した item={candidate.item_id}(失敗の通知を送った後。"
+            "次の朝からは知らせない)",
+            extra=log_extra,
+        )
+    else:
+        logger.warning(
+            f"材料不足の指定を外さなかった item={candidate.item_id}: 選定の後に本人が操作した"
+            "(再指定・パス)。指定が残っていれば次の朝にもう一度知らせる",
+            extra=log_extra,
+        )
+    return released
 
 
 def _dig_one(

@@ -446,8 +446,9 @@ def test_watchdog_not_due_before_time(conn, tmp_path) -> None:
 def test_notify_run_failure_once_per_day(conn, tmp_path) -> None:
     api = FakeApi()
     config = make_config(tmp_path)
-    notify_run_failure(conn, config, api, ["collect", "digest"], "01RUN", logger)
-    notify_run_failure(conn, config, api, ["export"], "01RUN2", logger)
+    # 送れたかを返す(材料不足のリプライ指定は、送れたときだけ外す。GH#337)
+    assert notify_run_failure(conn, config, api, ["collect", "digest"], "01RUN", logger)
+    assert not notify_run_failure(conn, config, api, ["export"], "01RUN2", logger)
 
     assert len(api.sent) == 1
     assert "collect, digest" in api.sent[0][1]
@@ -512,9 +513,9 @@ def test_notify_run_failure_swallows_send_error(conn, tmp_path) -> None:
         def send_message(self, chat_id, text, *, reply_markup=None):
             raise DeliveryError("送信失敗")
 
-    notify_run_failure(
+    assert not notify_run_failure(
         conn, make_config(tmp_path), FailingApi(), ["deliver"], "01RUN", logger
-    )  # 例外が漏れない
+    )  # 例外が漏れず、送れなかったと返す(GH#337)
     # 送信できなかった日は通知枠を消費しない(次の再走で再通知できる)
     assert get_state(conn, STATE_RUN_FAILURE_NOTIFIED) is None
 
