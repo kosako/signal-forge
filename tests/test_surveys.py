@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Config, TelegramConfig, XConfig
+from app.config import Config, DigConfig, TelegramConfig, XConfig
 from app.db import apply_migrations, connect
 from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poller
 from app.delivery.poller import TIMER_RETRY_S
@@ -23,7 +23,14 @@ from app.delivery.surveys import (
 from app.delivery.telegram import DeliveryError
 from app.jst import JST, today_jst
 from tests.test_delivery import add_digest, add_item
-from tests.test_poller import CHAT_ID, FakeApi, FakeWorker, make_callback_update, make_config
+from tests.test_poller import (
+    CHAT_ID,
+    FakeApi,
+    FakeWorker,
+    make_callback_update,
+    make_config,
+    make_reply_update,
+)
 
 logger = logging.getLogger("test-surveys")
 
@@ -1105,3 +1112,310 @@ def test_dig_backlog_message_id_recorded_in_ledger(conn, tmp_path) -> None:
     # FakeApi の message_id は 900 + 送信順(1始まり)
     assert rows[0]["message_id"] == 900 + backlog_position + 1
     assert rows[0]["sent_date"] == now.strftime("%Y-%m-%d")
+
+
+# --- 未消化一覧の各行の状態と明朝の予定(GH#349。設計 06 §2) ---
+
+BODY = "深掘りの材料になる本文。" * 30  # min_body_chars(既定 200 字)を満たす
+
+
+def add_body(conn, item_id: int, text: str = BODY) -> None:
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, language, extraction_status,"
+        " expires_at) VALUES (?, ?, 'ja', 'ok', '2099-01-01T00:00:00Z')",
+        (item_id, text),
+    )
+
+
+def add_queue(
+    conn,
+    item_id: int,
+    status: str = "queued",
+    *,
+    requested_at: str | None = None,
+    enqueued_at: str = "2026-07-01T00:00:00Z",
+) -> None:
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, requested_at, enqueued_at) "
+        "VALUES (?, ?, 'bookmark', ?, ?)",
+        (item_id, status, requested_at, enqueued_at),
+    )
+
+
+def config_with_cap(tmp_path: Path, daily_cap: int) -> Config:
+    return replace(make_config(tmp_path), dig=DigConfig(daily_cap=daily_cap))
+
+
+def send_backlog(conn, config: Config, now: datetime | None = None) -> str | None:
+    """夜アンケートを送り、未消化一覧の本文を返す(送らなければ None)。"""
+    api = FakeApi()
+    run_due_timers(conn, config, api, logger, now or jst_now("21:30"))
+    return next((t for _, t in api.sent if "未消化の深掘り候補" in t), None)
+
+
+def backlog_line(text: str, item_id: int) -> str:
+    return next(line for line in text.splitlines() if line.startswith(f"{item_id}. "))
+
+
+def test_dig_backlog_marks_each_state(conn, tmp_path) -> None:
+    # 各行の番号の後に深掘りの状態の印を添える。上限 1 件なので 2 件目の queued は ⏳ 待ち
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    items = {}
+    for name in ("planned", "waiting", "done", "passed", "queued_no_body", "gone", "plain"):
+        items[name] = add_item(conn, f"https://a/{name}", title=f"記事-{name}")
+        add_dig_reaction(conn, items[name], yesterday)
+    for name in ("planned", "waiting", "done", "passed", "plain"):
+        add_body(conn, items[name])
+    add_queue(conn, items["planned"], enqueued_at="2026-07-03T00:00:00Z")  # ② の新しい順で先
+    add_queue(conn, items["waiting"], enqueued_at="2026-07-02T00:00:00Z")
+    add_queue(conn, items["done"], "done")
+    add_queue(conn, items["passed"], "passed")
+    add_queue(conn, items["queued_no_body"])  # キューにあるが本文が消えた
+    # gone = キューに無く本文も無い / plain = キューに無く本文あり(印なし)
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 1), now)
+
+    assert backlog is not None
+    expected = {
+        "planned": "🗓 明朝 ",
+        "waiting": "⏳ 待ち ",
+        "done": "✅ 掘った ",
+        "passed": "⏭️ パス ",
+        "queued_no_body": "⚠️ 本文なし ",
+        "gone": "⚠️ 本文なし ",
+        "plain": "",
+    }
+    for name, mark in expected.items():
+        assert backlog_line(backlog, items[name]).startswith(f"{items[name]}. {mark}<a "), name
+    assert "(7件)" in backlog
+
+
+def test_dig_backlog_done_and_passed_marks_ignore_missing_body(conn, tmp_path) -> None:
+    # done・passed はキューの状態のまま示す(本文が消えていても ⚠️ にしない)
+    now = jst_now("21:30")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    silence_watchdog(conn)
+    done = add_item(conn, "https://a/done", title="掘った")
+    passed = add_item(conn, "https://a/passed", title="パスした")
+    for item, status in ((done, "done"), (passed, "passed")):
+        add_dig_reaction(conn, item, yesterday)
+        add_queue(conn, item, status)
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 2), now)
+
+    assert "✅ 掘った <a " in backlog_line(backlog, done)
+    assert "⏭️ パス <a " in backlog_line(backlog, passed)
+
+
+def test_dig_backlog_plan_rows_on_top_and_not_counted_in_limit(conn, tmp_path) -> None:
+    # 予定の行は先頭に置き、上限 15 件に数えずに必ず載せる。🔖 が一番古い行でも先頭へ
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    planned = add_item(conn, "https://a/planned", title="予定の記事")
+    add_dig_reaction(conn, planned, (now - timedelta(days=30)).strftime("%Y-%m-%d"))
+    add_body(conn, planned)
+    add_queue(conn, planned)
+    for i in range(16):
+        item = add_item(conn, f"https://a/many-{i}", title=f"記事{i}")
+        add_dig_reaction(conn, item, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 1), now)
+
+    lines = backlog.splitlines()
+    assert lines[0] == "🔖 未消化の深掘り候補(17件)"
+    assert lines[1].startswith(f"{planned}. 🗓 明朝 ")
+    assert backlog.count("<a href=") == 16  # 予定 1 + 残りの上限 15
+    assert sum(line.startswith(f"{planned}. ") for line in lines) == 1  # 残りの行に重ねない
+    assert "(他 1 件)" in backlog
+
+
+def test_dig_backlog_adds_plan_rows_outside_bookmarks(conn, tmp_path) -> None:
+    # 🔖 の一覧に無い予定(カードからの調べ直しの依頼など)も行として足す。① が ② より先
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    bookmarked = add_item(conn, "https://a/bookmarked", title="🔖の記事")
+    add_dig_reaction(conn, bookmarked, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    add_body(conn, bookmarked)
+    add_queue(conn, bookmarked, enqueued_at="2026-07-05T00:00:00Z")
+    redig = add_item(conn, "https://a/redig", title="調べ直しの記事", title_ja="調べ直し(和題)")
+    add_body(conn, redig)
+    add_queue(conn, redig, requested_at="2026-07-04T00:00:00Z")
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 2), now)
+
+    lines = backlog.splitlines()
+    assert lines[0] == "🔖 未消化の深掘り候補(2件)"
+    assert lines[1] == f'{redig}. 🗓 明朝 <a href="https://a/redig">調べ直し(和題)</a>'
+    assert lines[2].startswith(f"{bookmarked}. 🗓 明朝 ")
+    assert "ダイジェストの上位" not in backlog  # 予定が上限に届いている
+
+
+def test_dig_backlog_sent_with_plan_only_and_reply_accepts_plan_id(conn, tmp_path) -> None:
+    # 🔖 の一覧が空でも予定があれば送り、予定の行の番号はリプライで指定できる
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    redig = add_item(conn, "https://a/redig", title="調べ直しの記事")
+    add_body(conn, redig)
+    add_queue(conn, redig, requested_at="2026-07-04T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    assert pending_dig_items(conn) == []
+
+    api = FakeApi()
+    run_due_timers(conn, config, api, logger, now)
+
+    texts = [t for _, t in api.sent]
+    position = next(i for i, t in enumerate(texts) if "未消化の深掘り候補" in t)
+    backlog = texts[position]
+    assert "(1件)" in backlog
+    assert backlog_line(backlog, redig).startswith(f"{redig}. 🗓 明朝 ")
+    assert f"「{redig} を◯◯の観点で」" in backlog  # リプライ例は予定の行の id
+    message_id = 900 + position + 1
+    assert conn.execute(
+        "SELECT 1 FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+    ).fetchone()
+
+    poll_once(conn, config, FakeApi([[make_reply_update(f"{redig} はパス", message_id)]]), logger)
+
+    status = conn.execute(
+        "SELECT status FROM dig_queue WHERE item_id = ?", (redig,)
+    ).fetchone()["status"]
+    assert status == "passed"
+
+
+def test_dig_backlog_not_sent_without_bookmarks_or_plan(conn, tmp_path) -> None:
+    # 🔖 の一覧が空で予定も無い日は今までどおり送らない(本文の無い queued は予定にならない)
+    silence_watchdog(conn)
+    gone = add_item(conn, "https://a/gone")
+    add_queue(conn, gone, requested_at="2026-07-04T00:00:00Z")
+
+    assert send_backlog(conn, config_with_cap(tmp_path, 2)) is None
+
+
+def test_dig_backlog_caveat_lines(conn, tmp_path) -> None:
+    # 予定があれば入れ替わりの 1 行、予定が翌日の上限に足りなければ digest で埋める 1 行
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    planned = add_item(conn, "https://a/planned")
+    add_dig_reaction(conn, planned, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    add_body(conn, planned)
+    add_queue(conn, planned)
+    swap_note = "🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります"
+
+    short = send_backlog(conn, config_with_cap(tmp_path, 3), now)
+    assert swap_note in short.splitlines()
+    assert "残り 2 件は明朝のダイジェストの上位から選びます" in short.splitlines()
+
+    set_state(conn, STATE_SURVEY_SENT, "")  # 同じ日にもう一度送る
+    full = send_backlog(conn, config_with_cap(tmp_path, 1), now)
+    assert swap_note in full.splitlines()
+    assert "ダイジェストの上位" not in full
+
+    conn.execute("UPDATE dig_queue SET status = 'passed'")
+    set_state(conn, STATE_SURVEY_SENT, "")
+    none_planned = send_backlog(conn, config_with_cap(tmp_path, 2), now)
+    assert swap_note not in none_planned
+    lines = none_planned.splitlines()
+    # 注記は行の後に空行で区切って置き、リプライの案内は最後
+    assert lines[-4:-2] == ["", "残り 2 件は明朝のダイジェストの上位から選びます"]
+    assert lines[-2] == ""
+    assert lines[-1].startswith("↩️ ")
+
+
+def test_dig_backlog_unchanged_when_daily_cap_zero(conn, tmp_path) -> None:
+    # [dig].daily_cap = 0 なら印も予定も出さず、今の一覧のまま。🔖 に無い予定も足さない
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    item = add_item(conn, "https://a/fresh", title="候補記事")
+    add_dig_reaction(conn, item, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    add_body(conn, item)
+    add_queue(conn, item)
+    redig = add_item(conn, "https://a/redig", title="調べ直しの記事")
+    add_body(conn, redig)
+    add_queue(conn, redig, requested_at="2026-07-04T00:00:00Z")
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 0), now)
+
+    assert backlog == (
+        "🔖 未消化の深掘り候補(1件)\n"
+        f'{item}. <a href="https://a/fresh">候補記事</a>\n'
+        "\n"
+        f"↩️ このメッセージへのリプライで指定: 「{item} を◯◯の観点で」= "
+        f"朝の深掘りに登録 / 「{item} はパス」= 深掘り対象から外す"
+    )
+
+
+def test_dig_backlog_plan_only_not_sent_when_daily_cap_zero(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    redig = add_item(conn, "https://a/redig")
+    add_body(conn, redig)
+    add_queue(conn, redig, requested_at="2026-07-04T00:00:00Z")
+
+    assert send_backlog(conn, config_with_cap(tmp_path, 0)) is None
+
+
+def test_dig_backlog_plan_row_outside_bookmarks_is_escaped(conn, tmp_path) -> None:
+    # 🔖 に無い予定の行も、タイトルは escape・URL は属性の escape(設計 04 §1)
+    silence_watchdog(conn)
+    url = 'https://a/x?q="1"&r=<2>'
+    redig = add_item(conn, url, title="<b>危ない</b> & タイトル")
+    add_body(conn, redig)
+    add_queue(conn, redig, requested_at="2026-07-04T00:00:00Z")
+
+    backlog = send_backlog(conn, config_with_cap(tmp_path, 1))
+
+    line = backlog_line(backlog, redig)
+    assert "&lt;b&gt;危ない&lt;/b&gt; &amp; タイトル" in line
+    assert "<b>" not in line
+    assert 'href="https://a/x?q=&quot;1&quot;&amp;r=&lt;2&gt;"' in line
+
+
+def test_dig_backlog_does_not_write_queue(conn, tmp_path) -> None:
+    # 夜の一覧は読むだけ(キューは変えない。設計 06 §7 の 3)
+    now = jst_now("21:30")
+    silence_watchdog(conn)
+    for i, status in enumerate(("queued", "queued", "done", "passed")):
+        item = add_item(conn, f"https://a/{i}")
+        add_dig_reaction(conn, item, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+        add_body(conn, item)
+        add_queue(conn, item, status)
+    conn.commit()
+    before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue ORDER BY item_id")]
+
+    assert send_backlog(conn, config_with_cap(tmp_path, 1), now) is not None
+
+    after = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue ORDER BY item_id")]
+    assert after == before
+
+
+def test_next_morning_plan_matches_morning_queue_selection(conn, tmp_path) -> None:
+    # 夜の予定と朝の選定の ①② は同じ関数(GH#349)。③ の digest の上位は夜には含めない
+    from app.deepdive import _select_candidates
+    from app.dig import next_morning_plan
+
+    config = config_with_cap(tmp_path, 3)
+    requested = add_item(conn, "https://a/requested")
+    add_body(conn, requested)
+    add_queue(conn, requested, requested_at="2026-07-04T00:00:00Z")
+    no_body = add_item(conn, "https://a/no-body")
+    add_queue(conn, no_body, requested_at="2026-07-05T00:00:00Z")  # 材料不足の指定は予定にしない
+    auto = add_item(conn, "https://a/auto")
+    add_body(conn, auto)
+    add_queue(conn, auto)
+    top = add_item(conn, "https://a/digest-top")
+    add_body(conn, top)
+    day = "2026-07-23"
+    digest_id = add_digest(conn, [top])
+    conn.execute(
+        "UPDATE digests SET digest_date = ?, delivery_status = 'sent' WHERE id = ?",
+        (day, digest_id),
+    )
+
+    plan = next_morning_plan(conn, config, day)
+    morning, skipped = _select_candidates(conn, config, 3, day)
+
+    assert [c.item_id for c in plan] == [requested, auto]
+    assert [c.item_id for c in morning] == [requested, auto, top]  # 朝は ③ で埋める
+    assert [c.item_id for c in skipped] == [no_body]
+    assert next_morning_plan(conn, config_with_cap(tmp_path, 0), day) == []

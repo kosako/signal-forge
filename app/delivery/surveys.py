@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Mapping, Sequence
 from datetime import datetime, time, timedelta
 
 from app import source_health
@@ -23,6 +24,7 @@ from app.delivery.telegram import (
     escape_and_truncate,
     escape_attr,
 )
+from app.dig import DigCandidate, DigState, dig_states, next_morning_plan
 from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
@@ -36,6 +38,14 @@ READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4
 # 未消化 🔖 一覧(GH#88)。可視テキストを 4096 字制限に収める(URL は href 側で不算入)
 DIG_BACKLOG_MAX_ITEMS = 15
 DIG_BACKLOG_TITLE_MAX_CHARS = 80
+# 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
+DIG_STATE_MARKS: dict[DigState, str] = {
+    "planned": "🗓 明朝",
+    "waiting": "⏳ 待ち",
+    "done": "✅ 掘った",
+    "passed": "⏭️ パス",
+    "no_body": "⚠️ 本文なし",
+}
 
 # watchdog の 1 通の上限。Telegram の 4096 字に余裕を残す(超えると試し直すたびに送信が
 # 失敗し、watchdog が届かない。GH#124 でソースの行が可変長になった)
@@ -151,8 +161,11 @@ def send_evening_survey(
         reply_markup=q2_keyboard(date_compact),
     )
     backlog = pending_dig_items(conn)
-    if backlog:  # 0件の日は送らない(GH#88)
-        message_id = api.send_message(chat_id, _dig_backlog_text(backlog))
+    # 明朝の予定(GH#349)。夜の時点のキューを朝の選定と同じ規則で並べる(読むだけ)
+    plan = next_morning_plan(conn, config, (now + timedelta(days=1)).strftime("%Y-%m-%d"))
+    backlog_text = _dig_backlog_message(conn, config, backlog, plan)
+    if backlog_text is not None:  # 0件で予定も無い日は送らない(GH#88・GH#349)
+        message_id = api.send_message(chat_id, backlog_text)
         # リプライ先の認識用台帳(GH#104)。過去の一覧へのリプライも有効にするため
         # 蓄積する(REPLACE は getUpdates 再配達等での同一 id 再送に対する冪等)
         conn.execute(
@@ -172,12 +185,16 @@ def send_evening_survey(
         "夜アンケート送信",
         extra={
             "stage": "poll",
-            "extra": {"followups": len(followups), "dig_backlog": len(backlog)},
+            "extra": {
+                "followups": len(followups),
+                "dig_backlog": len(backlog),
+                "dig_plan": len(plan),
+            },
         },
     )
 
 
-def _linked_title(row: sqlite3.Row, budget: int) -> str:
+def _linked_title(row: Mapping, budget: int) -> str:
     """タイトルを深掘り動線(canonical_url へのリンク)にする(GH#88)。"""
     title = escape_and_truncate(
         (row["title_ja"] or row["title"] or "(タイトルなし)").strip(), budget
@@ -185,20 +202,87 @@ def _linked_title(row: sqlite3.Row, budget: int) -> str:
     return f'<a href="{escape_attr(row["canonical_url"])}">{title}</a>'
 
 
-def _dig_backlog_text(rows: list[sqlite3.Row]) -> str:
+def _dig_backlog_message(
+    conn: sqlite3.Connection,
+    config: Config,
+    backlog: list[sqlite3.Row],
+    plan: Sequence[DigCandidate],
+) -> str | None:
+    """未消化一覧の本文。None = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
+
+    `[dig].daily_cap = 0`(深掘りの段が止まっている)なら印も予定も出さず、今までの一覧のまま
+    にする(GH#349。設計 06 §2)。予定の行は先頭に置いて上限(DIG_BACKLOG_MAX_ITEMS)に数えず、
+    🔖 の一覧に無い予定(カードからの調べ直しの依頼など)も行として足す。予定の行の番号も
+    キューにあるので、一覧へのリプライで指定できる(poller の valid_ids は queue_item_ids を含む)。
+    """
+    if config.dig.daily_cap <= 0:
+        return _dig_backlog_text(backlog) if backlog else None
+    if not backlog and not plan:
+        return None
+    by_id = {row["item_id"]: row for row in backlog}
+    planned_ids = {candidate.item_id for candidate in plan}
+    plan_rows: list[Mapping] = [
+        by_id.get(candidate.item_id)
+        or {
+            "item_id": candidate.item_id,
+            "title": candidate.title,
+            "title_ja": candidate.title_ja,
+            "canonical_url": candidate.canonical_url,
+        }
+        for candidate in plan
+    ]
+    rest = [row for row in backlog if row["item_id"] not in planned_ids]
+    shown_ids = [row["item_id"] for row in rest[:DIG_BACKLOG_MAX_ITEMS]]
+    return _dig_backlog_text(
+        rest,
+        plan_rows=plan_rows,
+        states=dig_states(conn, config, shown_ids, planned_ids),
+        digest_fill=config.dig.daily_cap - len(plan),
+    )
+
+
+def _dig_backlog_text(
+    rows: Sequence[Mapping],
+    *,
+    plan_rows: Sequence[Mapping] = (),
+    states: Mapping[int, DigState | None] | None = None,
+    digest_fill: int = 0,
+) -> str:
     """未消化 🔖 一覧(1通)。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
 
     番号は item id(GH#104)。表示位置の連番だと日ごとに変わり、リプライ指定
     「3664 を◯◯の観点で」が翌日以降の一覧や記憶と食い違うため、安定な id を使う。
+    GH#349: states があれば番号の後に深掘りの状態の印を添える。plan_rows(明朝の予定)は
+    先頭に 🗓 明朝 で置き、上限に数えない。rows は予定を除いた残りの行。digest_fill は
+    予定が翌日の上限に足りない件数(明朝の digest の上位から埋める分)。既定の引数では
+    今までの一覧のまま(`[dig].daily_cap = 0`)。
     """
-    lines = [f"🔖 未消化の深掘り候補({len(rows)}件)"]
+    states = states or {}
+    lines = [f"🔖 未消化の深掘り候補({len(plan_rows) + len(rows)}件)"]
     lines += [
-        f"{row['item_id']}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
-        for row in rows[:DIG_BACKLOG_MAX_ITEMS]
+        f"{row['item_id']}. {DIG_STATE_MARKS['planned']} "
+        f"{_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
+        for row in plan_rows
     ]
+    for row in rows[:DIG_BACKLOG_MAX_ITEMS]:
+        state = states.get(row["item_id"])
+        mark = f"{DIG_STATE_MARKS[state]} " if state is not None else ""
+        lines.append(
+            f"{row['item_id']}. {mark}{_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
+        )
     if len(rows) > DIG_BACKLOG_MAX_ITEMS:
         lines.append(f"(他 {len(rows) - DIG_BACKLOG_MAX_ITEMS} 件)")
-    example_id = rows[0]["item_id"]
+    # 夜の予定は確約ではない(GH#349。設計 06 §2)。② は新しい順なので、朝の x_signals 段が
+    # 取り込む新しい 🔖 が押し出しうる。③ は朝の digest で決まるので件数だけ示す
+    notes = []
+    if plan_rows:
+        notes.append("🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります")
+    if digest_fill > 0:
+        notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
+    if notes:
+        lines.append("")
+        lines += notes
+    example_id = (plan_rows or rows)[0]["item_id"]
     lines.append("")
     lines.append(
         f"↩️ このメッセージへのリプライで指定: 「{example_id} を◯◯の観点で」= "
