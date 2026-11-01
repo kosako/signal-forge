@@ -2,6 +2,7 @@
 
 - Bot API は httpx 直叩き。parse_mode=HTML。エスケープ規定: テキストノードは
   `& < >`、属性値はさらに `"` `'`(canonical_url は外部制御可能なため属性破壊を防ぐ)
+- リンクプレビューは全送信で止める(link_preview_options。GH#377)
 - 構成: ヘッダ1通+アイテム最大 `digest.max_items` 通(1アイテム=1メッセージ。
   ボタンをアイテム単位に付けるため)
 - 冪等性: `digest_messages` 台帳(今の世代の行。GH#190)にある message は再送しない
@@ -61,6 +62,11 @@ BOOKMARK_TITLE_MAX_CHARS = 80
 # 深掘りカードへの質問への返事(GH#126)の 1 通の上限。Telegram の 4096 字に余裕を残す
 ANSWER_TEXT_MAX_CHARS = 4000
 
+# すべての送信でリンクプレビューを止める(GH#377。Bot API 7.0+ の link_preview_options)。
+# 本文には LLM 出力や外部記事の文字列が入り、任意の URL を含みうる。プレビューがあると、
+# 本人が開かなくても Telegram のサーバーがその URL を取りに行く。リンクは押せるまま残す
+_LINK_PREVIEW_OPTIONS = json.dumps({"is_disabled": True})
+
 _WEEKDAYS_JA = "月火水木金土日"
 
 # 反応ボタン(callback_data 形式の正本は設計 04 §3)
@@ -103,7 +109,13 @@ class TelegramApi:
         reply_to_message_id: int | None = None,
     ) -> int:
         """sendMessage を実行し message_id を返す。リトライ規約は設計 05 §8。"""
-        payload: dict[str, object] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        payload: dict[str, object] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            # 本文を送る口はここだけ。呼び出し側で外せないようここで必ず付ける(GH#377)
+            "link_preview_options": _LINK_PREVIEW_OPTIONS,
+        }
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
         if reply_to_message_id is not None:

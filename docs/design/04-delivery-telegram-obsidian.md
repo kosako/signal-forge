@@ -11,6 +11,7 @@
   - **再配達の冪等性**: offset は処理の後に保存するので、その間に止まる(または offset の保存がロック競合で失敗する)と同じ update が再配達される。感想(§5。`item_notes` / `digest_notes`)は受信したリプライの `chat_id`・`message_id` を一意キーにし(01 §3。GH#193)、記帳の 1 文で処理済みかを判定する(記帳済みなら記帳も返信もしない)。深掘りカードへの質問は `dig_questions` の UNIQUE(01 §7)で同じく 2 回受け付けない。未消化一覧へのリプライ(深掘りの指定。§4)も、受信したリプライの `chat_id`・`message_id` を `dig_backlog_replies` に記帳し(01 §7。GH#335)、記帳と指定の反映を同じトランザクションで行う(記帳済みなら反映も返信もしない。本人が別のメッセージで指定し直したときは受け付ける)。signals(§3)は追記型で、重複は集計側で吸収する。
 - parse_mode は **HTML** を採用 — MarkdownV2 はエスケープ対象が多く事故りやすい。エスケープ規定: **テキストノードは `& < >` の3文字、属性値(`href` 等)はさらに `"` と `'` も**エスケープする(canonical_url は外部制御可能であり、`"` 入り URL による属性破壊を防ぐ)。
 - 本文由来の文字列(タイトル・要約・理由)は**必ず HTML エスケープ**して埋め込む。URL は LLM 出力でなく **items テーブルの正規 URL のみ**(PROPOSAL のインジェクション対策)。scheme は 01 §4 の allowlist(http/https のみ)で挿入時に保証済み。
+- **リンクプレビューは全送信で止める(GH#377)**: sendMessage には必ず `link_preview_options` の `is_disabled: true` を付ける(Bot API 7.0+。旧 `disable_web_page_preview` の後継)。digest も、深掘りカード・返事・通知も同じ。付けるのは送信の payload を組む 1 か所(`TelegramApi.send_message`)で、呼び出し側では外せない。理由: 本文には LLM 出力や外部記事の文字列が入り、任意の URL を含みうる。プレビューがあると、本人が開かなくても Telegram のサーバーがその URL を取りに行く。リンクは押せるまま残し、本文・エスケープ・分割・ボタンは変えない。本文を持たない呼び出し(editMessageReplyMarkup など)は対象外。
 
 ## 2. 朝ダイジェストのメッセージフォーマット
 

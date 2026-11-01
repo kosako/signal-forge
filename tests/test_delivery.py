@@ -873,3 +873,34 @@ def test_send_message_reply_target(tmp_path) -> None:
         "allow_sending_without_reply": True,
     }
     assert "reply_parameters" not in recorder.requests[1]
+
+
+def test_send_message_always_disables_link_preview(tmp_path) -> None:
+    # GH#377: 本文は任意の URL を含みうるので、どの送信でもリンクプレビューを止める
+    recorder = ApiRecorder()
+    api = recorder.api()
+
+    api.send_message(CHAT_ID, "通常 https://example.com/a")
+    api.send_message(CHAT_ID, "返事", reply_to_message_id=55)
+    api.send_message(
+        CHAT_ID, "ボタン付き", reply_markup={"inline_keyboard": [[{"text": "x", "url": "https://b/"}]]}
+    )
+
+    assert len(recorder.requests) == 3
+    for payload in recorder.requests:
+        assert json.loads(payload["link_preview_options"]) == {"is_disabled": True}
+        assert "disable_web_page_preview" not in payload
+
+
+def test_digest_delivery_disables_link_preview_on_every_message(conn, tmp_path) -> None:
+    # GH#377: digest のヘッダもアイテムも、送信の payload で必ずプレビューを止める
+    a = add_item(conn, "https://a/1", title="タイトルA")
+    b = add_item(conn, "https://a/2", title="タイトルB")
+    digest_id = add_digest(conn, [a, b])
+    recorder = ApiRecorder()
+
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert len(recorder.requests) == 3
+    for payload in recorder.requests:
+        assert json.loads(payload["link_preview_options"]) == {"is_disabled": True}
