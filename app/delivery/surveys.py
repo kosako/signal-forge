@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, time, timedelta
 
 from app import source_health
@@ -24,7 +24,7 @@ from app.delivery.telegram import (
     TelegramApi,
     escape_and_truncate,
     escape_attr,
-    pack_lines,
+    pack_line_groups,
     visible_length,
 )
 from app.dig import DigCandidate, DigState, dig_states, next_morning_plan
@@ -45,6 +45,9 @@ DIG_BACKLOG_TITLE_MAX_CHARS = 80
 # 数えないので、超えたら行の単位で次の 1 通に分ける(GH#349)
 DIG_BACKLOG_TEXT_MAX_CHARS = 4000
 DIG_BACKLOG_CONTINUED = "🔖 未消化の深掘り候補(続き)"
+# 明朝の予定の行の skip のボタン(GH#349。設計 06 §2・04 §3)。1 通のボタンの数の上限は、
+# Telegram の inline keyboard の上限(約 100)に余裕を残す。超えるなら行の単位で次の 1 通に分ける
+DIG_BACKLOG_MAX_BUTTONS = 50
 # 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
 DIG_STATE_MARKS: dict[DigState, str] = {
     "planned": "🗓 明朝",
@@ -94,6 +97,22 @@ def followup_keyboard(item_id: int, *, selected: str | None = None) -> dict:
             {"text": _mark("はい", selected == "y"), "callback_data": f"f:{item_id}:y"},
             {"text": _mark("いいえ", selected == "n"), "callback_data": f"f:{item_id}:n"},
         ]]
+    }
+
+
+def backlog_skip_keyboard(item_ids: Sequence[int], *, selected: Collection[int] = ()) -> dict:
+    """未消化一覧の 1 通の skip のボタン(GH#349)。その 1 通に載せた明朝の予定の行ごとに 1 つ。
+
+    selected の item(外した item)のボタンに ✓ を付ける(押した後の盤面。設計 04 §3)。
+    """
+    return {
+        "inline_keyboard": [
+            [{
+                "text": _mark(f"⏭️ {item_id} を外す", item_id in selected),
+                "callback_data": f"b:{item_id}:p",
+            }]
+            for item_id in item_ids
+        ]
     }
 
 
@@ -171,10 +190,11 @@ def send_evening_survey(
     # 明朝の予定(GH#349)。夜の時点のキューを朝の選定と同じ規則で並べる(読むだけ)
     plan = next_morning_plan(conn, config, (now + timedelta(days=1)).strftime("%Y-%m-%d"))
     backlog_failure: DeliveryError | None = None
-    # 0件で予定も無い日は送らない(GH#88・GH#349)。長ければ行の単位で複数通に分ける(GH#349)
-    for text in _dig_backlog_message(conn, config, backlog, plan):
+    # 0件で予定も無い日は送らない(GH#88・GH#349)。長ければ行の単位で複数通に分ける(GH#349)。
+    # 明朝の予定の行がある 1 通には、その行の skip のボタンを付ける(GH#349)
+    for text, keyboard in _dig_backlog_message(conn, config, backlog, plan):
         try:
-            message_id = api.send_message(chat_id, text)
+            message_id = api.send_message(chat_id, text, reply_markup=keyboard)
         except DeliveryError as e:
             # 一覧の失敗で追い掛けを止めない。送れた分は台帳に残っている。失敗は追い掛けの
             # 後に投げ直し、内蔵タイマーの失敗として残す(夜アンケートは送信前に記録済みなので
@@ -225,8 +245,8 @@ def _dig_backlog_message(
     config: Config,
     backlog: list[sqlite3.Row],
     plan: Sequence[DigCandidate],
-) -> list[str]:
-    """未消化一覧の本文(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
+) -> list[tuple[str, dict | None]]:
+    """未消化一覧の本文とボタン(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
 
     `[dig].daily_cap = 0`(深掘りの段が止まっている)なら印も予定も出さず、今までの一覧のまま
     にする(GH#349。設計 06 §2)。予定の行は先頭に置いて上限(DIG_BACKLOG_MAX_ITEMS)に数えず、
@@ -265,7 +285,7 @@ def _dig_backlog_text(
     plan_rows: Sequence[Mapping] = (),
     states: Mapping[int, DigState | None] | None = None,
     digest_fill: int = 0,
-) -> list[str]:
+) -> list[tuple[str, dict | None]]:
     """未消化 🔖 一覧。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
 
     番号は item id(GH#104)。表示位置の連番だと日ごとに変わり、リプライ指定
@@ -277,6 +297,8 @@ def _dig_backlog_text(
     予定の行には上限が無い(`[dig].daily_cap` に上限が無い)ので、可視の長さが 1 通の上限
     (DIG_BACKLOG_TEXT_MAX_CHARS)を超えるときは行の単位で複数通に分ける。見出しは 1 通目、
     注記とリプライの案内は最後の 1 通に置き、2 通目以降には続きの見出しを付ける(GH#349)。
+    予定の行を載せた 1 通には、その行の skip のボタンを付ける(他の 1 通の行のボタンは付けない。
+    1 通のボタンは DIG_BACKLOG_MAX_BUTTONS 個まで。GH#349)。予定の行が無い 1 通はボタンなし。
     """
     states = states or {}
     lines = [f"🔖 未消化の深掘り候補({len(plan_rows) + len(rows)}件)"]
@@ -307,14 +329,24 @@ def _dig_backlog_text(
     )
     # 注記とリプライの案内は、空行で区切った 1 つの塊として最後の 1 通に置く
     lines.append("\n".join(["", *(notes + [""] if notes else []), hint]))
-    messages = pack_lines(
+    # 予定の行の添字(見出しの次から)→ item id。ボタンはその行を載せた 1 通に付ける
+    planned_at = {index: row["item_id"] for index, row in enumerate(plan_rows, start=1)}
+    groups = pack_line_groups(
         lines,
         DIG_BACKLOG_TEXT_MAX_CHARS - visible_length(DIG_BACKLOG_CONTINUED) - 1,
         measure=visible_length,
+        counted=planned_at,
+        max_counted=DIG_BACKLOG_MAX_BUTTONS,
     )
-    # 注記の塊が 2 通目以降の頭に来たときは、先頭の空行を続きの見出しで置き換える
-    continued = [message.removeprefix("\n") for message in messages[1:]]
-    return messages[:1] + [f"{DIG_BACKLOG_CONTINUED}\n{message}" for message in continued]
+    messages: list[tuple[str, dict | None]] = []
+    for position, group in enumerate(groups):
+        text = "\n".join(lines[index] for index in group)
+        if position > 0:
+            # 注記の塊が 2 通目以降の頭に来たときは、先頭の空行を続きの見出しで置き換える
+            text = DIG_BACKLOG_CONTINUED + "\n" + text.removeprefix("\n")
+        skip_ids = [planned_at[index] for index in group if index in planned_at]
+        messages.append((text, backlog_skip_keyboard(skip_ids) if skip_ids else None))
+    return messages
 
 
 def notify_run_failure(

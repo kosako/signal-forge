@@ -1171,6 +1171,68 @@ def test_requeue_during_generation_is_preserved(conn, config) -> None:
     assert len(api.sent) == 1  # 今回の生成物は公開・送信される
 
 
+def test_skip_button_during_generation_is_preserved(conn, config) -> None:
+    # GH#349: 生成中に未消化一覧の skip のボタンを押したときも、リプライのパスと同じく本人の
+    # 操作を優先する(done 化の compare-and-set が外れてパスが残る)。生成物のカードは届く
+    from app.delivery.poller import handle_update
+    from app.delivery.surveys import backlog_skip_keyboard
+
+    item = add_item(conn, "https://blog.example/post", language="ja")
+    enqueue(conn, item, angle="運用の観点", requested_at="2026-07-21T12:00:00Z")
+    conn.execute(
+        "INSERT INTO dig_backlog_messages (message_id, sent_date) VALUES (640, '2026-07-21')"
+    )
+    conn.commit()
+
+    class CallbackApi:
+        def __init__(self):
+            self.answered: list[str | None] = []
+
+        def answer_callback_query(self, callback_query_id, *, text=None):
+            self.answered.append(text)
+
+        def edit_message_reply_markup(self, chat_id, message_id, reply_markup):
+            pass
+
+    callback_api = CallbackApi()
+    press = {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": config.telegram.owner_user_id},
+            "data": f"b:{item}:p",
+            "message": {
+                "message_id": 640,
+                "chat": {"id": config.telegram.owner_chat_id},
+                "reply_markup": backlog_skip_keyboard([item]),
+            },
+        },
+    }
+
+    class SkipDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if not callback_api.answered:
+                handle_update(conn, config, callback_api, press, logger)
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, SkipDuringGeneration())
+
+    api = FakeApi()
+    run_dig_stage(conn, config, factory, api, logger, today="2026-07-22")
+
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert (row["status"], row["angle"], row["requested_at"]) == (
+        "passed", "運用の観点", "2026-07-21T12:00:00Z",
+    )
+    assert callback_api.answered[0].startswith(f"⏭️ {item} を外しました")
+    assert len(api.sent) == 1  # 今回の生成物は公開・送信される
+    card = conn.execute("SELECT message_id FROM dig_results WHERE item_id = ?", (item,)).fetchone()
+    assert card["message_id"] == 901
+
+
 def test_requeue_in_same_second_is_still_detected(conn, config) -> None:
     # updated_at は秒解像度。同一秒内の再指定(updated_at が同値のまま angle 等が
     # 変わる)も CAS が実値比較で検出する(Codex P2)

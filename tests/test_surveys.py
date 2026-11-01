@@ -18,6 +18,7 @@ from app.delivery.surveys import (
     STATE_SOURCE_REPORT_SENT,
     STATE_SURVEY_SENT,
     STATE_WATCHDOG_NOTIFIED,
+    backlog_skip_keyboard,
     pending_dig_items,
 )
 from app.delivery.telegram import DeliveryError
@@ -25,11 +26,16 @@ from app.jst import JST, today_jst
 from tests.test_delivery import add_digest, add_item
 from tests.test_poller import (
     CHAT_ID,
+    OWNER_ID,
     FakeApi,
     FakeWorker,
+    RedeliveringApi,
+    _Stopped,
     make_callback_update,
     make_config,
     make_reply_update,
+    saved_offset,
+    stop_before_saving_offset,
 )
 
 logger = logging.getLogger("test-surveys")
@@ -112,18 +118,7 @@ def test_survey_sent_once_at_time(conn, tmp_path) -> None:
 
 
 def test_survey_callback_data_carries_date(conn, tmp_path) -> None:
-    api = FakeApi()
-
-    class RecordingApi(FakeApi):
-        def __init__(self):
-            super().__init__()
-            self.markups: list[dict] = []
-
-        def send_message(self, chat_id, text, *, reply_markup=None):
-            self.markups.append(reply_markup)
-            return super().send_message(chat_id, text, reply_markup=reply_markup)
-
-    api = RecordingApi()
+    api = FakeApi()  # reply_markup を送った順に記録する
     now = jst_now("21:30")
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
@@ -1507,3 +1502,409 @@ def test_dig_backlog_plans_item_dug_today_and_requested_again(conn, tmp_path) ->
 
     backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
     assert backlog_line(backlog, item).startswith(f"{item}. 🗓 明朝 ")
+
+
+
+# --- 未消化一覧の skip のボタン(GH#349。設計 06 §2・04 §3) ---
+
+
+def sent_backlog(conn, config: Config, now: datetime | None = None):
+    """夜アンケートを送り、未消化一覧の (message_id, 本文, reply_markup) を送った順に返す。"""
+    api = FakeApi()
+    run_due_timers(conn, config, api, logger, now or jst_now("21:30"))
+    return [
+        (900 + position + 1, text, markup)
+        for position, ((_, text), markup) in enumerate(zip(api.sent, api.markups, strict=True))
+        if "未消化の深掘り候補" in text
+    ]
+
+
+def planned_ids_in(text: str) -> list[int]:
+    """1 通の本文の明朝の予定の行の番号(載せた順)。"""
+    return [
+        int(line.split(".", 1)[0])
+        for line in text.splitlines()
+        if re.match(r"\d+\. 🗓 明朝 ", line)
+    ]
+
+
+def skip_ids(markup: dict | None) -> list[int]:
+    if markup is None:
+        return []
+    return [int(row[0]["callback_data"].split(":")[1]) for row in markup["inline_keyboard"]]
+
+
+def add_queued_bookmark(conn, url: str, *, enqueued_at: str, **queue) -> int:
+    item = add_item(conn, url, title=f"記事 {url}")
+    add_dig_reaction(conn, item, (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d"))
+    add_body(conn, item)
+    add_queue(conn, item, enqueued_at=enqueued_at, **queue)
+    return item
+
+
+def skip_press(
+    item_id: int,
+    message_id: object,
+    markup: dict | None,
+    *,
+    update_id: int = 1,
+    from_id: int = OWNER_ID,
+    chat_id: object = CHAT_ID,
+) -> dict:
+    """skip のボタンの callback。Telegram は押されたメッセージの reply_markup も渡す。"""
+    message: dict = {"message_id": message_id, "chat": {"id": chat_id}}
+    if markup is not None:
+        message["reply_markup"] = markup
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "from": {"id": from_id},
+            "data": f"b:{item_id}:p",
+            "message": message,
+        },
+    }
+
+
+def queue_row(conn, item_id: int) -> sqlite3.Row:
+    return conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item_id,)).fetchone()
+
+
+def test_skip_buttons_only_on_plan_rows(conn, tmp_path) -> None:
+    # 「明朝」の行ごとに 1 つ。⏳ 待ち・⚠️ 本文なしの行には付けない
+    silence_watchdog(conn)
+    first = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-03T00:00:00Z")
+    second = add_queued_bookmark(conn, "https://a/2", enqueued_at="2026-07-02T00:00:00Z")
+    waiting = add_queued_bookmark(conn, "https://a/3", enqueued_at="2026-07-01T00:00:00Z")
+    no_body = add_item(conn, "https://a/no-body")
+    add_dig_reaction(conn, no_body, (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+    [(_, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
+
+    assert planned_ids_in(text) == [first, second]
+    assert "⏳ 待ち " in backlog_line(text, waiting)
+    assert "⚠️ 本文なし " in backlog_line(text, no_body)
+    assert markup == {
+        "inline_keyboard": [
+            [{"text": f"⏭️ {first} を外す", "callback_data": f"b:{first}:p"}],
+            [{"text": f"⏭️ {second} を外す", "callback_data": f"b:{second}:p"}],
+        ]
+    }
+    biggest = 2**63 - 1  # SQLite の id の最大でも callback_data は 64 バイト以内(設計 04 §3)
+    assert len(f"b:{biggest}:p".encode()) <= 64
+
+
+def test_no_skip_buttons_without_plan_or_when_daily_cap_zero(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-03T00:00:00Z")
+
+    [(_, _, stopped)] = sent_backlog(conn, config_with_cap(tmp_path, 0))
+    assert stopped is None  # [dig].daily_cap = 0 は今の一覧のまま(設計 06 §2)
+
+    conn.execute("UPDATE dig_queue SET status = 'passed' WHERE item_id = ?", (item,))
+    set_state(conn, STATE_SURVEY_SENT, "")  # 同じ日にもう一度送る
+    [(_, text, no_plan)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
+    assert planned_ids_in(text) == []
+    assert no_plan is None
+
+
+def test_skip_buttons_follow_rows_when_list_is_split(conn, tmp_path) -> None:
+    # 一覧が複数通に分かれても(GH#349)、どの 1 通も、その 1 通に載せた予定の行のボタンだけを持つ
+    silence_watchdog(conn)
+    planned = []
+    for i in range(60):
+        item = add_queued_bookmark(
+            conn, f"https://a/plan-{i}?" + "q" * 300, enqueued_at=f"2026-07-01T00:{i:02d}:00Z"
+        )
+        conn.execute(
+            "UPDATE analyses SET title_ja = ? WHERE item_id = ?", ("長い題" * 60 + str(i), item)
+        )
+        planned.append(item)
+
+    messages = sent_backlog(conn, config_with_cap(tmp_path, 60))
+
+    assert len(messages) >= 2
+    for _, text, markup in messages:
+        assert skip_ids(markup) == planned_ids_in(text)
+    assert sorted(i for _, _, markup in messages for i in skip_ids(markup)) == sorted(planned)
+    assert all(markup is not None for _, _, markup in messages[:-1])
+
+
+def test_skip_buttons_per_message_are_capped(conn, tmp_path) -> None:
+    # 短い行なら 1 通に多くの行が入る。ボタンは 1 通に DIG_BACKLOG_MAX_BUTTONS 個までにし、
+    # 超える分は次の 1 通に分ける(Telegram の inline keyboard の上限)
+    from app.delivery.surveys import DIG_BACKLOG_MAX_BUTTONS
+
+    silence_watchdog(conn)
+    count = DIG_BACKLOG_MAX_BUTTONS * 2 + 3
+    planned = [
+        add_queued_bookmark(
+            conn, f"https://a/{i}", enqueued_at=f"2026-07-01T{i // 60:02d}:{i % 60:02d}:00Z"
+        )
+        for i in range(count)
+    ]
+    conn.execute("UPDATE analyses SET title_ja = 't'")
+
+    messages = sent_backlog(conn, config_with_cap(tmp_path, count))
+
+    assert [len(skip_ids(markup)) for _, _, markup in messages] == [
+        DIG_BACKLOG_MAX_BUTTONS, DIG_BACKLOG_MAX_BUTTONS, 3,
+    ]
+    for _, text, markup in messages:
+        assert skip_ids(markup) == planned_ids_in(text)
+    assert sorted(i for _, _, markup in messages for i in skip_ids(markup)) == sorted(planned)
+    assert messages[0][1].startswith(f"🔖 未消化の深掘り候補({count}件)\n")
+    assert all(t.startswith("🔖 未消化の深掘り候補(続き)\n") for _, t, _ in messages[1:])
+    assert "↩️ " in messages[-1][1]
+
+
+def add_question(conn) -> int:
+    """受け付け済みの質問を 1 件作り、id を返す(受付の順序の印の比較用。GH#235)。"""
+    card_item = add_item(conn, "https://a/card")
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', 700)",
+        (card_item,),
+    ).lastrowid
+    return conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (?, '質問', 81)",
+        (dig_id,),
+    ).lastrowid
+
+
+def test_skip_button_passes_like_reply(conn, tmp_path) -> None:
+    # 押した後はリプライのパスと同じ(status = passed。観点・requested_at・受付の順序の印)。
+    # 未消化は変えないので、次の夜の一覧に ⏭️ パスで残る。盤面は押したボタンに ✓
+    silence_watchdog(conn)
+    by_button = add_queued_bookmark(
+        conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z",
+        requested_at="2026-07-04T00:00:00Z",
+    )
+    by_reply = add_queued_bookmark(
+        conn, "https://a/2", enqueued_at="2026-07-01T00:00:00Z",
+        requested_at="2026-07-03T00:00:00Z",
+    )
+    conn.execute("UPDATE dig_queue SET angle = '運用の観点'")
+    question_id = add_question(conn)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+    assert planned_ids_in(text) == [by_button, by_reply]
+
+    api = FakeApi([
+        [skip_press(by_button, message_id, markup, update_id=1)],
+        [make_reply_update(f"{by_reply} はパス", message_id, update_id=2)],
+    ])
+    poll_once(conn, config, api, logger)
+    poll_once(conn, config, api, logger)
+
+    button_row, reply_row = queue_row(conn, by_button), queue_row(conn, by_reply)
+    assert (button_row["status"], button_row["angle"], button_row["requested_at"]) == (
+        "passed", "運用の観点", "2026-07-04T00:00:00Z",
+    )
+    assert (reply_row["status"], reply_row["angle"], reply_row["requested_at"]) == (
+        "passed", "運用の観点", "2026-07-03T00:00:00Z",
+    )
+    assert button_row["backlog_op_question_id"] == question_id
+    assert reply_row["backlog_op_question_id"] == question_id
+    kinds = {row["kind"] for row in conn.execute(
+        "SELECT kind FROM signals WHERE item_id = ?", (by_button,)
+    )}
+    assert kinds == {"reaction"}  # signals には書かない
+    assert api.answered == [
+        ("cb1", f"⏭️ {by_button} を外しました(戻すときは一覧へ「{by_button} も」とリプライ)")
+    ]
+    assert api.edited == [(CHAT_ID, message_id, {
+        "inline_keyboard": [
+            [{"text": f"⏭️ {by_button} を外す ✓", "callback_data": f"b:{by_button}:p"}],
+            [{"text": f"⏭️ {by_reply} を外す", "callback_data": f"b:{by_reply}:p"}],
+        ]
+    })]
+
+    set_state(conn, STATE_SURVEY_SENT, "")  # 次の夜の一覧には ⏭️ パスで残る
+    [(_, next_text, _)] = sent_backlog(conn, config)
+    assert "⏭️ パス <a " in backlog_line(next_text, by_button)
+
+
+def test_skip_button_keeps_checks_and_is_idempotent_and_undoable(conn, tmp_path) -> None:
+    # 前に押したボタンの ✓ は残る。二重押しは外し済みと知らせ、戻すのはリプライ(「{id} も」)
+    silence_watchdog(conn)
+    first = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-02T00:00:00Z")
+    second = add_queued_bookmark(conn, "https://a/2", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+
+    api = FakeApi([
+        [skip_press(first, message_id, markup, update_id=1)],
+        [skip_press(second, message_id, markup, update_id=2)],
+        [skip_press(first, message_id, markup, update_id=3)],
+    ])
+    for _ in range(3):
+        poll_once(conn, config, api, logger)
+
+    assert queue_row(conn, first)["status"] == "passed"
+    assert queue_row(conn, second)["status"] == "passed"
+    assert api.answered[2] == ("cb3", f"⏭️ {first} は外し済みです")
+    both_checked = backlog_skip_keyboard([first, second], selected={first, second})
+    assert [markup for _, _, markup in api.edited] == [
+        backlog_skip_keyboard([first, second], selected={first}),
+        both_checked,
+        both_checked,
+    ]
+
+    undo = FakeApi([[make_reply_update(f"{first} も", message_id, update_id=4)]])
+    poll_once(conn, config, undo, logger)
+    assert queue_row(conn, first)["status"] == "queued"
+
+    again = FakeApi([[skip_press(first, message_id, markup, update_id=5)]])
+    poll_once(conn, config, again, logger)
+    assert queue_row(conn, first)["status"] == "passed"
+    assert again.answered[0][1].startswith(f"⏭️ {first} を外しました")
+
+
+def test_skip_button_on_previous_nights_list_is_accepted(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    conn.execute(
+        "INSERT INTO dig_backlog_messages (message_id, sent_date) VALUES (321, '2026-07-01')"
+    )
+
+    api = FakeApi([[skip_press(item, 321, backlog_skip_keyboard([item]))]])
+    poll_once(conn, config_with_cap(tmp_path, 2), api, logger)
+
+    assert queue_row(conn, item)["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    ("press", "answered"),
+    [
+        # allowlist 外(設計 04 §6): 応答も返さない
+        ({"from_id": OWNER_ID + 1}, []),
+        # 未消化一覧として送っていないメッセージ(callback_data だけを信じない)
+        ({"message_id": 9999}, [("cb1", "⚠️ この一覧には対応できません")]),
+        ({"message_id": "901"}, [("cb1", "⚠️ この一覧には対応できません")]),
+        # owner の chat 以外
+        ({"chat_id": CHAT_ID + 1}, [("cb1", "⚠️ この一覧には対応できません")]),
+    ],
+)
+def test_skip_button_rejected_unless_owner_presses_recorded_list(
+    conn, tmp_path, press, answered
+) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    options = {"message_id": message_id, **press}
+
+    api = FakeApi([[skip_press(item, options.pop("message_id"), markup, **options)]])
+    poll_once(conn, config, api, logger)
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["backlog_op_question_id"]) == ("queued", None)
+    assert api.answered == answered
+    assert api.edited == []
+
+
+def test_skip_button_without_message_is_rejected(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    sent_backlog(conn, config)
+    update = skip_press(item, 0, None)
+    del update["callback_query"]["message"]
+
+    api = FakeApi([[update]])
+    poll_once(conn, config, api, logger)
+
+    assert queue_row(conn, item)["status"] == "queued"
+    assert api.answered == [("cb1", "⚠️ この一覧には対応できません")]
+
+
+@pytest.mark.parametrize(
+    ("status", "answered"),
+    [
+        ("done", "✅ {id} はもう掘り終えています"),  # 朝に掘り終えた後の古い一覧
+        (None, "⚠️ この番号は深掘りのキューにありません"),  # 偽造・壊れた data
+    ],
+)
+def test_skip_button_for_item_out_of_queue_writes_nothing(
+    conn, tmp_path, status, answered
+) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    if status is None:
+        conn.execute("DELETE FROM dig_queue")
+    else:
+        conn.execute("UPDATE dig_queue SET status = ? WHERE item_id = ?", (status, item))
+    before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")]
+
+    api = FakeApi([[skip_press(item, message_id, markup)]])
+    poll_once(conn, config, api, logger)
+
+    assert [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")] == before
+    assert api.answered == [("cb1", answered.format(id=item))]
+    assert api.edited == []
+
+
+def test_redelivered_skip_press_is_safe(conn, tmp_path, monkeypatch) -> None:
+    # GH#181: 反映した後、offset を保存する前に止まると同じ callback が再配達される。
+    # キューは passed のまま、外し済みとして知らせ、offset を進める
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    api = RedeliveringApi([skip_press(item, message_id, markup, update_id=7)])
+    stop_before_saving_offset(monkeypatch)
+
+    with pytest.raises(_Stopped):
+        poll_once(conn, config, api, logger)
+    poll_once(conn, config, api, logger)  # 再起動の後
+
+    assert api.offsets == [None, None]  # 同じ callback が再配達された
+    assert queue_row(conn, item)["status"] == "passed"
+    assert [text for _, text in api.answered] == [
+        f"⏭️ {item} を外しました(戻すときは一覧へ「{item} も」とリプライ)",
+        f"⏭️ {item} は外し済みです",
+    ]
+    assert saved_offset(conn) == "8"
+
+
+def test_skip_button_db_failure_answers_warning(conn, tmp_path, monkeypatch) -> None:
+    from app.delivery import poller
+
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+
+    def locked(conn, instructions):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(poller, "apply_instructions", locked)
+    api = FakeApi([[skip_press(item, message_id, markup)]])
+    poll_once(conn, config, api, logger)
+
+    assert queue_row(conn, item)["status"] == "queued"
+    assert api.answered == [("cb1", "⚠️ 外せませんでした。もう一度押してください")]
+    assert api.edited == []
+    assert saved_offset(conn) == "2"  # 押し直せば済むので、再配達を待たずに進める
+
+
+@pytest.mark.parametrize(
+    "markup", [None, {"inline_keyboard": "x"}, {"inline_keyboard": [[{"callback_data": 1}]]}]
+)
+def test_skip_button_with_unreadable_markup_applies_without_board(
+    conn, tmp_path, markup
+) -> None:
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, _)] = sent_backlog(conn, config)
+
+    api = FakeApi([[skip_press(item, message_id, markup)]])
+    poll_once(conn, config, api, logger)
+
+    assert queue_row(conn, item)["status"] == "passed"
+    assert api.edited == []
