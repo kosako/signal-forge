@@ -9,6 +9,9 @@
   区切りとして扱い(「GPT-5」の 5 のような本文中の数字を誤検出しない)、番号の直後が
   パス語だけなら除外、それ以外は残り全文が観点。観点は自由文のまま調査段(GH#105)へ
   渡るため、LLM は使わない(poller を軽く保つ)
+- 朝の選定のキューの規則(①リプライ指定 ②自動キュー。設計 06 §3)もここに置き、朝の調査段
+  (app.deepdive)と夜の未消化一覧の「明朝の予定」(app.delivery.surveys)が同じ関数を呼ぶ
+  (GH#349。設計 06 §2)。③ の digest の上位は朝の digest で決まるので app.deepdive に残す
 - 本モジュールは delivery 層に依存しない(候補集合は呼び出し側が渡す)
 """
 
@@ -16,7 +19,11 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
+
+from app.config import Config
 
 # パス判定: 番号の直後の残りが「(助詞)+ パス語 (+軽い述語)」だけのとき除外。
 # 観点の文中に現れるパス語(「クリティカルパスの観点で」)は除外にしない
@@ -174,3 +181,168 @@ def apply_instructions(
 def queue_item_ids(conn: sqlite3.Connection) -> set[int]:
     """キュー在籍の item id 集合(リプライで指定可能な番号の一部)。"""
     return {row["item_id"] for row in conn.execute("SELECT item_id FROM dig_queue")}
+
+
+@dataclass(frozen=True)
+class DigCandidate:
+    item_id: int
+    angle: str | None
+    requested: bool  # リプライ指定(requested_at あり)
+    # done 化の compare-and-set 用スナップショット(updated_at は秒解像度のため、
+    # 同一秒内の更新も検出できるよう status 以外の実値も比較する。Codex P2)。
+    # digest の上位から選んだ候補(from_digest)はキューの行が無いので None
+    queue_updated_at: str | None
+    queue_requested_at: str | None
+    title: str | None
+    author: str | None
+    published_at: str | None
+    canonical_url: str
+    body: str | None  # documents.extracted_text
+    language: str | None
+    title_ja: str | None  # 既存分析(あれば)
+    summary: str | None
+    # 同じ item の前回の解説ノート(調べ直し = done からの再指定。GH#137)。新しいノートからリンクする
+    previous_note_name: str | None = None
+    # 本文を取得・抽出した JST の日付(documents.extracted_at)。原文・対訳ノートの fetched に
+    # 書く(深掘りした日ではない。GH#239)
+    fetched_date: str | None = None
+    # その日の digest の上位から選んだ(設計 06 §3 の ③。GH#349)。キューの行は記帳のときに足す
+    from_digest: bool = False
+
+
+def has_material(body: str | None, config: Config) -> bool:
+    """調査段の材料が足りるか(documents の抽出本文が min_body_chars 字以上)。
+
+    朝の選定と、深掘りカードへの調べ直しの受付(dig_answer。GH#197)、夜の未消化一覧の
+    ⚠️ 本文なしの印(GH#349)が同じ条件を使う。
+    """
+    return bool(body) and len(body) >= config.dig.min_body_chars
+
+
+def select_from_queue(
+    conn: sqlite3.Connection, config: Config, limit: int, day: str
+) -> tuple[list[DigCandidate], list[DigCandidate]]:
+    """キュー(設計 06 §3 の ①②)から、優先順に材料十分な candidate を limit 件選ぶ。読むだけ。
+
+    戻り値 = (選定, 材料不足のリプライ指定)。材料不足の自動選出は枠を消費せず
+    静かに残す(未消化一覧に見えている。ここで毎朝 ERROR を出すとノイズになる)。
+    同日に実行済みの item は選ばない(done 直後の再指定を同日中に再実行すると
+    ノート名が衝突し、カードが古いノートを指しうる。Codex P2。翌朝に掘られる =
+    「夜選ぶ → 朝届く」のリズム通り)。
+    朝の調査段と夜の未消化一覧の「明朝の予定」が共用する(GH#349。next_morning_plan)。
+    """
+    rows = conn.execute(
+        """
+        SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
+               i.title, i.author, i.published_at, i.canonical_url,
+               d.extracted_text, d.language,
+               date(d.extracted_at, '+9 hours') AS fetched_date,
+               a.title_ja, a.summary,
+               (SELECT r.note_name FROM dig_results r
+                WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
+                ORDER BY r.id DESC LIMIT 1) AS previous_note_name
+        FROM dig_queue q
+        JOIN items i ON i.id = q.item_id
+        LEFT JOIN documents d ON d.item_id = q.item_id
+        LEFT JOIN analyses a ON a.id = (
+            SELECT max(id) FROM analyses
+            WHERE item_id = q.item_id AND degraded = 0
+        )
+        WHERE q.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM dig_results r
+            WHERE r.item_id = q.item_id AND date(r.created_at, '+9 hours') = ?
+          )
+        ORDER BY (q.requested_at IS NULL), q.requested_at DESC, q.enqueued_at DESC
+        """,
+        (day,),
+    ).fetchall()
+    selected: list[DigCandidate] = []
+    skipped_requested: list[DigCandidate] = []
+    for row in rows:
+        if len(selected) >= limit:
+            break
+        candidate = DigCandidate(
+            item_id=row["item_id"],
+            angle=row["angle"],
+            requested=row["requested_at"] is not None,
+            queue_updated_at=row["updated_at"],
+            queue_requested_at=row["requested_at"],
+            title=row["title"],
+            author=row["author"],
+            published_at=row["published_at"],
+            canonical_url=row["canonical_url"],
+            body=row["extracted_text"],
+            language=row["language"],
+            title_ja=row["title_ja"],
+            summary=row["summary"],
+            previous_note_name=row["previous_note_name"],
+            fetched_date=row["fetched_date"],
+        )
+        if has_material(candidate.body, config):
+            selected.append(candidate)
+        elif candidate.requested:
+            skipped_requested.append(candidate)
+        # 材料不足の自動選出は対象外のまま(キューに残る。docstring 参照)
+    return selected, skipped_requested
+
+
+def next_morning_plan(conn: sqlite3.Connection, config: Config, day: str) -> list[DigCandidate]:
+    """明朝の予定(GH#349。設計 06 §2): キューから朝の選定と同じ規則で選ぶ、翌日の上限の件数ぶん。
+
+    day は翌朝の JST の暦日。夜の時点では翌日の実行数は 0 なので、件数は `[dig].daily_cap`。
+    ③(digest の上位)は朝の digest で決まるので含めない。読むだけでキューは変えない。
+    """
+    if config.dig.daily_cap <= 0:
+        return []
+    planned, _ = select_from_queue(conn, config, config.dig.daily_cap, day)
+    return planned
+
+
+# 未消化一覧の各行の深掘りの状態(GH#349。設計 06 §2)。None = 印なし(キューに無く本文もある)
+DigState = Literal["planned", "waiting", "done", "passed", "no_body"]
+
+
+def dig_states(
+    conn: sqlite3.Connection,
+    config: Config,
+    item_ids: Iterable[int],
+    planned_ids: set[int],
+) -> dict[int, DigState | None]:
+    """item ごとの深掘りの状態(GH#349。設計 06 §2)。読むだけ。
+
+    - planned: 明朝の予定(planned_ids。next_morning_plan の結果)
+    - done / passed: dig_queue の status のまま(本文の有無を問わない)
+    - waiting: queued で本文もあるが、予定の枠の外
+    - no_body: queued のまま、またはキューに無い item で、材料不足(has_material と同じ条件)
+    - None: キューに無く本文もある(リプライで指定すれば掘る)
+    """
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT i.id AS item_id, q.status, d.extracted_text
+        FROM items i
+        LEFT JOIN dig_queue q ON q.item_id = i.id
+        LEFT JOIN documents d ON d.item_id = i.id
+        WHERE i.id IN ({placeholders})
+        """,
+        ids,
+    ).fetchall()
+    states: dict[int, DigState | None] = {}
+    for row in rows:
+        item_id = row["item_id"]
+        status = row["status"]
+        if item_id in planned_ids:
+            states[item_id] = "planned"
+        elif status in ("done", "passed"):
+            states[item_id] = status
+        elif not has_material(row["extracted_text"], config):
+            states[item_id] = "no_body"
+        elif status == "queued":
+            states[item_id] = "waiting"
+        else:
+            states[item_id] = None
+    return states
