@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.export.neutralize import neutralize_markdown
+from app.export.neutralize import neutralize_markdown, neutralize_note
 
 # --- 画像の埋め込み ---
 
@@ -15,7 +15,7 @@ from app.export.neutralize import neutralize_markdown
         ('![図](https://e.example/a.png "題")', '[画像: 図](https://e.example/a.png "題")'),
         ("![図](//e.example/a.png)", "[画像: 図](//e.example/a.png)"),
         ("![図](<https://e.example/a b.png>)", "[画像: 図](https://e.example/a%20b.png)"),
-        ("![図](https://e.example/a_(1).png)", "[画像: 図](https://e.example/a_%281%29.png)"),
+        ("![図](https://e.example/a_(1).png)", "[画像: 図](https://e.example/a_(1).png)"),
         ("![図](data:image/png;base64,AAAA)", "[画像: 図](data:image/png;base64,AAAA)"),
         ("![図](file:///tmp/a.png)", "[画像: 図](file:///tmp/a.png)"),
         # 宛先に実体参照(`&#58;` = `:`)があっても vault の中とはみなさない
@@ -53,6 +53,7 @@ def test_unparsed_image_syntax_is_escaped(source) -> None:
     [
         "![図](attachments/a.png)",
         "![図](a%20b.png)",
+        "![図](a_(1).png)",
         "![[ノート]]",
         "![[画像.png|200]]",
         "![[ノート#見出し]]",
@@ -60,6 +61,19 @@ def test_unparsed_image_syntax_is_escaped(source) -> None:
 )
 def test_vault_local_embed_is_kept(source) -> None:
     assert neutralize_markdown(source) == source
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("![図](<attachments/a.png>)", "![図](attachments/a.png)"),
+        ("![図](<添付/a b.png>)", "![図](添付/a%20b.png)"),
+        ("![図](<a(1).png>)", "![図](a(1).png)"),
+    ],
+)
+def test_vault_local_embed_in_angle_form_is_kept(source, expected) -> None:
+    # `<>` の形でも vault の中の添付は埋め込みのまま(`<` を残さない形にする)
+    assert neutralize_markdown(source) == expected
 
 
 @pytest.mark.parametrize(
@@ -142,9 +156,12 @@ def test_text_without_embeds_or_html_is_unchanged(source) -> None:
 def test_angle_link_destination_drops_brackets() -> None:
     assert neutralize_markdown("[a](<https://e.example/a b>)") == "[a](https://e.example/a%20b)"
     assert neutralize_markdown('[a](<https://e.example/a> "題")') == '[a](https://e.example/a "題")'
-    # 括弧を含む・`)` で閉じない形は宛先と読まない(`<` は escape する)
-    assert neutralize_markdown("[a](<x(1).md>)") == "[a](&lt;x(1).md>)"
+    # 括弧は対応が取れていればそのまま、取れていなければ % で表す(リンクのまま押せる)
+    assert neutralize_markdown("[a](<x(1).md>)") == "[a](x(1).md)"
+    assert neutralize_markdown("[a](<x(.md>)") == "[a](x%28.md)"
+    # `)` で閉じない形は宛先と読まない(`<` は escape する。CommonMark でもリンクにならない)
     assert neutralize_markdown("[a](<img src=x>") == "[a](&lt;img src=x>"
+    assert neutralize_markdown("[a](<b c> d)") == "[a](&lt;b c> d)"
 
 
 # --- コード(描画されない場所は触らない) ---
@@ -214,6 +231,19 @@ def test_ambiguous_inline_code_is_not_trusted(source) -> None:
     assert "<img" not in out
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        '[^a`b] <img src="https://e.example/p.png"> `\n\n[^a`b]: 注',
+        "本文[^`x] <iframe src=https://e.example/> `",
+    ],
+)
+def test_footnote_label_does_not_protect_inline_code(source) -> None:
+    # 脚注の参照のラベルはインラインのコードより先に読まれうる(コードと見なさない)
+    out = neutralize_markdown(source)
+    assert "<img" not in out and "<iframe" not in out
+
+
 def test_full_width_space_line_does_not_end_paragraph() -> None:
     # 全角空白だけの行は CommonMark では空行でない(段落が続く)
     out = neutralize_markdown("`a\n\u3000\nb` <img src=x> `c`")
@@ -239,3 +269,14 @@ def test_applying_twice_changes_nothing(source) -> None:
 
 def test_crlf_is_normalized_and_kept_as_lines() -> None:
     assert neutralize_markdown("a\r\nb <i>\r\n") == "a\nb &lt;i>\n"
+
+
+def test_neutralize_note_keeps_frontmatter_and_fixes_body() -> None:
+    note = '---\ntitle: "<b>題</b>"\nurl: https://e.example/\n---\n\n![図](https://e.example/a.png)\n'
+    assert neutralize_note(note) == (
+        '---\ntitle: "<b>題</b>"\nurl: https://e.example/\n---\n\n'
+        "[画像: 図](https://e.example/a.png)\n"
+    )
+    assert neutralize_note(neutralize_note(note)) == neutralize_note(note)
+    # frontmatter の無いノートは全体を直す
+    assert neutralize_note("<img src=x>") == "&lt;img src=x>"

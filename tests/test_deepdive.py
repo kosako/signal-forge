@@ -2742,3 +2742,29 @@ def test_review_callout_findings_have_no_remote_embed(conn, config) -> None:
     assert_no_remote_embed(note)
     assert '&lt;img src="https://img.example/p.png">' in note
     assert "[画像: x](https://img.example/q.png)" in note
+
+
+def test_unpublished_ledger_note_is_neutralized_on_publish(conn, config) -> None:
+    # 直しより前に台帳へ記帳した未公開の本文も、公開の直前に直す(GH#377)
+    item = add_item(conn, "https://blog.example/post")
+    note = (
+        '---\nid: 1\ntitle: "<b>題</b>"\n---\n\n## 概要\n\n'
+        "![図](https://img.example/a.png) <img src=https://img.example/b.png>\n"
+    )
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, source_note_name, card_text,"
+        " note_markdown, source_note_markdown)"
+        " VALUES (?, 'n-深掘り', 'n-対訳', 'カード', ?, ?)",
+        (item, note, "<iframe src=https://img.example/f></iframe>"),
+    )
+    conn.commit()
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-23")
+
+    published = (deepdive_dir(config) / "n-深掘り.md").read_text()
+    assert published == (
+        '---\nid: 1\ntitle: "<b>題</b>"\n---\n\n## 概要\n\n'
+        "[画像: 図](https://img.example/a.png) &lt;img src=https://img.example/b.png>\n"
+    )
+    source = (deepdive_dir(config) / "n-対訳.md").read_text()
+    assert source == "&lt;iframe src=https://img.example/f>&lt;/iframe>"

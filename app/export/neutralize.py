@@ -12,11 +12,11 @@ Obsidian はノートを開くだけで、それらの参照先(外部のホス�
   `![[…]]` の中身が URL の形(`:` や `//` を含む)のときと、直後に `(`・`[`・`!` が続いて
   ふつうの画像と読まれうるときは、同じく `\\!` にする
 - 生の HTML のタグ・コメントの始まりの `<` を `&lt;` にする。表示は同じ文字のまま、描画されない。
-  `<https://…>` の自動リンクは残す。リンクの宛先の `](<…>)` の形は、`<>` を外した形に直す
+  `<https://…>` の自動リンクは残す。リンク・画像の宛先の `(<…>)` の形は、`<>` を外した形に直す
 - リンク `[text](url)` と裸の URL は変えない(押すまで読みに行かない)
 - コード(フェンスとインラインのコード)の中は HTML として描画されないので触らない。ただし
   コードかどうかの解釈が揺れうる形(字下げや入れ子のフェンス、閉じていないフェンス、表・数式・
-  リンクの宛先と同じ段落のインラインのコードなど)は守らずに直す。そのときコードの中の表示が
+  脚注・リンクの宛先と同じ段落のインラインのコードなど)は守らずに直す。そのときコードの中の表示が
   `&lt;` などになるだけで、読み込みは起きない
 
 埋め込みも HTML も含まない入力は、改行の形(`\\r\\n` は `\\n` に揃える)を除いてそのまま返す。
@@ -40,19 +40,20 @@ _AUTOLINK = re.compile(
 # インラインの画像 `![alt](宛先 "タイトル")`。1 行の中だけを見る(合わない形は `\!` にする)
 _INLINE_IMAGE = re.compile(
     r"!\[(?P<alt>(?:[^\[\]\\\n]|\\.)*)\]"
-    r"\([ \t]*(?:<(?P<angle>[^<>\n]*)>|(?P<bare>(?:[^\s()<>\\]|\\\S|\([^\s()<>\\]*\))+))"
+    r"\([ \t]*(?:<(?P<angle>[^<>\n]*)>|(?P<bare>(?:[^\s()<>\\]|\\[^\s<>]|\([^\s()<>\\]*\))+))"
     r"(?P<title>[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\)"
 )
 # vault の中を指す相対パス(スキームの `:`・`//` で始まる形・`\`・実体参照の `&` を含まない)
-_LOCAL_TARGET = re.compile(r"(?!//)[\w.~/%+\-]+")
+_LOCAL_TARGET = re.compile(r"(?!//)[\w.~/%+\-()]+")
 # `![[…]]` の直後が `(` / `[` なら、CommonMark では角括弧入りの代替テキストの画像になる。
 # 直後の `![` はリンクに直すと `[` になるので、同じく残さない
 _WIKI_EMBED = re.compile(r"!\[\[([^\[\]\n]*)\]\](?![(\[!])")
 _URL_LIKE = re.compile(r":|//|\\")
-# リンクの宛先の `<…>` の形(`](` の直後で、後ろにタイトルと `)` が続くときだけ)。中に括弧や
-# `&lt;` を含む形は扱わない(直した後の出力にもう一度かけたときに、別の形に読み直さないため)
+# リンクの宛先の `<…>` の形(`](` の直後で、後ろにタイトルと `)` が続くときだけ)。この形に
+# 合わない `](<` の `<` は escape する(CommonMark では `<` で始まる宛先は `<…>` の形だけなので、
+# リンクにはならず表示も変わらない。直した後の出力にもう一度かけたときに、別の形に読み直さない)
 _ANGLE_DEST = re.compile(
-    r"<((?:(?!&lt;)[^<>()\[\]\n])*)>"
+    r"<((?:(?!&lt;)[^<>\n])*)>"
     r"(?=[ \t]*(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\))?[ \t]*\))"
 )
 
@@ -63,8 +64,26 @@ _FENCE_OPEN = re.compile(r"(`{3,}|~{3,})(.*)")
 _BACKTICK_RUN = re.compile(r"`+")
 # 同じまとまり(_neutralize_block)にあると、インラインのコードの区切りの解釈がコードの外の
 # 規則に左右されうる形
-# (リンク・参照の定義の宛先、wikilink、脚注、表の区切り、数式、Obsidian のコメント)
-_SPAN_AMBIGUOUS = re.compile(r"\]\(|\]:|\[\[|\^\[|\||\$|%%")
+# (リンク・参照の定義の宛先、wikilink、脚注の参照 `[^…]`・インラインの脚注 `^[…]`、表の区切り、
+# 数式、Obsidian のコメント。脚注のラベルはインラインのコードより先に読まれうる)
+_SPAN_AMBIGUOUS = re.compile(r"\]\(|\]:|\[\[|\[\^|\^\[|\||\$|%%")
+
+
+# ノートの先頭の frontmatter(render_frontmatter の出力。値の中の改行の後ろは字下げされるので、
+# 最初の `\n---\n` が終わり)
+_FRONT_MATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+
+
+def neutralize_note(content: str) -> str:
+    """ノート全体のうち、先頭の frontmatter を除いた本文を neutralize_markdown で直す。
+
+    frontmatter は YAML シリアライザの出力で、値は描画されないので触らない。frontmatter が
+    無ければ全体を直す。neutralize_markdown は 2 回かけても変わらないので、組み立てのときに
+    直した本文にもう一度かけてよい。
+    """
+    m = _FRONT_MATTER.match(content)
+    head = m[0] if m else ""
+    return head + neutralize_markdown(content[len(head) :])
 
 
 def neutralize_markdown(text: str) -> str:
@@ -205,7 +224,7 @@ def _neutralize_inline(text: str) -> str:
                 out.append(m[0])
                 i = m.end()
                 continue
-            if _TAG_START.match(text, i):
+            if _TAG_START.match(text, i) or text.endswith("](", 0, i):
                 out.append("&lt;")
                 i += 1
                 continue
@@ -226,22 +245,39 @@ def _neutralize_image(text: str, i: int) -> tuple[str, int]:
         return "\\!", i + 1  # 参照形式・解釈しきれない形は埋め込みにしない
     alt = _neutralize_inline(m["alt"])
     title = _neutralize_inline(m["title"] or "")
-    bare = m["bare"]
+    bare, angle = m["bare"], m["angle"]
     if bare is not None and _LOCAL_TARGET.fullmatch(bare):
         return f"![{alt}]({bare}{title})", m.end()  # vault の中の添付は外部を読まない
+    if angle is not None and _LOCAL_TARGET.fullmatch(angle.replace(" ", "")):
+        # `<>` の形の vault の中の添付も残す(`<` を残さない形に直す)
+        return f"![{alt}]({_encode_dest(angle)}{title})", m.end()
     # 宛先の中の `![` などを、リンクにした後で埋め込みと読み直されないよう % で表す
-    dest = _encode_dest(m["angle"] if bare is None else bare)
+    dest = _encode_dest(angle if bare is None else bare)
     label = f"画像: {alt}" if alt else "画像"
     return f"[{label}]({dest}{title})", m.end()
 
 
 _DEST_ESCAPES = str.maketrans(
-    {" ": "%20", "(": "%28", ")": "%29", "[": "%5B", "]": "%5D", "!": "%21", "`": "%60",
-     "\\": "%5C"}
+    {" ": "%20", "[": "%5B", "]": "%5D", "!": "%21", "`": "%60", "\\": "%5C"}
 )
+_PAREN_ESCAPES = str.maketrans({"(": "%28", ")": "%29"})
 
 
 def _encode_dest(dest: str) -> str:
-    """`<>` を外しても宛先が 1 つのまま読めるよう、空白・括弧と Markdown の記号を % で表す
-    (外した宛先の中の `![` などを、もう一度かけたときに読み直さないため)。"""
-    return dest.translate(_DEST_ESCAPES)
+    """`<>` を外しても宛先が 1 つのまま読めるよう、空白と Markdown の記号を % で表す
+    (外した宛先の中の `![` などを、もう一度かけたときに読み直さないため)。括弧は対応が
+    取れていればそのまま残す(`<>` の無い宛先でも書ける)。"""
+    encoded = dest.translate(_DEST_ESCAPES)
+    return encoded if _balanced(encoded) else encoded.translate(_PAREN_ESCAPES)
+
+
+def _balanced(text: str) -> bool:
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
