@@ -68,12 +68,14 @@ class FakeApi:
         self.answered: list[tuple[str, str | None]] = []
         self.edited: list[tuple[int, int, dict]] = []
         self.sent: list[tuple[int, str]] = []
+        self.markups: list[dict | None] = []  # sent と同じ順の reply_markup
 
     def send_message(self, chat_id: int, text: str, *, reply_markup: dict | None = None) -> int:
         error = telegram_text_error(text)
         if error is not None:
             raise DeliveryError(f"Telegram sendMessage が失敗: HTTP 400: {error}")
         self.sent.append((chat_id, text))
+        self.markups.append(reply_markup)
         return 900 + len(self.sent)
 
     def get_updates(self, offset: int | None) -> list[dict]:

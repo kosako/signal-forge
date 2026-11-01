@@ -24,7 +24,7 @@ import random
 import re
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -453,21 +453,42 @@ def pack_lines(
     measure は 1 通の長さの数え方(既定は文字数。可視の長さで数えるなら visible_length)。
     深掘り指定の確認返信(GH#228)と未消化一覧(GH#349)が使う。
     """
-    messages: list[str] = []
-    current = ""
+    return [
+        "\n".join(lines[index] for index in group)
+        for group in pack_line_groups(lines, budget, measure=measure)
+    ]
+
+
+def pack_line_groups(
+    lines: Sequence[str],
+    budget: int,
+    *,
+    measure: Callable[[str], int] = len,
+    counted: Collection[int] = (),
+    max_counted: int | None = None,
+) -> list[list[int]]:
+    """pack_lines の分け方で、1 通ごとの行の添字を返す。
+
+    counted の行(添字)は 1 通に max_counted 行までにする(ボタンを付ける行の数を、1 通の
+    ボタンの数の上限に収める。未消化一覧の skip のボタン。GH#349)。
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
     used = 0
-    for line in lines:
+    in_current = 0
+    for index, line in enumerate(lines):
         size = measure(line)
-        if current and used + 1 + size > budget:
-            messages.append(current)
-            current, used = line, size
-        elif current:
-            current, used = f"{current}\n{line}", used + 1 + size
-        else:
-            current, used = line, size
+        is_counted = index in counted
+        full = max_counted is not None and is_counted and in_current >= max_counted
+        if current and (used + 1 + size > budget or full):
+            groups.append(current)
+            current, used, in_current = [], 0, 0
+        used = used + 1 + size if current else size
+        current.append(index)
+        in_current += int(is_counted)
     if current:
-        messages.append(current)
-    return messages
+        groups.append(current)
+    return groups
 
 
 def _published_md(published_at: str | None) -> str | None:

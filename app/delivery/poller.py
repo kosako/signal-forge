@@ -15,8 +15,8 @@
   (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
-- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)の callback も本デーモンで処理する
-  (送信は surveys.py の内蔵タイマー)
+- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)、未消化一覧の skip のボタン(`b:`。GH#349)の
+  callback も本デーモンで処理する(送信は surveys.py の内蔵タイマー)
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from app.delivery.answer_worker import AnswerWorker
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     READ_MIN_CHOICES,
+    backlog_skip_keyboard,
     followup_keyboard,
     pending_dig_items,
     q1_keyboard,
@@ -49,7 +50,7 @@ from app.delivery.telegram import (
     pack_lines,
     reaction_keyboard,
 )
-from app.dig import apply_instructions, parse_dig_reply, queue_item_ids
+from app.dig import DigInstruction, apply_instructions, parse_dig_reply, queue_item_ids
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.export.obsidian import note_projection_date
 from app.jst import JST
@@ -347,6 +348,9 @@ def _handle_callback(
                 now_fn(), answer_worker,
             )
             return
+        if prefix == "b" and arg.isdigit() and code == "p":
+            _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
+            return
     # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
     # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
     api.answer_callback_query(callback_id)
@@ -520,6 +524,124 @@ def _record_dig_request(
     api.answer_callback_query(callback_id, text=accepted_text)
     if answer_worker is not None:
         answer_worker.kick(logger)
+
+
+# 未消化一覧の skip のボタンの callback_data(GH#349。設計 04 §3)。盤面を作り直すときに、押された
+# メッセージのボタンから item id を読む
+_SKIP_DATA_RE = re.compile(r"b:(\d+):p")
+
+
+def _record_backlog_skip(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    logger: logging.Logger,
+) -> None:
+    """未消化一覧の「⏭️ {id} を外す」(GH#349。設計 06 §2)。リプライのパスと同じ関数でキューから外す。
+
+    押されたメッセージが owner の chat の未消化一覧(dig_backlog_messages)であることを確かめる
+    (callback_data だけを信じない。深掘りカードのボタンと同じ)。前の夜の一覧も受け付ける。
+    - queued: パスにする(apply_instructions。観点・requested_at は残り、受付の順序の印も
+      リプライのパスと同じく残す。GH#235)。朝の生成中でも、done 化の compare-and-set が外れて
+      パスが残る(app.deepdive)
+    - passed(二重押し・再配達・リプライで外した後): もう一度パスにする。キューの状態は変わらず、
+      印はリプライでパスし直したときと同じく今の時点に進む
+    - done(掘り終えた): 書かない。キューから外す対象が無い(調べ直しを止めるのとは別の操作)
+    - キューに無い: 書かない(予定の行はキューにあるので、偽造か壊れた data)
+    外した後は、押したメッセージのボタンのうち外した item に ✓ を付けた盤面に差し替える。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    listed = type(message_id) is int and (
+        conn.execute(
+            "SELECT 1 FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        is not None
+    )
+    if not listed or chat_id != config.telegram.owner_chat_id:
+        logger.warning("未消化一覧と結び付かない skip のボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": item_id}
+    try:
+        # 状態の確認と反映を 1 つのトランザクションにする(朝の done 化と競わない)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status FROM dig_queue WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            status = row["status"] if row is not None else None
+            if status in ("queued", "passed"):
+                apply_instructions(conn, [DigInstruction(item_id, "pass")])
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(f"skip のボタンを反映できなかった: {type(e).__name__}: {e}", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ 外せませんでした。もう一度押してください")
+        return
+    if status is None:
+        logger.warning("キューに無い item の skip のボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ この番号は深掘りのキューにありません")
+        return
+    if status == "done":
+        logger.info("掘り終えた item の skip のボタン(書かない)", extra=log_extra)
+        api.answer_callback_query(callback_id, text=f"✅ {item_id} はもう掘り終えています")
+        return
+    if status == "passed":
+        logger.info("外し済みの item の skip のボタン(二重押し・再配達)", extra=log_extra)
+        api.answer_callback_query(callback_id, text=f"⏭️ {item_id} は外し済みです")
+    else:
+        logger.info("skip のボタンで深掘りのキューから外した", extra=log_extra)
+        api.answer_callback_query(
+            callback_id,
+            text=f"⏭️ {item_id} を外しました(戻すときは一覧へ「{item_id} も」とリプライ)",
+        )
+    _refresh_skip_board(conn, api, callback, logger)
+
+
+def _refresh_skip_board(
+    conn: sqlite3.Connection, api: TelegramApi, callback: dict, logger: logging.Logger
+) -> None:
+    """押された未消化一覧の 1 通のボタンを、外した item に ✓ を付けて差し替える(GH#349)。
+
+    その 1 通にどの行を載せたかは台帳に残していないので、押されたメッセージのボタン
+    (callback の message.reply_markup)から item id だけを読み、盤面は自前で作り直す
+    (Telegram の値の文言は使わない)。✓ はキューの今の状態(passed)で付けるので、同じ 1 通の
+    前に押したボタンの ✓ も残る。本文の印(🗓 明朝)は書き換えない。読めなければ差し替えない。
+    """
+    message = callback.get("message")
+    markup = message.get("reply_markup") if isinstance(message, dict) else None
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    item_ids: list[int] = []
+    for buttons in rows if isinstance(rows, list) else []:
+        for button in buttons if isinstance(buttons, list) else []:
+            data = button.get("callback_data") if isinstance(button, dict) else None
+            match = _SKIP_DATA_RE.fullmatch(data) if isinstance(data, str) else None
+            if match is not None:
+                item_ids.append(int(match.group(1)))
+    if not item_ids:
+        logger.warning("一覧のボタンを読めないため盤面の差し替えを skip", extra={"stage": "poll"})
+        return
+    placeholders = ", ".join("?" for _ in item_ids)
+    passed = {
+        row["item_id"]
+        for row in conn.execute(
+            "SELECT item_id FROM dig_queue "
+            f"WHERE status = 'passed' AND item_id IN ({placeholders})",
+            item_ids,
+        )
+    }
+    _edit_markup_best_effort(
+        api, callback, backlog_skip_keyboard(item_ids, selected=passed), logger
+    )
 
 
 def _record_followup(
