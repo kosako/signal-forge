@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from app.analysis.fallback import run_fallback_notice
 from app.analysis.llm import LLMEngine
@@ -37,6 +38,9 @@ from app.jst import today_jst
 from app.purge import purge_expired
 from app.vault_guard import VaultGuard
 
+if TYPE_CHECKING:
+    from app.deepdive import DigCandidate
+
 
 class RunFailures(list[str]):
     """run_pipeline の結果。失敗した段の名前の一覧(空 = 全段成功)。
@@ -48,10 +52,13 @@ class RunFailures(list[str]):
     deliver_date: deliver 段が送ろうとした digest の日付(GH#247)。失敗通知が、日をまたいだ
     ときの送り直し方(`intel deliver --date`)をこの日付で添える。通知は全段の後なので、
     その時点の日付からは推し量らない。deliver 段が digest を引けなかった実行は None。
+    material_requests: dig 段が材料不足で掘れなかったリプライ指定(GH#337)。失敗の通知を
+    送れた後に、CLI が指定を外す(app.deepdive.release_material_request)。
     """
 
     digest_held: bool = False
     deliver_date: str | None = None
+    material_requests: tuple[DigCandidate, ...] = ()
 
 
 def run_pipeline(
@@ -131,8 +138,19 @@ def run_pipeline(
             "Telegram 未設定のため deliver 段を skip",
             extra={"run_id": run_id, "stage": "deliver"},
         )
+
+    def dig() -> None:
+        from app.deepdive import DigError
+
+        try:
+            dig_stage(conn, config, env, logger, run_id=run_id)
+        except DigError as e:
+            # 材料不足の指定は、失敗の通知を送れた後に外す(GH#337)。段の失敗としては同じく記録する
+            failures.material_requests = e.material_requests
+            raise
+
     if config.dig.daily_cap > 0:  # 0 = 調査段無効(段ごと省く。x_signals と同じ流儀)
-        stage("dig", lambda: dig_stage(conn, config, env, logger, run_id=run_id))
+        stage("dig", dig)
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
     stage("backup", lambda: backup_daily(conn, config, logger, run_id=run_id))
 
