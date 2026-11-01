@@ -29,6 +29,7 @@ from app.deepdive import (
     _TRANSLATE_CHUNK_CHARS,
     AUTO_BRIEF,
     REVIEW_MAX_FINDINGS,
+    STATE_NO_CANDIDATE_NOTIFIED,
     DigDraft,
     DigError,
     DigReview,
@@ -46,6 +47,7 @@ from app.deepdive import (
     run_dig_stage,
 )
 from app.delivery import DeliveryError
+from app.delivery.state import get_state
 from app.dig import DigInstruction, apply_instructions, enqueue_bookmark
 from app.extraction import extract_pending
 from app.http import HttpClient
@@ -2357,3 +2359,186 @@ def test_failed_digest_pick_leaves_no_queue_row(conn, config) -> None:
     assert queue_row(conn, item) is None
     assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 0
     assert [c.item_id for c in _select_from_digest(conn, config, 2, "2026-07-22")] == [item]
+
+
+# --- 候補の無い朝の知らせ(設計 06 §3。GH#349) ---
+
+NOTICE_NONE = (
+    "🔎 今朝の深掘りはありません。キューにも今日のダイジェストにも、掘れる候補がありませんでした。"
+    "\n今夜の未消化一覧へのリプライで指定できます"
+)
+NOTICE_NO_DIGEST = (
+    "🔎 今朝の深掘りはありません。今日のダイジェストが配信されていないため、"
+    "上位から選べませんでした。\n今夜の未消化一覧へのリプライで指定できます"
+)
+
+
+def add_result(
+    conn: sqlite3.Connection, item_id: int, *, created_at: str, sent_at: str | None
+) -> None:
+    """公開済みの台帳の行を足す(sent_at が None なら未送信のカード)。"""
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at, published_at,"
+        " message_id, sent_at) VALUES (?, 'n', 'カード', ?, ?, ?, ?)",
+        (item_id, created_at, created_at, 900 if sent_at is not None else None, sent_at),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("digest", "expected"),
+    [
+        # 配信した digest に掘れる item が無い(キューに行がある・本文なし)
+        ("sent", NOTICE_NONE),
+        # digest が無い・配信していない日は ③ を見られない
+        (None, NOTICE_NO_DIGEST),
+        ("pending", NOTICE_NO_DIGEST),
+        ("failed", NOTICE_NO_DIGEST),
+    ],
+)
+def test_no_candidate_notice_tells_the_reason(conn, config, digest, expected) -> None:
+    no_body = add_item(conn, "https://a.example/nobody", body=None)
+    enqueue(conn, no_body)  # 本文の消えた自動キューは黙って飛ばす
+    if digest is not None:
+        add_digest(conn, "2026-07-22", [no_body], delivery_status=digest)
+    api = FakeApi()
+
+    assert run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22") is True
+
+    assert api.sent == [(10, expected)]
+    assert api.markups == [None]
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) == "2026-07-22"
+
+
+def test_no_candidate_notice_is_sent_once_a_day(conn, config) -> None:
+    # 同じ日の再走・intel dig では送らない。次の日はまた送る
+    api = FakeApi()
+    for _ in range(2):
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == [(10, NOTICE_NO_DIGEST)]
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+    assert api.sent == [(10, NOTICE_NO_DIGEST)] * 2
+
+
+def test_no_candidate_notice_failure_is_logged_and_retried(conn, config, caplog) -> None:
+    # 送れなかった知らせは段の失敗にせず、印も付けない。同じ日の次の実行が知らせ直す
+    with caplog.at_level(logging.ERROR, logger="test-deepdive"):
+        run_dig_stage(
+            conn, config, make_factory({}), FakeApi(fail=True), logger, today="2026-07-22"
+        )
+    assert "候補の無い朝の知らせを送れなかった" in caplog.text
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) is None
+
+    api = FakeApi()
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == [(10, NOTICE_NO_DIGEST)]
+
+
+def test_no_candidate_notice_comes_with_material_failure(conn, config) -> None:
+    # リプライの指定が材料不足で掘れず、ほかに選べない朝は、段の失敗(失敗の通知)とこの知らせの
+    # 両方が届く。指定を外す候補も今までどおり返す(GH#337)
+    item = add_item(conn, "https://a.example/1", body=None)
+    enqueue(conn, item, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    api = FakeApi()
+
+    with pytest.raises(DigError, match=_KEPT) as raised:
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+
+    assert [c.item_id for c in raised.value.material_requests] == [item]
+    assert api.sent == [(10, NOTICE_NO_DIGEST)]
+
+
+def test_no_candidate_notice_not_sent_when_cap_reached(conn, config) -> None:
+    # 上限に達していて選ばなかった朝(カードの送信は前の日にして、上限だけで止まることを見る)
+    for i in range(2):
+        add_result(
+            conn,
+            add_item(conn, f"https://a.example/{i}"),
+            created_at="2026-07-21T22:00:00Z",  # JST 2026-07-22 に実行済み
+            sent_at="2026-07-20T00:00:00Z",
+        )
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == []
+
+
+def test_no_candidate_notice_not_sent_after_card_sent_today(conn, config) -> None:
+    # 先の実行がカードを送った日の再走(残枠はあるが候補が無い)は「深掘りはありません」と言わない
+    add_result(
+        conn,
+        add_item(conn, "https://a.example/1"),
+        created_at="2026-07-20T00:00:00Z",  # 前の日の生成を、今日の先の実行が再開して送った
+        sent_at="2026-07-21T22:00:00Z",  # JST 2026-07-22
+    )
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == []
+
+
+def test_no_candidate_notice_not_sent_when_resuming_cards(conn, config) -> None:
+    # 新しい候補は無いが、中断した分のカードを送った実行では送らない
+    add_result(
+        conn, add_item(conn, "https://a.example/1"), created_at="2026-07-20T00:00:00Z",
+        sent_at=None,
+    )
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == [(10, "カード")]
+
+
+def test_no_candidate_notice_not_sent_when_resumed_card_fails(conn, config) -> None:
+    # 中断した分のカードを送れなかった実行も送らない(失敗の通知で知らせ、次の実行が送る)
+    class CardFailApi(FakeApi):
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
+            if reply_markup is not None:  # カード(ボタン付き)だけを失敗させる
+                raise RuntimeError("送信失敗")
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    add_result(
+        conn, add_item(conn, "https://a.example/1"), created_at="2026-07-20T00:00:00Z",
+        sent_at=None,
+    )
+    api = CardFailApi()
+
+    with pytest.raises(DigError, match="カード送信"):
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == []
+
+
+def test_no_candidate_notice_not_sent_when_selected_item_fails(conn, config) -> None:
+    # 選べたが生成に失敗した朝は、失敗の通知に任せる(候補はあった)
+    enqueue(conn, add_item(conn, "https://a.example/1"))
+    api = FakeApi()
+
+    with pytest.raises(DigError):
+        run_dig_stage(
+            conn, config, make_factory({}, {"DigDraft"}), api, logger, today="2026-07-22"
+        )
+    assert api.sent == []
+
+
+def test_no_candidate_notice_not_sent_without_telegram_or_cap(conn, config) -> None:
+    # Telegram が未設定の朝は送らず、印も付けない。daily_cap = 0 は選定ごと行わない
+    run_dig_stage(conn, config, make_factory({}), None, logger, today="2026-07-22")
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) is None
+
+    api = FakeApi()
+    disabled = replace(config, dig=DigConfig(daily_cap=0))
+    run_dig_stage(conn, disabled, make_factory({}), api, logger, today="2026-07-22")
+    assert api.sent == []
+
+
+def test_no_candidate_notice_not_sent_while_another_dig_runs(conn, config, tmp_path) -> None:
+    # 別の実行が調査段を進めている間に来た実行は、何もしないので知らせもしない(GH#196)
+    import fcntl
+
+    api = FakeApi()
+    with (tmp_path / "intel.db.dig.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ran = run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert ran is False
+    assert api.sent == []
