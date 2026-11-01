@@ -21,6 +21,8 @@
   失敗の通知を送れた後(release_material_request。GH#337)
 - 同じ台帳を使う実行(朝バッチの dig 段と `intel dig`)は 1 つずつ。候補の選定から公開・送信までを
   ロックで囲み、後から来た方は待たずに何もしない(朝バッチを止めない。GH#196)
+- 上限に達していないのに ①〜③ のどれからも選べず、カードも届かない朝は、段の終わりに理由を
+  1 通で知らせる(_notify_no_candidates。失敗の通知とは別で、段の失敗にしない。GH#349)
 
 別系統の AI のレビュー(GH#153。config `[dig].review`): ドラフトを Claude API が元記事と
 照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
@@ -54,7 +56,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -71,6 +73,7 @@ from app.analysis.llm import (
 )
 from app.analysis.profile import load_interest_profile
 from app.config import Config
+from app.delivery.state import get_state, set_state
 from app.delivery.telegram import (
     TelegramApi,
     dig_card_keyboard,
@@ -79,7 +82,7 @@ from app.delivery.telegram import (
 )
 from app.dig import DigCandidate, has_material, select_from_queue
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
-from app.jst import JST
+from app.jst import today_jst
 from app.prompting import fill_template, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
@@ -104,6 +107,18 @@ _DIG_LOCK_SUFFIX = ".dig.lock"
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
 _REQUESTED_NONE = "(観点指定なし:ブックマーク自動キューからの深掘り)"
 _REQUESTED_DIGEST = "(観点指定なし:今日の digest の上位からの深掘り)"  # 設計 06 §3 の ③
+
+# 候補の無い朝の知らせ(設計 06 §3。GH#349)。固定の文言だけで、外部由来の本文を入れない。
+# 印は telegram_state の日付キー(送れた日の JST 暦日。失敗の通知の印と同じ流儀)
+STATE_NO_CANDIDATE_NOTIFIED = "dig_no_candidate_notified_date"
+_NO_CANDIDATE_NONE = (
+    "🔎 今朝の深掘りはありません。キューにも今日のダイジェストにも、掘れる候補がありませんでした"
+)
+_NO_CANDIDATE_NO_DIGEST = (
+    "🔎 今朝の深掘りはありません。今日のダイジェストが配信されていないため、"
+    "上位から選べませんでした"
+)
+_NO_CANDIDATE_GUIDE = "今夜、未消化一覧が届いたら、そのリプライで指定できます"
 
 # 対訳は 1 チャンクずつ生成する(1 呼び出しの出力を有界に保つ。段落境界で分割)。
 # 出力は原文の再掲(callout の引用記法つき)と訳文の両方を含み、入力のチャンクに訳文の分が
@@ -281,10 +296,14 @@ def _run_dig_stage_locked(
     vault: VaultGuard | None,
 ) -> None:
     """run_dig_stage の本体(_dig_lock の中で呼ぶ)。"""
-    day = today or datetime.now(JST).strftime("%Y-%m-%d")
+    # 段の初めの実時計の暦日。候補の無い朝の知らせの印を、送れた日へ進めるのに使う(GH#349)。
+    # 注入しないときの day も同じ値にする(別々に読むと、その間に 0 時を越えて食い違う)
+    started_on = today_jst()
+    day = today or started_on
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
     material_requests: list[DigCandidate] = []
+    selected: list[DigCandidate] = []
 
     if remaining > 0:
         selected, skipped_requested = _select_candidates(conn, config, remaining, day)
@@ -321,6 +340,13 @@ def _run_dig_stage_locked(
             extra={"run_id": run_id, "stage": "dig"},
         )
 
+    # 候補の無い朝(GH#349)。中断した分(未公開・未送信の行)を再開する実行は、送れたかに
+    # かかわらず知らせない(届いたカードの直後に「深掘りはありません」と言わない。送れなければ
+    # 失敗の通知で知らせ、次の実行が送る。設計 06 §3)。再開の前に台帳を見る
+    no_candidates = (
+        api is not None and remaining > 0 and not selected and not _has_unsent_cards(conn)
+    )
+
     # 未公開ノートの書出(過去の中断分を含む)
     failures.extend(
         _publish_pending_notes(conn, config, logger, run_id, vault or VaultGuard())
@@ -339,6 +365,11 @@ def _run_dig_stage_locked(
                 extra={"run_id": run_id, "stage": "dig"},
             )
 
+    # 候補の無い朝の知らせ(GH#349)。材料不足のリプライ指定で段が失敗する朝も、先に送る
+    # (失敗の通知とこの知らせの両方が届く。設計 06 §3)
+    if no_candidates and api is not None:
+        _notify_no_candidates(conn, config, api, logger, run_id, day, started_on)
+
     if failures:
         raise DigError(
             f"調査段で {len(failures)} 件失敗: " + " / ".join(failures),
@@ -352,6 +383,77 @@ def _digs_on(conn: sqlite3.Connection, day: str) -> int:
         "SELECT count(*) AS n FROM dig_results WHERE date(created_at, '+9 hours') = ?",
         (day,),
     ).fetchone()["n"]
+
+
+def _notify_no_candidates(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    run_id: str | None,
+    day: str,
+    started_on: str,
+) -> None:
+    """上限に達していないのに候補を選べなかった朝に、その理由を 1 通で知らせる(設計 06 §3。GH#349)。
+
+    呼ぶのは、この実行が ①〜③ のどれからも選べず、中断した分の再開も無かったときだけ。
+    次のときは送らない。
+    - その日に送れた印がある(同じ日の再走・`intel dig`)。印は送れてから記録する(失敗の
+      通知と同じ。送れなかった日は、次の実行が知らせ直せる)
+    - その日に先の実行がカードを送った(「今朝の深掘りはありません」と食い違う)
+    知らせの失敗(DB・送信)は段の失敗にせず、ログだけ残す。
+    """
+    try:
+        if get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) == day:
+            return
+        sent_today = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM dig_results"
+            " WHERE date(sent_at, '+9 hours') = ?) AS found",
+            (day,),
+        ).fetchone()["found"]
+        if sent_today:
+            return
+        reason = _NO_CANDIDATE_NONE if _digest_delivered(conn, day) else _NO_CANDIDATE_NO_DIGEST
+        api.send_message(config.telegram.owner_chat_id, f"{reason}。\n{_NO_CANDIDATE_GUIDE}")
+        # 印は送れた時点の暦日にする。段の初めの day のままだと、23:59 に始めた実行が選定・
+        # 公開・送信の間に 0 時を越えたとき、前の日の印になり、その朝の実行がもう 1 通送る。
+        # day は注入できる(テスト)ので、段の初め(started_on)から送れるまでに実時計が進んだ
+        # 日数だけ day を進める
+        elapsed = date.fromisoformat(today_jst()) - date.fromisoformat(started_on)
+        set_state(
+            conn,
+            STATE_NO_CANDIDATE_NOTIFIED,
+            (date.fromisoformat(day) + elapsed).isoformat(),
+        )
+    except Exception as e:
+        logger.error(
+            f"候補の無い朝の知らせを送れなかった: {type(e).__name__}",
+            extra={"run_id": run_id, "stage": "dig"},
+        )
+        return
+    logger.info(
+        "dig: 候補が無いので、深掘りが無いことを知らせた",
+        extra={"run_id": run_id, "stage": "dig"},
+    )
+
+
+def _has_unsent_cards(conn: sqlite3.Connection) -> bool:
+    """台帳に未送信のカード(未公開のノートを含む中断分)があるか。"""
+    return (
+        conn.execute("SELECT 1 FROM dig_results WHERE message_id IS NULL LIMIT 1").fetchone()
+        is not None
+    )
+
+
+def _digest_delivered(conn: sqlite3.Connection, day: str) -> bool:
+    """その日の digest を配信したか(③ の選定 _select_from_digest が digest を見る条件と同じ)。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM digests WHERE digest_date = ? AND delivery_status = 'sent'",
+            (day,),
+        ).fetchone()
+        is not None
+    )
 
 
 def item_has_material(conn: sqlite3.Connection, config: Config, item_id: int) -> bool:

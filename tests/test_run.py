@@ -303,8 +303,11 @@ def test_empty_digest_after_analyze_failure_is_delivered_on_same_day_rerun(
 def test_date_change_after_digest_is_not_taken_as_held(conn, tmp_path, monkeypatch) -> None:
     # analyze 段が失敗しても載せる記事があれば digest を作る。その後に JST の日付が変わっても
     # 保留と取り違えない(deliver を黙って省かず、通知も「作れなかった」と言わない。GH#191)
+    from dataclasses import replace
+
     from app import run as run_module
     from app.analysis.llm import LLMUnavailableError
+    from app.config import DigConfig
     from tests.test_ranking import add_analyzed
 
     class UnavailableEngine:
@@ -327,8 +330,10 @@ def test_date_change_after_digest_is_not_taken_as_held(conn, tmp_path, monkeypat
 
     monkeypatch.setattr(run_module, "generate_digest", generate_then_cross_midnight)
     sent = use_fake_telegram(monkeypatch)
+    # 調査段はこのテストの対象外。止めないと、候補の無い朝の知らせ(GH#349)が届く
+    config = replace(with_telegram(make_config(tmp_path)), dig=DigConfig(daily_cap=0))
     failures = run_pipeline(
-        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        conn, config, {"TELEGRAM_BOT_TOKEN": "tok"},
         {"rss": StaticConnector()}, make_http(), lambda: UnavailableEngine(), logger, "01RUN",
     )
     digest = conn.execute("SELECT digest_date, item_ids, delivery_status FROM digests").fetchone()
@@ -338,6 +343,37 @@ def test_date_change_after_digest_is_not_taken_as_held(conn, tmp_path, monkeypat
     assert "deliver" in failures
     assert sent == []
     assert failures.deliver_date is None  # 送る digest を引けていない(送り直し方を添えない)
+
+
+def test_no_candidate_notice_is_sent_once_and_is_not_a_stage_failure(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # 分析の障害で digest を作れなかった朝、キューも空なら、dig 段が理由を 1 通で知らせる。
+    # 段の失敗にはせず、同じ日の再走では送らない(設計 06 §3。GH#349)
+    from app.analysis.llm import LLMUnavailableError
+
+    class UnavailableEngine:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 起動失敗")
+
+    sent = use_fake_telegram(monkeypatch)
+    args = (
+        conn, with_telegram(make_config(tmp_path)), {"TELEGRAM_BOT_TOKEN": "tok"},
+        {"rss": StaticConnector()}, make_http(),
+    )
+    failures = run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN1")
+    assert failures == ["analyze"]  # dig は失敗にしない
+    texts = [dict(httpx.QueryParams(r.content.decode()))["text"] for r in sent]
+    assert texts == [
+        "🔎 今朝の深掘りはありません。今日のダイジェストが配信されていないため、"
+        "上位から選べませんでした。\n今夜、未消化一覧が届いたら、そのリプライで指定できます"
+    ]
+
+    assert run_pipeline(*args, lambda: UnavailableEngine(), logger, "01RUN2") == ["analyze"]
+    assert len(sent) == 1  # 同じ日の再走では送らない
 
 
 def test_failed_delivery_keeps_digest_date_across_midnight(conn, tmp_path, monkeypatch) -> None:
