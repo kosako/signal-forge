@@ -1300,6 +1300,32 @@ def test_requested_without_material_is_reported_again_after_stop_before_notice(
     assert _queue_row(conn, item) == ("queued", "観点", "2026-07-21T00:00:00Z")
 
 
+def test_material_request_waits_for_next_morning_when_rerun_has_no_slot(conn, config) -> None:
+    # 他の件で当日の枠を使い切った後、通知の前に止まった。同じ日の再走は残枠 0 で候補を
+    # 選び直さないので知らせず、指定も残る。翌朝に知らせ、送れた後に外す(GH#337)
+    item = add_item(conn, "https://a.example/1", body=None)
+    enqueue(conn, item, angle="観点", requested_at="2026-07-21T00:00:00Z")
+    for i in range(2):
+        enqueue(conn, add_item(conn, f"https://b.example/{i}"))
+    api = FakeApi()
+
+    with pytest.raises(DigError, match=_KEPT):
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert conn.execute("SELECT count(*) AS n FROM dig_results").fetchone()["n"] == 2
+    # 注入した日 (JST 2026-07-22) の実行として数える(test_daily_cap_and_rerun_idempotency と同じ)
+    conn.execute("UPDATE dig_results SET created_at = '2026-07-21T22:00:00Z'")
+    conn.commit()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22")
+    assert _queue_row(conn, item) == ("queued", "観点", "2026-07-21T00:00:00Z")
+
+    with pytest.raises(DigError, match=_KEPT) as next_morning:
+        run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+    assert [c.item_id for c in next_morning.value.material_requests] == [item]
+    assert release_material_request(conn, next_morning.value.material_requests[0], logger, "01RUN")
+    assert _queue_row(conn, item) == ("queued", "観点", None)
+
+
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
