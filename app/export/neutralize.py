@@ -4,16 +4,17 @@ LLM の出力と記事の抽出本文は untrusted のデータで、画像の�
 Obsidian はノートを開くだけで、それらの参照先(外部のホスト)を読みに行く。そこで vault に
 書く前に、次のように直す(設計 04 §7・06 §4):
 
-- 外部を指す画像の埋め込み `![alt](https://…)`(`![alt](<…>)` の形を含む)は、ふつうのリンク
-  `[画像: alt](https://…)` にする。開いただけでは読みに行かず、押せば開ける
-- 形を解釈しきれない `![`(参照形式の `![alt][ref]` など)は、`!` を `\\!` にして埋め込みにしない。
-  参照形式はふつうのリンクとして残る
-- vault の中を指す埋め込み(相対パスの画像・`![[ノート]]`)は残す。外部を読みに行かないため。
-  `![[…]]` の中身が URL の形(`:` や `//` を含む)のときと、直後に `(`・`[`・`!` が続いて
-  ふつうの画像と読まれうるときは、同じく `\\!` にする
-- 生の HTML のタグ・コメントの始まりの `<` を `&lt;` にする。表示は同じ文字のまま、描画されない。
-  `<https://…>` の自動リンクは残す。リンク・画像の宛先の `(<…>)` の形は、`<>` を外した形に直す
-- リンク `[text](url)` と裸の URL は変えない(押すまで読みに行かない)
+- 画像の埋め込みは、`!` を `\\!` にしてふつうのリンクとして見せる(参照形式 `![alt][ref]` も
+  同じ)。宛先は 1 文字も書き換えない。開いただけでは読みに行かず、押せば開ける
+- 埋め込みのまま残すのは、vault の中を指すと形から決まるものだけ。1 行の中の `![alt](宛先)` で、
+  宛先が `<>` もスキームも無い相対パス(先頭が `/`・`\\` でなく、空白・`\\`・`:`・`&`・括弧・角括弧・
+  バッククォートを含まない)、代替テキストに角括弧・バッククォート・`\\`・`<` が無く、タイトルが
+  無いもの。`![[ノート]]` は、中身が URL の形(`:`・`//`・`\\` を含む)のときと、直後に `(`・`[`・
+  `!` が続いてふつうの画像と読まれうるとき以外は残す
+- 生の HTML のタグ・コメント・宣言・処理命令の始まりの `<` を `&lt;` にする。表示は同じ文字の
+  まま、描画されない。`<https://…>` とメールアドレスの自動リンクは残す
+- リンク `[text](url)`、裸の URL、自動リンクは変えない(押すまで読みに行かない)。宛先を `<…>` で
+  囲んだリンクのようにまれな形は、`<` を escape するので文字として見えることがある
 - コード(フェンスとインラインのコード)の中は HTML として描画されないので触らない。ただし
   コードかどうかの解釈が揺れうる形(字下げや入れ子のフェンス、閉じていないフェンス、表・数式・
   脚注・リンクの宛先と同じ段落のインラインのコードなど)は守らずに直す。そのときコードの中の表示が
@@ -37,25 +38,13 @@ _AUTOLINK = re.compile(
     r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\-]+@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*)>"
 )
-# インラインの画像 `![alt](宛先 "タイトル")`。1 行の中だけを見る(合わない形は `\!` にする)
-_INLINE_IMAGE = re.compile(
-    r"!\[(?P<alt>(?:[^\[\]\\\n]|\\.)*)\]"
-    r"\([ \t]*(?:<(?P<angle>[^<>\n]*)>|(?P<bare>(?:[^\s()<>\\]|\\[^\s<>]|\([^\s()<>\\]*\))+))"
-    r"(?P<title>[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\)"
-)
-# vault の中を指す相対パス(スキームの `:`・`//` で始まる形・`\`・実体参照の `&` を含まない)
-_LOCAL_TARGET = re.compile(r"(?!//)[\w.~/%+\-()]+")
+# 埋め込みのまま残す、vault の中の添付の画像の形(単純で解釈の揺れの無いものだけ)。宛先は
+# スキームの `:`・先頭の `/`(`//` を含む)・`\`・実体参照の `&`・空白・括弧を含まない相対パス
+_LOCAL_IMAGE = re.compile(r"!\[[^\[\]`\\<\n]*\]\([\w.~%+\-][\w.~/%+\-]*\)")
 # `![[…]]` の直後が `(` / `[` なら、CommonMark では角括弧入りの代替テキストの画像になる。
-# 直後の `![` はリンクに直すと `[` になるので、同じく残さない
+# 直後の `![` と並ぶ形も、念のため残さない
 _WIKI_EMBED = re.compile(r"!\[\[([^\[\]\n]*)\]\](?![(\[!])")
 _URL_LIKE = re.compile(r":|//|\\")
-# リンクの宛先の `<…>` の形(`](` の直後で、後ろにタイトルと `)` が続くときだけ)。この形に
-# 合わない `](<` の `<` は escape する(CommonMark では `<` で始まる宛先は `<…>` の形だけなので、
-# リンクにはならず表示も変わらない。直した後の出力にもう一度かけたときに、別の形に読み直さない)
-_ANGLE_DEST = re.compile(
-    r"<((?:(?!&lt;)[^<>\n])*)>"
-    r"(?=[ \t]*(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\))?[ \t]*\))"
-)
 
 # フェンスの行の形(行頭の字下げ・引用・リストの印の後ろに ``` / ~~~)。これに当たる行が
 # 解釈の揺れの無い組になっていないときは、フェンスの中を守らない
@@ -209,22 +198,15 @@ def _neutralize_inline(text: str) -> str:
             continue
         if ch == "!" and text.startswith("[", i + 1):
             replaced, i = _neutralize_image(text, i)
-            if replaced.startswith("[") and out and out[-1] == "!":
-                out[-1] = "\\!"  # 直前の `!` とリンクにした `[` で、新しい埋め込みを作らない
             out.append(replaced)
             continue
         if ch == "<":
-            m = _ANGLE_DEST.match(text, i) if text.endswith("](", 0, i) else None
-            if m is not None:  # `](<宛先>)` は `<>` を外した宛先に(`<` を残さない)
-                out.append(_encode_dest(m[1]))
-                i = m.end()
-                continue
             m = _AUTOLINK.match(text, i)
             if m is not None:
                 out.append(m[0])
                 i = m.end()
                 continue
-            if _TAG_START.match(text, i) or text.endswith("](", 0, i):
+            if _TAG_START.match(text, i):
                 out.append("&lt;")
                 i += 1
                 continue
@@ -234,50 +216,15 @@ def _neutralize_inline(text: str) -> str:
 
 
 def _neutralize_image(text: str, i: int) -> tuple[str, int]:
-    """`![` で始まる位置の埋め込みを直し、(出力, 次に読む位置)を返す。"""
+    """`![` で始まる位置を直し、(出力, 次に読む位置)を返す。宛先は書き換えない。"""
     if text.startswith("[[", i + 1):
         m = _WIKI_EMBED.match(text, i)
         if m is not None and _URL_LIKE.search(m[1]) is None:
             return "!", i + 1  # vault の中のノート・添付の埋め込みは残す
         return "\\!", i + 1
-    m = _INLINE_IMAGE.match(text, i)
-    if m is None:
-        return "\\!", i + 1  # 参照形式・解釈しきれない形は埋め込みにしない
-    alt = _neutralize_inline(m["alt"])
-    title = _neutralize_inline(m["title"] or "")
-    bare, angle = m["bare"], m["angle"]
-    if bare is not None and _LOCAL_TARGET.fullmatch(bare):
-        return f"![{alt}]({bare}{title})", m.end()  # vault の中の添付は外部を読まない
-    if angle is not None and _LOCAL_TARGET.fullmatch(angle.replace(" ", "")):
-        # `<>` の形の vault の中の添付も残す(`<` を残さない形に直す)
-        return f"![{alt}]({_encode_dest(angle)}{title})", m.end()
-    # 宛先の中の `![` などを、リンクにした後で埋め込みと読み直されないよう % で表す
-    dest = _encode_dest(angle if bare is None else bare)
-    label = f"画像: {alt}" if alt else "画像"
-    return f"[{label}]({dest}{title})", m.end()
-
-
-_DEST_ESCAPES = str.maketrans(
-    {" ": "%20", "[": "%5B", "]": "%5D", "!": "%21", "`": "%60", "\\": "%5C"}
-)
-_PAREN_ESCAPES = str.maketrans({"(": "%28", ")": "%29"})
-
-
-def _encode_dest(dest: str) -> str:
-    """`<>` を外しても宛先が 1 つのまま読めるよう、空白と Markdown の記号を % で表す
-    (外した宛先の中の `![` などを、もう一度かけたときに読み直さないため)。括弧は対応が
-    取れていればそのまま残す(`<>` の無い宛先でも書ける)。"""
-    encoded = dest.translate(_DEST_ESCAPES)
-    return encoded if _balanced(encoded) else encoded.translate(_PAREN_ESCAPES)
-
-
-def _balanced(text: str) -> bool:
-    depth = 0
-    for ch in text:
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
+    m = _LOCAL_IMAGE.match(text, i)
+    if m is not None:
+        return m[0], m.end()  # vault の中の添付は外部を読まない
+    # それ以外は `!` を escape して、ふつうのリンク(と文字)として見せる。続く `[…](…)` は
+    # 呼び出し側がそのまま読み進める
+    return "\\!", i + 1

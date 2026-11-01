@@ -2709,7 +2709,7 @@ def test_explainer_and_translation_notes_have_no_remote_embed(conn, config) -> N
     translation = next(deepdive_dir(config).glob("*対訳*.md")).read_text()
     for note in (explainer, translation):
         assert_no_remote_embed(note)
-        assert "[画像: 図](https://img.example/a.png)" in note  # 押せば開けるリンクに
+        assert "\\![図](https://img.example/a.png)" in note  # 押せば開けるリンクに
         assert "&lt;iframe" in note  # 生のタグは文字として見える
         assert "[リンク](https://blog.example/)" in note  # ふつうのリンクはそのまま
         assert '```html\n<video src="https://img.example/v.mp4"></video>\n```' in note
@@ -2731,7 +2731,7 @@ def test_source_copy_of_extracted_body_has_no_remote_embed(conn, config) -> None
     source = next(deepdive_dir(config).glob("*原文*.md")).read_text()
     assert_no_remote_embed(source.split("---\n", 2)[2])
     assert "&lt;img src=\"https://img.example/t.png\">" in source
-    assert "[画像: 図](https://img.example/a.png)" in source
+    assert "\\![図](https://img.example/a.png)" in source
     # frontmatter の題は YAML の値で、本文の直しの対象外
     assert frontmatter_of(source)["title"] == "原文:<b>題</b>"
 
@@ -2741,7 +2741,7 @@ def test_review_callout_findings_have_no_remote_embed(conn, config) -> None:
     _row, note, _card, _engines = run_with_review(conn, config, ReviewEngine(findings))
     assert_no_remote_embed(note)
     assert '&lt;img src="https://img.example/p.png">' in note
-    assert "[画像: x](https://img.example/q.png)" in note
+    assert "\\![x](https://img.example/q.png)" in note
 
 
 def test_unpublished_ledger_note_is_neutralized_on_publish(conn, config) -> None:
@@ -2764,7 +2764,7 @@ def test_unpublished_ledger_note_is_neutralized_on_publish(conn, config) -> None
     published = (deepdive_dir(config) / "n-深掘り.md").read_text()
     assert published == (
         '---\nid: 1\ntitle: "<b>題</b>"\n---\n\n## 概要\n\n'
-        "[画像: 図](https://img.example/a.png) &lt;img src=https://img.example/b.png>\n"
+        "\\![図](https://img.example/a.png) &lt;img src=https://img.example/b.png>\n"
     )
     source = (deepdive_dir(config) / "n-対訳.md").read_text()
     assert source == "&lt;iframe src=https://img.example/f>&lt;/iframe>"

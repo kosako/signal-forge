@@ -8,44 +8,48 @@ from app.export.neutralize import neutralize_markdown, neutralize_note
 
 
 @pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        ("![図](https://e.example/a.png)", "[画像: 図](https://e.example/a.png)"),
-        ("![](http://e.example/a.png)", "[画像](http://e.example/a.png)"),
-        ('![図](https://e.example/a.png "題")', '[画像: 図](https://e.example/a.png "題")'),
-        ("![図](//e.example/a.png)", "[画像: 図](//e.example/a.png)"),
-        ("![図](<https://e.example/a b.png>)", "[画像: 図](https://e.example/a%20b.png)"),
-        ("![図](https://e.example/a_(1).png)", "[画像: 図](https://e.example/a_(1).png)"),
-        ("![図](data:image/png;base64,AAAA)", "[画像: 図](data:image/png;base64,AAAA)"),
-        ("![図](file:///tmp/a.png)", "[画像: 図](file:///tmp/a.png)"),
-        # 宛先に実体参照(`&#58;` = `:`)があっても vault の中とはみなさない
-        ("![図](https&#58;//e.example/a.png)", "[画像: 図](https&#58;//e.example/a.png)"),
-        ("前 ![a](https://e.example/1.png) 後", "前 [画像: a](https://e.example/1.png) 後"),
-    ],
-)
-def test_remote_image_becomes_link(source, expected) -> None:
-    assert neutralize_markdown(source) == expected
-
-
-def test_reference_style_image_is_not_embedded() -> None:
-    source = "![図][ref] と ![ref]\n\n[ref]: https://e.example/a.png"
-    out = neutralize_markdown(source)
-    # `!` を escape するので、参照形式はふつうのリンクとして残る(定義は変えない)
-    assert out == "\\![図][ref] と \\![ref]\n\n[ref]: https://e.example/a.png"
-
-
-@pytest.mark.parametrize(
     "source",
     [
-        "![図](https://e.example/a b.png)",  # 宛先に空白(形が崩れている)
+        "![図](https://e.example/a.png)",
+        "![](http://e.example/a.png)",
+        '![図](https://e.example/a.png "題")',
+        "![図](//e.example/a.png)",
+        "![図](/abs/a.png)",
+        "![図](https://e.example/a_(1).png)",
+        "![図](data:image/png;base64,AAAA)",
+        "![図](file:///tmp/a.png)",
+        # 宛先に実体参照(`&#58;` = `:`)があっても vault の中とはみなさない
+        "![図](https&#58;//e.example/a.png)",
+        "![図](\\\\host/a.png)",
+        "![図](a\\_b.png)",
+        "![図](a b.png)",
+        "![図](a_(1).png)",  # 括弧のある宛先は vault の中でも残さない
+        '![図](a.png "題")',  # タイトルつき
+        "![図 `x`](a.png)",  # 代替テキストにバッククォート
         "![図](https://e.example/a.png",  # 閉じていない(抜粋の切り詰めなど)
-        "![図\n](https://e.example/a.png)",  # 行をまたぐ
         "![[図]](https://e.example/a.png)",
     ],
 )
-def test_unparsed_image_syntax_is_escaped(source) -> None:
-    out = neutralize_markdown(source)
-    assert "![" not in out.replace("\\![", "")
+def test_image_becomes_link_with_destination_unchanged(source) -> None:
+    # `!` を escape するだけ。宛先は 1 文字も書き換えない(ふつうのリンクとして押せる)
+    assert neutralize_markdown(source) == "\\" + source
+
+
+def test_image_in_sentence_and_reference_style() -> None:
+    assert neutralize_markdown("前 ![a](https://e.example/1.png) 後") == (
+        "前 \\![a](https://e.example/1.png) 後"
+    )
+    source = "![図][ref] と ![ref]\n\n[ref]: https://e.example/a.png"
+    # 参照形式もふつうのリンクとして残る(定義は変えない)
+    assert neutralize_markdown(source) == (
+        "\\![図][ref] と \\![ref]\n\n[ref]: https://e.example/a.png"
+    )
+
+
+def test_image_over_lines_is_escaped() -> None:
+    assert neutralize_markdown("![図\n](https://e.example/a.png)") == (
+        "\\![図\n](https://e.example/a.png)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -53,7 +57,8 @@ def test_unparsed_image_syntax_is_escaped(source) -> None:
     [
         "![図](attachments/a.png)",
         "![図](a%20b.png)",
-        "![図](a_(1).png)",
+        "![図](./a.png)",
+        "![](添付/画像.png)",
         "![[ノート]]",
         "![[画像.png|200]]",
         "![[ノート#見出し]]",
@@ -66,14 +71,18 @@ def test_vault_local_embed_is_kept(source) -> None:
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        ("![図](<attachments/a.png>)", "![図](attachments/a.png)"),
-        ("![図](<添付/a b.png>)", "![図](添付/a%20b.png)"),
-        ("![図](<a(1).png>)", "![図](a(1).png)"),
+        # `<>` の宛先は単純な形ではないので埋め込みにしない。`<` は escape する
+        ("![図](<attachments/a.png>)", "\\![図](&lt;attachments/a.png>)"),
+        ("![図](<https://e.example/a b.png>)", "\\![図](&lt;https://e.example/a b.png>)"),
+        # 二重の括弧(PR #378 のレビュー)。2 回かけても同じ形のまま
+        ("![図](<a((1)).png>)", "\\![図](&lt;a((1)).png>)"),
+        ("![図](a((1)).png)", "\\![図](a((1)).png)"),
     ],
 )
-def test_vault_local_embed_in_angle_form_is_kept(source, expected) -> None:
-    # `<>` の形でも vault の中の添付は埋め込みのまま(`<` を残さない形にする)
-    assert neutralize_markdown(source) == expected
+def test_angle_form_image_is_not_embedded_and_stable(source, expected) -> None:
+    out = neutralize_markdown(source)
+    assert out == expected
+    assert neutralize_markdown(out) == out
 
 
 @pytest.mark.parametrize(
@@ -83,10 +92,16 @@ def test_wiki_embed_with_url_is_escaped(source) -> None:
     assert neutralize_markdown(source) == "\\" + source
 
 
+def test_bang_before_image_does_not_make_new_embed() -> None:
+    out = neutralize_markdown("!![a](https://e.example/x.png) ![[a]]![b](https://e.example/y.png)")
+    assert out == "!\\![a](https://e.example/x.png) \\![[a]]\\![b](https://e.example/y.png)"
+    assert neutralize_markdown(out) == out
+
+
 def test_html_in_image_alt_and_title_is_escaped() -> None:
     out = neutralize_markdown('![<b>x</b>](https://e.example/a.png "<i>t</i>")')
-    assert out == '[画像: &lt;b>x&lt;/b>](https://e.example/a.png "&lt;i>t&lt;/i>")'
-    assert neutralize_markdown("![<b>x</b>](a.png)") == "![&lt;b>x&lt;/b>](a.png)"
+    assert out == '\\![&lt;b>x&lt;/b>](https://e.example/a.png "&lt;i>t&lt;/i>")'
+    assert neutralize_markdown("![<b>x</b>](a.png)") == "\\![&lt;b>x&lt;/b>](a.png)"
 
 
 # --- 生の HTML ---
@@ -153,15 +168,24 @@ def test_text_without_embeds_or_html_is_unchanged(source) -> None:
     assert neutralize_markdown(source) == source
 
 
-def test_angle_link_destination_drops_brackets() -> None:
-    assert neutralize_markdown("[a](<https://e.example/a b>)") == "[a](https://e.example/a%20b)"
-    assert neutralize_markdown('[a](<https://e.example/a> "題")') == '[a](https://e.example/a "題")'
-    # 括弧は対応が取れていればそのまま、取れていなければ % で表す(リンクのまま押せる)
-    assert neutralize_markdown("[a](<x(1).md>)") == "[a](x(1).md)"
-    assert neutralize_markdown("[a](<x(.md>)") == "[a](x%28.md)"
-    # `)` で閉じない形は宛先と読まない(`<` は escape する。CommonMark でもリンクにならない)
-    assert neutralize_markdown("[a](<img src=x>") == "[a](&lt;img src=x>"
-    assert neutralize_markdown("[a](<b c> d)") == "[a](&lt;b c> d)"
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # 宛先は書き換えない。`<…>` の形はまれなので、`<` を escape して文字として見せる
+        ("[a](<x.md>)", "[a](&lt;x.md>)"),
+        ("[a](<x\\_y.md>)", "[a](&lt;x\\_y.md>)"),  # バックスラッシュも変えない
+        ("[a]( <note.md>)", "[a]( &lt;note.md>)"),  # `(` の後ろの空白
+        ("[a](<x(1).md>)", "[a](&lt;x(1).md>)"),
+        # タグの形でない `<` と自動リンクの形は、宛先でもそのまま
+        ("[a](<1.md>)", "[a](<1.md>)"),
+        ("[a](<https://e.example/a>)", "[a](<https://e.example/a>)"),
+    ],
+)
+def test_angle_link_destination_is_not_rewritten(source, expected) -> None:
+    out = neutralize_markdown(source)
+    assert out == expected
+    assert "%" not in out
+    assert neutralize_markdown(out) == out
 
 
 # --- コード(描画されない場所は触らない) ---
@@ -275,7 +299,7 @@ def test_neutralize_note_keeps_frontmatter_and_fixes_body() -> None:
     note = '---\ntitle: "<b>題</b>"\nurl: https://e.example/\n---\n\n![図](https://e.example/a.png)\n'
     assert neutralize_note(note) == (
         '---\ntitle: "<b>題</b>"\nurl: https://e.example/\n---\n\n'
-        "[画像: 図](https://e.example/a.png)\n"
+        "\\![図](https://e.example/a.png)\n"
     )
     assert neutralize_note(neutralize_note(note)) == neutralize_note(note)
     # frontmatter の無いノートは全体を直す

@@ -1118,7 +1118,7 @@ def test_items_and_daily_notes_have_no_remote_embed(conn, tmp_path) -> None:
     text = note.read_text()
     generated = generated_part(text)
     assert_no_remote_embed(generated)
-    assert "[画像: 図](https://img.example/a.png) と [記事](https://a/1)" in generated
+    assert "\\![図](https://img.example/a.png) と [記事](https://a/1)" in generated
     assert '&lt;img src="https://img.example/x.png">' in generated  # 抜粋も直す
     assert "&lt;iframe" in generated
     assert "`<style>`" in generated  # インラインのコードの中は触らない
@@ -1128,7 +1128,7 @@ def test_items_and_daily_notes_have_no_remote_embed(conn, tmp_path) -> None:
     daily_generated = generated_part(daily)
     assert_no_remote_embed(daily_generated)
     assert "## 1. &lt;img src=https://img.example/t.png>" in daily_generated
-    assert "[画像: 図](https://img.example/d.png)" in daily_generated
+    assert "\\![図](https://img.example/d.png)" in daily_generated
     assert "- URL: https://a/1" in daily_generated  # 裸の URL はそのまま
 
 
