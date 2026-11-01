@@ -297,6 +297,8 @@ def _run_dig_stage_locked(
 ) -> None:
     """run_dig_stage の本体(_dig_lock の中で呼ぶ)。"""
     day = today or datetime.now(JST).strftime("%Y-%m-%d")
+    # 段の初めの実時計の暦日。候補の無い朝の知らせの印を、送れた日へ進めるのに使う(GH#349)
+    started_on = today_jst()
     remaining = config.dig.daily_cap - _digs_on(conn, day)
     failures: list[str] = []
     material_requests: list[DigCandidate] = []
@@ -365,7 +367,7 @@ def _run_dig_stage_locked(
     # 候補の無い朝の知らせ(GH#349)。材料不足のリプライ指定で段が失敗する朝も、先に送る
     # (失敗の通知とこの知らせの両方が届く。設計 06 §3)
     if no_candidates and api is not None:
-        _notify_no_candidates(conn, config, api, logger, run_id, day)
+        _notify_no_candidates(conn, config, api, logger, run_id, day, started_on)
 
     if failures:
         raise DigError(
@@ -389,6 +391,7 @@ def _notify_no_candidates(
     logger: logging.Logger,
     run_id: str | None,
     day: str,
+    started_on: str,
 ) -> None:
     """上限に達していないのに候補を選べなかった朝に、その理由を 1 通で知らせる(設計 06 §3。GH#349)。
 
@@ -410,12 +413,12 @@ def _notify_no_candidates(
         if sent_today:
             return
         reason = _NO_CANDIDATE_NONE if _digest_delivered(conn, day) else _NO_CANDIDATE_NO_DIGEST
-        before = today_jst()
         api.send_message(config.telegram.owner_chat_id, f"{reason}。\n{_NO_CANDIDATE_GUIDE}")
-        # 印は送れた時点の暦日にする。段の初めの day のままだと、23:59 に始めた実行が送信の
-        # 試し直しで 0 時を越えたとき、前の日の印になり、その朝の実行がもう 1 通送る。
-        # day は注入できる(テスト)ので、送信の間に進んだ日数だけ day を進める
-        elapsed = date.fromisoformat(today_jst()) - date.fromisoformat(before)
+        # 印は送れた時点の暦日にする。段の初めの day のままだと、23:59 に始めた実行が選定・
+        # 公開・送信の間に 0 時を越えたとき、前の日の印になり、その朝の実行がもう 1 通送る。
+        # day は注入できる(テスト)ので、段の初め(started_on)から送れるまでに実時計が進んだ
+        # 日数だけ day を進める
+        elapsed = date.fromisoformat(today_jst()) - date.fromisoformat(started_on)
         set_state(
             conn,
             STATE_NO_CANDIDATE_NOTIFIED,
