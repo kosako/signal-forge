@@ -3,13 +3,22 @@
 分析・トレンド・深掘り・カードへの返事が同じ規約で使う:
 - 外部由来の値は sanitize(1 行)・sanitize_body(本文)で制御文字・nonce・フェンス境界を落とす
 - テンプレートは fill_template で 1 回だけ置換する(入力由来の {{...}} を展開しない)
+- 深掘りの文章の書き方の手引き(prompts/writing-guide-ja-*)は load_writing_guide で読む(GH#381)
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+# 書き方の手引き(GH#381)。深掘りの文章を作るプロンプトが共通で入れる(今は dig-answer)。
+# 版を上げるときは prompts/ に新しい番号のファイルを足し、この定数を更新する(既存の版は書き換えない)
+WRITING_GUIDE_VERSION = "writing-guide-ja-v001"
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+# 手引きの先頭の HTML コメント(出典と写した commit の記録)。LLM には渡さない
+_LEADING_COMMENT = re.compile(r"\A\s*<!--.*?-->\s*", re.DOTALL)
 
 
 def sanitize(value: str | None, max_length: int, nonce: str) -> str:
@@ -32,3 +41,13 @@ def fill_template(template: str, mapping: dict[str, str]) -> str:
     """単一パス置換: テンプレート上のプレースホルダだけを置き換え、置換後の値は再走査しない
     (逐次 .replace() だと入力由来の {{nonce}} 等が展開され nonce が漏れる)。"""
     return re.sub(r"\{\{(\w+)\}\}", lambda m: mapping[m.group(1)], template)
+
+
+def load_writing_guide() -> str:
+    """書き方の手引きの本文(GH#381)。先頭のコメントを外して返す。
+
+    リポジトリの中の信頼される指示なので、fill_template の値としてそのまま入れる(nonce の囲みの
+    外に置く)。値は再走査されないので、手引きの中の文字列がプレースホルダとして展開されることはない。
+    """
+    text = (_PROMPTS_DIR / f"{WRITING_GUIDE_VERSION}.md").read_text(encoding="utf-8")
+    return _LEADING_COMMENT.sub("", text, count=1).strip()

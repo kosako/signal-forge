@@ -224,7 +224,7 @@ uv run ruff check .
 repo 固有の決まり:
 
 - **migration は forward-only**。適用済みのファイルは編集も改名もせず、新しい番号のファイルを足す([設計 01 §10](docs/design/01-data-model.md)、[app/db.py](app/db.py))。
-- **prompt は既存のファイルを書き換えない**。新しい版のファイルを足し、それを指すモジュールの版の定数(`PROMPT_VERSION`。深掘りの対訳・レビュー・直しは `app/deepdive.py` の `TRANSLATE_PROMPT_VERSION`・`REVIEW_PROMPT_VERSION`・`REVISE_PROMPT_VERSION`、カードへのリプライの意図の判定は `app/dig_answer.py` の `INTENT_PROMPT_VERSION`)を更新する([設計 03 §5](docs/design/03-analysis-ranking.md))。
+- **prompt は既存のファイルを書き換えない**。新しい版のファイルを足し、それを指すモジュールの版の定数(`PROMPT_VERSION`。深掘りの対訳・レビュー・直しは `app/deepdive.py` の `TRANSLATE_PROMPT_VERSION`・`REVIEW_PROMPT_VERSION`・`REVISE_PROMPT_VERSION`、カードへのリプライの意図の判定は `app/dig_answer.py` の `INTENT_PROMPT_VERSION`、深掘りの文章の書き方の手引きは `app/prompting.py` の `WRITING_GUIDE_VERSION`)を更新する([設計 03 §5](docs/design/03-analysis-ranking.md))。
 - **runbook の §番号を変えない**。コードのメッセージが §番号で参照している([app/cli.py](app/cli.py)、[app/insights.py](app/insights.py))。
 - **LLM は隔離して呼ぶ**(`codex exec` は隔離した使い捨ての起動で、Claude API は tools を付けない素の Messages API で)。ツールや書き込み・送信の権限を LLM に与えず、vault への書き込みと Telegram への送信は Python 側が行う。外部の本文はプロンプトの中で実行ごとの nonce の囲みに入れ、データとして扱う([設計 00 §5](docs/design/00-architecture.md)、[設計 03 §3.2](docs/design/03-analysis-ranking.md))。
 
