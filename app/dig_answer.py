@@ -38,9 +38,11 @@ from app.prompting import fill_template, load_writing_guide, sanitize_body
 from app.vault_dir import VaultDir, folder_dir, open_regular
 from app.vault_guard import VaultGuard, VaultStalled
 
-# 枠のプロンプトと返事の形は同じ版で揃える(GH#381。prompts/dig-answer-v004.md と -question・
-# -summary・-more)。どれかを変えるときは、まとめて次の版を足す
-PROMPT_VERSION = "dig-answer-v004"
+# 枠のプロンプトと返事の形は同じ版で揃える(GH#381。prompts/dig-answer-v005.md と -question・
+# -summary・-more)。どれかを変えるときは、まとめて次の版を足す。v005 は、書き方の手引きの v002 で
+# 外した読む場所の規則(Telegram で読む・Markdown の記号を使わない・箇条書きと区切り)を枠の
+# 「返事の前提」に移した版(形のファイルは v004 と同じ文)
+PROMPT_VERSION = "dig-answer-v005"
 INTENT_PROMPT_VERSION = "dig-intent-v001"  # 本人のリプライの意図の判定(GH#245)
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -96,7 +98,7 @@ SendReply = Callable[[int, str], int]
 
 
 class DigAnswer(BaseModel):
-    """返事の構造化出力(prompts/dig-answer-v004.md)。
+    """返事の構造化出力(prompts/dig-answer-v005.md)。
 
     リプライの種類と調べ直しの依頼かは返させない(DigIntent で別に決める。GH#245)。
     """

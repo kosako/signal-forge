@@ -1615,7 +1615,13 @@ def test_dig_prompt_carries_the_guide_outside_the_fence(conn, config) -> None:
     assert prompt.count(f"<<<DATA-{nonce}") == 1 and prompt.count(f"DATA-{nonce}>>>") == 1
     assert "## 文の型" not in _fenced(prompt, "DATA", nonce)
     # 手引きの Telegram 向けの項目はカードの欄だけに当て、ノートは Markdown の見出しを使う
-    assert "カードの欄だけに当てる" in prompt
+    # 読む場所の規則(Telegram・Markdown の記号)は、カードの欄の基準(出力仕様)にだけ書く。
+    # 手引き(v002)は持たない(GH#381)
+    assert prompt.count("Markdown の記号") == 1
+    spec = prompt.index("# 出力仕様")
+    assert prompt.index("Markdown の記号") > spec
+    guide_part = prompt[prompt.index("# 書き方の手引き") : spec]
+    assert "Telegram" not in guide_part and "Markdown の記号" not in guide_part
     assert "`##` と `###`" in prompt
 
 

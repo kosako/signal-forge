@@ -1113,7 +1113,7 @@ def test_retry_of_failed_button_request_uses_the_article_body(conn, config) -> N
 
 # --- 返事の形と書き方の手引き(GH#381) ---
 
-# 形ごとの見分けの印(prompts/dig-answer-v004-<形>.md の見出し)と、質問の答え方の規則
+# 形ごとの見分けの印(prompts/dig-answer-v005-<形>.md の見出し)と、質問の答え方の規則
 FORM_HEADINGS = {
     "question": "# 返事の形(質問・感想へのリプライ)",
     "summary": "# 返事の形(📝 要約のボタン)",
@@ -1154,6 +1154,14 @@ def test_each_request_gets_the_writing_guide_and_only_its_own_form(conn, config,
     # 手引きと形は信頼される側(囲みの外)に置く
     fenced = "".join(re.findall(rf"<<<DATA-{nonce}\n(.*?)\nDATA-{nonce}>>>", prompt, re.DOTALL))
     assert "## 文の型" not in fenced and FORM_HEADINGS[kind] not in fenced
+    # 読む場所の規則は、手引きの v002 から枠の「返事の前提」だけが持つ(GH#381。どの形にも 1 回)
+    for rule in (
+        "私はスマホの Telegram で読む。",
+        "Markdown の記号\n(** や #、表、コードの囲み)は使わない。",
+        "箇条書きは「・」、まとまりの区切りは空行と【】の\n短いラベルにする。",
+    ):
+        assert prompt.count(rule) == 1
+    assert prompt.index("Markdown の記号") < prompt.index("# 書き方の手引き")
 
 
 def test_summary_and_more_forms_carry_their_shape(conn, config) -> None:
@@ -1194,8 +1202,8 @@ def test_retry_of_failed_button_request_keeps_the_button_form(conn, config) -> N
 
 
 def test_prompt_versions_and_form_files() -> None:
-    assert dig_answer.PROMPT_VERSION == "dig-answer-v004"
-    assert WRITING_GUIDE_VERSION == "writing-guide-ja-v001"
+    assert dig_answer.PROMPT_VERSION == "dig-answer-v005"
+    assert WRITING_GUIDE_VERSION == "writing-guide-ja-v002"
     prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
     frame = (prompts_dir / f"{dig_answer.PROMPT_VERSION}.md").read_text(encoding="utf-8")
     assert "{{writing_guide}}" in frame and "{{form}}" in frame
