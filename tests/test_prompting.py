@@ -50,6 +50,18 @@ def test_writing_guide_drops_the_source_comment_and_keeps_the_rules() -> None:
     assert "結論を先に書く" in guide
 
 
+def test_writing_guide_v002_leaves_the_reading_place_to_each_prompt() -> None:
+    # GH#381: 読む場所の規則(Telegram・Markdown)は各プロンプトが持つ。解説ノートは Obsidian で
+    # 読む Markdown なので、共通の手引きに置くと食い違う
+    assert WRITING_GUIDE_VERSION == "writing-guide-ja-v002"
+    guide = load_writing_guide()
+    assert "Telegram" not in guide and "Markdown" not in guide and "スマホ" not in guide
+    # 但し書きの置き場は、返事だけの言い方をやめて各指示に任せる
+    assert "各指示が決めた場所" in guide and "返事の形" not in guide
+    raw = (_PROMPTS_DIR / f"{WRITING_GUIDE_VERSION}.md").read_text(encoding="utf-8")
+    assert "v001 からの変更" in raw and "GH#381 の後の PR" not in raw
+
+
 def test_writing_guide_cannot_break_the_template_or_fences() -> None:
     # 手引きは fill_template の値として入れる。囲みの印やプレースホルダを含めない
     guide = load_writing_guide()

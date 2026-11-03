@@ -101,7 +101,8 @@ prompts/          # バージョン付き .md(analyze・trend・dig・dig-transl
                   #   ほかは各モジュールの版の定数。PROMPT_VERSION と、deepdive.py の TRANSLATE_・REVIEW_・
                   #   REVISE_PROMPT_VERSION、dig_answer.py の INTENT_PROMPT_VERSION、prompting.py の
                   #   WRITING_GUIDE_VERSION。dig-answer は枠と返事の形のファイル(-question・-summary・
-                  #   -more)を同じ版で揃える。設計 06 §6・GH#381)
+                  #   -more)を同じ版で揃える。writing-guide-ja は dig-answer と dig に入れ、dig-revise は
+                  #   dig を含むので入る(dig-review には入れない)。設計 06 §4〜§6・GH#381)
 tests/
 ```
 

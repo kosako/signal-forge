@@ -13,9 +13,12 @@ from pathlib import Path
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
-# 書き方の手引き(GH#381)。深掘りの文章を作るプロンプトが共通で入れる(今は dig-answer)。
+# 書き方の手引き(GH#381)。深掘りの文章を作るプロンプトが共通で入れる(dig-answer と dig。
+# dig-revise は dig を含むので入る)。
 # 版を上げるときは prompts/ に新しい番号のファイルを足し、この定数を更新する(既存の版は書き換えない)
-WRITING_GUIDE_VERSION = "writing-guide-ja-v001"
+# v002 は読む場所の規則(Telegram・Markdown)を外し、各プロンプトに持たせた(GH#381。解説ノートは
+# Obsidian で読む Markdown のため)
+WRITING_GUIDE_VERSION = "writing-guide-ja-v002"
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # 手引きの先頭の HTML コメント(出典と写した commit の記録)。LLM には渡さない
 _LEADING_COMMENT = re.compile(r"\A\s*<!--.*?-->\s*", re.DOTALL)
