@@ -30,6 +30,7 @@ from app.dig_answer import (
     enqueue_request,
 )
 from app.dig_take import record_takes
+from app.prompting import WRITING_GUIDE_VERSION, load_writing_guide
 from app.vault_guard import VaultGuard
 
 logger = logging.getLogger("test-dig-answer")
@@ -1108,3 +1109,99 @@ def test_retry_of_failed_button_request_uses_the_article_body(conn, config) -> N
     assert "## 解説ノート" not in prompt
     assert f"もう一度\n\n{RETRY_LEAD}\n\n{REQUESTS['summary']}" in prompt
     assert len(engine.intent_prompts) == 1  # やり直しは本人のリプライなので意図は判定する
+
+
+# --- 返事の形と書き方の手引き(GH#381) ---
+
+# 形ごとの見分けの印(prompts/dig-answer-v004-<形>.md の見出し)と、質問の答え方の規則
+FORM_HEADINGS = {
+    "question": "# 返事の形(質問・感想へのリプライ)",
+    "summary": "# 返事の形(📝 要約のボタン)",
+    "more": "# 返事の形(📖 詳しくのボタン)",
+}
+QA_RULE = "外部照合が要る主張は「未検証」と明記する"
+
+
+def prompt_for(conn, config, kind: str, url: str = "https://a.example/1") -> str:
+    """kind(question / summary / more)の依頼 1 件に答えたときの、返事のプロンプト。"""
+    dig_id = add_dig(conn, config, url=url)
+    add_document(conn, dig_id, "The original article body extracted from the web.")
+    if kind == "question":
+        ask(conn, dig_id, "ユースケースがいまいちわからん", 71)
+    else:
+        enqueue_request(conn, dig_id, kind)
+        conn.commit()
+    engine = Engine()
+    answer_pending(conn, config, engine.factory, Sender(), logger)
+    assert len(engine.prompts) == 1
+    return engine.prompts[0]
+
+
+@pytest.mark.parametrize("kind", ["question", "summary", "more"])
+def test_each_request_gets_the_writing_guide_and_only_its_own_form(conn, config, kind) -> None:
+    prompt = prompt_for(conn, config, kind)
+
+    assert load_writing_guide() in prompt  # どの形にも共通の手引きを入れる
+    assert "<!--" not in prompt  # 手引きの先頭の出典のコメントは LLM に渡さない
+    for other, heading in FORM_HEADINGS.items():
+        assert (heading in prompt) == (other == kind)
+    # 質問の答え方の規則(未検証の明記など)は、質問にだけ当てる(要約・詳しくに混ぜない)
+    assert (QA_RULE in prompt) == (kind == "question")
+    # プレースホルダはすべて埋まり、囲みは材料とやり取りの 2 つだけ
+    assert re.search(r"\{\{\w+\}\}", prompt) is None
+    nonce = re.search(r"<<<DATA-(\w+)", prompt).group(1)
+    assert prompt.count(f"<<<DATA-{nonce}") == 2 and prompt.count(f"DATA-{nonce}>>>") == 2
+    # 手引きと形は信頼される側(囲みの外)に置く
+    fenced = "".join(re.findall(rf"<<<DATA-{nonce}\n(.*?)\nDATA-{nonce}>>>", prompt, re.DOTALL))
+    assert "## 文の型" not in fenced and FORM_HEADINGS[kind] not in fenced
+
+
+def test_summary_and_more_forms_carry_their_shape(conn, config) -> None:
+    summary = prompt_for(conn, config, "summary", url="https://a.example/1")
+    assert "1 行目は、この記事が言っていること" in summary
+    assert "要点を 3〜5 個" in summary
+    assert "但し書きは書かない" in summary
+    more = prompt_for(conn, config, "more", url="https://a.example/2")
+    assert "まとめを 2〜3 行" in more
+    assert "【何をしたか】【結果】【限界】" in more
+    assert "最後の行は「つまり」で始め" in more
+
+
+def test_question_form_keeps_no_headings(conn, config) -> None:
+    # 質問への返事は v003 と同じく見出しを使わない。手引きが勧める【】のラベルは、詳しくの形
+    # だけのもの(GH#381)
+    assert "見出し(【】のラベルを\n  含む)は使わない" in prompt_for(conn, config, "question")
+    assert "見出し(【】のラベルを" not in prompt_for(
+        conn, config, "more", url="https://a.example/2"
+    )
+
+
+def test_retry_of_failed_button_request_keeps_the_button_form(conn, config) -> None:
+    # ボタンからの依頼のやり直しは、返事の形もボタンと同じ(質問の答え方にしない)
+    dig_id = add_dig(conn, config)
+    add_document(conn, dig_id, "The original article body extracted from the web.")
+    enqueue_request(conn, dig_id, "more")
+    sender = Sender()
+    answer_pending(conn, config, Engine(fail_on={1, 2}).factory, sender, logger)
+    reply_to_failure(conn, dig_id, "もう一度", 72, rows(conn)[0]["id"])
+    engine = Engine()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    prompt = engine.prompts[0]
+    assert FORM_HEADINGS["more"] in prompt
+    assert FORM_HEADINGS["question"] not in prompt and QA_RULE not in prompt
+
+
+def test_prompt_versions_and_form_files() -> None:
+    assert dig_answer.PROMPT_VERSION == "dig-answer-v004"
+    assert WRITING_GUIDE_VERSION == "writing-guide-ja-v001"
+    prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
+    frame = (prompts_dir / f"{dig_answer.PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    assert "{{writing_guide}}" in frame and "{{form}}" in frame
+    # 形は依頼の種類(dig_questions.request の値と、本人のリプライ = None)をすべて覆う
+    assert set(dig_answer._FORMS) == {None, *REQUESTS}
+    for form in dig_answer._FORMS.values():
+        text = (prompts_dir / f"{dig_answer.PROMPT_VERSION}-{form}.md").read_text(encoding="utf-8")
+        assert text.startswith(FORM_HEADINGS[form])
+        assert "{{" not in text and "DATA-" not in text  # 形の文が囲みやプレースホルダを作らない

@@ -13,6 +13,9 @@
   出力で決めない(GH#245)。本人の入力(リプライの本文と、返信先が失敗の知らせか)だけを渡す
   別の呼び出し(prompts/dig-intent-v001)で決める。返事の材料(外部由来のノート・元記事)の中の
   文が、本人の質問を take として記録させたり、調べ直しを積ませたりできないようにするため
+- 返事の形は依頼の種類ごとに分ける(GH#381)。質問・感想への答え方と、カードのボタンの 📝 要約・
+  📖 詳しく の形を、別のファイル(prompts/<版>-<形>.md)に置き、枠のプロンプトの form に入れる。
+  どの形にも、共通の書き方の手引き(app.prompting.load_writing_guide)を入れる
 """
 
 from __future__ import annotations
@@ -31,16 +34,18 @@ from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.dig import DigInstruction, apply_instructions
-from app.prompting import fill_template, sanitize_body
+from app.prompting import fill_template, load_writing_guide, sanitize_body
 from app.vault_dir import VaultDir, folder_dir, open_regular
 from app.vault_guard import VaultGuard, VaultStalled
 
-PROMPT_VERSION = "dig-answer-v003"
+# 枠のプロンプトと返事の形は同じ版で揃える(GH#381。prompts/dig-answer-v004.md と -question・
+# -summary・-more)。どれかを変えるときは、まとめて次の版を足す
+PROMPT_VERSION = "dig-answer-v004"
 INTENT_PROMPT_VERSION = "dig-intent-v001"  # 本人のリプライの意図の判定(GH#245)
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# 返事の目安はプロンプトで 1,500 字。スキーマの上限は余裕を持たせる(少し超えただけで
-# 検証失敗 → 返事が届かない、を避ける。送る側が媒体の上限で切る)
+# 返事の目安は、どの形(GH#381)もプロンプトで長くても 1,500 字。スキーマの上限は余裕を持たせる
+# (少し超えただけで検証失敗 → 返事が届かない、を避ける。送る側が媒体の上限で切る)
 ANSWER_MAX_CHARS = 3_000
 QUESTION_MAX_CHARS = 2_000  # 1 リプライの上限(プロンプトに渡す長さ)
 EXPLAINER_MAX_CHARS = 20_000  # 解説ノート(平均 3,500 字。本人の追記で伸びても抑える)
@@ -69,18 +74,17 @@ REDIG_NO_MATERIAL_NOTICE = (
 )
 
 # カードのボタンからの依頼(GH#141)。台帳の question にこの文を入れ、質問と同じ流れで答える
-# (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)
+# (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)。返事の形(何をどの順で
+# 書くか)は依頼の文に書かず、プロンプトの返事の形(_FORMS)に持たせる(GH#381。2 か所に書いて
+# 食い違わないように)
 REQUESTS = {
-    "summary": (
-        "(📝 要約のボタン)元記事の要約を日本語で書いてほしい。元記事が日本語以外なら、和訳した"
-        "要約にする。記事が何を主張し、何を根拠にしているかが分かるように、要点を 3〜5 個の"
-        "短い箇条書きで。"
-    ),
-    "more": (
-        "(📖 詳しくのボタン)元記事の中身を、概要カードより詳しく日本語で説明してほしい。記事の"
-        "流れに沿って、主張・根拠・具体例を省きすぎずに。元記事が日本語以外なら日本語で。"
-    ),
+    "summary": "(📝 要約のボタン)元記事を日本語で要約してほしい。",
+    "more": "(📖 詳しくのボタン)元記事の中身を、概要カードより詳しく日本語で説明してほしい。",
 }
+# 返事の形(GH#381)。dig_questions.request(None = 本人のリプライ)から、prompts/<版>-<形>.md へ。
+# 質問・感想には今までの答え方を、ボタンには要約・詳しくの専用の形を使う(質問の規則の「未検証と
+# 明記」「材料が短ければ一言」などを要約に混ぜない)
+_FORMS = {None: "question", "summary": "summary", "more": "more"}
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 # 受付の順序の印(GH#336。migration 025)。質問を受け付けた時点で記帳済みの signals.id の最大。
@@ -92,7 +96,7 @@ SendReply = Callable[[int, str], int]
 
 
 class DigAnswer(BaseModel):
-    """返事の構造化出力(prompts/dig-answer-v003.md)。
+    """返事の構造化出力(prompts/dig-answer-v004.md)。
 
     リプライの種類と調べ直しの依頼かは返させない(DigIntent で別に決める。GH#245)。
     """
@@ -417,11 +421,15 @@ def build_answer_prompt(
             [question, RETRY_LEAD]
             + [sanitize_body(q["question"], nonce)[:QUESTION_MAX_CHARS] for q in retried]
         )
-    # ボタンからの依頼のやり直しは、材料もボタンと同じにする(元記事の本文。GH#141・GH#236)
+    # ボタンからの依頼のやり直しは、材料と返事の形もボタンと同じにする(元記事の本文。
+    # GH#141・GH#236・GH#381)
     request = retried[0]["request"] if retried else row["request"]
+    form = (_PROMPTS_DIR / f"{PROMPT_VERSION}-{_FORMS[request]}.md").read_text(encoding="utf-8")
     return fill_template(
         template,
         {
+            "writing_guide": load_writing_guide(),
+            "form": form.strip(),
             "interest_profile": profile,
             "materials": (
                 _request_materials(conn, config, row, nonce, vault)

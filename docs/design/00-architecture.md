@@ -97,9 +97,11 @@ app/
                   #   同じ atomic_write を使う。DeepDive ノートの中身は deepdive.py が作る)
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
 prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer・dig-intent・
-                  #   dig-review・dig-revise。analyses は prompt_version 列で追跡し、ほかは各モジュールの
-                  #   版の定数。PROMPT_VERSION と、deepdive.py の TRANSLATE_・REVIEW_・REVISE_PROMPT_VERSION、
-                  #   dig_answer.py の INTENT_PROMPT_VERSION)
+                  #   dig-review・dig-revise・writing-guide-ja。analyses は prompt_version 列で追跡し、
+                  #   ほかは各モジュールの版の定数。PROMPT_VERSION と、deepdive.py の TRANSLATE_・REVIEW_・
+                  #   REVISE_PROMPT_VERSION、dig_answer.py の INTENT_PROMPT_VERSION、prompting.py の
+                  #   WRITING_GUIDE_VERSION。dig-answer は枠と返事の形のファイル(-question・-summary・
+                  #   -more)を同じ版で揃える。設計 06 §6・GH#381)
 tests/
 ```
 
