@@ -15,6 +15,7 @@ import httpx
 import pytest
 import yaml
 
+from app import deepdive
 from app.analysis.fallback import fallback_engine_factory
 from app.analysis.llm import (
     ANTHROPIC_API_KEY_ENV,
@@ -51,6 +52,7 @@ from app.delivery.state import get_state
 from app.dig import DigInstruction, apply_instructions, enqueue_bookmark
 from app.extraction import extract_pending
 from app.http import HttpClient
+from app.prompting import load_writing_guide
 from app.vault_guard import VaultGuard
 from tests.test_delivery import telegram_text_error
 
@@ -160,7 +162,7 @@ class ScriptedEngine:
                 writer_stance="現場リーダー向けの週刊ニュースレター著者",
                 for_you="あなたの運用と直結します",
                 for_world="議論の重心を動かす論考です",
-                note_markdown="## 概要\n\n**あなたにとって**:…\n\n## 骨子\n\n1. …",
+                note_markdown="## 概要\n\n### あなたにとって\n\n…\n\n## 骨子\n\n1. …",
             )
         return TranslationChunk(markdown="## 対訳\n\n> [!quote]- 原文(英語)\n> …\n\n訳文")
 
@@ -1572,6 +1574,109 @@ def test_prompt_truncates_long_body(conn, config) -> None:
     assert "長さ上限で切り詰め" in prompt
 
 
+# --- 書き方の手引き(GH#381) ---
+
+
+def _fenced(prompt: str, label: str, nonce: str) -> str:
+    """nonce の囲み(label)の中身をつなげたもの。"""
+    return "".join(
+        re.findall(rf"<<<{label}-{nonce}\n(.*?)\n{label}-{nonce}>>>", prompt, re.DOTALL)
+    )
+
+
+def test_prompt_versions_and_which_prompts_carry_the_guide() -> None:
+    assert deepdive.PROMPT_VERSION == "dig-v002"
+    assert deepdive.REVISE_PROMPT_VERSION == "dig-revise-v002"
+    # レビューは元記事との照合だけを見るので、手引きを入れた版にしない
+    assert deepdive.REVIEW_PROMPT_VERSION == "dig-review-v001"
+    prompts_dir = Path(deepdive.__file__).resolve().parent.parent / "prompts"
+    dig = (prompts_dir / f"{deepdive.PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    revise = (prompts_dir / f"{deepdive.REVISE_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    review = (prompts_dir / f"{deepdive.REVIEW_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    # 手引きは解説の囲みより前(信頼される側)に 1 回だけ置く
+    assert dig.count("{{writing_guide}}") == 1
+    assert dig.index("{{writing_guide}}") < dig.index("<<<DATA-{{nonce}}")
+    # 直しは解説のプロンプトを丸ごと含むので、手引きを二重に入れない
+    assert "{{writing_guide}}" not in revise and revise.startswith("{{dig_prompt}}")
+    assert "{{writing_guide}}" not in review
+
+
+def test_dig_prompt_carries_the_guide_outside_the_fence(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", body=BODY)
+    enqueue(conn, item, angle="この観点")
+    selected, _ = _select_candidates(conn, config, 1, "2026-07-22")
+    prompt = build_dig_prompt(config, selected[0], "source-note")
+
+    guide = load_writing_guide()
+    assert prompt.count(guide) == 1 and "<!--" not in prompt
+    # プレースホルダはすべて埋まり、囲みは本文の 1 つだけ
+    assert re.search(r"\{\{\w+\}\}", prompt) is None
+    nonce = re.search(r"<<<DATA-(\w+)", prompt).group(1)
+    assert prompt.count(f"<<<DATA-{nonce}") == 1 and prompt.count(f"DATA-{nonce}>>>") == 1
+    assert "## 文の型" not in _fenced(prompt, "DATA", nonce)
+    # 手引きの Telegram 向けの項目はカードの欄だけに当て、ノートは Markdown の見出しを使う
+    assert "カードの欄だけに当てる" in prompt
+    assert "`##` と `###`" in prompt
+
+
+def test_dig_prompt_has_no_bold_label_instruction(conn, config) -> None:
+    # 手引きの「太字の見出しに中身を続けない」と食い違う、概要の **あなたにとって**: の指示を
+    # 小見出しに置き換えた(GH#381)
+    item = add_item(conn, "https://blog.example/post", body=BODY)
+    enqueue(conn, item)
+    selected, _ = _select_candidates(conn, config, 1, "2026-07-22")
+    prompt = build_dig_prompt(config, selected[0], None)
+
+    assert "**あなたにとって**" not in prompt and "**世の中にとって**" not in prompt
+    assert "### あなたにとって" in prompt and "### 世の中にとって" in prompt
+    # 節の構成は v001 と同じ 7 つ(この順)
+    headings = [
+        "`## 概要`",
+        "`## 書き手の立ち位置`",
+        "`## 骨子`",
+        "`## 根拠の強さ(検証)`",
+        "`## 自分への接続`",
+        "`## 残った問い`",
+        "`## ソース`",
+    ]
+    positions = [prompt.index(h) for h in headings]
+    assert positions == sorted(positions)
+    # 未検証の注記は「根拠の強さ」にまとめ、カードには書かない
+    assert "但し書きと未検証の注記を書かない" in prompt
+    assert "1 行目は結論" in prompt
+
+
+def test_revise_prompt_has_the_guide_once_outside_the_fences(conn, config) -> None:
+    item = add_item(conn, "https://blog.example/post", body=BODY)
+    enqueue(conn, item)
+    (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
+    engines: dict[str, ScriptedEngine] = {}
+    finding = ReviewFinding(
+        kind="misread", severity="must", location="## 骨子", problem="違う", fix="直す"
+    )
+    _revise_draft(config, make_factory(engines), candidate, None, injected_draft(), (finding,))
+    ((_, prompt),) = engines["medium"].prompts
+
+    guide = load_writing_guide()
+    assert prompt.count(guide) == 1
+    assert prompt.index(guide) < prompt.index("<<<DATA-")
+    nonces = set(re.findall(r"<<<(?:DATA|DRAFT|REVIEW)-(\w+)", prompt))
+    for nonce in nonces:
+        for label in ("DATA", "DRAFT", "REVIEW"):
+            assert "## 文の型" not in _fenced(prompt, label, nonce)
+    assert "直した文も、上の書き方の手引きと解説ノートの構成に従う" in prompt
+
+
+def test_review_prompt_does_not_carry_the_guide(conn, config) -> None:
+    # 査読は元記事との食い違いだけを見る。手引きを渡して、書き方を指摘に混ぜない(GH#381)
+    item = add_item(conn, "https://blog.example/post", body=BODY)
+    enqueue(conn, item)
+    (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
+    prompt = build_review_prompt(config, candidate, injected_draft())
+    assert "## 文の型" not in prompt and "深掘りの文章の書き方" not in prompt
+    assert "文体・言い回し・構成の好み" in prompt  # 指摘しないもの(v001 のまま)
+
+
 def test_split_paragraphs_groups_by_blank_line() -> None:
     text = "\n\n".join(["段落" * 10] * 10)
     chunks = _split_paragraphs(text, 100)
@@ -1988,6 +2093,8 @@ def test_review_off_leaves_no_trace(conn, config) -> None:
     assert "review" not in yaml.safe_load(note.split("---")[1])
     assert "レビュー" not in note and "レビュー" not in card
     assert note.endswith("## 骨子\n\n1. …\n\n---\n\n(この下は手書きメモ・take 領域)\n")
+    # 概要の小見出し(dig-v002。GH#381)は、記帳と公開の直しを経てもそのまま残る
+    assert "\n## 概要\n\n### あなたにとって\n\n…\n\n## 骨子\n" in note
 
 
 # --- 予備の Claude が書いたドラフトのレビュー(GH#180) ---

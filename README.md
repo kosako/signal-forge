@@ -242,7 +242,7 @@ repo 固有の決まり:
 | `app/export/` | Obsidian への書き出し |
 | `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口)、朝の調査段、カードへの質問への返事、take の記録 |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
-| `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-intent・dig-review・dig-revise)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
+| `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-intent・dig-review・dig-revise)と、深掘りの文章の書き方の手引き(writing-guide-ja。dig-answer と dig が入れる)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |
 | `scripts/` | `kpi/` は KPI 集計の SQL(使い方は [docs/project/kpi-queries.md](docs/project/kpi-queries.md))。`day0_x_probe.py` は Day 0 の使い捨てスクリプト |
 | `tests/` | pytest のテスト |

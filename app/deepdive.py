@@ -89,14 +89,18 @@ from app.dig import DigCandidate, has_material, select_from_queue
 from app.export.neutralize import neutralize_markdown, neutralize_note
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import today_jst
-from app.prompting import fill_template, sanitize, sanitize_body
+from app.prompting import fill_template, load_writing_guide, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
 from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
 
-PROMPT_VERSION = "dig-v001"
+# 解説とその直しには書き方の手引き(app.prompting.load_writing_guide)を入れる(GH#381)。手引きは
+# 解説のプロンプトの writing_guide に入れ、直しは解説のプロンプトを丸ごと含むので二重には入れない
+PROMPT_VERSION = "dig-v002"
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
+# レビューには手引きを入れない(GH#381)。元記事との食い違いだけを見る役で、文の書き方を指摘の
+# 対象にしない(手引きを渡すと、書き方の好みが事実の指摘に混ざりうる)
 REVIEW_PROMPT_VERSION = "dig-review-v001"  # 別系統の AI のレビュー(GH#153)
-REVISE_PROMPT_VERSION = "dig-revise-v001"  # 指摘を受けて書き手が 1 回直す
+REVISE_PROMPT_VERSION = "dig-revise-v002"  # 指摘を受けて書き手が 1 回直す
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 DEEPDIVE_FOLDER = "DeepDive"  # vault の folder 配下(書込先はここに限定。ADR 0004)
@@ -191,7 +195,7 @@ class DigError(Exception):
 
 
 class DigDraft(BaseModel):
-    """解説ノート + カードの構造化出力(prompts/dig-v001.md)。"""
+    """解説ノート + カードの構造化出力(prompts/dig-v002.md)。"""
 
     title_ja: str = Field(min_length=1, max_length=_CARD_TITLE_MAX)
     writer_stance: str = Field(min_length=1)
@@ -1077,6 +1081,7 @@ def build_dig_prompt(
     return fill_template(
         template,
         {
+            "writing_guide": load_writing_guide(),  # 信頼される側(囲みの外。GH#381)
             "brief": brief,
             "interest_profile": profile,
             "meta": "\n".join(meta_lines),
