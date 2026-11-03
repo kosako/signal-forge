@@ -1167,6 +1167,15 @@ def test_summary_and_more_forms_carry_their_shape(conn, config) -> None:
     assert "最後の行は「つまり」で始め" in more
 
 
+def test_question_form_keeps_no_headings(conn, config) -> None:
+    # 質問への返事は v003 と同じく見出しを使わない。手引きが勧める【】のラベルは、詳しくの形
+    # だけのもの(GH#381)
+    assert "見出し(【】のラベルを\n  含む)は使わない" in prompt_for(conn, config, "question")
+    assert "見出し(【】のラベルを" not in prompt_for(
+        conn, config, "more", url="https://a.example/2"
+    )
+
+
 def test_retry_of_failed_button_request_keeps_the_button_form(conn, config) -> None:
     # ボタンからの依頼のやり直しは、返事の形もボタンと同じ(質問の答え方にしない)
     dig_id = add_dig(conn, config)
