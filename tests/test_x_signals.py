@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from app.analysis.stage1 import preselect
-from app.config import Config, XSignalsConfig
+from app.config import Config, XConfig, XSignalsConfig
 from app.connectors.x_oauth2 import (
     OAUTH2_SCOPES,
     TOKEN_URL,
@@ -16,7 +16,12 @@ from app.connectors.x_oauth2 import (
     XOAuth2Session,
     XOAuth2Token,
 )
-from app.connectors.x_signals import XSignalsError, collect_x_signals, signal_reads_on
+from app.connectors.x_signals import (
+    EXPANSIONS,
+    XSignalsError,
+    collect_x_signals,
+    signal_reads_on,
+)
 from app.db import apply_migrations, connect
 from app.jst import today_jst
 from app.normalize import normalize_url
@@ -159,7 +164,9 @@ def test_all_kinds_recorded_with_cost(conn, tmp_path) -> None:
     assert rt_rows[0]["text_excerpt"] == "元ツイ本文"
     run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
     assert run["status"] == "ok" and run["api_reads"] == 4
-    assert run["estimated_cost_usd"] == pytest.approx(4 * 0.004)
+    # 費用 = ポスト 4 件 × 単価 + includes のユーザー 3 件(alice を 2 回 + bob)× ユーザーの単価 +
+    # includes のポスト 1 件(RT 元)× ポストの単価(GH#386。返った物の数で数える)
+    assert run["estimated_cost_usd"] == pytest.approx(4 * 0.004 + 3 * 0.010 + 1 * 0.005)
 
 
 def test_diff_stops_at_known_tweet(conn, tmp_path) -> None:
@@ -291,6 +298,61 @@ def test_partial_page_failure_still_counts_reads_and_cost(conn, tmp_path) -> Non
     assert run["api_reads"] == 3
     assert run["estimated_cost_usd"] == pytest.approx(3 * 0.004)
     assert "bookmark" in run["error"]
+
+
+def test_signals_request_keeps_expansions(conn, tmp_path) -> None:
+    # GH#386: 興味シグナルは RT 元の本文と著者の username に includes を使うので、expansions を保つ
+    assert EXPANSIONS == "author_id,referenced_tweets.id,referenced_tweets.id.author_id"
+    session = session_with([page(tw("b1"))], [page(tw("l1"))], [page(rt("1000", "900"))])
+    collect_x_signals(conn, make_config(tmp_path), session, logger)
+    for key in ("/bookmarks", "/liked_tweets", "42/tweets"):
+        (params,) = calls_to(session, key)
+        assert params["expansions"] == EXPANSIONS
+
+
+def test_includes_cost_by_type_and_reads_count_posts_only(conn, tmp_path, monkeypatch) -> None:
+    # GH#386: includes の物は種類ごとの単価で費用に足す(media・polls・places と知らない種類は
+    # その他の単価)。日次の上限の使用量(api_reads)はポストの件数だけで、includes は数えない
+    monkeypatch.setattr("app.connectors.x_signals.today_jst", lambda: DAY)
+    body = page(tw("b1"), tw("b2"))
+    body["includes"] = {
+        "users": [{"id": "u1", "username": "alice"}, {"id": "u2", "username": "bob"}],
+        "tweets": [{"id": "900", "text": "元"}],
+        "media": [{"media_key": "m1"}, {"media_key": "m2"}],
+        "polls": [{"id": "p1"}],
+        "places": [{"id": "pl1"}],
+        "topics": [{"id": "t1"}],  # 知らない種類も見積もりから漏らさない
+    }
+    config = Config(
+        config_dir=tmp_path,
+        x=XConfig(
+            unit_price_usd=0.004,
+            expansion_user_price_usd=0.1,
+            expansion_post_price_usd=0.01,
+            expansion_other_price_usd=0.001,
+        ),
+        x_signals=XSignalsConfig(daily_read_cap=50),
+    )
+    totals = collect_x_signals(conn, config, session_with([body], []), logger)
+    assert totals == {"api_reads": 2, "new_signals": 2}
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["api_reads"] == 2
+    assert run["estimated_cost_usd"] == pytest.approx(2 * 0.004 + 2 * 0.1 + 1 * 0.01 + 5 * 0.001)
+    conn.execute("UPDATE x_signal_runs SET started_at = ?", ("2026-10-24T01:00:00Z",))
+    assert signal_reads_on(conn, DAY) == 2
+
+
+def test_includes_cost_kept_when_stage_fails(conn, tmp_path) -> None:
+    # GH#386: 段が落ちる経路(GH#330 の failed の行)でも、取得済みのページの includes の費用を残す
+    fail_signal_insert(conn, "l1")
+    alice = {"id": "u1", "username": "alice"}
+    session = session_with([page(tw("b1"), users=[alice])], [page(tw("l1"), users=[alice])])
+    with pytest.raises(sqlite3.IntegrityError, match="boom"):
+        collect_x_signals(conn, make_config(tmp_path), session, logger)
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "failed"
+    assert run["api_reads"] == 2
+    assert run["estimated_cost_usd"] == pytest.approx(2 * 0.004 + 2 * 0.010)
 
 
 def test_backfill_pages_past_known_within_limit(conn, tmp_path) -> None:

@@ -51,6 +51,13 @@ class XConfig:
     # (再走は台帳の当日の合計を引いた残りだけを読む。GH#178)
     daily_read_cap: int = 130
     unit_price_usd: float = 0.004  # Day 0 実測(2026-07-10)。config で上書き可
+    # expansions で返る includes の 1 件ごとの単価(GH#386)。X の従量課金は 2026-11-22 から、
+    # includes の物を、その種類の通常の単価で数える。ユーザー = users、ポスト = tweets、
+    # その他 = media・polls・places。台帳の費用の見積もりにだけ使い、読取の上限(api_reads)は
+    # ポストの件数のまま数える
+    expansion_user_price_usd: float = 0.010
+    expansion_post_price_usd: float = 0.005
+    expansion_other_price_usd: float = 0.005
     # ホームTL + 検索(+S1 の取込)の合算日次読取上限(単一ノブ。ADR 0001 予算配分)。
     # 内訳(daily_read_cap / [x_search].daily_read_cap)の合計がこれを超えると起動時エラー
     combined_daily_read_cap: int = 165
@@ -520,6 +527,15 @@ def _validate(path: Path, config: Config) -> None:
             raise ConfigError(f"{path}: [{section}].{key} は正の整数であること: {value}")
     if config.x.unit_price_usd < 0 or config.budget.monthly_cap_usd <= 0:
         raise ConfigError(f"{path}: 単価・予算上限は正の値であること")
+    # includes の物の単価(GH#386)。0 は「数えない」の明示として受ける
+    for key in (
+        "expansion_user_price_usd",
+        "expansion_post_price_usd",
+        "expansion_other_price_usd",
+    ):
+        price = getattr(config.x, key)
+        if price < 0:
+            raise ConfigError(f"{path}: [x].{key} は 0 以上であること: {price}")
     for key, value in (
         ("survey_time", config.telegram.survey_time),
         ("watchdog_time", config.telegram.watchdog_time),

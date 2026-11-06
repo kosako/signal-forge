@@ -30,6 +30,11 @@
   人間ゲート。ADR 0001)。backfill は「kind ごと直近 N 件を種に」の上限つき
   (全ページ辿りは過去のいいねが多いとコスト事故になる。GH#84)。自RT の backfill は
   since_id カーソルを送らず直近 N 件を読み、カーソルは後ろへ戻さない(GH#231)
+- 費用の見積もり = 読取数 × 単価 + includes の物の数 × 種類ごとの単価(GH#386)。X の従量課金は
+  2026-11-22 から、expansions で返る includes の物(ユーザー・ポスト・メディアなど)を通常の単価で
+  数える。RT 元の本文と著者の username に要るので、この段は expansions を保つ。日付で切り替えず
+  常に足す(課金の開始の前の 2 週間ほどは少し多めに見積もる。費用の上振れは安全側)。日次の
+  上限(api_reads)はポストの件数だけを数え、includes は数えない
 - text_excerpt は TTL キャッシュのみ(purge が retention.x_cache_ttl_days で
   NULL 化。Issue #2 の確定ポリシー)
 - 失敗は kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)。
@@ -46,7 +51,7 @@ import sqlite3
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from app.config import X_SIGNALS_MIN_PAGE, Config
+from app.config import X_SIGNALS_MIN_PAGE, Config, XConfig
 from app.connectors.base import FatalError
 from app.connectors.x import raise_for_auth, rate_limit_exhausted, tweet_full_text
 from app.connectors.x_oauth2 import USERS_ME_URL, XOAuth2Error, XOAuth2Session
@@ -70,6 +75,10 @@ EXCERPT_MAX = 280  # text_excerpt の上限(TTL キャッシュ。恒久保存�
 # canonical_url 素材。GH#99)。フィールド追加は同一読取のため課金は不変
 TWEET_FIELDS = "created_at,author_id,referenced_tweets,note_tweet,entities"
 EXPANSIONS = "author_id,referenced_tweets.id,referenced_tweets.id.author_id"
+
+# includes の物を数える分け方(GH#386)。users = ユーザーの単価、tweets = ポストの単価、other =
+# その他の単価(media・polls・places)。知らない種類が来ても other で数え、見積もりから漏らさない
+INCLUDES_KINDS = ("users", "tweets", "other")
 
 BOOKMARK_SOURCE_NAME = "x:bookmark"  # item の帰属先(enabled=0 = collect 対象外)
 
@@ -113,6 +122,8 @@ def collect_x_signals(
     used_today = 0 if backfill else signal_reads_on(conn, today_jst())
     me_id = _get_me_id(session)
     totals = {"api_reads": 0, "new_signals": 0}
+    # 応答の includes の物の数(費用の見積もりだけに使う。GH#386)
+    includes = dict.fromkeys(INCLUDES_KINDS, 0)
     outcomes: dict[str, str] = {}  # 試行した kind → 'ok' | 'failed'(skip は含めない)
     errors: list[str] = []
     try:
@@ -130,8 +141,11 @@ def collect_x_signals(
                 )
                 continue
             stats = {"api_reads": 0, "new_signals": 0, "rate_limited": 0}
+            kind_includes = dict.fromkeys(INCLUDES_KINDS, 0)
             try:
-                _collect_kind(conn, session, kind, me_id, remaining, run_id, stats, backfill)
+                _collect_kind(
+                    conn, session, kind, me_id, remaining, run_id, stats, backfill, kind_includes
+                )
             except (XSignalsError, XOAuth2Error, FatalError) as e:
                 # kind 単位で隔離(bookmark の 403 = scope 不備でも like / self_rt は取る)
                 outcomes[kind] = "failed"
@@ -152,6 +166,8 @@ def collect_x_signals(
                 # 後続 kind に予算が再配分され cap を実質超過するのを防ぐ)
                 totals["api_reads"] += stats["api_reads"]
                 totals["new_signals"] += stats["new_signals"]
+                for key, count in kind_includes.items():
+                    includes[key] += count
     except BaseException as e:
         # 分類外の例外(保存の sqlite3.Error・想定外のバグなど)は今までどおり段の失敗として
         # 抜けるが、その前に取得済みの読取数と費用を failed の行で台帳に残す(設計 02 §2。
@@ -159,7 +175,16 @@ def collect_x_signals(
         # 加算済み。台帳を書けなくても元の例外を送出する
         errors.append(f"{kind}: {_error_text(e)}")
         try:
-            _record_run(conn, config, totals, errors, failed=True, run_id=run_id, backfill=backfill)
+            _record_run(
+                conn,
+                config,
+                totals,
+                includes,
+                errors,
+                failed=True,
+                run_id=run_id,
+                backfill=backfill,
+            )
         except Exception:
             logger.exception(
                 "x_signals の台帳を書けない(取込の元の例外を送出する)",
@@ -168,7 +193,7 @@ def collect_x_signals(
         raise
     all_failed = bool(outcomes) and all(v == "failed" for v in outcomes.values())
     cost = _record_run(
-        conn, config, totals, errors, failed=all_failed, run_id=run_id, backfill=backfill
+        conn, config, totals, includes, errors, failed=all_failed, run_id=run_id, backfill=backfill
     )
     logger.info(
         "x_signals 取込完了",
@@ -187,14 +212,19 @@ def _record_run(
     conn: sqlite3.Connection,
     config: Config,
     totals: dict[str, int],
+    includes: dict[str, int],
     errors: list[str],
     *,
     failed: bool,
     run_id: str | None,
     backfill: bool,
 ) -> float:
-    """取込 1 回の読取数・費用を x_signal_runs へ 1 行記録し、費用を返す。"""
-    cost = totals["api_reads"] * config.x.unit_price_usd
+    """取込 1 回の読取数・費用を x_signal_runs へ 1 行記録し、費用を返す。
+
+    費用 = 読取数 × 単価 + includes の物の費用(GH#386)。includes の数は列に持たず、費用に
+    含めて記録する(doctor #9 の当月の集計は estimated_cost_usd の合計で足りる)。
+    """
+    cost = totals["api_reads"] * config.x.unit_price_usd + includes_cost_usd(includes, config.x)
     conn.execute(
         "INSERT INTO x_signal_runs (status, api_reads, estimated_cost_usd, new_signals, "
         "error, run_id, backfill) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -209,6 +239,26 @@ def _record_run(
         ),
     )
     return cost
+
+
+def count_includes(body: dict, into: dict[str, int]) -> None:
+    """応答の includes の物を種類ごとに into へ足す(GH#386。課金は返った物の数で決まる)。"""
+    included = body.get("includes")
+    if not isinstance(included, dict):
+        return
+    for name, objects in included.items():
+        if not isinstance(objects, list):
+            continue
+        into[name if name in ("users", "tweets") else "other"] += len(objects)
+
+
+def includes_cost_usd(includes: dict[str, int], x: XConfig) -> float:
+    """includes の物の費用の見積もり(GH#386)。"""
+    return (
+        includes["users"] * x.expansion_user_price_usd
+        + includes["tweets"] * x.expansion_post_price_usd
+        + includes["other"] * x.expansion_other_price_usd
+    )
 
 
 def _error_text(error: BaseException) -> str:
@@ -253,9 +303,11 @@ def _collect_kind(
     run_id: str | None,
     stats: dict[str, int],
     backfill: bool,
+    includes: dict[str, int],
 ) -> None:
-    """1 kind をページングで取込む。stats(api_reads / new_signals / rate_limited)を
-    ページごとに更新する(例外時も取得済みぶんが呼び出し側に残る)。
+    """1 kind をページングで取込む。stats(api_reads / new_signals / rate_limited)と
+    includes(応答の includes の物の数。GH#386)をページごとに更新する(例外時も取得済みぶんが
+    呼び出し側に残る)。
 
     打ち切り条件: (a) 既知 tweet_id に到達(backfill 時は無効)(b) 予算残 < 下限
     (c) next_token なし (d) rate limit 残 0(429 は待たない)。
@@ -300,6 +352,8 @@ def _collect_kind(
         if response.status_code != 200:
             raise XSignalsError(f"{kind} が HTTP {response.status_code}")
         body = response.json()
+        # includes の物は読取の上限に数えず、費用の見積もりにだけ足す(GH#386)
+        count_includes(body, includes)
         tweets = body.get("data", [])
         if not tweets:
             break

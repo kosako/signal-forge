@@ -73,7 +73,8 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
                    unit_price=0.004, seen=None, reads_used_today=0) -> XConnector:
     """pages[i] = (status, body_dict, headers)。timeline リクエストは pagination_token で
     index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。200 応答は
-    max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、その
+    max_results で data を切り詰めて実 API の挙動を模す。実 API と同じく、expansions を
+    要求しない応答に includes は付けない(GH#386)。status に例外を置くと、その
     ページの要求で送出する(通信の失敗。GH#182)。"""
     token_index = {
         body.get("meta", {}).get("next_token"): i + 1
@@ -95,6 +96,8 @@ def connector_from(pages: list, *, me_id="me", daily_read_cap=130,
         if status == 200:
             limit = int(query.get("max_results", ["100"])[0])
             body = {**body, "data": body.get("data", [])[:limit]}
+            if "expansions" not in query:
+                body = {k: v for k, v in body.items() if k != "includes"}
         return httpx.Response(status, json=body, headers=headers)
 
     return XConnector(
@@ -112,7 +115,8 @@ def test_basic_fetch_parses_and_costs() -> None:
         [tweet("300", "こんにちは"), tweet("299", "ふたつめ", author="a2")],
         users={"a1": "alice", "a2": "bob"},
     )
-    result = connector_from([(200, body, {})]).fetch(make_source(), {})
+    seen: list[httpx.Request] = []
+    result = connector_from([(200, body, {})], seen=seen).fetch(make_source(), {})
 
     assert result.stats.items_fetched == 2
     assert result.stats.api_reads == 2
@@ -120,12 +124,20 @@ def test_basic_fetch_parses_and_costs() -> None:
     first, second = result.items
     assert first.external_id == "300"
     assert first.url == "https://x.com/i/web/status/300"
-    assert first.author == "alice"
+    # 著者の username は expansions の includes にしか無い。要求しないので持たない(GH#386)
+    assert first.author is None
     assert first.raw_content == "こんにちは"
     assert first.title is None
     assert first.published_at.isoformat() == "2026-07-10T09:00:00+00:00"
-    assert second.author == "bob"
+    assert second.author is None
     assert result.next_cursor == {"since_id": "300"}  # 最大 tweet id
+    # expansions は送らない(GH#386。includes の物が課金対象になるため)。author_id は
+    # tweet.fields で受け取る(自分の RT の判定に使う)
+    timeline = next(r for r in seen if "timelines" in str(r.url))
+    query = parse_qs(urlsplit(str(timeline.url)).query)
+    assert "expansions" not in query
+    assert "user.fields" not in query
+    assert "author_id" in query["tweet.fields"][0].split(",")
 
 
 def test_pagination_hard_caps_at_daily_read_cap() -> None:

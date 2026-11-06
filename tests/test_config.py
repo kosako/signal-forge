@@ -374,6 +374,24 @@ def test_x_signals_weights_reject_non_finite(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, "[x_signals]\nweight_like = inf\n"))
 
 
+def test_x_expansion_prices_defaults_overrides_and_range(tmp_path: Path) -> None:
+    # GH#386: includes の物の単価(X の従量課金の通常の単価)。上書きでき、負は受けない
+    x = load_config(write_config(tmp_path, "")).x
+    assert (x.expansion_user_price_usd, x.expansion_post_price_usd) == (0.010, 0.005)
+    assert x.expansion_other_price_usd == 0.005
+    body = "[x]\nexpansion_user_price_usd = 0.02\nexpansion_post_price_usd = 0\n"
+    x = load_config(write_config(tmp_path, body)).x
+    assert (x.expansion_user_price_usd, x.expansion_post_price_usd) == (0.02, 0)
+    for key in (
+        "expansion_user_price_usd",
+        "expansion_post_price_usd",
+        "expansion_other_price_usd",
+    ):
+        write_config(tmp_path, f"[x]\n{key} = -0.001\n")
+        with pytest.raises(ConfigError, match=rf"\[x\]\.{key} は 0 以上"):
+            load_config(tmp_path)
+
+
 @pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
 def test_float_settings_reject_non_finite(tmp_path: Path, bad: str) -> None:
     # nan は大小比較が常に偽、inf は「0 以上」「正」を満たすので、値域の検証より先に

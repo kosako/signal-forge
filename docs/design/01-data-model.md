@@ -65,7 +65,7 @@ CREATE TABLE items (
   url            TEXT    NOT NULL,        -- 取得時の生URL(表示・再訪用)
   canonical_url  TEXT    NOT NULL,        -- §4 の規則で正規化。配信・ノートにはこちらのみ使う
   title          TEXT,
-  author         TEXT,
+  author         TEXT,                    -- X のホームTL・検索は NULL(expansions を送らない。設計 02 §2。GH#386)
   published_at   TEXT,
   fetched_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   raw_payload    TEXT    CHECK (raw_payload IS NULL OR json_valid(raw_payload)),
@@ -398,7 +398,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 ## 9. コスト記録
 
 - LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率の表示は未実装 = 拡張点)。
-- X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。失敗の行(`status='error'`)も、それまでに読んだぶんを記録する(部分取得のあとの失敗 = GH#183・GH#182、途中の 401/403 と保存の失敗 = GH#178。X の日次の読取上限の当日の使用量にも使う。設計 02 §2)。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。
+- X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。失敗の行(`status='error'`)も、それまでに読んだぶんを記録する(部分取得のあとの失敗 = GH#183・GH#182、途中の 401/403 と保存の失敗 = GH#178。X の日次の読取上限の当日の使用量にも使う。設計 02 §2)。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。興味シグナルの費用には、応答の `includes` の物(expansions で返るユーザー・ポストなど)の数 × 種類ごとの単価を足す(GH#386。X の従量課金が 2026-11-22 から数えるため。数は列に持たない。設計 02 §2)。
 - Claude API(GH#153・#156): 深掘りのレビューは `dig_results.review_cost_usd`、主のエンジンが失敗したときの予備は `llm_fallback_calls`(migration 018。1 呼び出し = 1 行。段・朝バッチの run_id・モデル・主の失敗の種類(`skipped` = 主を飛ばした)・予備が答えたか・トークン数・見積もり額。予備も失敗した呼び出しも残す)。予備の月の上限の判定にも使う(UTC の暦月)。トークン数が空で額がある行は、応答の usage を受け取れず費用が分からなかった呼び出しで、額は課金されうる最大の額の見積もり(GH#241。設計 00 §5)。
 - `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(dig_results.review_cost_usd) + sum(llm_fallback_calls.cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿(月は UTC の暦月)。
 

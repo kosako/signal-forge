@@ -117,7 +117,7 @@ LONG_TEXT = "二十文字の閾値を確実に超える十分に長い本文を�
 def x_payload(**tweet_fields) -> dict:
     """X ホームTL コネクタが実際に書く raw_payload(collect 経由と同じ形)。me_id = "me"。"""
     tweet = {"id": "9", "text": LONG_TEXT, "author_id": "a1", **tweet_fields}
-    raw = _to_raw_item(tweet, {}, "me")
+    raw = _to_raw_item(tweet, "me")
     assert raw is not None
     return json.loads(_raw_payload(raw))
 

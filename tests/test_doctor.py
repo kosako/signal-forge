@@ -1,3 +1,4 @@
+import calendar
 import json
 import os
 import re
@@ -1231,6 +1232,43 @@ def test_month_cost_summary_includes_x_signal_runs(config_dir, tmp_path) -> None
     summary = month_cost_summary(conn, load_config(config_dir))
     conn.close()
     assert summary["x_usd"] == pytest.approx(0.06)  # S1b 取込コストも月次見込みに載る
+
+
+def test_month_cost_summary_includes_expansion_cost(config_dir, tmp_path) -> None:
+    # GH#386: 興味シグナルの includes の物の費用は x_signal_runs.estimated_cost_usd に含めて記録し、
+    # doctor #9 の当月の実績と着地見込みに載る(列は足さない)
+    import logging
+
+    from app.config import load_config
+    from app.connectors.x_signals import collect_x_signals
+
+    class Session:
+        def get(self, url: str, params: dict | None = None) -> httpx.Response:
+            if url.endswith("/users/me"):
+                return httpx.Response(200, json={"data": {"id": "42"}})
+            if url.endswith("/bookmarks"):
+                return httpx.Response(200, json={
+                    "data": [{"id": "b1", "author_id": "u1", "text": "t"}],
+                    "includes": {
+                        "users": [{"id": "u1", "username": "alice"}],
+                        "tweets": [{"id": "900", "text": "元"}],
+                    },
+                })
+            return httpx.Response(200, json={"data": []})
+
+    db_path = tmp_path / "intel.db"
+    conn = connect(db_path)
+    apply_migrations(conn, db_path)
+    enable_x_signals(config_dir)
+    config = load_config(config_dir)
+    collect_x_signals(conn, config, Session(), logging.getLogger("t"), kinds=("bookmark",))
+    summary = month_cost_summary(conn, config)
+    conn.close()
+    expected = 1 * 0.004 + 1 * 0.010 + 1 * 0.005  # ポスト + includes のユーザー + ポスト
+    assert summary["x_usd"] == pytest.approx(expected)
+    now = datetime.now(UTC)
+    days = calendar.monthrange(now.year, now.month)[1]
+    assert summary["projected_usd"] == pytest.approx(expected / now.day * days)
 
 
 def test_x_mode_consistency_flags_enabled_bookmark_row(tmp_path) -> None:
