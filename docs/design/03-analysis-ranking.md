@@ -212,7 +212,7 @@ negativeペナルティ: negative ラベル 1 個につき −15
 
 > **現状(未実装。plan #20)**: 自動の縮退・予算判定はまだ無い。今あるのは集計と警告だけで、`app/doctor.py` の `month_cost_summary` が当月の実績と着地見込みを出し、doctor #9 が着地見込みが `[budget].monthly_cap_usd` を超えるペースなら WARN を出す(`intel doctor --cost` で単発表示)。朝バッチには予算判定の段も呼び出しも無い。以下は実装するときの設計。
 
-- **概算集計**(実装済み): 月初からの累計 = Σ `analyses.estimated_cost_usd`(サブスク枠時は 0)+ X の読み取り費用(`collect_runs.estimated_cost_usd` と `x_signal_runs.estimated_cost_usd` の合計。読み取り件数 × config の実測単価)。月末着地見込みは線形外挿。`intel doctor`(#9)と `--cost` に表示する(朝バッチのログには出さない)。
+- **概算集計**(実装済み): 月初からの累計 = Σ `analyses.estimated_cost_usd`(サブスク枠時は 0)+ X の読み取り費用(`collect_runs.estimated_cost_usd` と `x_signal_runs.estimated_cost_usd` の合計。読み取り件数 × config の実測単価。興味シグナルは includes の物の費用も含む = GH#386・設計 02 §2)。月末着地見込みは線形外挿。`intel doctor`(#9)と `--cost` に表示する(朝バッチのログには出さない)。
 - **執行点は朝バッチの 2 箇所**(未実装。いずれも同じ集計関数を呼ぶ budget check。判定箇所をこれ以上増やさない):
   1. **collect 直前**: 月次着地見込みで X 従量コストの 3 段縮退(下表)。
   2. **analyze 直前(API 課金エンジン使用時のみ)**: `daily_llm_limit` は**件数上限でありドル上限ではない**ため、実行前にドルで判定する。Week 1 実測の平均トークン量 × 当日対象件数から「1日最大 LLM 費」を見積もり、当月実績+見積が $30 を超える見込みなら `daily_llm_limit` を残予算から逆算して縮小、残予算ゼロならタイトルのみの degraded に落とす。サブスク CLI エンジン(現金 $0)時は no-op。

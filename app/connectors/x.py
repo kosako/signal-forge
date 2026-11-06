@@ -16,6 +16,10 @@
   status id で `x.com/i/web/status/{id}` に統一するため、元ツイの直接ポストと重複排除される)。
   自分宛以外のリプライは除外(設計 02 §2)。
 - api_reads(課金対象の読取件数)× 単価を FetchStats.estimated_cost_usd に載せる。
+- expansions は要求しない(GH#386)。X の従量課金は 2026-11-22 から includes の物(ユーザー・
+  ポストなど)を通常の単価で数える。author_id の expansion は著者の username(items.author)の
+  ためだけで、URL は status id で作るので、外して items.author を NULL にする。author_id は
+  tweet.fields のまま受け取る(ポストの一部で追加の課金はない。自分の RT の判定に使う)。
 - daily_read_cap は JST の暦日の上限で、同じ日の実行で共有する(GH#178)。合成点が台帳
   (collect_runs.api_reads)の当日の合計を `x_reads_today` で引き、コネクタは上限から
   それを引いた残りだけを読む(fetch は DB に触らない契約のまま。設計 02 §1)。
@@ -54,7 +58,7 @@ MAX_RESULTS = 100  # 1ページ上限(設計 02 §2)
 # note_tweet = 長文ポストの全文(GH#94)。text は280字で切り詰められるため、記事系
 # コンテンツの中身を analyze に渡すには必須。同一読取のフィールド追加で課金は不変
 TWEET_FIELDS = "created_at,author_id,referenced_tweets,in_reply_to_user_id,note_tweet"
-EXPANSIONS = "author_id"
+# expansions は送らない(GH#386。includes の物が課金対象になるため。モジュールの説明を参照)
 TIMEOUT_S = 30
 _ENV_KEYS = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")
 
@@ -134,11 +138,9 @@ class XConnector:
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
         me_id = self._get_me_id()
-        tweets, users, reads, http_status, error = self._fetch_timeline(
-            me_id, cursor.get("since_id")
-        )
+        tweets, reads, http_status, error = self._fetch_timeline(me_id, cursor.get("since_id"))
         items = _merge_same_original([
-            item for tweet in tweets if (item := _to_raw_item(tweet, users, me_id)) is not None
+            item for tweet in tweets if (item := _to_raw_item(tweet, me_id)) is not None
         ])
         # 次回 since_id は今回取得した最大 tweet id(予算・rate limit で打ち切っても古い側の穴は
         # 追わない。設計 02 §2)。部分取得のあとの失敗では据え置く(GH#182。失敗で取れなかった
@@ -178,14 +180,13 @@ class XConnector:
 
     def _fetch_timeline(
         self, me_id: str, since_id: str | None
-    ) -> tuple[list[dict], dict[str, str], int, int | None, Exception | None]:
-        """returns (tweets, users, reads, http_status, error)。
+    ) -> tuple[list[dict], int, int | None, Exception | None]:
+        """returns (tweets, reads, http_status, error)。
 
         error = 2 ページ目以降の HTTP の失敗・通信のリトライ尽き(GH#182)。1 ページ目の失敗は例外。
         """
         url = f"{API_BASE}/users/{me_id}/timelines/reverse_chronological"
         tweets: list[dict] = []
-        users: dict[str, str] = {}
         reads = 0
         token: str | None = None
         http_status: int | None = None
@@ -194,7 +195,6 @@ class XConnector:
                 # cap を1件も超えないよう残枠を上限に(設計 02 §2 / ADR 0001 予算配分)
                 "max_results": min(MAX_RESULTS, self._read_budget - reads),
                 "tweet.fields": TWEET_FIELDS,
-                "expansions": EXPANSIONS,
             }
             if since_id:
                 params["since_id"] = since_id
@@ -207,7 +207,7 @@ class XConnector:
                 # 捨てると、その読み取りの費用も台帳に残らない
                 if not tweets:
                     raise
-                return tweets, users, reads, http_status, e
+                return tweets, reads, http_status, e
             http_status = response.status_code
             # 2 ページ目以降の 401/403 も致命の失敗のまま送出するが、それまでの読取数と費用を
             # 添えて collect に台帳へ残させる(GH#178。取得ぶんは保存せず since_id は据え置く。
@@ -226,11 +226,9 @@ class XConnector:
                 error = status_error(response, url)
                 if not tweets:
                     raise error
-                return tweets, users, reads, http_status, error
+                return tweets, reads, http_status, error
             body = response.json()
             page = body.get("data", [])
-            for user in body.get("includes", {}).get("users", []):
-                users[user["id"]] = user.get("username")
             tweets.extend(page)
             reads += len(page)
             if not page:
@@ -240,7 +238,7 @@ class XConnector:
             token = body.get("meta", {}).get("next_token")
             if not token:
                 break  # since_id 到達 / TL 末尾
-        return tweets, users, reads, http_status, None
+        return tweets, reads, http_status, None
 
 
 def raise_for_auth(
@@ -339,7 +337,7 @@ def rate_limit_exhausted(response: httpx.Response) -> bool:
     return remaining is not None and remaining.isdigit() and int(remaining) == 0
 
 
-def _to_raw_item(tweet: dict, users: dict[str, str], me_id: str) -> RawItem | None:
+def _to_raw_item(tweet: dict, me_id: str) -> RawItem | None:
     in_reply_to = tweet.get("in_reply_to_user_id")
     if in_reply_to is not None and in_reply_to != me_id:
         return None  # 自分宛以外のリプライは除外(設計 02 §2)
@@ -352,7 +350,9 @@ def _to_raw_item(tweet: dict, users: dict[str, str], me_id: str) -> RawItem | No
         external_id=effective_id,
         url=f"https://x.com/i/web/status/{effective_id}",  # normalize_url が status id で統一
         title=None,  # tweet に title はない(本文は raw_content)
-        author=users.get(tweet.get("author_id")),
+        # 著者の username は expansions の includes にしか無いので持たない(GH#386。RSS の著者の
+        # 無い記事と同じ扱い)
+        author=None,
         published_at=parse_created_at(tweet.get("created_at")),
         raw_content=tweet_full_text(tweet),
         # self_retweet = 自分の RT(本人が既に見たもの)。Stage 1 の規則 3 が reply と合わせて除外する

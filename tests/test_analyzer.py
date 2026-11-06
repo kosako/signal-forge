@@ -446,6 +446,32 @@ def test_build_prompt_contains_fences_and_sanitized_fields(conn, tmp_path) -> No
     assert "{{" not in prompt  # プレースホルダの置換漏れなし
 
 
+def test_x_item_without_author_matches_rss_without_author(conn, tmp_path) -> None:
+    # GH#386: X のホームTL と検索は expansions を外し、items.author が NULL になる。著者の無い
+    # RSS の記事と同じ空の author の行になり、"None" の文字列は入らない
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'home')")  # id=3
+    rss = add_item(conn, "https://a.example/1")
+    x_item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, title, author, published_at, "
+        "content_hash) VALUES (3, 'https://x.com/i/web/status/1', "
+        "'https://x.com/i/web/status/1', NULL, NULL, '2026-11-06T00:00:00Z', 'sha256:y')"
+    ).lastrowid
+    rows = conn.execute(
+        """
+        SELECT items.*, documents.extracted_text, documents.extraction_status,
+               sources.type || ':' || sources.name AS source_label
+        FROM items JOIN sources ON sources.id = items.source_id
+        LEFT JOIN documents ON documents.item_id = items.id
+        WHERE items.id IN (?, ?) ORDER BY items.id
+        """,
+        (rss, x_item),
+    ).fetchall()
+    prompt = build_prompt(make_config(tmp_path), "p", [], rows, nonce="abcd1234")
+    assert "source: rss:feed-a / author:  / published_at: " in prompt
+    assert "source: x:home / author:  / published_at: 2026-11-06T00:00:00Z" in prompt
+    assert "None" not in prompt
+
+
 def test_placeholder_in_inputs_not_reinterpreted(conn, tmp_path) -> None:
     # 入力由来の {{nonce}} 等が展開されると nonce がフェンス外に漏れる(単一パス置換の検証)
     item_id = add_item(conn, "https://a.example/1", title="悪意 {{nonce}} {{schema}}")

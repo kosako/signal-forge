@@ -36,6 +36,7 @@
   残る正常な終わりは、そのスロットの成否を確かめていないので、ソースの失敗の状態も解除させない
   (`FetchResult.skipped_slots`。GH#331。先の実行で後ろのスロットが 400 になった日に、同じ日の
   再実行がそのスロットを要求せずに失敗を消さない)。
+- expansions は要求せず、items.author は NULL にする(GH#386。ホームTL と同じ理由)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
 """
@@ -70,7 +71,7 @@ SEARCH_URL = f"{API_BASE}/tweets/search/recent"
 # RT・リプライはクエリ演算子で除外済みのため referenced_tweets 等は要らない。
 # note_tweet = 長文ポストの全文(GH#94。ホームTL と同じ理由)
 TWEET_FIELDS = "created_at,author_id,note_tweet"
-EXPANSIONS = "author_id"
+# expansions は送らない(GH#386。includes の物が課金対象になるため。ホームTL と同じ)
 # search/recent が受け付ける since_id は直近 7 日(実測の 400 応答で確認・GH#121)。watermark を
 # 時刻にして送る start_time も同じ窓に限られる(GH#319)。
 # run の所要時間と時計のずれに 1 日の余裕を取る(この古さなら予算はどのみち新しい側で埋まる)
@@ -127,7 +128,6 @@ class XSearchConnector:
         start_time = (
             _snowflake_time(since_id).strftime("%Y-%m-%dT%H:%M:%SZ") if since_id else None
         )
-        users: dict[str, str] = {}
         fetched: list[tuple[str, list[dict]]] = []  # (スロットのクエリ, tweets)
         reads = 0
         http_status: int | None = None
@@ -139,7 +139,7 @@ class XSearchConnector:
         error: Exception | None = None
         for query, budget in zip(self._slots, budgets, strict=True):
             tweets, status, stopped, error = self._fetch_slot(
-                query, budget, start_time, end_time, users, prior_reads=reads
+                query, budget, start_time, end_time, prior_reads=reads
             )
             fetched.append((query, tweets))
             reads += len(tweets)
@@ -148,7 +148,7 @@ class XSearchConnector:
             if stopped:
                 break  # rate limit 残 0 / 部分取得後の失敗 → 残りスロットも当日分は諦める
         items = [
-            _to_raw_item(tweet, users, query) for query, tweets in fetched for tweet in tweets
+            _to_raw_item(tweet, query) for query, tweets in fetched for tweet in tweets
         ]
         all_ids = [int(t["id"]) for _q, tweets in fetched for t in tweets]
         # 次回 since_id は「全スロット完走」時のみ今回の最大 tweet id に進める。
@@ -185,7 +185,6 @@ class XSearchConnector:
         budget: int,
         start_time: str | None,
         end_time: str,
-        users: dict[str, str],
         *,
         prior_reads: int,
     ) -> tuple[list[dict], int | None, bool, Exception | None]:
@@ -203,7 +202,6 @@ class XSearchConnector:
                 "max_results": min(MAX_RESULTS, budget - len(tweets)),
                 "end_time": end_time,  # 全スロット共通の上限(GH#184)
                 "tweet.fields": TWEET_FIELDS,
-                "expansions": EXPANSIONS,
             }
             if start_time:
                 params["start_time"] = start_time  # watermark の時刻(GH#319。since_id は送らない)
@@ -237,8 +235,6 @@ class XSearchConnector:
                 return tweets, http_status, True, error
             body = response.json()
             page = body.get("data", [])
-            for user in body.get("includes", {}).get("users", []):
-                users[user["id"]] = user.get("username")
             tweets.extend(page)
             if not page:
                 break  # 空ページ = 新規なし。next_token 循環によるループも塞ぐ
@@ -283,12 +279,12 @@ def _split_budget(total: int, n: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(n)]
 
 
-def _to_raw_item(tweet: dict, users: dict[str, str], query: str) -> RawItem:
+def _to_raw_item(tweet: dict, query: str) -> RawItem:
     return RawItem(
         external_id=tweet["id"],
         url=f"https://x.com/i/web/status/{tweet['id']}",  # normalize_url が status id で統一
         title=None,  # tweet に title はない(本文は raw_content)
-        author=users.get(tweet.get("author_id")),
+        author=None,  # username は includes にしか無いので持たない(GH#386)
         published_at=parse_created_at(tweet.get("created_at")),
         raw_content=tweet_full_text(tweet),
         meta={"query": query},  # どのスロットが拾ったか(週次レビューの再配分材料)

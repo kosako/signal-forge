@@ -96,7 +96,8 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
                    reads_used_today=0) -> XSearchConnector:
     """pages[slot] = [(status, body, headers), ...](ページ順)。リクエストの next_token で
     ページ index を引く(リトライで同 token を再送しても同じ応答 = リトライ安全)。
-    200 応答は max_results で data を切り詰めて実 API の挙動を模す。status に例外を置くと、
+    200 応答は max_results で data を切り詰めて実 API の挙動を模す。expansions を要求しない
+    応答に includes は付けない(実 API と同じ。GH#386)。status に例外を置くと、
     そのページの要求で送出する(通信の失敗。GH#182)。id と時刻の併用は 400(GH#319)。
     時刻の範囲の違反(逆転・同値・7 日窓の外・end_time が新しすぎる)も 400(GH#343)。
     要求の時刻は now(この模型では時計は進まない)。"""
@@ -124,6 +125,8 @@ def connector_from(pages: dict[str, list[tuple]], *, slots, daily_read_cap=35,
         if status == 200:
             limit = int(query["max_results"][0])
             body = {**body, "data": body.get("data", [])[:limit]}
+            if "expansions" not in query:
+                body = {k: v for k, v in body.items() if k != "includes"}
         return httpx.Response(status, json=body, headers=headers)
 
     return XSearchConnector(
@@ -154,17 +157,24 @@ def test_three_slots_fetch_parse_and_cost() -> None:
     first, second = result.items
     assert first.external_id == "300"
     assert first.url == "https://x.com/i/web/status/300"
-    assert first.author == "alice"
+    assert first.author is None  # username は includes にしか無い。要求しない(GH#386)
     assert first.raw_content == "こんにちは"
     assert first.title is None
     assert first.published_at.isoformat() == "2026-07-11T06:00:00+00:00"
     assert first.meta == {"query": "ai agents"}
-    assert second.author == "bob"
+    assert second.author is None
     assert second.meta == {"query": "llm"}
     assert result.next_cursor == {"since_id": "300"}  # 全スロット横断の最大 tweet id
     # 予算はスロット数で均等割・端数は先頭から(35 → 12/12/11)
     limits = [parse_qs(urlsplit(str(r.url)).query)["max_results"][0] for r in seen]
     assert limits == ["12", "12", "11"]
+    # expansions は送らない(GH#386。includes の物が課金対象になるため)。author_id は
+    # tweet.fields のまま(ポストの一部で追加の課金はない)
+    for request in seen:
+        query = parse_qs(urlsplit(str(request.url)).query)
+        assert "expansions" not in query
+        assert "user.fields" not in query
+        assert "author_id" in query["tweet.fields"][0].split(",")
 
 
 def test_or_slot_is_grouped_so_exclusions_cover_every_branch() -> None:
