@@ -111,7 +111,10 @@ def collect_x_signals(
     """3 種のシグナルを cap 内で取込み、x_signal_runs に 1 行記録して集計を返す。
 
     backfill_limit を渡すと cold start モード: 既知到達で打ち切らず、日次 cap の
-    代わりに **kind ごと**の読取上限として適用する(最悪コスト = 3 × limit × 単価)。
+    代わりに **kind ごと**の読取上限として適用する。最悪コスト = 3 × limit × 1 件の上限。
+    1 件の上限 = 単価 + 3 × ユーザーの単価 + 2 × ポストの単価(GH#386。EXPANSIONS の範囲で
+    1 件のポストに付きうる includes = 著者 1 人 + 参照先 2 件(返信先と引用元)+ その著者 2 人。
+    参照は種類ごとに 1 件で、RT は元ツイの 1 件だけ。media・polls・places は要求しない)。
     kinds で対象 kind を限定できる(既定 = 全種。過去ブックマークの再読取 backfill 等、
     コストを 1 kind に絞る用途。GH#99)。
     通常の取込の日次 cap は同じ日(JST)の実行で共有する(GH#178)。backfill は台帳を見ず、

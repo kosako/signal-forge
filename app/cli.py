@@ -328,7 +328,9 @@ def x_signals(
         100,
         "--limit",
         min=5,
-        help="--backfill 時の kind ごと読取上限(最悪コスト = 3 × limit × 単価。GH#84)",
+        help="--backfill 時の kind ごと読取上限(GH#84)。最悪コスト = 3 × limit ×"
+        "(単価 + 3 × ユーザーの単価 + 2 × ポストの単価)。expansions の includes を含む"
+        "(GH#386。既定の単価で 1 件 $0.044、limit 100 で $13.2)",
     ),
     kind: list[str] = typer.Option(
         [],

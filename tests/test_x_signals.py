@@ -355,6 +355,91 @@ def test_includes_cost_kept_when_stage_fails(conn, tmp_path) -> None:
     assert run["estimated_cost_usd"] == pytest.approx(2 * 0.004 + 2 * 0.010)
 
 
+def test_includes_counted_per_response_across_pages(conn, tmp_path) -> None:
+    # GH#386: includes は応答ごとに課金される。同じ kind の別のページに同じユーザーが出たら、
+    # ページごとに数える(実行の中で重複を除かない)。api_reads はポストの件数のまま
+    alice = {"id": "u1", "username": "alice"}
+    session = session_with(
+        [
+            page(tw("b1"), tw("b2"), users=[alice], next_token="p2"),
+            page(tw("b3"), users=[alice]),
+        ],
+        [],
+    )
+    totals = collect_x_signals(conn, make_config(tmp_path), session, logger)
+    assert page_tokens(session, "/bookmarks") == [None, "p2"]
+    assert totals["api_reads"] == 3
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["api_reads"] == 3
+    assert run["estimated_cost_usd"] == pytest.approx(3 * 0.004 + 2 * 0.010)
+
+
+def test_backfill_records_includes_cost(conn, tmp_path, monkeypatch) -> None:
+    # GH#386: backfill(日次の上限の外の別枠)の行にも includes の費用が入る。backfill の行は
+    # 通常の取込の当日の使用量に数えない(GH#178)ままで、api_reads はポストの件数
+    monkeypatch.setattr("app.connectors.x_signals.today_jst", lambda: DAY)
+    alice = {"id": "u1", "username": "alice"}
+    session = session_with(
+        [
+            page(tw("b1"), tw("b2"), users=[alice], ref_tweets=[{"id": "900"}], next_token="p2"),
+            page(tw("b3"), users=[alice, {"id": "u2", "username": "bob"}]),
+        ],
+        [],
+    )
+    totals = collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=100,
+        kinds=("bookmark",),
+    )
+    assert totals["api_reads"] == 3
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert (run["backfill"], run["api_reads"]) == (1, 3)
+    assert run["estimated_cost_usd"] == pytest.approx(3 * 0.004 + 3 * 0.010 + 1 * 0.005)
+    conn.execute("UPDATE x_signal_runs SET started_at = ?", ("2026-10-24T01:00:00Z",))
+    assert signal_reads_on(conn, DAY) == 0
+
+
+def test_http_failure_mid_kind_keeps_includes_cost_of_fetched_pages(conn, tmp_path) -> None:
+    # GH#386: 2 ページ目の HTTP の失敗で kind が失敗しても(kind の隔離)、取れたページの includes
+    # の費用は残る。後続の kind の費用も足し、api_reads はポストの件数
+    alice = {"id": "u1", "username": "alice"}
+    session = session_with(
+        [page(tw("b1"), tw("b2"), users=[alice], ref_tweets=[{"id": "900"}], next_token="p2"),
+         500, 500, 500],  # リトライ分も 500
+        [page(tw("l1"), users=[alice])],
+    )
+    totals = collect_x_signals(conn, make_config(tmp_path, cap=10), session, logger)
+    assert totals["api_reads"] == 3
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["status"] == "ok" and "bookmark" in run["error"]
+    assert run["api_reads"] == 3
+    assert run["estimated_cost_usd"] == pytest.approx(3 * 0.004 + 2 * 0.010 + 1 * 0.005)
+
+
+def test_backfill_worst_case_cost_per_read_bound(conn, tmp_path) -> None:
+    # GH#386: backfill の最悪コストの 1 件の上限(単価 + 3 × ユーザー + 2 × ポスト。cli の
+    # --limit の説明と設計 02 §2)。要求する expansions の範囲で 1 件のポストに付きうる includes が
+    # 最大のとき(著者と、返信先・引用元とその著者がすべて別)に、数えた費用がちょうど上限になる
+    posts, users, refs = [], [], []
+    for i in range(5):
+        post = tw(f"b{i}", author=f"a{i}")
+        post["referenced_tweets"] = [
+            {"type": "replied_to", "id": f"r{i}"},
+            {"type": "quoted", "id": f"q{i}"},
+        ]
+        posts.append(post)
+        users += [{"id": f"a{i}"}, {"id": f"ra{i}"}, {"id": f"qa{i}"}]
+        refs += [{"id": f"r{i}", "author_id": f"ra{i}"}, {"id": f"q{i}", "author_id": f"qa{i}"}]
+    session = session_with([page(*posts, users=users, ref_tweets=refs)], [])
+    collect_x_signals(
+        conn, make_config(tmp_path, cap=0), session, logger, backfill_limit=5,
+        kinds=("bookmark",),
+    )
+    run = conn.execute("SELECT * FROM x_signal_runs").fetchone()
+    assert run["api_reads"] == 5
+    assert run["estimated_cost_usd"] == pytest.approx(5 * (0.004 + 3 * 0.010 + 2 * 0.005))
+    assert run["estimated_cost_usd"] == pytest.approx(5 * 0.044)  # cli の説明の 1 件の額
+
+
 def test_backfill_pages_past_known_within_limit(conn, tmp_path) -> None:
     conn.execute("INSERT INTO x_signals (kind, tweet_id) VALUES ('bookmark', 'b1')")
     session = session_with([page(tw("b1"), tw("b2"), next_token="p2"), page(tw("b3"))], [])
