@@ -94,6 +94,7 @@ from app.dig import (
     dug_on,
     has_material,
     has_now_requests,
+    has_unsent_cards,
     interrupted_now_requests,
     select_from_queue,
 )
@@ -387,7 +388,7 @@ def _run_dig_stage_locked(
         api is not None
         and remaining > 0
         and not selected
-        and not _has_unsent_cards(conn)
+        and not has_unsent_cards(conn)
         and not has_now_requests(conn)
     )
 
@@ -495,7 +496,7 @@ def _run_dig_now_locked(
             close_now_request(conn, item_id, started_at, to_morning=False)
     # 前の実行が公開・送信できなかった分(送信の失敗など)を先に進める。依頼はもう閉じているので、
     # 下のループだけでは進まない
-    if _has_unsent_cards(conn):
+    if has_unsent_cards(conn):
         failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
 
     completed = True
@@ -560,7 +561,7 @@ def _run_dig_now_locked(
             continue
         failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
 
-    if api is None and _has_unsent_cards(conn):
+    if api is None and has_unsent_cards(conn):
         logger.warning(
             "Telegram 未設定のため、概要カードは未送信のまま",
             extra={"run_id": run_id, "stage": "dig-now"},
@@ -581,8 +582,8 @@ def _publish_and_send(
     """台帳の未公開のノートを公開し、未送信のカードを送る(dig.lock の中で。GH#388)。
 
     dig.lock が取れなければ何もしない。持っている実行(朝バッチの dig 段・`intel dig`)が、
-    段の終わりに同じ台帳から公開・送信する。間に合わなかった分は、poller が送れていない今すぐの
-    カードを見て `intel dig-now` を起動し直す。
+    段の終わりに同じ台帳から公開・送信する。間に合わなかった分は、poller が送れていない
+    カード(作った経路を問わない)を見て `intel dig-now` を起動し直す。
     """
     with _dig_lock(conn, "dig-now") as acquired:
         if not acquired:
@@ -677,14 +678,6 @@ def _notify_no_candidates(
     logger.info(
         "dig: 候補が無いので、深掘りが無いことを知らせた",
         extra={"run_id": run_id, "stage": "dig"},
-    )
-
-
-def _has_unsent_cards(conn: sqlite3.Connection) -> bool:
-    """台帳に未送信のカード(未公開のノートを含む中断分)があるか。"""
-    return (
-        conn.execute("SELECT 1 FROM dig_results WHERE message_id IS NULL LIMIT 1").fetchone()
-        is not None
     )
 
 

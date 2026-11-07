@@ -505,12 +505,15 @@ def has_now_requests(conn: sqlite3.Connection) -> bool:
     )
 
 
-def has_unsent_now_cards(conn: sqlite3.Connection) -> bool:
-    """今すぐの依頼で作った分に、公開か送信が済んでいないものがあるか(GH#388)。"""
+def has_unsent_cards(conn: sqlite3.Connection) -> bool:
+    """台帳に未送信のカード(未公開のノートを含む中断分)があるか。
+
+    朝の調査段と今すぐの深掘りが再開を決めるのに使い、poller は `intel dig-now` を起動して送り
+    直す合図にする(GH#388)。今すぐの依頼を朝の段が引き受けて作った分(on_demand = 0)も、
+    送れなかったら朝を待たずに送り直すため、作った経路を問わない。
+    """
     return (
-        conn.execute(
-            "SELECT 1 FROM dig_results WHERE on_demand = 1 AND message_id IS NULL LIMIT 1"
-        ).fetchone()
+        conn.execute("SELECT 1 FROM dig_results WHERE message_id IS NULL LIMIT 1").fetchone()
         is not None
     )
 

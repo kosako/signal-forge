@@ -278,8 +278,8 @@ def test_dig_now_worker_retries_unsent_cards_at_interval(conn, tmp_path) -> None
     assert len(popen.calls) == 2
 
 
-def test_dig_now_worker_ignores_unsent_morning_cards(conn, tmp_path) -> None:
-    # 朝の分の未送信は朝の実行が送る(今すぐの子を毎回起こさない)
+def test_dig_now_worker_also_retries_unsent_morning_cards(conn, tmp_path) -> None:
+    # 朝の段が今すぐの依頼を引き受けて作り、送れなかった分も、朝を待たずに送り直す
     popen = FakePopen()
     worker = DigNowWorker(tmp_path, popen=popen)
     conn.execute(
@@ -289,7 +289,7 @@ def test_dig_now_worker_ignores_unsent_morning_cards(conn, tmp_path) -> None:
 
     worker.sweep(conn, logger)
 
-    assert popen.calls == []
+    assert len(popen.calls) == 1
 
 
 def test_dig_now_worker_logs_abnormal_exit(conn, tmp_path, caplog) -> None:

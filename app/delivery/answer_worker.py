@@ -6,7 +6,7 @@
   作りかけの返事を道連れにしない(子の側の flock で同時に 1 つに絞るので重複しない)
 - 起動のきっかけ: 質問・依頼を台帳に積んだ直後(kick)と、各周期の見回り(sweep)。子が台帳を
   読み終えた直後に積まれた質問は、その子では拾われないため見回りで拾う
-- 送れていない返事・記録できていない take(GH#106)・送れていない今すぐのカードだけが
+- 送れていない返事・記録できていない take(GH#106)・送れていない深掘りのカードだけが
   残っているときは RETRY_UNSENT_S おきにだけ起動する(送信先や vault の障害が続く間に毎周期
   起動しない)
 - 今すぐの深掘りは朝バッチの dig 段とロックを共有する。段の間に起動した子は何もせず終わり、
@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
 
-from app.dig import has_now_requests, has_unsent_now_cards
+from app.dig import has_now_requests, has_unsent_cards
 from app.dig_answer import has_pending, has_unsent
 from app.dig_take import has_unrecorded_take
 
@@ -122,7 +122,11 @@ class AnswerWorker(_ChildWorker):
 
 
 class DigNowWorker(_ChildWorker):
-    """今すぐの深掘り(GH#388)。作っていない依頼と、送れていない今すぐのカードを見る。"""
+    """今すぐの深掘り(GH#388)。作っていない依頼と、送れていないカードを見る。
+
+    送れていないカードは作った経路を問わない(朝の段が今すぐの依頼を引き受けて作った分も、
+    朝を待たずに送り直す。dig-now は台帳の未公開・未送信を公開・送信してから依頼を見る)。
+    """
 
     subcommand = "dig-now"
 
@@ -130,4 +134,4 @@ class DigNowWorker(_ChildWorker):
         return has_now_requests(conn)
 
     def _has_unsent(self, conn: sqlite3.Connection) -> bool:
-        return has_unsent_now_cards(conn)
+        return has_unsent_cards(conn)

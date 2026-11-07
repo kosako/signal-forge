@@ -17,7 +17,7 @@ from app.dig import (
     dug_on,
     enqueue_bookmark,
     has_now_requests,
-    has_unsent_now_cards,
+    has_unsent_cards,
     interrupted_now_requests,
     parse_dig_reply,
     queue_item_ids,
@@ -477,7 +477,7 @@ def test_close_now_request_only_closes_same_claim(conn, config) -> None:
     assert row["requested_at"] is not None  # 明朝の深掘りの ①(リプライ指定)へ回した
 
 
-def test_dig_now_marked_and_unsent_now_cards(conn, config) -> None:
+def test_dig_now_marked_and_unsent_cards(conn, config) -> None:
     pending = add_item_with_body(conn, "https://a/1")
     done = add_item_with_body(conn, "https://a/2")
     plain = add_item_with_body(conn, "https://a/3")
@@ -487,13 +487,12 @@ def test_dig_now_marked_and_unsent_now_cards(conn, config) -> None:
     enqueue_bookmark(conn, plain)
 
     assert dig_now_marked(conn, [pending, done, plain]) == {pending, done}
-    assert not has_unsent_now_cards(conn)
-    conn.execute(
-        "INSERT INTO dig_results (item_id, note_name, card_text, on_demand) "
-        "VALUES (?, 'n', 'カード', 1)",
+    assert not has_unsent_cards(conn)
+    conn.execute(  # 朝の段が今すぐの依頼を引き受けて作った分(on_demand = 0)も送り直す対象
+        "INSERT INTO dig_results (item_id, note_name, card_text) VALUES (?, 'n', 'カード')",
         (pending,),
     )
-    assert has_unsent_now_cards(conn)
+    assert has_unsent_cards(conn)
 
 
 def test_redelivered_running_press_after_first_request_failed(conn, config) -> None:

@@ -3455,3 +3455,22 @@ def test_no_candidate_notice_is_not_sent_while_dig_now_generates(conn, config) -
 
     assert api.sent == []
     assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) is None
+
+
+def test_dig_now_resends_morning_card_for_taken_over_request(conn, config) -> None:
+    # 朝の段が今すぐの依頼を引き受けて作り(on_demand = 0)、カードを送れなかった。依頼は閉じて
+    # いるが、次の dig-now が台帳から送る(poller は送れていないカードを見て起動する)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    with pytest.raises(DigError):
+        run_dig_stage(
+            conn, config, make_factory({}), FakeApi(fail=True), logger, today=today_jst()
+        )
+    assert queue_state(conn, item)["now_requested_at"] is None
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger) is True
+
+    assert len(api.sent) == 1
+    assert conn.execute("SELECT on_demand, message_id FROM dig_results").fetchone()[:] == (0, 901)
