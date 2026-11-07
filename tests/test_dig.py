@@ -5,13 +5,22 @@ from pathlib import Path
 
 import pytest
 
+from app.config import Config, DigConfig
 from app.db import apply_migrations, connect
 from app.dig import (
     DigInstruction,
     apply_instructions,
+    claim_now_request,
+    close_now_request,
+    dig_now_marked,
+    dug_on,
     enqueue_bookmark,
+    has_now_requests,
+    has_unsent_now_cards,
+    interrupted_now_requests,
     parse_dig_reply,
     queue_item_ids,
+    request_dig_now,
 )
 
 
@@ -218,3 +227,215 @@ def test_reply_on_bookmark_row_keeps_origin_source(conn) -> None:
     assert row["requested_at"] is not None  # 明示指定は requested_at で判別
     apply_instructions(conn, [DigInstruction(item, "pass")])
     assert queue_row(conn, item)["source"] == "bookmark"
+
+
+# --- 今すぐの依頼(GH#388。設計 06 §3) ---
+
+BODY = "本文の段落です。" * 50  # min_body_chars(既定 200)を超える
+TODAY = "2026-07-22"
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Config:
+    return Config(config_dir=tmp_path, dig=DigConfig(daily_cap=2))
+
+
+def add_item_with_body(conn: sqlite3.Connection, url: str, body: str | None = BODY) -> int:
+    item_id = add_plain_item(conn, url)
+    if body is not None:
+        conn.execute(
+            "INSERT INTO documents (item_id, extracted_text, language, extraction_status,"
+            " expires_at) VALUES (?, ?, 'ja', 'ok', '2099-01-01T00:00:00Z')",
+            (item_id, body),
+        )
+    return item_id
+
+
+def add_question_row(conn: sqlite3.Connection) -> int:
+    """受け付け済みの質問(受付の順序の印の比較用。GH#235)。"""
+    card_item = add_plain_item(conn, "https://a/card")
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', 700)",
+        (card_item,),
+    ).lastrowid
+    return conn.execute(
+        "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+        "VALUES (?, '質問', 81)",
+        (dig_id,),
+    ).lastrowid
+
+
+def test_now_request_on_queued_row_only_marks_request(conn, config) -> None:
+    # 状態・観点・requested_at・updated_at を変えない(朝の生成中の done 化の照合を外さない)
+    item = add_item_with_body(conn, "https://a/1")
+    enqueue_bookmark(conn, item)
+    conn.execute("UPDATE dig_queue SET angle = '観点', updated_at = '2026-07-20T00:00:00Z'")
+    before = queue_row(conn, item)
+
+    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == "accepted"
+
+    row = queue_row(conn, item)
+    assert row["now_requested_at"] is not None and row["now_started_at"] is None
+    for column in ("status", "angle", "requested_at", "updated_at", "backlog_op_question_id"):
+        assert row[column] == before[column], column
+    assert has_now_requests(conn)
+
+
+def test_now_request_creates_row_for_item_out_of_queue(conn, config) -> None:
+    item = add_item_with_body(conn, "https://a/1")
+    question_id = add_question_row(conn)
+
+    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == "accepted"
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["source"], row["requested_at"]) == ("queued", "request", None)
+    assert row["now_requested_at"] is not None
+    assert row["backlog_op_question_id"] == question_id  # 未消化一覧への本人の操作の印
+
+
+def test_now_request_revives_passed_row(conn, config) -> None:
+    item = add_item_with_body(conn, "https://a/1")
+    apply_instructions(conn, [DigInstruction(item, "request", angle="前の観点")])
+    apply_instructions(conn, [DigInstruction(item, "pass")])
+    conn.execute("UPDATE dig_queue SET updated_at = '2026-07-20T00:00:00Z'")
+
+    assert request_dig_now(conn, config, item, TODAY, from_backlog=False) == "accepted"
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["angle"]) == ("queued", "前の観点")
+    assert row["updated_at"] != "2026-07-20T00:00:00Z"  # 本人の明示の操作
+    assert row["now_requested_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("setup", "outcome"),
+    [
+        ("done", "done"),
+        ("pending", "pending"),
+        ("running", "running"),
+        ("dug_today", "dug_today"),
+        ("no_body", "no_body"),
+        ("short_body", "no_body"),
+    ],
+)
+def test_now_request_refusals_write_nothing(conn, config, setup, outcome) -> None:
+    body = {"no_body": None, "short_body": "短い"}.get(setup, BODY)
+    item = add_item_with_body(conn, "https://a/1", body)
+    enqueue_bookmark(conn, item)
+    if setup == "done":
+        conn.execute("UPDATE dig_queue SET status = 'done'")
+    elif setup in ("pending", "running"):
+        conn.execute(
+            "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z', now_started_at = ?",
+            ("2026-07-22T00:00:01Z" if setup == "running" else None,),
+        )
+    elif setup == "dug_today":
+        conn.execute(  # JST 2026-07-22 の朝に掘った(created_at は UTC)
+            "INSERT INTO dig_results (item_id, note_name, card_text, created_at) "
+            "VALUES (?, 'n', 'カード', '2026-07-21T21:40:00Z')",
+            (item,),
+        )
+    before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")]
+
+    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == outcome
+
+    assert [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")] == before
+
+
+def test_now_request_for_missing_item(conn, config) -> None:
+    assert request_dig_now(conn, config, 9999, TODAY, from_backlog=True) == "no_item"
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+
+
+def test_dug_on_uses_jst_day(conn) -> None:
+    item = add_plain_item(conn, "https://a/1")
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, created_at) "
+        "VALUES (?, 'n', 'カード', '2026-07-21T15:00:00Z')",  # JST 2026-07-22 00:00
+        (item,),
+    )
+    assert dug_on(conn, item, "2026-07-22")
+    assert not dug_on(conn, item, "2026-07-21")
+
+
+def test_pass_cancels_now_request(conn, config) -> None:
+    # パスは今すぐの依頼を取り消す(作っている途中の印も消し、作り終えた側は done にしない)
+    item = add_item_with_body(conn, "https://a/1")
+    request_dig_now(conn, config, item, TODAY, from_backlog=True)
+    claim_now_request(conn)
+
+    apply_instructions(conn, [DigInstruction(item, "pass")])
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "passed", None, None,
+    )
+    assert not has_now_requests(conn)
+
+
+def test_reply_request_keeps_now_request(conn, config) -> None:
+    item = add_item_with_body(conn, "https://a/1")
+    request_dig_now(conn, config, item, TODAY, from_backlog=True)
+
+    apply_instructions(conn, [DigInstruction(item, "request", angle="観点")])
+
+    assert queue_row(conn, item)["now_requested_at"] is not None
+
+
+def test_claim_takes_oldest_request_and_marks_started(conn, config) -> None:
+    first = add_item_with_body(conn, "https://a/1")
+    second = add_item_with_body(conn, "https://a/2")
+    for item in (second, first):
+        request_dig_now(conn, config, item, TODAY, from_backlog=True)
+    conn.execute(
+        "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z' WHERE item_id = ?",
+        (first,),
+    )
+    snapshot = queue_row(conn, first)
+
+    candidate = claim_now_request(conn)
+
+    assert candidate is not None and candidate.item_id == first
+    assert candidate.on_demand and candidate.now_started_at is not None
+    assert candidate.queue_updated_at == snapshot["updated_at"]  # 印は updated_at を進めない
+    assert queue_row(conn, first)["now_started_at"] == candidate.now_started_at
+    assert interrupted_now_requests(conn) == [(first, candidate.now_started_at)]
+    next_candidate = claim_now_request(conn)
+    assert next_candidate is not None and next_candidate.item_id == second
+    assert claim_now_request(conn) is None
+
+
+def test_close_now_request_only_closes_same_claim(conn, config) -> None:
+    item = add_item_with_body(conn, "https://a/1")
+    request_dig_now(conn, config, item, TODAY, from_backlog=True)
+    candidate = claim_now_request(conn)
+    assert candidate is not None
+
+    assert not close_now_request(conn, item, "2000-01-01T00:00:00Z", to_morning=False)
+    assert close_now_request(conn, item, candidate.now_started_at, to_morning=True)
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "queued", None, None,
+    )
+    assert row["requested_at"] is not None  # 明朝の深掘りの ①(リプライ指定)へ回した
+
+
+def test_dig_now_marked_and_unsent_now_cards(conn, config) -> None:
+    pending = add_item_with_body(conn, "https://a/1")
+    done = add_item_with_body(conn, "https://a/2")
+    plain = add_item_with_body(conn, "https://a/3")
+    request_dig_now(conn, config, pending, TODAY, from_backlog=True)
+    enqueue_bookmark(conn, done)
+    conn.execute("UPDATE dig_queue SET status = 'done' WHERE item_id = ?", (done,))
+    enqueue_bookmark(conn, plain)
+
+    assert dig_now_marked(conn, [pending, done, plain]) == {pending, done}
+    assert not has_unsent_now_cards(conn)
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, on_demand) "
+        "VALUES (?, 'n', 'カード', 1)",
+        (pending,),
+    )
+    assert has_unsent_now_cards(conn)

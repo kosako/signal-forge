@@ -15,8 +15,9 @@
   (manual は本文が無く content_hash が空になるため 24h 内容 dedup の対象外)
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
-- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)、未消化一覧の skip のボタン(`b:`。GH#349)の
-  callback も本デーモンで処理する(送信は surveys.py の内蔵タイマー)
+- 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)、未消化一覧の skip と今すぐのボタン(`b:`。
+  GH#349・GH#388)の callback も本デーモンで処理する(送信は surveys.py の内蔵タイマー)。今すぐの
+  依頼は台帳に積み、深掘りは別プロセスの `intel dig-now` が作る(DigNowWorker)
 """
 
 from __future__ import annotations
@@ -31,11 +32,12 @@ from urllib.parse import urlsplit
 
 from app.config import Config
 from app.db import insert_item_with_dedup
-from app.delivery.answer_worker import AnswerWorker
+from app.delivery.answer_worker import AnswerWorker, DigNowWorker
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     READ_MIN_CHOICES,
-    backlog_skip_keyboard,
+    BacklogButtons,
+    backlog_keyboard,
     followup_keyboard,
     pending_dig_items,
     q1_keyboard,
@@ -50,7 +52,15 @@ from app.delivery.telegram import (
     pack_lines,
     reaction_keyboard,
 )
-from app.dig import DigInstruction, apply_instructions, parse_dig_reply, queue_item_ids
+from app.dig import (
+    DigInstruction,
+    NowRequestOutcome,
+    apply_instructions,
+    dig_now_marked,
+    parse_dig_reply,
+    queue_item_ids,
+    request_dig_now,
+)
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
 from app.export.obsidian import note_projection_date
 from app.jst import JST
@@ -103,6 +113,7 @@ def run_poller(
     should_stop: Callable[[], bool] = lambda: False,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
     answer_worker: AnswerWorker | None = None,
+    dig_now_worker: DigNowWorker | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """常駐ループ。失敗は即時再接続、連続失敗は30s間隔(設計 05 §8)。
@@ -120,6 +131,8 @@ def run_poller(
         raise DeliveryError("config.toml の [telegram].owner_chat_id が未設定(設計 04 §6)")
     if answer_worker is None:
         answer_worker = AnswerWorker(config.config_dir)
+    if dig_now_worker is None:
+        dig_now_worker = DigNowWorker(config.config_dir)
     logger.info("poller 起動", extra={"stage": "poll"})
     # 一時的な失敗で再処理を待つ update の、続けて失敗した回数(周期をまたいで持つ。GH#181)
     transient_failures: dict[int, int] = {}
@@ -130,12 +143,15 @@ def run_poller(
             # 質問への返事の取りこぼしを拾う(GH#126)。受信やタイマーが失敗する周期でも
             # 終わった子の回収と起動し直しを止めないよう、周期の最初に行う
             answer_worker.sweep(conn, logger)
+            # 今すぐの深掘りも同じ(GH#388)。朝バッチの dig 段の間に押された依頼は、段が終わった
+            # 後の周期で作る
+            dig_now_worker.sweep(conn, logger)
             if timer_failed_at is None or clock() - timer_failed_at >= TIMER_RETRY_S:
                 timer_ok = _run_timers(conn, config, api, logger, now_fn())
                 timer_failed_at = None if timer_ok else clock()
             poll_once(
                 conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker,
-                transient_failures=transient_failures,
+                dig_now_worker=dig_now_worker, transient_failures=transient_failures,
             )
         except DeliveryError as e:
             logger.error(f"getUpdates 失敗(30s 後に再接続): {e}", extra={"stage": "poll"})
@@ -194,6 +210,7 @@ def poll_once(
     *,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
     answer_worker: AnswerWorker | None = None,
+    dig_now_worker: DigNowWorker | None = None,
     transient_failures: dict[int, int] | None = None,
 ) -> int:
     """getUpdates 1回分を処理し、処理した update 数を返す。
@@ -218,7 +235,8 @@ def poll_once(
         # ただし DB の一時的な失敗は、待てば保存できるので offset を進めない(GH#181)
         try:
             handle_update(
-                conn, config, api, update, logger, now_fn=now_fn, answer_worker=answer_worker
+                conn, config, api, update, logger, now_fn=now_fn, answer_worker=answer_worker,
+                dig_now_worker=dig_now_worker,
             )
         except Exception as e:
             if not _is_transient_db_error(e):
@@ -271,11 +289,13 @@ def handle_update(
     *,
     now_fn: Callable[[], datetime] = lambda: datetime.now(JST),
     answer_worker: AnswerWorker | None = None,
+    dig_now_worker: DigNowWorker | None = None,
 ) -> None:
     callback = update.get("callback_query")
     if isinstance(callback, dict):
         _handle_callback(
-            conn, config, api, callback, logger, now_fn=now_fn, answer_worker=answer_worker
+            conn, config, api, callback, logger, now_fn=now_fn, answer_worker=answer_worker,
+            dig_now_worker=dig_now_worker,
         )
         return
     message = update.get("message")
@@ -299,6 +319,7 @@ def _handle_callback(
     *,
     now_fn: Callable[[], datetime],
     answer_worker: AnswerWorker | None = None,
+    dig_now_worker: DigNowWorker | None = None,
 ) -> None:
     # 外部 API 由来のネスト値は形を仮定しない(型不正は未認可と同じ扱いで破棄)
     sender = callback.get("from")
@@ -350,6 +371,12 @@ def _handle_callback(
             return
         if prefix == "b" and arg.isdigit() and code == "p":
             _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
+            return
+        if prefix == "b" and arg.isdigit() and code == "n":
+            _record_backlog_now(
+                conn, config, api, callback, callback_id, int(arg), logger, now_fn(),
+                dig_now_worker,
+            )
             return
     # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
     # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
@@ -526,9 +553,27 @@ def _record_dig_request(
         answer_worker.kick(logger)
 
 
-# 未消化一覧の skip のボタンの callback_data(GH#349。設計 04 §3)。盤面を作り直すときに、押された
-# メッセージのボタンから item id を読む
-_SKIP_DATA_RE = re.compile(r"b:(\d+):p")
+# 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。
+# 盤面を作り直すときに、押されたメッセージのボタンから item id とボタンの種類を読む
+_BACKLOG_DATA_RE = re.compile(r"b:(\d+):([pn])")
+
+
+def _is_backlog_message(conn: sqlite3.Connection, config: Config, callback: dict) -> bool:
+    """押されたメッセージが owner の chat の未消化一覧(dig_backlog_messages)か。
+
+    callback_data だけを信じない(深掘りカードのボタンと同じ)。前の夜の一覧も受け付ける。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    listed = type(message_id) is int and (
+        conn.execute(
+            "SELECT 1 FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        is not None
+    )
+    return listed and chat_id == config.telegram.owner_chat_id
 
 
 def _record_backlog_skip(
@@ -542,28 +587,17 @@ def _record_backlog_skip(
 ) -> None:
     """未消化一覧の「⏭️ {id} を外す」(GH#349。設計 06 §2)。リプライのパスと同じ関数でキューから外す。
 
-    押されたメッセージが owner の chat の未消化一覧(dig_backlog_messages)であることを確かめる
-    (callback_data だけを信じない。深掘りカードのボタンと同じ)。前の夜の一覧も受け付ける。
+    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。
     - queued: パスにする(apply_instructions。観点・requested_at は残り、受付の順序の印も
       リプライのパスと同じく残す。GH#235)。朝の生成中でも、done 化の compare-and-set が外れて
-      パスが残る(app.deepdive)
+      パスが残る(app.deepdive)。今すぐの依頼も取り消す(GH#388)
     - passed(二重押し・再配達・リプライで外した後): もう一度パスにする。キューの状態は変わらず、
       印はリプライでパスし直したときと同じく今の時点に進む
     - done(掘り終えた): 書かない。キューから外す対象が無い(調べ直しを止めるのとは別の操作)
     - キューに無い: 書かない(予定の行はキューにあるので、偽造か壊れた data)
     外した後は、押したメッセージのボタンのうち外した item に ✓ を付けた盤面に差し替える。
     """
-    message = callback.get("message")
-    message_id = message.get("message_id") if isinstance(message, dict) else None
-    chat = message.get("chat") if isinstance(message, dict) else None
-    chat_id = chat.get("id") if isinstance(chat, dict) else None
-    listed = type(message_id) is int and (
-        conn.execute(
-            "SELECT 1 FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
-        ).fetchone()
-        is not None
-    )
-    if not listed or chat_id != config.telegram.owner_chat_id:
+    if not _is_backlog_message(conn, config, callback):
         logger.warning("未消化一覧と結び付かない skip のボタンを破棄", extra={"stage": "poll"})
         api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
         return
@@ -604,32 +638,99 @@ def _record_backlog_skip(
             callback_id,
             text=f"⏭️ {item_id} を外しました(戻すときは一覧へ「{item_id} も」とリプライ)",
         )
-    _refresh_skip_board(conn, api, callback, logger)
+    _refresh_backlog_board(conn, api, callback, logger)
 
 
-def _refresh_skip_board(
+# 今すぐのボタンの answer(GH#388。設計 04 §3)。受け付けたときだけ `intel dig-now` を起動する
+_NOW_ANSWERS: dict[NowRequestOutcome, str] = {
+    "accepted": "⚡ {item_id} を今すぐ掘ります。数分でカードが届きます",
+    "pending": "⚡ {item_id} は受け付け済みです(数分でカードが届きます)",
+    "running": "⚡ {item_id} は作成中です",
+    "done": "✅ {item_id} はもう掘り終えています",
+    "dug_today": "🗓 {item_id} は今日もう掘りました(掘り直しは明日以降)",
+    "no_body": "⚠️ {item_id} は本文が無いため掘れません",
+    "no_item": "⚠️ この番号の記事が見つかりません",
+}
+
+
+def _record_backlog_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    logger: logging.Logger,
+    now: datetime,
+    dig_now_worker: DigNowWorker | None,
+) -> None:
+    """未消化一覧の「⚡ {id} を今すぐ」(GH#388。設計 06 §2〜3)。今すぐの依頼を台帳に積む。
+
+    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。状態の確認と
+    反映は 1 つのトランザクションで行い(app.dig.request_dig_now)、受け付けたときだけ
+    `intel dig-now` を起動する。二重押し・再配達は受け付け済みとして答え、2 回は作らない。
+    深掘りの段が止まっている設定(`[dig].daily_cap = 0`)では受け付けない(一覧にボタンも
+    付かないので、前の一覧のボタン)。押した後は盤面を差し替え、今すぐに ✓ を付ける。
+    """
+    if not _is_backlog_message(conn, config, callback):
+        logger.warning("未消化一覧と結び付かない今すぐのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": item_id}
+    if config.dig.daily_cap <= 0:
+        api.answer_callback_query(callback_id, text="深掘りをしない設定です")
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            today = now.astimezone(JST).date().isoformat()
+            outcome = request_dig_now(conn, config, item_id, today, from_backlog=True)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"今すぐのボタンを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 受け付けに失敗、もう一度押してください")
+        return
+    if outcome == "no_item":
+        logger.warning("item の無い今すぐのボタンを破棄", extra=log_extra)
+    else:
+        logger.info(f"今すぐのボタン: {outcome}", extra=log_extra)
+    api.answer_callback_query(callback_id, text=_NOW_ANSWERS[outcome].format(item_id=item_id))
+    if outcome == "accepted" and dig_now_worker is not None:
+        dig_now_worker.kick(logger)
+    _refresh_backlog_board(conn, api, callback, logger)
+
+
+def _refresh_backlog_board(
     conn: sqlite3.Connection, api: TelegramApi, callback: dict, logger: logging.Logger
 ) -> None:
-    """押された未消化一覧の 1 通のボタンを、外した item に ✓ を付けて差し替える(GH#349)。
+    """押された未消化一覧の 1 通のボタンを、今の状態の ✓ を付けて差し替える(GH#349・GH#388)。
 
     その 1 通にどの行を載せたかは台帳に残していないので、押されたメッセージのボタン
-    (callback の message.reply_markup)から item id だけを読み、盤面は自前で作り直す
-    (Telegram の値の文言は使わない)。✓ はキューの今の状態(passed)で付けるので、同じ 1 通の
-    前に押したボタンの ✓ も残る。本文の印(🗓 明朝)は書き換えない。読めなければ差し替えない。
+    (callback の message.reply_markup)から item id とボタンの種類だけを読み、盤面は自前で作り直す
+    (Telegram の値の文言は使わない)。✓ はキューの今の状態で付けるので(外した = passed、今すぐ =
+    依頼を受け付けた・掘り終えた)、同じ 1 通の前に押したボタンの ✓ も残る。本文の印(🗓 明朝)は
+    書き換えない。読めなければ差し替えない。
     """
     message = callback.get("message")
     markup = message.get("reply_markup") if isinstance(message, dict) else None
     rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
-    item_ids: list[int] = []
+    kinds: dict[int, set[str]] = {}  # 行の順(dict の挿入順)を保つ
     for buttons in rows if isinstance(rows, list) else []:
         for button in buttons if isinstance(buttons, list) else []:
             data = button.get("callback_data") if isinstance(button, dict) else None
-            match = _SKIP_DATA_RE.fullmatch(data) if isinstance(data, str) else None
+            match = _BACKLOG_DATA_RE.fullmatch(data) if isinstance(data, str) else None
             if match is not None:
-                item_ids.append(int(match.group(1)))
-    if not item_ids:
+                kinds.setdefault(int(match.group(1)), set()).add(match.group(2))
+    if not kinds:
         logger.warning("一覧のボタンを読めないため盤面の差し替えを skip", extra={"stage": "poll"})
         return
+    item_ids = list(kinds)
     placeholders = ", ".join("?" for _ in item_ids)
     passed = {
         row["item_id"]
@@ -639,8 +740,15 @@ def _refresh_skip_board(
             item_ids,
         )
     }
+    board = [
+        BacklogButtons(item_id, now="n" in found, skip="p" in found)
+        for item_id, found in kinds.items()
+    ]
     _edit_markup_best_effort(
-        api, callback, backlog_skip_keyboard(item_ids, selected=passed), logger
+        api,
+        callback,
+        backlog_keyboard(board, passed=passed, now_marked=dig_now_marked(conn, item_ids)),
+        logger,
     )
 
 

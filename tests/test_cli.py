@@ -390,7 +390,10 @@ class _StopAtFactory(Exception):
 
 @pytest.mark.parametrize(
     ("command", "stage"),
-    [("analyze", "analyze"), ("digest", "trend"), ("dig", "dig"), ("answer", "answer")],
+    [
+        ("analyze", "analyze"), ("digest", "trend"), ("dig", "dig"), ("dig-now", "dig"),
+        ("answer", "answer"),
+    ],
 )
 def test_commands_build_engines_through_fallback(tmp_path, monkeypatch, command, stage) -> None:
     # 主のエンジンを使う各コマンドは、段の名前で予備への切り替え(GH#156)を通して作る
@@ -447,6 +450,37 @@ def test_commands_run_same_stage_as_morning_batch(
     assert [kwargs for _, kwargs in calls] == [passed]
     assert calls[0][0].get("TELEGRAM_BOT_TOKEN") == "test-token"  # .env の dict を渡す
     assert output in result.output
+
+
+@pytest.mark.parametrize(
+    ("outcome", "exit_code", "output"),
+    [
+        (True, 0, "dig-now 完了"),
+        (False, 0, "別の実行が深掘りを進めているため、今は作らなかった"),
+        ("error", 1, "今すぐの深掘りで 1 件失敗"),
+    ],
+)
+def test_dig_now_runs_dig_now_stage(tmp_path, monkeypatch, outcome, exit_code, output) -> None:
+    # poller が起動する `intel dig-now`(GH#388)。run_id を作って渡し、ログは dig-now.log
+    from app import logs, run
+    from app.deepdive import DigError
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    calls: list[dict] = []
+
+    def spy(conn, config, env, logger, **kwargs):
+        calls.append(kwargs)
+        if outcome == "error":
+            raise DigError("今すぐの深掘りで 1 件失敗: item 1: RuntimeError")
+        return outcome
+
+    monkeypatch.setattr(run, "dig_now_stage", spy)
+    result = runner.invoke(app, ["dig-now", "--config-dir", str(tmp_path)])
+    assert result.exit_code == exit_code, result.output
+    assert [set(kwargs) for kwargs in calls] == [{"run_id"}] and calls[0]["run_id"]
+    assert output in result.output
+    assert (tmp_path / "logs" / "dig-now.log").exists()
 
 
 def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
@@ -597,8 +631,8 @@ def test_run_releases_material_request_only_after_failure_notice_is_sent(
 # config.toml を読む全コマンド(検査だけの doctor を除く)。DB・外部・設定の置き場に書くか、
 # 既定の DB を読む(GH#338)
 _CONFIG_REQUIRED = [
-    ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["answer"],
-    ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"],
+    ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["dig-now"],
+    ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"],
     ["doctor", "--purge"], ["doctor", "--cost"],
 ]
 

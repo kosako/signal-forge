@@ -1,5 +1,6 @@
 """朝の調査段(GH#105 / 設計 06 §3〜5)。"""
 
+import contextlib
 import json
 import logging
 import os
@@ -45,13 +46,15 @@ from app.deepdive import (
     build_dig_prompt,
     build_review_prompt,
     release_material_request,
+    run_dig_now,
     run_dig_stage,
 )
 from app.delivery import DeliveryError
 from app.delivery.state import get_state
-from app.dig import DigInstruction, apply_instructions, enqueue_bookmark
+from app.dig import DigInstruction, apply_instructions, enqueue_bookmark, request_dig_now
 from app.extraction import extract_pending
 from app.http import HttpClient
+from app.jst import today_jst
 from app.prompting import load_writing_guide
 from app.vault_guard import VaultGuard
 from tests.test_delivery import telegram_text_error
@@ -1177,7 +1180,7 @@ def test_skip_button_during_generation_is_preserved(conn, config) -> None:
     # GH#349: 生成中に未消化一覧の skip のボタンを押したときも、リプライのパスと同じく本人の
     # 操作を優先する(done 化の compare-and-set が外れてパスが残る)。生成物のカードは届く
     from app.delivery.poller import handle_update
-    from app.delivery.surveys import backlog_skip_keyboard
+    from app.delivery.surveys import BacklogButtons, backlog_keyboard
 
     item = add_item(conn, "https://blog.example/post", language="ja")
     enqueue(conn, item, angle="運用の観点", requested_at="2026-07-21T12:00:00Z")
@@ -1206,7 +1209,7 @@ def test_skip_button_during_generation_is_preserved(conn, config) -> None:
             "message": {
                 "message_id": 640,
                 "chat": {"id": config.telegram.owner_chat_id},
-                "reply_markup": backlog_skip_keyboard([item]),
+                "reply_markup": backlog_keyboard([BacklogButtons(item, True, True)]),
             },
         },
     }
@@ -2881,3 +2884,375 @@ def test_unpublished_ledger_note_is_neutralized_on_publish(conn, config) -> None
     )
     source = (deepdive_dir(config) / "n-対訳.md").read_text()
     assert source == "&lt;iframe src=https://img.example/f>&lt;/iframe>"
+
+
+# --- 今すぐの深掘り(GH#388。設計 06 §3) ---
+
+NOW_FAILED = "⚠️ {id} の今すぐの深掘りを作れませんでした。明朝の深掘りに回します"
+
+
+def request_now(conn: sqlite3.Connection, config: Config, item_id: int) -> None:
+    assert request_dig_now(conn, config, item_id, today_jst(), from_backlog=True) == "accepted"
+
+
+def queue_state(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
+    return conn.execute(
+        "SELECT status, requested_at, now_requested_at, now_started_at FROM dig_queue "
+        "WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+
+
+def test_dig_now_digs_request_and_sends_card(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", title="日本語の記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger) is True
+
+    result = conn.execute("SELECT on_demand, message_id FROM dig_results").fetchone()
+    assert (result["on_demand"], result["message_id"]) == (1, 901)
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == ("done", None, None)
+    [(_, card)] = api.sent
+    assert "⚡ 今すぐの依頼・観点なし" in card
+    [note] = deepdive_dir(config).glob("*-深掘り.md")
+    assert note.name.startswith(today_jst().replace("-", "") + f"-{item}-")
+    assert "requested: (観点指定なし:今すぐの依頼からの深掘り)" in note.read_text()
+
+
+def test_dig_now_keeps_angle_of_request(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", title="日本語の記事", language="ja")
+    enqueue(conn, item, angle="運用の観点")
+    request_now(conn, config, item)
+    api = FakeApi()
+
+    run_dig_now(conn, config, make_factory({}), api, logger)
+
+    assert "観点「運用の観点」" in api.sent[0][1]
+
+
+def test_dig_now_is_not_counted_in_morning_cap(conn, config) -> None:
+    # 今すぐの分は朝の 1 日の上限に数えない(dig_results.on_demand)
+    now_item = add_item(conn, "https://ja.example/1", language="ja")
+    morning_item = add_item(conn, "https://ja.example/2", language="ja")
+    enqueue(conn, now_item)
+    request_now(conn, config, now_item)
+    run_dig_now(conn, config, make_factory({}), FakeApi(), logger)
+    enqueue(conn, morning_item)
+    one_a_day = replace(config, dig=DigConfig(daily_cap=1))
+
+    run_dig_stage(conn, one_a_day, make_factory({}), FakeApi(), logger, today=today_jst())
+
+    assert queue_state(conn, morning_item)["status"] == "done"
+
+
+def test_dig_now_failure_goes_to_morning_and_notifies(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    api = FakeApi()
+
+    with pytest.raises(DigError, match="今すぐの深掘りで 1 件失敗"):
+        run_dig_now(conn, config, make_factory({}, fail_for={"DigDraft"}), api, logger)
+
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "queued", None, None,
+    )
+    assert row["requested_at"] is not None  # 明朝の ①(リプライ指定)
+    assert api.sent == [(10, NOW_FAILED.format(id=item))]
+    selected, _ = _select_candidates(conn, config, 2, "2099-01-01")
+    assert [c.item_id for c in selected] == [item] and selected[0].requested
+
+
+def test_dig_now_does_not_redo_interrupted_request(conn, config) -> None:
+    # 作り始めた印が残った依頼(前の実行が途中で止まった)は、LLM を呼ばずに明朝へ回して知らせる
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute("UPDATE dig_queue SET now_started_at = '2026-07-22T00:00:00Z'")
+    engines: dict[str, ScriptedEngine] = {}
+    api = FakeApi()
+
+    with pytest.raises(DigError, match="途中で止まった"):
+        run_dig_now(conn, config, make_factory(engines), api, logger)
+
+    assert engines == {}
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_started_at"]) == ("queued", None)
+    assert row["requested_at"] is not None
+    assert api.sent == [(10, NOW_FAILED.format(id=item))]
+
+
+def test_dig_now_closes_request_for_item_dug_today(conn, config) -> None:
+    # 朝の生成中に押された依頼の取りこぼし。今日のカードは届いているので作らない
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at, message_id) "
+        "VALUES (?, 'n', 'カード', '2026-07-22T00:00:00Z', 700)",
+        (item,),
+    )  # created_at は今の時刻 = 今日
+    engines: dict[str, ScriptedEngine] = {}
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory(engines), api, logger) is True
+
+    assert engines == {} and api.sent == []
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "queued", None, None,
+    )
+
+
+def test_dig_now_without_body_closes_and_notifies(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute("DELETE FROM documents")  # 受け付けた後に purge で消えた
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger) is True
+
+    assert queue_state(conn, item)["now_requested_at"] is None
+    assert api.sent == [
+        (10, f"⚠️ {item} は本文が無いため、今すぐの深掘りを作れませんでした")
+    ]
+
+
+def test_dig_now_does_nothing_while_dig_lock_held(conn, config, tmp_path) -> None:
+    # 朝バッチの dig 段の間は作らない。依頼は残り、poller が後で起動し直す
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    other = connect(tmp_path / "intel.db")
+    engines: dict[str, ScriptedEngine] = {}
+    try:
+        with deepdive._dig_lock(other) as held:
+            assert held
+            assert run_dig_now(conn, config, make_factory(engines), FakeApi(), logger) is False
+    finally:
+        other.close()
+
+    assert engines == {}
+    row = queue_state(conn, item)
+    assert row["now_requested_at"] is not None and row["now_started_at"] is None
+
+
+def test_dig_now_digs_requests_in_order(conn, config) -> None:
+    first = add_item(conn, "https://ja.example/1", title="一つ目", language="ja")
+    second = add_item(conn, "https://ja.example/2", title="二つ目", language="ja")
+    for item in (first, second):
+        enqueue(conn, item)
+    request_now(conn, config, second)
+    request_now(conn, config, first)
+    conn.execute(
+        "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z' WHERE item_id = ?",
+        (second,),
+    )
+    api = FakeApi()
+
+    run_dig_now(conn, config, make_factory({}), api, logger)
+
+    assert [f"#{second}" in text for _, text in api.sent] == [True, False]
+    assert [f"#{first}" in text for _, text in api.sent] == [False, True]
+
+
+def test_morning_dig_closes_pending_now_request(conn, config) -> None:
+    # 朝の選定がその item を掘ったら、今すぐの依頼も閉じる(朝のカードで満たされる)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+
+    run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today=today_jst())
+
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == ("done", None, None)
+    assert conn.execute("SELECT on_demand FROM dig_results").fetchone()[0] == 0
+
+
+def test_now_press_during_morning_generation_is_closed_by_morning(conn, config) -> None:
+    # 朝が選んだ後・記帳の前に押されても、依頼の印は updated_at を進めないので done 化が外れない
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+
+    class PressDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if schema is DigDraft and queue_state(conn, item)["now_requested_at"] is None:
+                request_now(conn, config, item)
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, PressDuringGeneration())
+
+    run_dig_stage(conn, config, factory, FakeApi(), logger, today=today_jst())
+
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"]) == ("done", None)
+
+
+def test_pass_during_dig_now_keeps_pass_and_sends_card(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+
+    class PassDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if schema is DigDraft:
+                apply_instructions(conn, [DigInstruction(item, "pass")])
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, PassDuringGeneration())
+
+    api = FakeApi()
+    run_dig_now(conn, config, factory, api, logger)
+
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "passed", None, None,
+    )
+    assert len(api.sent) == 1  # 作ったカードは届く(朝の生成中のパスと同じ)
+
+
+def test_requeue_during_dig_now_keeps_new_angle_and_closes_request(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+
+    class RequeueDuringGeneration(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if schema is DigDraft:
+                apply_instructions(conn, [DigInstruction(item, "request", angle="新しい観点")])
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    engines: dict[str, ScriptedEngine] = {}
+
+    def factory(effort: str) -> ScriptedEngine:
+        return engines.setdefault(effort, RequeueDuringGeneration())
+
+    run_dig_now(conn, config, factory, FakeApi(), logger)
+
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "queued", None, None,
+    )
+    assert conn.execute("SELECT angle FROM dig_queue").fetchone()[0] == "新しい観点"
+    assert conn.execute("SELECT count(*) FROM dig_results").fetchone()[0] == 1
+
+
+def test_morning_dig_is_not_blocked_by_dig_now_generation(conn, config, tmp_path) -> None:
+    # 今すぐの生成の間は dig.lock を持たない。朝の dig 段は止まらずに選び、取り出された依頼は
+    # 選ばない(2 回作らない)。今すぐの分は、生成の後に dig.lock の中で公開・送信する
+    now_item = add_item(conn, "https://ja.example/now", title="今すぐの記事", language="ja")
+    morning_item = add_item(conn, "https://ja.example/morning", title="朝の記事", language="ja")
+    enqueue(conn, now_item, requested_at="2026-07-22T00:00:00Z")  # 朝の ① でもある
+    enqueue(conn, morning_item)
+    request_now(conn, config, now_item)
+    held = threading.Event()
+    release = threading.Event()
+
+    class HoldingEngine(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            if schema is DigDraft and not held.is_set():
+                held.set()
+                release.wait(30)
+            return super().complete_structured(prompt, schema, timeout_s)
+
+    now_api = FakeApi()
+    outcome: list[object] = []
+
+    def dig_now_run() -> None:
+        other = connect(tmp_path / "intel.db")
+        try:
+            outcome.append(run_dig_now(
+                other, config, lambda effort: HoldingEngine(), now_api, logger
+            ))
+        except BaseException as e:
+            outcome.append(e)
+        finally:
+            other.close()
+
+    worker = threading.Thread(target=dig_now_run)
+    worker.start()
+    morning_api = FakeApi()
+    try:
+        assert held.wait(5)
+        assert run_dig_stage(
+            conn, config, make_factory({}), morning_api, logger, today=today_jst()
+        ) is True
+    finally:
+        release.set()
+        worker.join(10)
+
+    assert outcome == [True]
+    assert [f"#{morning_item}" in text for _, text in morning_api.sent] == [True]
+    assert [f"#{now_item}" in text for _, text in now_api.sent] == [True]
+    rows = conn.execute("SELECT item_id, on_demand FROM dig_results ORDER BY item_id").fetchall()
+    assert sorted((r["item_id"], r["on_demand"]) for r in rows) == sorted(
+        [(now_item, 1), (morning_item, 0)]
+    )
+
+
+def test_dig_now_leaves_publish_and_send_to_lock_holder(conn, config, tmp_path) -> None:
+    # 作り終えたときに dig.lock を別の実行が持っていれば、公開・送信はその実行(か次の実行)に任せる
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    holder = connect(tmp_path / "intel.db")
+    hold = contextlib.ExitStack()
+
+    class LockAfterDraft(ScriptedEngine):
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            result = super().complete_structured(prompt, schema, timeout_s)
+            if schema is DigDraft and not hold._exit_callbacks:
+                assert hold.enter_context(deepdive._dig_lock(holder))
+            return result
+
+    api = FakeApi()
+    try:
+        assert run_dig_now(conn, config, lambda effort: LockAfterDraft(), api, logger) is True
+        assert api.sent == []
+        row = conn.execute("SELECT published_at, message_id FROM dig_results").fetchone()
+        assert (row["published_at"], row["message_id"]) == (None, None)
+    finally:
+        hold.close()
+        holder.close()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today=today_jst())
+    assert len(api.sent) == 1  # 台帳から公開・送信を再開する(朝の分と同じ)
+
+
+def test_second_dig_now_does_nothing_while_first_runs(conn, config, tmp_path) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    other = connect(tmp_path / "intel.db")
+    engines: dict[str, ScriptedEngine] = {}
+    try:
+        with deepdive._db_side_lock(other, deepdive._DIG_NOW_LOCK_SUFFIX) as held:
+            assert held
+            assert run_dig_now(conn, config, make_factory(engines), FakeApi(), logger) is False
+    finally:
+        other.close()
+
+    assert engines == {}
+    assert queue_state(conn, item)["now_started_at"] is None  # 途中で止まった扱いにしない
+
+
+def test_morning_selection_skips_claimed_now_request(conn, config) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item, requested_at="2026-07-22T00:00:00Z")
+    conn.execute("UPDATE dig_queue SET now_requested_at = '2026-07-22T01:00:00Z', "
+                 "now_started_at = '2026-07-22T01:00:01Z'")
+
+    selected, _ = _select_candidates(conn, config, 2, "2099-01-01")
+
+    assert [c.item_id for c in selected] == []

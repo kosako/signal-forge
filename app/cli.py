@@ -208,6 +208,39 @@ def dig(
     typer.echo("dig 完了(生成・送信の内訳はログ参照)")
 
 
+@app.command(name="dig-now")
+def dig_now(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """今すぐの深掘りの依頼を作り、ノート生成+概要カード送信(GH#388)。poller が起動する。"""
+    from ulid import ULID
+
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.deepdive import DigError
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import dig_now_stage
+
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    # 朝バッチ・poller・answer とはプロセスが別なので、日次ローテーションが競合しないよう分ける
+    logger = setup_logging(DEFAULT_LOG_DIR, "dig-now.log")
+    if config.dig.daily_cap <= 0:
+        typer.echo("[dig].daily_cap = 0(調査段は無効)")
+        raise typer.Exit(code=0)
+    try:
+        ran = dig_now_stage(conn, config, env, logger, run_id=str(ULID()))
+    except DigError as e:  # 明朝に回した依頼は知らせ済み。poller の異常終了のログに残す
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from None
+    if not ran:  # 別の実行が調査段を進めている。依頼はキューに残り、poller が起動し直す
+        typer.echo("別の実行が深掘りを進めているため、今は作らなかった")
+        return
+    typer.echo("dig-now 完了(生成・送信の内訳はログ参照)")
+
+
 @app.command()
 def answer(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
@@ -559,5 +592,6 @@ def main() -> None:
         raise SystemExit(1) from None
 
 
-if __name__ == "__main__":  # poller が `python -m app.cli answer` で起動する(GH#126)
+# poller が `python -m app.cli answer`(GH#126)と `python -m app.cli dig-now`(GH#388)で起動する
+if __name__ == "__main__":
     main()
