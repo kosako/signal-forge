@@ -127,6 +127,10 @@ _DIG_LOCK_SUFFIX = ".dig.lock"
 # 残った依頼を「前の実行が途中で止まった」と見分ける。dig.lock とは別で、生成の間は dig.lock を
 # 持たない(朝バッチの dig 段を止めない)
 _DIG_NOW_LOCK_SUFFIX = ".dig-now.lock"
+# 朝の dig 段と `intel dig` が、`intel dig-now` の短い取り出し・公開・送信の間の dig.lock を
+# 待つ上限と確かめる間隔(GH#388)。dig-now は生成の間は dig.lock を持たないので、ふつうは数秒で取れる
+_DIG_NOW_YIELD_WAIT_S = 120.0
+_DIG_LOCK_POLL_S = 0.5
 
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
@@ -287,9 +291,18 @@ def run_dig_stage(
     重なると、両方が同じ候補を選んで生成し、1 日上限を超え、カードが重複するため。待たない
     のは、生成が分オーダーで続き、朝バッチの purge・backup を遅らせるため(先の実行が同じ
     台帳から生成・公開・送信を終えるので、何もしなくても取りこぼさない)。
+    例外は `intel dig-now`(GH#388)が短く持っているときで、取れるまで待つ(_stage_dig_lock)。
+    dig-now は朝の候補を選ばないので、何もしないとその日の朝の深掘りが届かない。上限まで待っても
+    取れなければ段の失敗にして知らせる。
     """
-    with _dig_lock(conn) as acquired:
-        if not acquired:
+    with _stage_dig_lock(conn) as lock:
+        if lock == "dig_now":
+            # 今すぐの深掘りが dig.lock を放さなかった。何もしないと、その日の朝の深掘りが届かない
+            raise DigError(
+                "今すぐの深掘り(intel dig-now)が調査段のロックを放さなかったので、深掘りを"
+                "行わなかった(intel dig で再実行)"
+            )
+        if lock == "busy":
             logger.warning(
                 "dig: 別の実行(朝バッチか intel dig)が調査段を進めているので、この実行では"
                 "何もしない(生成・公開・送信はその実行が行う)",
@@ -471,6 +484,14 @@ def _run_dig_now_locked(
             )
             _notify_now(config, api, logger, run_id, _NOW_FAILED.format(item_id=item_id))
             failures.append(f"item {item_id}: 前の実行が途中で止まった(明朝に回した)")
+        else:
+            # 作っている間に本人がパスした(依頼は取り消し済み)。作り始めた印だけを消す。残すと、
+            # 指定し直しても朝の選定がこの行を選ばない
+            close_now_request(conn, item_id, started_at, to_morning=False)
+    # 前の実行が公開・送信できなかった分(送信の失敗など)を先に進める。依頼はもう閉じているので、
+    # 下のループだけでは進まない
+    if _has_unsent_cards(conn):
+        failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
 
     completed = True
     while has_now_requests(conn):  # 無ければ dig.lock を取りに行かない(朝の段と競わない)
@@ -1186,6 +1207,45 @@ def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
     """
     with _db_side_lock(conn, _DIG_LOCK_SUFFIX) as acquired:
         yield acquired
+
+
+@contextlib.contextmanager
+def _stage_dig_lock(
+    conn: sqlite3.Connection,
+    *,
+    wait_s: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Iterator[Literal["acquired", "busy", "dig_now"]]:
+    """朝の dig 段と `intel dig` の dig.lock(GH#196・GH#388)。
+
+    - acquired: 取れた
+    - busy: 別の朝の dig 段か `intel dig` が持っている(待たない。今までどおり)
+    - dig_now: `intel dig-now` が持ったまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
+      放さなかった
+    dig-now が動いている間(`<DB>.dig-now.lock` が取れない間)だけ待つ。dig-now は依頼の取り出しと
+    公開・送信の間だけ dig.lock を持ち、生成の間は放すので、ふつうは数秒で取れる。待っている
+    間に dig-now が終われば、そのときの持ち主は朝の dig 段か `intel dig` なので待つのをやめる。
+    """
+    deadline = clock() + (_DIG_NOW_YIELD_WAIT_S if wait_s is None else wait_s)
+    while True:
+        with _dig_lock(conn) as acquired:
+            if acquired:
+                yield "acquired"
+                return
+        if not _dig_now_running(conn):
+            yield "busy"
+            return
+        if clock() >= deadline:
+            yield "dig_now"
+            return
+        sleep(_DIG_LOCK_POLL_S)
+
+
+def _dig_now_running(conn: sqlite3.Connection) -> bool:
+    """`intel dig-now` が動いているか(`<DB>.dig-now.lock` を持つ実行がある)。"""
+    with _db_side_lock(conn, _DIG_NOW_LOCK_SUFFIX) as free:
+        return not free
 
 
 @contextlib.contextmanager

@@ -644,6 +644,7 @@ def _record_backlog_skip(
 # 今すぐのボタンの answer(GH#388。設計 04 §3)。受け付けたときだけ `intel dig-now` を起動する
 _NOW_ANSWERS: dict[NowRequestOutcome, str] = {
     "accepted": "⚡ {item_id} を今すぐ掘ります。数分でカードが届きます",
+    "duplicate": "⚡ {item_id} は受け付け済みです",
     "pending": "⚡ {item_id} は受け付け済みです(数分でカードが届きます)",
     "running": "⚡ {item_id} は作成中です",
     "done": "✅ {item_id} はもう掘り終えています",
@@ -668,7 +669,8 @@ def _record_backlog_now(
 
     押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。状態の確認と
     反映は 1 つのトランザクションで行い(app.dig.request_dig_now)、受け付けたときだけ
-    `intel dig-now` を起動する。二重押し・再配達は受け付け済みとして答え、2 回は作らない。
+    `intel dig-now` を起動する。二重押し・再配達は受け付け済みとして答え、2 回は作らない(再配達は
+    callback の id で見分け、依頼を閉じた後に届いても受け付け直さない)。
     深掘りの段が止まっている設定(`[dig].daily_cap = 0`)では受け付けない(一覧にボタンも
     付かないので、前の一覧のボタン)。押した後は盤面を差し替え、今すぐに ✓ を付ける。
     """
@@ -684,7 +686,9 @@ def _record_backlog_now(
         conn.execute("BEGIN IMMEDIATE")
         try:
             today = now.astimezone(JST).date().isoformat()
-            outcome = request_dig_now(conn, config, item_id, today, from_backlog=True)
+            outcome = request_dig_now(
+                conn, config, item_id, today, callback_id, from_backlog=True
+            )
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:

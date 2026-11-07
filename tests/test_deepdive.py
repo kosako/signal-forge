@@ -2891,8 +2891,13 @@ def test_unpublished_ledger_note_is_neutralized_on_publish(conn, config) -> None
 NOW_FAILED = "⚠️ {id} の今すぐの深掘りを作れませんでした。明朝の深掘りに回します"
 
 
+_now_callbacks = iter(range(1, 10_000))
+
+
 def request_now(conn: sqlite3.Connection, config: Config, item_id: int) -> None:
-    assert request_dig_now(conn, config, item_id, today_jst(), from_backlog=True) == "accepted"
+    callback_id = f"cb-{next(_now_callbacks)}"
+    outcome = request_dig_now(conn, config, item_id, today_jst(), callback_id, from_backlog=True)
+    assert outcome == "accepted"
 
 
 def queue_state(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
@@ -3256,3 +3261,101 @@ def test_morning_selection_skips_claimed_now_request(conn, config) -> None:
     selected, _ = _select_candidates(conn, config, 2, "2099-01-01")
 
     assert [c.item_id for c in selected] == []
+
+
+def test_dig_now_resends_unsent_card_without_requests(conn, config) -> None:
+    # 依頼を閉じた後に送信だけが失敗した分は、依頼が無くても次の dig-now が台帳から送る
+    # (poller は送れていない今すぐのカードを見て起動する)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    with pytest.raises(DigError, match="カード送信"):
+        run_dig_now(conn, config, make_factory({}), FakeApi(fail=True), logger)
+    assert queue_state(conn, item)["now_requested_at"] is None
+    api = FakeApi()
+    engines: dict[str, ScriptedEngine] = {}
+
+    assert run_dig_now(conn, config, make_factory(engines), api, logger) is True
+
+    assert engines == {} and len(api.sent) == 1
+    assert conn.execute("SELECT message_id FROM dig_results").fetchone()[0] == 901
+
+
+def test_dig_now_clears_started_mark_of_passed_interrupted_row(conn, config) -> None:
+    # 作っている途中で本人がパスし、そのまま前の実行が止まった。知らせずに印だけを消す
+    # (残すと、指定し直しても朝の選定がこの行を選ばない)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    conn.execute("UPDATE dig_queue SET status = 'passed', now_started_at = '2026-07-22T00:00:00Z'")
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger) is True
+
+    assert queue_state(conn, item)["now_started_at"] is None
+    assert api.sent == []
+
+
+def hold_locks(tmp_path: Path, *suffixes: str) -> contextlib.ExitStack:
+    """別の実行がロックを持っている状態を作る(同じ DB への別の接続)。"""
+    stack = contextlib.ExitStack()
+    other = connect(tmp_path / "intel.db")
+    stack.callback(other.close)
+    for suffix in suffixes:
+        assert stack.enter_context(deepdive._db_side_lock(other, suffix))
+    return stack
+
+
+def test_stage_lock_does_not_wait_for_other_stage(conn, tmp_path) -> None:
+    # 朝の dig 段と intel dig が重なったときは今までどおり待たない(GH#196)
+    sleeps: list[float] = []
+    with (
+        hold_locks(tmp_path, deepdive._DIG_LOCK_SUFFIX),
+        deepdive._stage_dig_lock(conn, sleep=sleeps.append) as lock,
+    ):
+        assert lock == "busy"
+    assert sleeps == []
+
+
+def test_stage_lock_waits_while_dig_now_holds_briefly(conn, tmp_path) -> None:
+    # dig-now は取り出し・公開・送信の間だけ dig.lock を持つ。朝の dig 段は放されるまで待つ
+    holder = hold_locks(tmp_path, deepdive._DIG_NOW_LOCK_SUFFIX)
+    dig = hold_locks(tmp_path, deepdive._DIG_LOCK_SUFFIX)
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        dig.close()  # dig-now が公開・送信を終えて dig.lock を放した
+
+    try:
+        with deepdive._stage_dig_lock(conn, sleep=sleep) as lock:
+            assert lock == "acquired"
+    finally:
+        dig.close()
+        holder.close()
+    assert len(sleeps) == 1
+
+
+def test_morning_dig_fails_loudly_when_dig_now_never_releases(
+    conn, config, tmp_path, monkeypatch
+) -> None:
+    # 上限まで待っても dig-now が放さなければ、何もしないで終わらず段の失敗にする(その日の朝の
+    # 深掘りが届かないことを知らせる)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    with (
+        hold_locks(tmp_path, deepdive._DIG_NOW_LOCK_SUFFIX, deepdive._DIG_LOCK_SUFFIX),
+        deepdive._stage_dig_lock(conn, wait_s=0) as lock,
+    ):
+        assert lock == "dig_now"
+
+    real_stage_lock = deepdive._stage_dig_lock
+    monkeypatch.setattr(
+        deepdive, "_stage_dig_lock",
+        lambda conn: real_stage_lock(conn, wait_s=0, sleep=lambda _s: None),
+    )
+    with (
+        hold_locks(tmp_path, deepdive._DIG_NOW_LOCK_SUFFIX, deepdive._DIG_LOCK_SUFFIX),
+        pytest.raises(DigError, match="intel dig で再実行"),
+    ):
+        run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
+    assert queue_state(conn, item)["status"] == "queued"

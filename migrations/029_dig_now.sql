@@ -4,9 +4,13 @@
 --                               作れずに明朝の深掘りへ回したとき、本人がパスしたときに NULL に戻す
 --   dig_queue.now_started_at    `intel dig-now` が作り始めた時刻(1 回押して 1 回だけ作るための印)。
 --                               印が残ったまま次の実行が見つけたら、前の実行が途中で止まったとみなし、
---                               作り直さずに明朝の深掘りへ回す(LLM を繰り返し呼ばない)
+--                               作り直さずに明朝の深掘りへ回す(LLM を繰り返し呼ばない)。作っている間は
+--                               朝の選定がこの行を選ばない(本人がパスしても、作り終えるまで残す)
+--   dig_queue.now_callback_id   最後に受け付けた今すぐのボタンの callback の id。依頼を閉じても残し、
+--                               同じ callback の再配達を新しい依頼として受け付けない
 --   dig_results.on_demand       1 = 今すぐの依頼で作った。朝の 1 日の上限([dig].daily_cap)に数えない
 ALTER TABLE dig_queue ADD COLUMN now_requested_at TEXT;
 ALTER TABLE dig_queue ADD COLUMN now_started_at TEXT;
+ALTER TABLE dig_queue ADD COLUMN now_callback_id TEXT;
 ALTER TABLE dig_results ADD COLUMN on_demand INTEGER NOT NULL DEFAULT 0
   CHECK (on_demand IN (0, 1));

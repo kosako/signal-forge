@@ -2155,3 +2155,23 @@ def test_no_now_button_on_rows_dug_today(conn, tmp_path) -> None:
 
     assert planned_ids_in(text) == [planned]  # 明朝は翌日なので予定になる(掘り直し)
     assert now_ids(markup) == [] and skip_ids(markup) == [planned]
+
+
+def test_redelivered_now_press_after_request_closed_is_not_new(conn, tmp_path) -> None:
+    # 受け付けた後、offset を保存する前に poller が止まり、その間に依頼が閉じた(作れずに明朝へ
+    # 回した)。同じ callback の再配達を新しい依頼にしない(1 回押して 1 回だけ作る)
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    press = now_press(item, message_id, markup, update_id=7)
+    worker = FakeWorker()
+
+    poll_once(conn, config, FakeApi([[press]]), logger, dig_now_worker=worker)
+    conn.execute("UPDATE dig_queue SET now_requested_at = NULL")  # 依頼を閉じた
+    again = FakeApi([[press]])
+    poll_once(conn, config, again, logger, dig_now_worker=worker)
+
+    assert again.answered == [("cb7", f"⚡ {item} は受け付け済みです")]
+    assert queue_row(conn, item)["now_requested_at"] is None
+    assert worker.kicks == 1

@@ -1,5 +1,6 @@
 """深掘りキューとリプライパーサ(GH#104 / 設計 06 §2〜3)。"""
 
+import itertools
 import sqlite3
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from app.dig import (
     parse_dig_reply,
     queue_item_ids,
     request_dig_now,
+    select_from_queue,
 )
 
 
@@ -251,6 +253,22 @@ def add_item_with_body(conn: sqlite3.Connection, url: str, body: str | None = BO
     return item_id
 
 
+_callbacks = itertools.count(1)
+
+
+def press_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    item_id: int,
+    *,
+    from_backlog: bool = True,
+    callback_id: str | None = None,
+) -> str:
+    """今すぐのボタンを押す(callback の id は押すたびに新しい。再配達は callback_id で渡す)。"""
+    callback = callback_id if callback_id is not None else f"cb-{next(_callbacks)}"
+    return request_dig_now(conn, config, item_id, TODAY, callback, from_backlog=from_backlog)
+
+
 def add_question_row(conn: sqlite3.Connection) -> int:
     """受け付け済みの質問(受付の順序の印の比較用。GH#235)。"""
     card_item = add_plain_item(conn, "https://a/card")
@@ -273,7 +291,7 @@ def test_now_request_on_queued_row_only_marks_request(conn, config) -> None:
     conn.execute("UPDATE dig_queue SET angle = '観点', updated_at = '2026-07-20T00:00:00Z'")
     before = queue_row(conn, item)
 
-    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == "accepted"
+    assert press_now(conn, config, item) == "accepted"
 
     row = queue_row(conn, item)
     assert row["now_requested_at"] is not None and row["now_started_at"] is None
@@ -286,7 +304,7 @@ def test_now_request_creates_row_for_item_out_of_queue(conn, config) -> None:
     item = add_item_with_body(conn, "https://a/1")
     question_id = add_question_row(conn)
 
-    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == "accepted"
+    assert press_now(conn, config, item) == "accepted"
 
     row = queue_row(conn, item)
     assert (row["status"], row["source"], row["requested_at"]) == ("queued", "request", None)
@@ -300,7 +318,7 @@ def test_now_request_revives_passed_row(conn, config) -> None:
     apply_instructions(conn, [DigInstruction(item, "pass")])
     conn.execute("UPDATE dig_queue SET updated_at = '2026-07-20T00:00:00Z'")
 
-    assert request_dig_now(conn, config, item, TODAY, from_backlog=False) == "accepted"
+    assert press_now(conn, config, item, from_backlog=False) == "accepted"
 
     row = queue_row(conn, item)
     assert (row["status"], row["angle"]) == ("queued", "前の観点")
@@ -338,13 +356,13 @@ def test_now_request_refusals_write_nothing(conn, config, setup, outcome) -> Non
         )
     before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")]
 
-    assert request_dig_now(conn, config, item, TODAY, from_backlog=True) == outcome
+    assert press_now(conn, config, item) == outcome
 
     assert [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")] == before
 
 
 def test_now_request_for_missing_item(conn, config) -> None:
-    assert request_dig_now(conn, config, 9999, TODAY, from_backlog=True) == "no_item"
+    assert press_now(conn, config, 9999) == "no_item"
     assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
 
 
@@ -359,11 +377,29 @@ def test_dug_on_uses_jst_day(conn) -> None:
     assert not dug_on(conn, item, "2026-07-21")
 
 
-def test_pass_cancels_now_request(conn, config) -> None:
-    # パスは今すぐの依頼を取り消す(作っている途中の印も消し、作り終えた側は done にしない)
+def test_pass_cancels_now_request_but_keeps_started_mark(conn, config) -> None:
+    # パスは今すぐの依頼を取り消す。作っている途中の印は残し、作り終えるまで朝の選定に選ばせない
+    # (パスの後に指定し直しても、同じ item を 2 回作らない)
     item = add_item_with_body(conn, "https://a/1")
-    request_dig_now(conn, config, item, TODAY, from_backlog=True)
-    claim_now_request(conn)
+    press_now(conn, config, item)
+    candidate = claim_now_request(conn)
+    assert candidate is not None
+
+    apply_instructions(conn, [DigInstruction(item, "pass")])
+    apply_instructions(conn, [DigInstruction(item, "request", angle="観点")])
+
+    row = queue_row(conn, item)
+    assert (row["status"], row["now_requested_at"], row["now_started_at"]) == (
+        "queued", None, candidate.now_started_at,
+    )
+    assert claim_now_request(conn) is None  # 依頼は取り消し済み
+    assert has_now_requests(conn)  # 印の残った行は dig-now を起こす(止まっていれば片付ける)
+    assert select_from_queue(conn, config, 2, "2099-01-01") == ([], [])
+
+
+def test_pass_before_claim_cancels_request(conn, config) -> None:
+    item = add_item_with_body(conn, "https://a/1")
+    press_now(conn, config, item)
 
     apply_instructions(conn, [DigInstruction(item, "pass")])
 
@@ -374,9 +410,23 @@ def test_pass_cancels_now_request(conn, config) -> None:
     assert not has_now_requests(conn)
 
 
+def test_redelivered_callback_is_not_a_new_request(conn, config) -> None:
+    # 受け付けた後、offset を保存する前に poller が止まると同じ callback が再配達される。依頼を
+    # 閉じた後(作れずに明朝へ回した)に届いても、新しい依頼にしない。別の押下は受け付ける
+    item = add_item_with_body(conn, "https://a/1")
+    assert press_now(conn, config, item, callback_id="cb-a") == "accepted"
+    candidate = claim_now_request(conn)
+    assert candidate is not None
+    close_now_request(conn, item, candidate.now_started_at, to_morning=True)
+
+    assert press_now(conn, config, item, callback_id="cb-a") == "duplicate"
+    assert queue_row(conn, item)["now_requested_at"] is None
+    assert press_now(conn, config, item, callback_id="cb-b") == "accepted"
+
+
 def test_reply_request_keeps_now_request(conn, config) -> None:
     item = add_item_with_body(conn, "https://a/1")
-    request_dig_now(conn, config, item, TODAY, from_backlog=True)
+    press_now(conn, config, item)
 
     apply_instructions(conn, [DigInstruction(item, "request", angle="観点")])
 
@@ -387,7 +437,7 @@ def test_claim_takes_oldest_request_and_marks_started(conn, config) -> None:
     first = add_item_with_body(conn, "https://a/1")
     second = add_item_with_body(conn, "https://a/2")
     for item in (second, first):
-        request_dig_now(conn, config, item, TODAY, from_backlog=True)
+        press_now(conn, config, item)
     conn.execute(
         "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z' WHERE item_id = ?",
         (first,),
@@ -408,7 +458,7 @@ def test_claim_takes_oldest_request_and_marks_started(conn, config) -> None:
 
 def test_close_now_request_only_closes_same_claim(conn, config) -> None:
     item = add_item_with_body(conn, "https://a/1")
-    request_dig_now(conn, config, item, TODAY, from_backlog=True)
+    press_now(conn, config, item)
     candidate = claim_now_request(conn)
     assert candidate is not None
 
@@ -426,7 +476,7 @@ def test_dig_now_marked_and_unsent_now_cards(conn, config) -> None:
     pending = add_item_with_body(conn, "https://a/1")
     done = add_item_with_body(conn, "https://a/2")
     plain = add_item_with_body(conn, "https://a/3")
-    request_dig_now(conn, config, pending, TODAY, from_backlog=True)
+    press_now(conn, config, pending)
     enqueue_bookmark(conn, done)
     conn.execute("UPDATE dig_queue SET status = 'done' WHERE item_id = ?", (done,))
     enqueue_bookmark(conn, plain)

@@ -143,7 +143,8 @@ def apply_instructions(
       なければ既存を保持(「3664 も」= 優先度だけ上げる)
     - pass: status を passed に。観点・requested_at は保持する(後で request 復帰した
       とき前回の観点が生きる)。今すぐの依頼(GH#388)は取り消す。作っている途中なら、
-      作り終えた `intel dig-now` が done にせずパスを残す(朝の生成中のパスと同じ)
+      作り始めた印は残し(作り終えるまで朝の選定がこの行を選ばない)、作り終えた
+      `intel dig-now` が done にせずパスを残す(朝の生成中のパスと同じ)
     - source は初回投入の経路のまま変えない(migration 009 の契約。明示指定の有無は
       requested_at / status が担う)
     - from_backlog = 未消化一覧への本人の操作か(既定)。そうなら受付の順序の印として、
@@ -160,7 +161,6 @@ def apply_instructions(
                 ON CONFLICT(item_id) DO UPDATE SET
                   status = 'passed',
                   now_requested_at = NULL,
-                  now_started_at = NULL,
                   backlog_op_question_id = {_KEEP_MARK},
                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 """,
@@ -384,7 +384,8 @@ def dig_states(
 # 今すぐの依頼(GH#388。設計 06 §3)を受け付けた結果。accepted のときだけキューに書く
 NowRequestOutcome = Literal[
     "accepted",  # 受け付けた(poller が起動する `intel dig-now` が作る)
-    "pending",  # 受け付け済み(二重押し・再配達)
+    "duplicate",  # 同じ callback の再配達(依頼を閉じた後でも受け付け直さない)
+    "pending",  # 受け付け済み(二重押し)
     "running",  # 作っている途中
     "done",  # 掘り終えている(掘り直さない。調べ直しはカードへのリプライ。GH#137)
     "dug_today",  # 今日もう掘った(同じ日に 2 回は掘らない。_DUG_ON_DAY)
@@ -409,10 +410,15 @@ def request_dig_now(
     config: Config,
     item_id: int,
     day: str,
+    callback_id: str,
     *,
     from_backlog: bool,
 ) -> NowRequestOutcome:
     """今すぐの依頼を受け付ける(GH#388。設計 06 §3)。day は押した日(JST の暦日)。
+
+    callback_id は押した callback の id。受け付けたときに行に残し(依頼を閉じても消さない)、同じ
+    callback の再配達(受け付けた後、offset を保存する前に poller が止まった)を新しい依頼にしない。
+    再配達は止まった update から順に届くので、最後に受け付けた id だけを残せば足りる。
 
     状態の確認と反映は、呼び出し側の 1 つのトランザクションの中で行う(commit も呼び出し側)。
     - キューに行が無い: queued・source = 'request' で足す(本人の明示の依頼。source は初回投入の
@@ -435,10 +441,13 @@ def request_dig_now(
     if item is None:
         return "no_item"
     queue = conn.execute(
-        "SELECT status, now_requested_at, now_started_at FROM dig_queue WHERE item_id = ?",
+        "SELECT status, now_requested_at, now_started_at, now_callback_id FROM dig_queue "
+        "WHERE item_id = ?",
         (item_id,),
     ).fetchone()
     status = queue["status"] if queue is not None else None
+    if queue is not None and queue["now_callback_id"] == callback_id:
+        return "duplicate"
     if status == "done":
         return "done"
     if queue is not None and queue["now_started_at"] is not None:
@@ -451,34 +460,39 @@ def request_dig_now(
         return "no_body"
     if queue is None:
         conn.execute(
-            "INSERT INTO dig_queue"
-            "  (item_id, status, source, now_requested_at, backlog_op_question_id) "
-            f"VALUES (?, 'queued', 'request', {_NOW}, {_BACKLOG_MARK})",
-            (item_id, int(from_backlog)),
+            "INSERT INTO dig_queue (item_id, status, source, now_requested_at, now_callback_id,"
+            "  backlog_op_question_id) "
+            f"VALUES (?, 'queued', 'request', {_NOW}, ?, {_BACKLOG_MARK})",
+            (item_id, callback_id, int(from_backlog)),
         )
     elif status == "passed":
         conn.execute(
             f"UPDATE dig_queue SET status = 'queued', now_requested_at = {_NOW}, "
+            "now_callback_id = ?, "
             f"backlog_op_question_id = COALESCE({_BACKLOG_MARK}, backlog_op_question_id), "
             f"updated_at = {_NOW} WHERE item_id = ?",
-            (int(from_backlog), item_id),
+            (callback_id, int(from_backlog), item_id),
         )
     else:
         conn.execute(
-            f"UPDATE dig_queue SET now_requested_at = {_NOW} WHERE item_id = ?", (item_id,)
+            f"UPDATE dig_queue SET now_requested_at = {_NOW}, now_callback_id = ? "
+            "WHERE item_id = ?",
+            (callback_id, item_id),
         )
     return "accepted"
 
 
 def has_now_requests(conn: sqlite3.Connection) -> bool:
-    """作っていない(か途中で止まった)今すぐの依頼があるか。
+    """作っていない今すぐの依頼か、作り始めた印の残った行があるか。
 
-    poller が `intel dig-now` を起動する合図(GH#388)。
+    poller が `intel dig-now` を起動する合図(GH#388)。印の残った行は、作っている途中か、前の
+    実行が途中で止まったもの(作っている途中なら、起動した dig-now は何もせずに終わる)。
     """
     return (
         conn.execute(
             "SELECT 1 FROM dig_queue "
-            "WHERE status = 'queued' AND now_requested_at IS NOT NULL LIMIT 1"
+            "WHERE (status = 'queued' AND now_requested_at IS NOT NULL) "
+            "   OR now_started_at IS NOT NULL LIMIT 1"
         ).fetchone()
         is not None
     )
