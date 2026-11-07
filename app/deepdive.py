@@ -381,9 +381,14 @@ def _run_dig_stage_locked(
 
     # 候補の無い朝(GH#349)。中断した分(未公開・未送信の行)を再開する実行は、送れたかに
     # かかわらず知らせない(届いたカードの直後に「深掘りはありません」と言わない。送れなければ
-    # 失敗の通知で知らせ、次の実行が送る。設計 06 §3)。再開の前に台帳を見る
+    # 失敗の通知で知らせ、次の実行が送る。設計 06 §3)。再開の前に台帳を見る。今すぐの依頼を
+    # 作っている途中(か、これから作る)ときも、その後にカードが届くので知らせない(GH#388)
     no_candidates = (
-        api is not None and remaining > 0 and not selected and not _has_unsent_cards(conn)
+        api is not None
+        and remaining > 0
+        and not selected
+        and not _has_unsent_cards(conn)
+        and not has_now_requests(conn)
     )
 
     # 未公開ノートの書出(過去の中断分を含む)

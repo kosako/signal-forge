@@ -3438,3 +3438,20 @@ def test_morning_waits_while_dig_now_sends_card(conn, config, tmp_path) -> None:
     finally:
         morning.close()
     assert seen == ["dig_now"]
+
+
+def test_no_candidate_notice_is_not_sent_while_dig_now_generates(conn, config) -> None:
+    # 唯一の候補を今すぐの深掘りが作っている途中(朝の選定は選ばない)。その後にカードが届くので、
+    # 「今朝の深掘りはありません」と知らせない
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    conn.execute(
+        "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z', "
+        "now_started_at = '2026-07-22T00:00:01Z'"
+    )
+    api = FakeApi()
+
+    assert run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-22") is True
+
+    assert api.sent == []
+    assert get_state(conn, STATE_NO_CANDIDATE_NOTIFIED) is None
