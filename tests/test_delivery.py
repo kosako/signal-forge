@@ -2,13 +2,14 @@ import json
 import logging
 import sqlite3
 import threading
+from dataclasses import replace
 from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
 import pytest
 
-from app.config import Config, TelegramConfig
+from app.config import Config, DigConfig, TelegramConfig
 from app.db import apply_migrations, connect
 from app.delivery import DeliveryError, TelegramApi, create_api, deliver_digest
 from app.delivery.telegram import ITEM_TEXT_MAX_CHARS, escape_attr, escape_text
@@ -195,6 +196,39 @@ def test_item_message_format_source_link_date_summary_implication(conn, tmp_path
         f"s:{a}:up", f"s:{a}:dig", f"s:{a}:knw", f"s:{a}:no"
     ]
     assert all(len(b["callback_data"].encode()) <= 64 for b in buttons)
+
+
+DIG_BODY = "本文の段落です。" * 50  # 調査段の材料(既定 200 字)に足りる
+
+
+def add_document(conn, item_id: int, text: str) -> None:
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, language, extraction_status,"
+        " expires_at) VALUES (?, ?, 'ja', 'ok', '2099-01-01T00:00:00Z')",
+        (item_id, text),
+    )
+
+
+@pytest.mark.parametrize("daily_cap", [2, 0])
+def test_item_message_has_dig_now_button_when_body_is_enough(conn, tmp_path, daily_cap) -> None:
+    # 今すぐの深掘りのボタン(GH#388)は、深掘りの段が動いていて本文が足りる記事にだけ 2 行目に付ける
+    enough = add_item(conn, "https://a/1")
+    short = add_item(conn, "https://a/2")
+    no_body = add_item(conn, "https://a/3")
+    add_document(conn, enough, DIG_BODY)
+    add_document(conn, short, "短い")
+    digest_id = add_digest(conn, [enough, short, no_body])
+    config = replace(make_config(tmp_path), dig=DigConfig(daily_cap=daily_cap))
+    recorder = ApiRecorder()
+    deliver_digest(conn, config, recorder.api(), digest_id, logger)
+
+    markups = [json.loads(r["reply_markup"]) for r in recorder.requests[1:4]]
+    rows = [m["inline_keyboard"] for m in markups]
+    assert all(len(row[0]) == 4 for row in rows)  # 反応の 4 ボタンは今までどおり
+    if daily_cap > 0:
+        assert rows[0][1] == [{"text": "⚡ 今すぐ深掘り", "callback_data": f"g:{enough}:n"}]
+        assert len(f"g:{2**63 - 1}:n".encode()) <= 64
+    assert [len(row) for row in rows] == ([2, 1, 1] if daily_cap > 0 else [1, 1, 1])
 
 
 def test_html_escaping_of_title_and_url(conn, tmp_path) -> None:

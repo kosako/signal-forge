@@ -16,8 +16,9 @@
 - allowlist 不一致は WARN 1行(from.id・update 種別・受信時刻のみ。本文ペイロードは
   保存しない)で破棄し、応答も返さない(bot の存在を確認させない。設計 04 §6)
 - 夜アンケート(`q1:`/`q2:`)と追い掛け(`f:`)、未消化一覧の skip と今すぐのボタン(`b:`。
-  GH#349・GH#388)の callback も本デーモンで処理する(送信は surveys.py の内蔵タイマー)。今すぐの
-  依頼は台帳に積み、深掘りは別プロセスの `intel dig-now` が作る(DigNowWorker)
+  GH#349・GH#388)、朝の digest の記事の今すぐのボタン(`g:`。GH#388)の callback も本デーモンで
+  処理する(送信は surveys.py の内蔵タイマー)。今すぐの依頼は台帳に積み、深掘りは別プロセスの
+  `intel dig-now` が作る(DigNowWorker)
 """
 
 from __future__ import annotations
@@ -378,6 +379,12 @@ def _handle_callback(
                 dig_now_worker,
             )
             return
+        if prefix == "g" and arg.isdigit() and code == "n":
+            _record_digest_now(
+                conn, config, api, callback, callback_id, int(arg), logger, now_fn(),
+                dig_now_worker,
+            )
+            return
     # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
     # スピナーだけ止める(認可済み owner の誤操作・旧形式を無限に回さない)
     api.answer_callback_query(callback_id)
@@ -419,7 +426,7 @@ def _record_reaction(
         },
     )
     _edit_markup_best_effort(
-        api, callback, reaction_keyboard(item_id, selected=code), logger
+        api, callback, _digest_item_keyboard(conn, callback, item_id, selected=code), logger
     )
 
 
@@ -667,27 +674,96 @@ def _record_backlog_now(
 ) -> None:
     """未消化一覧の「⚡ {id} を今すぐ」(GH#388。設計 06 §2〜3)。今すぐの依頼を台帳に積む。
 
-    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。状態の確認と
-    反映は 1 つのトランザクションで行い(app.dig.request_dig_now)、受け付けたときだけ
-    `intel dig-now` を起動する。二重押し・再配達は受け付け済みとして答え、2 回は作らない(再配達は
-    callback の id で見分け、依頼を閉じた後に届いても受け付け直さない)。
-    深掘りの段が止まっている設定(`[dig].daily_cap = 0`)では受け付けない(一覧にボタンも
-    付かないので、前の一覧のボタン)。押した後は盤面を差し替え、今すぐに ✓ を付ける。
+    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。受け付けは
+    _accept_dig_now(朝の digest の記事のボタンと共通)。押した後は盤面を差し替え、今すぐに ✓ を
+    付ける。
     """
     if not _is_backlog_message(conn, config, callback):
         logger.warning("未消化一覧と結び付かない今すぐのボタンを破棄", extra={"stage": "poll"})
         api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
         return
+    if _accept_dig_now(
+        conn, config, api, callback_id, item_id, logger, now, dig_now_worker, from_backlog=True
+    ):
+        _refresh_backlog_board(conn, api, callback, logger)
+
+
+def _record_digest_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    logger: logging.Logger,
+    now: datetime,
+    dig_now_worker: DigNowWorker | None,
+) -> None:
+    """朝の digest の記事の「⚡ 今すぐ深掘り」(GH#388。設計 06 §2〜3)。今すぐの依頼を台帳に積む。
+
+    押されたメッセージが、その記事として送った digest のメッセージ(digest_messages。置換の前の
+    世代も含む)で owner の chat にあることを確かめる(callback_data だけを信じない)。受け付けは
+    未消化一覧のボタンと共通(_accept_dig_now)。未消化一覧への操作ではないので、受付の順序の印
+    (GH#235)は付けない。押した後は、記事の反応の ✓ を残したまま今すぐに ✓ を付ける。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    listed = type(message_id) is int and (
+        conn.execute(
+            "SELECT 1 FROM digest_messages WHERE message_id = ? AND item_id = ?",
+            (message_id, item_id),
+        ).fetchone()
+        is not None
+    )
+    if not listed or chat_id != config.telegram.owner_chat_id:
+        logger.warning("digest の記事と結び付かない今すぐのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この記事には対応できません")
+        return
+    if _accept_dig_now(
+        conn, config, api, callback_id, item_id, logger, now, dig_now_worker, from_backlog=False
+    ):
+        _edit_markup_best_effort(
+            api,
+            callback,
+            _digest_item_keyboard(
+                conn, callback, item_id, selected=_latest_reaction_code(conn, item_id)
+            ),
+            logger,
+        )
+
+
+def _accept_dig_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback_id: str,
+    item_id: int,
+    logger: logging.Logger,
+    now: datetime,
+    dig_now_worker: DigNowWorker | None,
+    *,
+    from_backlog: bool,
+) -> bool:
+    """今すぐの依頼を受け付けて答える(GH#388)。盤面を差し替えてよければ True。
+
+    状態の確認と反映は 1 つのトランザクションで行い(app.dig.request_dig_now)、受け付けたとき
+    だけ `intel dig-now` を起動する。二重押し・再配達は受け付け済みとして答え、2 回は作らない
+    (再配達は callback の id で見分け、依頼を閉じた後に届いても受け付け直さない)。深掘りの段が
+    止まっている設定(`[dig].daily_cap = 0`)では受け付けない(ボタンも付かないので、前の
+    メッセージのボタン)。DB に書けなかったときは警告で答え、押し直してもらう。
+    """
     log_extra = {"stage": "poll", "item_id": item_id}
     if config.dig.daily_cap <= 0:
         api.answer_callback_query(callback_id, text="深掘りをしない設定です")
-        return
+        return False
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             today = now.astimezone(JST).date().isoformat()
             outcome = request_dig_now(
-                conn, config, item_id, today, callback_id, from_backlog=True
+                conn, config, item_id, today, callback_id, from_backlog=from_backlog
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -699,7 +775,7 @@ def _record_backlog_now(
             f"今すぐのボタンを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
         )
         api.answer_callback_query(callback_id, text="⚠️ 受け付けに失敗、もう一度押してください")
-        return
+        return False
     if outcome == "no_item":
         logger.warning("item の無い今すぐのボタンを破棄", extra=log_extra)
     else:
@@ -707,7 +783,49 @@ def _record_backlog_now(
     api.answer_callback_query(callback_id, text=_NOW_ANSWERS[outcome].format(item_id=item_id))
     if outcome == "accepted" and dig_now_worker is not None:
         dig_now_worker.kick(logger)
-    _refresh_backlog_board(conn, api, callback, logger)
+    return True
+
+
+# 反映した反応の値(signals.value)→ callback_data の code。digest の記事の盤面を作り直すときに使う
+_REACTION_CODES = {value: code for code, value in _REACTION_VALUES.items()}
+
+
+def _latest_reaction_code(conn: sqlite3.Connection, item_id: int) -> str | None:
+    """その記事に最後に付けた反応の code(盤面の ✓ を残すため)。
+
+    最新は KPI の集計と同じ規則で決める(created_at の最新、同じ秒は id の大きい方。設計 01 §7)。
+    """
+    row = conn.execute(
+        "SELECT value FROM signals WHERE kind = 'reaction' AND item_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    return _REACTION_CODES.get(row["value"]) if row is not None else None
+
+
+def _digest_item_keyboard(
+    conn: sqlite3.Connection, callback: dict, item_id: int, *, selected: str | None
+) -> dict:
+    """digest の記事の盤面を作り直す(反応の ✓ = selected、今すぐの ✓ = 今の状態。GH#388)。
+
+    今すぐのボタンは、押されたメッセージに付いていたときだけ残す(送ったときに材料の無かった記事と、
+    GH#388 より前の配信には付いていない)。Telegram の値の文言は使わず、callback_data だけを読む。
+    """
+    message = callback.get("message")
+    markup = message.get("reply_markup") if isinstance(message, dict) else None
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    now_data = f"g:{item_id}:n"
+    with_now = any(
+        isinstance(button, dict) and button.get("callback_data") == now_data
+        for buttons in (rows if isinstance(rows, list) else [])
+        for button in (buttons if isinstance(buttons, list) else [])
+    )
+    return reaction_keyboard(
+        item_id,
+        selected=selected,
+        with_now=with_now,
+        now_marked=with_now and item_id in dig_now_marked(conn, [item_id]),
+    )
 
 
 def _refresh_backlog_board(

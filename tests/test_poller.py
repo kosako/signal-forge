@@ -1775,3 +1775,172 @@ def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
     assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:s", "d:5:m"]
     assert dig_card_keyboard(5, None, with_requests=False) is None
 
+
+
+# --- 朝の digest の記事の今すぐのボタン(GH#388。設計 06 §2〜3・04 §3) ---
+
+DIG_BODY = "本文の段落です。" * 50
+
+
+def add_digest_item_messages(
+    conn, message_ids: tuple[int, ...] = (55,), *, body: str | None = DIG_BODY
+) -> list[int]:
+    """今日の digest に載せて送った記事を作り、item id を返す(本文つき。1 記事 1 メッセージ)。"""
+    item_ids = []
+    for message_id in message_ids:
+        item_id = add_item(conn, f"https://a/now/{message_id}")
+        if body is not None:
+            conn.execute(
+                "INSERT INTO documents (item_id, extracted_text, language, extraction_status,"
+                " expires_at) VALUES (?, ?, 'ja', 'ok', '2099-01-01T00:00:00Z')",
+                (item_id, body),
+            )
+        item_ids.append(item_id)
+    digest_id = add_digest(conn, item_ids)
+    conn.executemany(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
+        [(digest_id, item_id, m) for item_id, m in zip(item_ids, message_ids, strict=True)],
+    )
+    return item_ids
+
+
+def reaction_press(item_id: int, code: str, *, update_id: int, markup: dict) -> dict:
+    """digest の記事の反応のボタン(押されたメッセージの盤面つき)。"""
+    update = make_callback_update(item_id, code, update_id=update_id)
+    update["callback_query"]["message"]["reply_markup"] = markup
+    return update
+
+
+def digest_now_press(
+    item_id: int, *, update_id: int = 1, message_id: object = 55, chat_id: object = CHAT_ID,
+    markup: dict | None = None,
+) -> dict:
+    update = make_callback_update(item_id, update_id=update_id, data=f"g:{item_id}:n")
+    message = update["callback_query"]["message"]
+    message.update({"message_id": message_id, "chat": {"id": chat_id}})
+    message["reply_markup"] = markup or reaction_keyboard(item_id, with_now=True)
+    return update
+
+
+def test_digest_now_button_accepts_request(conn, tmp_path) -> None:
+    [item] = add_digest_item_messages(conn)
+    worker = FakeWorker()
+    api = FakeApi([[digest_now_press(item)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=worker)
+
+    row = conn.execute("SELECT * FROM dig_queue WHERE item_id = ?", (item,)).fetchone()
+    assert (row["status"], row["source"], row["requested_at"]) == ("queued", "request", None)
+    assert row["now_requested_at"] is not None and row["now_callback_id"] == "cb1"
+    assert row["backlog_op_question_id"] is None  # 未消化一覧への操作ではない
+    assert api.answered == [("cb1", f"⚡ {item} を今すぐ掘ります。数分でカードが届きます")]
+    assert worker.kicks == 1
+    assert api.edited == [
+        (CHAT_ID, 55, reaction_keyboard(item, with_now=True, now_marked=True))
+    ]
+    kinds = conn.execute("SELECT count(*) FROM signals WHERE item_id = ?", (item,)).fetchone()
+    assert kinds[0] == 0  # 反応(KPI)には書かない
+
+
+def test_digest_now_board_keeps_reaction_check(conn, tmp_path) -> None:
+    # 先に 👍 を押した記事で ⚡ を押しても、👍 の ✓ は残る。反応を押し直しても ⚡ の ✓ は残る
+    [item] = add_digest_item_messages(conn)
+    config = make_config(tmp_path)
+    sent = reaction_keyboard(item, with_now=True)
+    api = FakeApi([
+        [reaction_press(item, "up", update_id=1, markup=sent)],
+        [digest_now_press(item, update_id=2)],
+        [reaction_press(item, "dig", update_id=3, markup=sent)],
+    ])
+    for _ in range(3):
+        poll_once(conn, config, api, logger, dig_now_worker=FakeWorker())
+
+    assert [markup for _, _, markup in api.edited] == [
+        reaction_keyboard(item, selected="up", with_now=True),
+        reaction_keyboard(item, selected="up", with_now=True, now_marked=True),
+        reaction_keyboard(item, selected="dig", with_now=True, now_marked=True),
+    ]
+
+
+def test_reaction_on_message_without_now_button_does_not_add_it(conn, tmp_path) -> None:
+    # 本文が足りなかった記事と、GH#388 より前の配信には今すぐのボタンが無い。反応で足さない
+    [item] = add_digest_item_messages(conn)
+    api = FakeApi([[reaction_press(item, "up", update_id=1, markup=reaction_keyboard(item))]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert api.edited == [(CHAT_ID, 55, reaction_keyboard(item, selected="up"))]
+
+
+@pytest.mark.parametrize(
+    ("press", "answered"),
+    [
+        ({"message_id": 9999}, "⚠️ この記事には対応できません"),  # digest として送っていない
+        ({"chat_id": CHAT_ID + 1}, "⚠️ この記事には対応できません"),  # owner の chat 以外
+    ],
+)
+def test_digest_now_button_rejected_unless_recorded_message(
+    conn, tmp_path, press, answered
+) -> None:
+    [item] = add_digest_item_messages(conn)
+    api = FakeApi([[digest_now_press(item, **press)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    assert api.answered == [("cb1", answered)]
+    assert api.edited == []
+
+
+def test_digest_now_button_for_other_items_message_is_rejected(conn, tmp_path) -> None:
+    # 押されたメッセージが別の記事のもの(callback_data の item id と結び付かない)
+    _, other = add_digest_item_messages(conn, (55, 56))
+    api = FakeApi([[digest_now_press(other, message_id=55)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    assert api.answered == [("cb1", "⚠️ この記事には対応できません")]
+
+
+def test_digest_now_button_refused_when_dig_is_off(conn, tmp_path) -> None:
+    [item] = add_digest_item_messages(conn)
+    config = replace(make_config(tmp_path), dig=DigConfig(daily_cap=0))
+    api = FakeApi([[digest_now_press(item)]])
+
+    poll_once(conn, config, api, logger, dig_now_worker=FakeWorker())
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    assert api.answered == [("cb1", "深掘りをしない設定です")]
+
+
+def test_digest_now_button_without_body_answers_and_writes_nothing(conn, tmp_path) -> None:
+    [item] = add_digest_item_messages(conn, body=None)
+    worker = FakeWorker()
+    api = FakeApi([[digest_now_press(item)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=worker)
+
+    assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
+    assert api.answered == [("cb1", f"⚠️ {item} は本文が無いため掘れません")]
+    assert worker.kicks == 0
+
+
+def test_digest_now_board_uses_latest_reaction_by_created_at(conn, tmp_path) -> None:
+    # 反応の最新は KPI と同じく created_at の最新(同じ秒は id の大きい方。設計 01 §7)。挿入の順と
+    # 時刻が逆でも、盤面の ✓ は集計上の最新に合わせる
+    [item] = add_digest_item_messages(conn)
+    history = (("useful", "2026-07-05T10:00:00Z"), ("noise", "2026-07-05T09:00:00Z"))
+    for value, created_at in history:
+        conn.execute(
+            "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+            "VALUES ('reaction', ?, ?, '2026-07-05', ?)",
+            (item, value, created_at),
+        )
+    api = FakeApi([[digest_now_press(item)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+
+    assert api.edited == [
+        (CHAT_ID, 55, reaction_keyboard(item, selected="up", with_now=True, now_marked=True))
+    ]
