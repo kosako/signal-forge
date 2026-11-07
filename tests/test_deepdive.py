@@ -3386,3 +3386,55 @@ def test_stage_lock_not_fooled_when_dig_now_finishes(conn, tmp_path, monkeypatch
         dig.close()
         holder.close()
     assert attempts == [False, True]
+
+
+def test_stage_lock_does_not_wait_for_intel_dig_during_dig_now_generation(conn, tmp_path) -> None:
+    # dig-now の生成中(dig-now.lock だけを持つ)に `intel dig` が dig.lock を持っているなら、朝の
+    # dig 段は今までどおり待たない(持ち主の種類をロックの file で見分ける)
+    sleeps: list[float] = []
+    other = connect(tmp_path / "intel.db")
+    try:
+        with (
+            hold_locks(tmp_path, deepdive._DIG_NOW_LOCK_SUFFIX),
+            deepdive._dig_lock(other),  # intel dig(朝の段と同じ持ち主の種類)
+            deepdive._stage_dig_lock(conn, sleep=sleeps.append) as lock,
+        ):
+            assert lock == "busy"
+    finally:
+        other.close()
+    assert sleeps == []
+
+
+def test_dig_lock_records_holder_only_while_held(conn, tmp_path) -> None:
+    other = connect(tmp_path / "intel.db")
+    try:
+        with deepdive._dig_lock(other, "dig-now") as held:
+            assert held and deepdive._dig_lock_holder(conn) == "dig-now"
+        assert deepdive._dig_lock_holder(conn) == ""
+        with deepdive._dig_lock(other) as held:
+            assert held and deepdive._dig_lock_holder(conn) == "stage"
+        assert deepdive._dig_lock_holder(conn) == ""
+    finally:
+        other.close()
+
+
+def test_morning_waits_while_dig_now_sends_card(conn, config, tmp_path) -> None:
+    # dig-now が実際に dig.lock を持つ間(公開・送信)に朝の段が来たら、待つ側に判定する
+    # (dig-now はロックの file に持ち主の種類を書く)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    morning = connect(tmp_path / "intel.db")
+    seen: list[str] = []
+
+    class CheckingApi(FakeApi):
+        def send_message(self, chat_id: int, text: str, *, reply_markup=None) -> int:
+            with deepdive._stage_dig_lock(morning, wait_s=0) as lock:
+                seen.append(lock)
+            return super().send_message(chat_id, text, reply_markup=reply_markup)
+
+    try:
+        run_dig_now(conn, config, make_factory({}), CheckingApi(), logger)
+    finally:
+        morning.close()
+    assert seen == ["dig_now"]

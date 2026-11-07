@@ -495,7 +495,7 @@ def _run_dig_now_locked(
 
     completed = True
     while has_now_requests(conn):  # 無ければ dig.lock を取りに行かない(朝の段と競わない)
-        with _dig_lock(conn) as acquired:
+        with _dig_lock(conn, "dig-now") as acquired:
             if not acquired:
                 logger.info(
                     "dig-now: 別の実行が調査段を進めているので、残りの依頼は後で作る"
@@ -579,7 +579,7 @@ def _publish_and_send(
     段の終わりに同じ台帳から公開・送信する。間に合わなかった分は、poller が送れていない今すぐの
     カードを見て `intel dig-now` を起動し直す。
     """
-    with _dig_lock(conn) as acquired:
+    with _dig_lock(conn, "dig-now") as acquired:
         if not acquired:
             logger.info(
                 "dig-now: 別の実行が調査段を進めているので、公開と送信はその実行か次の実行に任せる",
@@ -1192,11 +1192,20 @@ def _db_file(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+# dig.lock の持ち主の種類(ロックの file に書く。GH#388)
+_DigLockHolder = Literal["stage", "dig-now"]
+
+
 @contextlib.contextmanager
-def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
+def _dig_lock(
+    conn: sqlite3.Connection, holder: _DigLockHolder = "stage"
+) -> Iterator[bool]:
     """調査段の実行を、同じ台帳を使う実行どうし(朝バッチの dig 段と `intel dig`)で 1 つに絞る
     (GH#196)。取れたら True、別の実行が握っていれば待たずに False。`intel dig-now` は依頼の
     取り出しと、公開・送信の間だけ持つ(GH#388。run_dig_now)。
+
+    holder は持ち主の種類で、持つ間だけロックの file に書く(放す前に消す)。取れなかった朝の
+    dig 段が、持ち主が dig-now か朝の段・`intel dig` かを見分けるのに使う(_stage_dig_lock)。
 
     SQLite のロックは 1 トランザクションの間しか続かず、LLM の待ち(分オーダー)をまたいで
     書き込みのトランザクションを持つと poller の書き込みを止めるので、DB の隣の専用ファイルに
@@ -1205,8 +1214,19 @@ def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
     握ったまま残っていてもデッドロックしない(公開のロックの待ちには上限がある)。メモリ上の
     DB は別の実行と台帳を共有しない。
     """
-    with _db_side_lock(conn, _DIG_LOCK_SUFFIX) as acquired:
+    with _db_side_lock(conn, _DIG_LOCK_SUFFIX, holder=holder) as acquired:
         yield acquired
+
+
+def _dig_lock_holder(conn: sqlite3.Connection) -> str:
+    """今 dig.lock の file に書かれた持ち主の種類(空 = 持ち主が書く前・放した後・読めない)。"""
+    db_file = _db_file(conn)
+    if db_file is None:
+        return ""
+    try:
+        return db_file.with_name(db_file.name + _DIG_LOCK_SUFFIX).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 @contextlib.contextmanager
@@ -1221,15 +1241,17 @@ def _stage_dig_lock(
 
     - acquired: 取れた
     - busy: 別の朝の dig 段か `intel dig` が持っている(待たない。今までどおり)
-    - dig_now: `intel dig-now` が動いたまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
+    - dig_now: `intel dig-now` が持ったまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
       取れなかった
     dig-now は `<DB>.dig-now.lock` を持つ間だけ dig.lock を持つ(取るのは dig-now.lock の後、放すのは
     前)。そこで先に dig-now.lock を待たずに取ってみる。取れたら dig-now は動いておらず、持つ間は
     始まらないので、そのまま dig.lock が取れなければ持ち主は朝の dig 段か `intel dig` と決まる
     (確かめる間に dig-now が終わっても取り違えない)。dig.lock を取ったら dig-now.lock はすぐ放す
     (dig-now は朝の段の間に起動しても何もせずに終わる)。dig-now.lock が取れなければ dig-now が
-    動いているので、dig.lock が取れるまで待つ。dig-now は依頼の取り出しと公開・送信の間だけ持ち、
-    生成の間は放すので、ふつうは数秒で取れる。
+    動いている。そのときの dig.lock の持ち主は、ロックの file に書かれた種類で見分ける。朝の段か
+    `intel dig` なら待たない(dig-now の生成中に `intel dig` が持っているとき)。dig-now か、書く前・
+    放した後(空)なら取れるまで待つ。dig-now は依頼の取り出しと公開・送信の間だけ持ち、生成の
+    間は放すので、ふつうは数秒で取れる。
     """
     deadline = clock() + (_DIG_NOW_YIELD_WAIT_S if wait_s is None else wait_s)
     while True:
@@ -1241,7 +1263,7 @@ def _stage_dig_lock(
             if acquired:
                 yield "acquired"
                 return
-            if no_dig_now:
+            if no_dig_now or _dig_lock_holder(conn) == "stage":
                 yield "busy"
                 return
         if clock() >= deadline:
@@ -1251,8 +1273,13 @@ def _stage_dig_lock(
 
 
 @contextlib.contextmanager
-def _db_side_lock(conn: sqlite3.Connection, suffix: str) -> Iterator[bool]:
-    """DB の隣の `<DB><suffix>` に flock を待たずに取る。取れたら True。メモリ上の DB は True。"""
+def _db_side_lock(
+    conn: sqlite3.Connection, suffix: str, *, holder: str | None = None
+) -> Iterator[bool]:
+    """DB の隣の `<DB><suffix>` に flock を待たずに取る。取れたら True。メモリ上の DB は True。
+
+    holder があれば、持つ間だけその文字列を file に書き、放す前に消す(持ち主の種類。dig.lock)。
+    """
     db_file = _db_file(conn)
     if db_file is None:
         yield True
@@ -1265,7 +1292,14 @@ def _db_side_lock(conn: sqlite3.Connection, suffix: str) -> Iterator[bool]:
             acquired = True
         except BlockingIOError:
             acquired = False
-        yield acquired
+        if acquired and holder is not None:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, holder.encode("ascii"), 0)
+        try:
+            yield acquired
+        finally:
+            if acquired and holder is not None:
+                os.ftruncate(fd, 0)
     finally:
         os.close(fd)  # close で flock は解放される
 
