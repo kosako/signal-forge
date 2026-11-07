@@ -1221,31 +1221,33 @@ def _stage_dig_lock(
 
     - acquired: 取れた
     - busy: 別の朝の dig 段か `intel dig` が持っている(待たない。今までどおり)
-    - dig_now: `intel dig-now` が持ったまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
-      放さなかった
-    dig-now が動いている間(`<DB>.dig-now.lock` が取れない間)だけ待つ。dig-now は依頼の取り出しと
-    公開・送信の間だけ dig.lock を持ち、生成の間は放すので、ふつうは数秒で取れる。待っている
-    間に dig-now が終われば、そのときの持ち主は朝の dig 段か `intel dig` なので待つのをやめる。
+    - dig_now: `intel dig-now` が動いたまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
+      取れなかった
+    dig-now は `<DB>.dig-now.lock` を持つ間だけ dig.lock を持つ(取るのは dig-now.lock の後、放すのは
+    前)。そこで先に dig-now.lock を待たずに取ってみる。取れたら dig-now は動いておらず、持つ間は
+    始まらないので、そのまま dig.lock が取れなければ持ち主は朝の dig 段か `intel dig` と決まる
+    (確かめる間に dig-now が終わっても取り違えない)。dig.lock を取ったら dig-now.lock はすぐ放す
+    (dig-now は朝の段の間に起動しても何もせずに終わる)。dig-now.lock が取れなければ dig-now が
+    動いているので、dig.lock が取れるまで待つ。dig-now は依頼の取り出しと公開・送信の間だけ持ち、
+    生成の間は放すので、ふつうは数秒で取れる。
     """
     deadline = clock() + (_DIG_NOW_YIELD_WAIT_S if wait_s is None else wait_s)
     while True:
-        with _dig_lock(conn) as acquired:
+        with contextlib.ExitStack() as held:
+            guard = contextlib.ExitStack()
+            no_dig_now = guard.enter_context(_db_side_lock(conn, _DIG_NOW_LOCK_SUFFIX))
+            acquired = held.enter_context(_dig_lock(conn))
+            guard.close()
             if acquired:
                 yield "acquired"
                 return
-        if not _dig_now_running(conn):
-            yield "busy"
-            return
+            if no_dig_now:
+                yield "busy"
+                return
         if clock() >= deadline:
             yield "dig_now"
             return
         sleep(_DIG_LOCK_POLL_S)
-
-
-def _dig_now_running(conn: sqlite3.Connection) -> bool:
-    """`intel dig-now` が動いているか(`<DB>.dig-now.lock` を持つ実行がある)。"""
-    with _db_side_lock(conn, _DIG_NOW_LOCK_SUFFIX) as free:
-        return not free
 
 
 @contextlib.contextmanager

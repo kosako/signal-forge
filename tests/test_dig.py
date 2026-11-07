@@ -354,11 +354,16 @@ def test_now_request_refusals_write_nothing(conn, config, setup, outcome) -> Non
             "VALUES (?, 'n', 'カード', '2026-07-21T21:40:00Z')",
             (item,),
         )
-    before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")]
+    columns = "item_id, status, source, angle, requested_at, updated_at, now_requested_at, " \
+        "now_started_at, backlog_op_question_id"
+    before = [tuple(row) for row in conn.execute(f"SELECT {columns} FROM dig_queue")]
 
-    assert press_now(conn, config, item) == outcome
+    assert press_now(conn, config, item, callback_id="cb-x") == outcome
 
-    assert [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")] == before
+    assert [tuple(row) for row in conn.execute(f"SELECT {columns} FROM dig_queue")] == before
+    # 受け付け済み・作成中と答えた callback は id を残し、再配達を新しい依頼にしない
+    kept = queue_row(conn, item)["now_callback_id"]
+    assert kept == ("cb-x" if outcome in ("pending", "running") else None)
 
 
 def test_now_request_for_missing_item(conn, config) -> None:
@@ -489,3 +494,17 @@ def test_dig_now_marked_and_unsent_now_cards(conn, config) -> None:
         (pending,),
     )
     assert has_unsent_now_cards(conn)
+
+
+def test_redelivered_running_press_after_first_request_failed(conn, config) -> None:
+    # A を作っている間に押した B(作成中と答えた)の再配達が、A が作れずに閉じた後に届いても、
+    # 新しい依頼にしない(1 回押して 1 回だけ作る)
+    item = add_item_with_body(conn, "https://a/1")
+    assert press_now(conn, config, item, callback_id="cb-a") == "accepted"
+    candidate = claim_now_request(conn)
+    assert candidate is not None
+    assert press_now(conn, config, item, callback_id="cb-b") == "running"
+    close_now_request(conn, item, candidate.now_started_at, to_morning=True)
+
+    assert press_now(conn, config, item, callback_id="cb-b") == "duplicate"
+    assert queue_row(conn, item)["now_requested_at"] is None

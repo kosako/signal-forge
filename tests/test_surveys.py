@@ -2065,13 +2065,14 @@ def test_now_button_refusals(conn, tmp_path, setup, answered) -> None:
         )
     else:
         conn.execute("DELETE FROM documents")
-    before = [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")]
+    columns = "item_id, status, angle, requested_at, updated_at, now_requested_at, now_started_at"
+    before = [tuple(row) for row in conn.execute(f"SELECT {columns} FROM dig_queue")]
     worker = FakeWorker()
 
     api = FakeApi([[now_press(item, message_id, markup)]])
     poll_once(conn, config, api, logger, dig_now_worker=worker)
 
-    assert [tuple(row) for row in conn.execute("SELECT * FROM dig_queue")] == before
+    assert [tuple(row) for row in conn.execute(f"SELECT {columns} FROM dig_queue")] == before
     assert api.answered == [("cb1", answered.format(id=item))]
     assert worker.kicks == 0
 

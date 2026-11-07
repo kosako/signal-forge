@@ -381,7 +381,8 @@ def dig_states(
     return states
 
 
-# 今すぐの依頼(GH#388。設計 06 §3)を受け付けた結果。accepted のときだけキューに書く
+# 今すぐの依頼(GH#388。設計 06 §3)を受け付けた結果。依頼を積むのは accepted だけで、pending と
+# running は callback の id だけを残す。ほかは書かない
 NowRequestOutcome = Literal[
     "accepted",  # 受け付けた(poller が起動する `intel dig-now` が作る)
     "duplicate",  # 同じ callback の再配達(依頼を閉じた後でも受け付け直さない)
@@ -416,9 +417,10 @@ def request_dig_now(
 ) -> NowRequestOutcome:
     """今すぐの依頼を受け付ける(GH#388。設計 06 §3)。day は押した日(JST の暦日)。
 
-    callback_id は押した callback の id。受け付けたときに行に残し(依頼を閉じても消さない)、同じ
-    callback の再配達(受け付けた後、offset を保存する前に poller が止まった)を新しい依頼にしない。
-    再配達は止まった update から順に届くので、最後に受け付けた id だけを残せば足りる。
+    callback_id は押した callback の id。受け付けたとき(受け付け済み・作成中と答えたときも)に行に
+    残し(依頼を閉じても消さない)、同じ callback の再配達(答えた後、offset を保存する前に poller が
+    止まった)を新しい依頼にしない。再配達は止まった update から順に届くので、最後の id だけを
+    残せば足りる。
 
     状態の確認と反映は、呼び出し側の 1 つのトランザクションの中で行う(commit も呼び出し側)。
     - キューに行が無い: queued・source = 'request' で足す(本人の明示の依頼。source は初回投入の
@@ -450,10 +452,15 @@ def request_dig_now(
         return "duplicate"
     if status == "done":
         return "done"
-    if queue is not None and queue["now_started_at"] is not None:
-        return "running"
-    if queue is not None and queue["now_requested_at"] is not None:
-        return "pending"
+    if queue is not None and (
+        queue["now_started_at"] is not None or queue["now_requested_at"] is not None
+    ):
+        # 受け付け済み・作成中と答えた callback の id も残す。残さないと、その callback の再配達が
+        # 先の依頼を閉じた後に届いたとき、新しい依頼になる
+        conn.execute(
+            "UPDATE dig_queue SET now_callback_id = ? WHERE item_id = ?", (callback_id, item_id)
+        )
+        return "running" if queue["now_started_at"] is not None else "pending"
     if dug_on(conn, item_id, day):
         return "dug_today"
     if not has_material(item["extracted_text"], config):

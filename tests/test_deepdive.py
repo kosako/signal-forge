@@ -3359,3 +3359,30 @@ def test_morning_dig_fails_loudly_when_dig_now_never_releases(
     ):
         run_dig_stage(conn, config, make_factory({}), FakeApi(), logger, today="2026-07-22")
     assert queue_state(conn, item)["status"] == "queued"
+
+
+def test_stage_lock_not_fooled_when_dig_now_finishes(conn, tmp_path, monkeypatch) -> None:
+    # dig.lock を取り損ねた直後に dig-now が両方のロックを放しても、「別の朝の段が持っている」と
+    # 取り違えて何もせずに終わらない(先に dig-now.lock を取ってから dig.lock を確かめる)
+    holder = hold_locks(tmp_path, deepdive._DIG_NOW_LOCK_SUFFIX)
+    dig = hold_locks(tmp_path, deepdive._DIG_LOCK_SUFFIX)
+    real_dig_lock = deepdive._dig_lock
+    attempts: list[bool] = []
+
+    @contextlib.contextmanager
+    def dig_lock_then_dig_now_finishes(conn):
+        with real_dig_lock(conn) as acquired:
+            attempts.append(acquired)
+            if not acquired:  # 取り損ねた直後に dig-now が終わった
+                dig.close()
+                holder.close()
+            yield acquired
+
+    monkeypatch.setattr(deepdive, "_dig_lock", dig_lock_then_dig_now_finishes)
+    try:
+        with deepdive._stage_dig_lock(conn, sleep=lambda _s: None) as lock:
+            assert lock == "acquired"
+    finally:
+        dig.close()
+        holder.close()
+    assert attempts == [False, True]
