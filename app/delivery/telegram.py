@@ -33,6 +33,7 @@ import httpx
 
 from app.config import Config
 from app.deliver_lock import delivery_lock
+from app.dig import items_with_material
 from app.digest.builder import BOOKMARK_SECTION_MAX
 from app.models import EXTRACTION_FAILED_NOTE
 
@@ -76,6 +77,8 @@ _REACTION_BUTTONS = (
     ("✅ 既知", "knw"),
     ("👎 不要", "no"),
 )
+# digest の記事の今すぐのボタン(GH#388。callback_data `g:{item_id}:n` の正本は設計 04 §3)
+_DIG_NOW_LABEL = "⚡ 今すぐ深掘り"
 
 
 class DeliveryError(Exception):
@@ -252,12 +255,13 @@ def deliver_digest(
         wait_message="別の配信が実行中のため、終わるのを待つ",
     ):
         return _deliver_locked(
-            conn, config.telegram.owner_chat_id, api, digest_id, logger, run_id, sleep
+            conn, config, config.telegram.owner_chat_id, api, digest_id, logger, run_id, sleep
         )
 
 
 def _deliver_locked(
     conn: sqlite3.Connection,
+    config: Config,
     chat_id: int,
     api: TelegramApi,
     digest_id: int,
@@ -279,6 +283,8 @@ def _deliver_locked(
     item_ids: list[int] = json.loads(digest["item_ids"])
     items = _load_items(conn, item_ids)
     sent_item_ids, header_sent = _load_ledger(conn, digest_id)
+    # 今すぐのボタン(GH#388)は、深掘りの段が動いていて、本文が材料に足りる記事にだけ付ける
+    now_ids = items_with_material(conn, config, item_ids) if config.dig.daily_cap > 0 else set()
 
     sent = 0
     try:
@@ -294,7 +300,9 @@ def _deliver_locked(
             message_id = api.send_message(
                 chat_id,
                 _item_text(position, row),
-                reply_markup=reaction_keyboard(row["item_id"]),
+                reply_markup=reaction_keyboard(
+                    row["item_id"], with_now=row["item_id"] in now_ids
+                ),
             )
             _record_message(conn, digest_id, row["item_id"], message_id, logger, run_id, sleep)
             sent += 1
@@ -516,19 +524,33 @@ def _published_md(published_at: str | None) -> str | None:
     return f"{date.month}/{date.day}"
 
 
-def reaction_keyboard(item_id: int, *, selected: str | None = None) -> dict:
-    """4ボタン InlineKeyboard。selected(up|dig|knw|no)のボタンに ✓ を付ける。"""
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": f"{label} ✓" if code == selected else label,
-                    "callback_data": f"s:{item_id}:{code}",
-                }
-                for label, code in _REACTION_BUTTONS
-            ]
+def reaction_keyboard(
+    item_id: int,
+    *,
+    selected: str | None = None,
+    with_now: bool = False,
+    now_marked: bool = False,
+) -> dict:
+    """4ボタン InlineKeyboard。selected(up|dig|knw|no)のボタンに ✓ を付ける。
+
+    with_now なら 2 行目に「⚡ 今すぐ深掘り」(GH#388)を付け、now_marked(今すぐの依頼を受け付けた・
+    掘り終えた)なら ✓ を付ける。
+    """
+    rows = [
+        [
+            {
+                "text": f"{label} ✓" if code == selected else label,
+                "callback_data": f"s:{item_id}:{code}",
+            }
+            for label, code in _REACTION_BUTTONS
         ]
-    }
+    ]
+    if with_now:
+        rows.append([{
+            "text": f"{_DIG_NOW_LABEL} ✓" if now_marked else _DIG_NOW_LABEL,
+            "callback_data": f"g:{item_id}:n",
+        }])
+    return {"inline_keyboard": rows}
 
 
 # 深掘りカードのボタン(GH#141。callback_data 形式の正本は設計 04 §3)
