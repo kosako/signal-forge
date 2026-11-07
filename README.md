@@ -33,6 +33,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
    受ける: ボタン / URL / ダイジェストへの感想 / 夜の回答と深掘りの指定 / 深掘りカードへの質問
    内蔵タイマー: 夜アンケート(既定 21:30)/ watchdog(既定 07:15)/ ソースの健康診断(日曜の夜)
    質問 → intel answer(別プロセス)→ Telegram のリプライで返事
+   今すぐの深掘り → intel dig-now(別プロセス)→ 解説ノートと概要カード
 ```
 
 - **朝バッチ `intel run`**: 上の段を順に実行して終わる。段の順序の正本は [設計 00 §2](docs/design/00-architecture.md)。
@@ -45,12 +46,13 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   - 反応ボタン(👍 価値あり / 🔖 深掘り / ✅ 既知 / 👎 不要)。
   - URL のメッセージ。手動投入として items に入り、翌朝のダイジェストで分析される。
   - ダイジェストの記事・ヘッダへのリプライ(感想)。翌朝の export で Obsidian の Items / Daily ノートに反映する。
-  - 夜アンケートの回答と、未消化一覧へのリプライ(深掘りの指定)。
+  - 夜アンケートの回答と、未消化一覧へのリプライ(深掘りの指定)と、一覧のボタン(⏭️ 外す・⚡ 今すぐ)。
   - 深掘りカードとその返事へのリプライ。感想として記録し、1 日の上限(`[dig].answer_daily_cap`)の内なら質問として返事を作る。
   - 内蔵タイマーで夜アンケートと watchdog を送る。時刻は config の `[telegram].survey_time` / `watchdog_time` で変えられる(上の時刻は既定値)。watchdog は、当日のダイジェストが未生成・未配信のときと、X ソースが続けて失敗しているとき(X を有効にしている場合。[設計 02 §2](docs/design/02-connectors.md))に知らせる。毎週日曜の夜アンケートの時刻に、ソースの健康診断(失敗・移転・新着なし・👍・🔖 の率の低いソース)を 1 通送る([設計 02 §3](docs/design/02-connectors.md))。
   - `[telegram].owner_user_id` 以外からの update は、ログに WARN を 1 行残すだけで破棄する(本文は保存せず、応答も返さない)。
 - **深掘りの流れ**([設計 06](docs/design/06-deepdive-experience.md))
   1. 夜: 未消化一覧(Telegram の 🔖 と X のブックマーク)に自由文でリプライし、「番号 + 観点」か「パス」を指定する。X で新しくブックマークした投稿(x_signals 段が取り込んだもの)は、指定しなくてもキューに入る。Telegram の 🔖 ボタンは未消化一覧に載るだけで、キューには入らない。一覧の各行には深掘りの状態の印が付き、明朝に掘る予定(🗓 明朝)は先頭に出る。
+     その場で深掘りしたくなったら、一覧の行の「⚡ {id} を今すぐ」を押す。poller が `intel dig-now` を別プロセスで起動し、朝を待たずに数分で 2. と 3. の解説ノートとカードが届く(件数の上限は無く、朝の上限にも数えない)。
   2. 朝: dig 段が 1 日の上限(既定 2 件)まで調べ、vault の `SignalForge/DeepDive/` に解説ノートと、原文ノート(日本語のソース)か対訳ノート(それ以外)を書く(ツイート本文だけのものは解説ノートのみ)。
   3. 概要カードを Telegram に送る。カードのボタンで、元記事を開く・元記事の要約(英語なら和訳)・もう少し詳しい説明を頼める。
   4. カードへのリプライ: poller が台帳に積み、`intel answer` を別プロセスで起動して返事をリプライで送る(1 日の上限は既定 20 件)。LLM が結論・感想(take)と分けたリプライは、原文を解説ノートの末尾に足す(ノートは書き直さず追記だけ)。
@@ -238,9 +240,9 @@ repo 固有の決まり:
 | `app/analysis/` | LLM の抽象層、事前選別(Stage 1)、本分析(Stage 2)、トレンドまとめ、関心プロファイルの読み込み |
 | `app/ranking/` | ランキング式 |
 | `app/digest/` | ダイジェストの生成 |
-| `app/delivery/` | Telegram の配信、受信デーモン、夜アンケートと watchdog と失敗通知、`intel answer` の起動 |
+| `app/delivery/` | Telegram の配信、受信デーモン、夜アンケートと watchdog と失敗通知、`intel answer`・`intel dig-now` の起動 |
 | `app/export/` | Obsidian への書き出し |
-| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口)、朝の調査段、カードへの質問への返事、take の記録 |
+| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口と今すぐの依頼)、朝の調査段と今すぐの深掘り、カードへの質問への返事、take の記録 |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
 | `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-intent・dig-review・dig-revise)と、深掘りの文章の書き方の手引き(writing-guide-ja。dig-answer と dig が入れる)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |

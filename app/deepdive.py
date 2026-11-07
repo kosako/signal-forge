@@ -23,6 +23,8 @@
   ロックで囲み、後から来た方は待たずに何もしない(朝バッチを止めない。GH#196)
 - 上限に達していないのに ①〜③ のどれからも選べず、カードも届かない朝は、段の終わりに理由を
   1 通で知らせる(_notify_no_candidates。失敗の通知とは別で、段の失敗にしない。GH#349)
+- 今すぐの依頼(GH#388): 未消化一覧のボタンで受け付けた依頼を、poller が起動する
+  `intel dig-now`(run_dig_now)が同じ台帳とロックで作る。朝の 1 日の上限には数えない
 
 別系統の AI のレビュー(GH#153。config `[dig].review`): ドラフトを Claude API が元記事と
 照らしてレビューし、指摘があれば書き手が 1 回だけ直す(直したあとの再レビューはしない)。
@@ -85,7 +87,17 @@ from app.delivery.telegram import (
     escape_and_truncate,
     escape_text,
 )
-from app.dig import DigCandidate, has_material, select_from_queue
+from app.dig import (
+    DigCandidate,
+    claim_now_request,
+    close_now_request,
+    dug_on,
+    has_material,
+    has_now_requests,
+    has_unsent_cards,
+    interrupted_now_requests,
+    select_from_queue,
+)
 from app.export.neutralize import neutralize_markdown, neutralize_note
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
 from app.jst import today_jst
@@ -112,11 +124,20 @@ _PUBLISH_LOCK_WAIT_S = VAULT_TIMEOUT_S
 # 調査段の実行を 1 つに絞るロック(GH#196)。DB の隣の `<DB>.dig.lock`(migrate.lock・
 # deliver.lock と同じ名付け)。公開のロックはこの中で取る(入れ子の順はこの 1 通り)
 _DIG_LOCK_SUFFIX = ".dig.lock"
+# `intel dig-now` を 1 つに絞るロック(GH#388)。プロセスの間ずっと持つ。この中で、作り始めた印の
+# 残った依頼を「前の実行が途中で止まった」と見分ける。dig.lock とは別で、生成の間は dig.lock を
+# 持たない(朝バッチの dig 段を止めない)
+_DIG_NOW_LOCK_SUFFIX = ".dig-now.lock"
+# 朝の dig 段と `intel dig` が、`intel dig-now` の短い取り出し・公開・送信の間の dig.lock を
+# 待つ上限と確かめる間隔(GH#388)。dig-now は生成の間は dig.lock を持たないので、ふつうは数秒で取れる
+_DIG_NOW_YIELD_WAIT_S = 120.0
+_DIG_LOCK_POLL_S = 0.5
 
 # 自動選出(観点なし)の調査ブリーフ(設計 06 §4)
 AUTO_BRIEF = "私の文脈(関心プロファイル)との接点を軸に、主張と根拠の強さを検証しながら読む"
 _REQUESTED_NONE = "(観点指定なし:ブックマーク自動キューからの深掘り)"
 _REQUESTED_DIGEST = "(観点指定なし:今日の digest の上位からの深掘り)"  # 設計 06 §3 の ③
+_REQUESTED_NOW = "(観点指定なし:今すぐの依頼からの深掘り)"  # GH#388
 
 # 候補の無い朝の知らせ(設計 06 §3。GH#349)。固定の文言だけで、外部由来の本文を入れない。
 # 印は telegram_state の日付キー(送れた日の JST 暦日。失敗の通知の印と同じ流儀)
@@ -271,9 +292,18 @@ def run_dig_stage(
     重なると、両方が同じ候補を選んで生成し、1 日上限を超え、カードが重複するため。待たない
     のは、生成が分オーダーで続き、朝バッチの purge・backup を遅らせるため(先の実行が同じ
     台帳から生成・公開・送信を終えるので、何もしなくても取りこぼさない)。
+    例外は `intel dig-now`(GH#388)が短く持っているときで、取れるまで待つ(_stage_dig_lock)。
+    dig-now は朝の候補を選ばないので、何もしないとその日の朝の深掘りが届かない。上限まで待っても
+    取れなければ段の失敗にして知らせる。
     """
-    with _dig_lock(conn) as acquired:
-        if not acquired:
+    with _stage_dig_lock(conn) as lock:
+        if lock == "dig_now":
+            # 今すぐの深掘りが dig.lock を放さなかった。何もしないと、その日の朝の深掘りが届かない
+            raise DigError(
+                "今すぐの深掘り(intel dig-now)が調査段のロックを放さなかったので、深掘りを"
+                "行わなかった(intel dig で再実行)"
+            )
+        if lock == "busy":
             logger.warning(
                 "dig: 別の実行(朝バッチか intel dig)が調査段を進めているので、この実行では"
                 "何もしない(生成・公開・送信はその実行が行う)",
@@ -352,9 +382,14 @@ def _run_dig_stage_locked(
 
     # 候補の無い朝(GH#349)。中断した分(未公開・未送信の行)を再開する実行は、送れたかに
     # かかわらず知らせない(届いたカードの直後に「深掘りはありません」と言わない。送れなければ
-    # 失敗の通知で知らせ、次の実行が送る。設計 06 §3)。再開の前に台帳を見る
+    # 失敗の通知で知らせ、次の実行が送る。設計 06 §3)。再開の前に台帳を見る。今すぐの依頼を
+    # 作っている途中(か、これから作る)ときも、その後にカードが届くので知らせない(GH#388)
     no_candidates = (
-        api is not None and remaining > 0 and not selected and not _has_unsent_cards(conn)
+        api is not None
+        and remaining > 0
+        and not selected
+        and not has_unsent_cards(conn)
+        and not has_now_requests(conn)
     )
 
     # 未公開ノートの書出(過去の中断分を含む)
@@ -387,10 +422,209 @@ def _run_dig_stage_locked(
         )
 
 
+def run_dig_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],  # effort → engine
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+    review_engine_factory: Callable[[], LLMEngine] | None = None,
+    vault: VaultGuard | None = None,
+) -> bool:
+    """今すぐの依頼(GH#388。設計 06 §3)を受け付けた順に 1 件ずつ作り、ノートの公開とカードの
+    送信まで進める。poller が起動する `intel dig-now` が呼ぶ。依頼を作り切ったら True、別の実行に
+    阻まれて依頼を残したら False(poller の見回りが後で起動し直す)。
+
+    朝の調査段と同じ台帳を使い、作った分は朝の 1 日の上限に数えない(dig_results.on_demand)。
+    - 実行どうし: `intel dig-now` は自分のロック(`<DB>.dig-now.lock`)で 1 つにする。調査段の
+      ロック(dig.lock)は、依頼を取り出す間と、公開・送信の間だけ持ち、生成の間は持たない。
+      朝バッチの dig 段がその間に始まっても止めずに済み、朝の選定は取り出した依頼を選ばない
+      (app.dig.select_from_queue)。dig.lock が取れなければ、取り出しはこの実行では止めて
+      False を返し、公開・送信は dig.lock を持つ実行(朝バッチなど)か、次の実行に任せる
+    - 1 回押して 1 回だけ作る。取り出すときに作り始めた印を付け、印の残った依頼(前の実行が
+      途中で止まった)は作り直さずに明朝の深掘りへ回して知らせる(LLM を繰り返し呼ばない)
+    - 作れなかった依頼(LLM の失敗など)も、明朝の深掘りの ① へ回して知らせ、段の失敗にする
+    - 今日もう掘った item は作らずに閉じる(同じ日に 2 回は掘らない。朝の生成中に押されたときの
+      取りこぼしで、カードは朝の分が届いている)。本文が消えていたら閉じて知らせる
+    - 1 件ごとに公開と送信まで進め、次の依頼で前のカードを待たせない。中断した分(未公開の
+      ノート・未送信のカード。朝の分を含む)は、朝の調査段と同じく台帳から再開する
+    """
+    with _db_side_lock(conn, _DIG_NOW_LOCK_SUFFIX) as acquired:
+        if not acquired:
+            logger.info(
+                "dig-now: 別の dig-now が実行中なので何もしない(依頼はその実行が作る)",
+                extra={"run_id": run_id, "stage": "dig-now"},
+            )
+            return False
+        return _run_dig_now_locked(
+            conn, config, engine_factory, api, logger, run_id, review_engine_factory,
+            vault or VaultGuard(),
+        )
+
+
+# 今すぐの依頼を作れなかったときの知らせ(GH#388)。固定の文言だけにし、外部由来の本文を入れない
+_NOW_FAILED = "⚠️ {item_id} の今すぐの深掘りを作れませんでした。明朝の深掘りに回します"
+_NOW_NO_BODY = "⚠️ {item_id} は本文が無いため、今すぐの深掘りを作れませんでした"
+
+
+def _run_dig_now_locked(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    run_id: str | None,
+    review_engine_factory: Callable[[], LLMEngine] | None,
+    vault: VaultGuard,
+) -> bool:
+    """run_dig_now の本体(`<DB>.dig-now.lock` の中で呼ぶ)。"""
+    failures: list[str] = []
+    # dig-now のロックの中なので、作り始めた印の残った依頼を作っている実行は無い
+    for item_id, started_at in interrupted_now_requests(conn):
+        if close_now_request(conn, item_id, started_at, to_morning=True):
+            logger.warning(
+                f"前の実行が途中で止まった今すぐの依頼を、明朝の深掘りに回した item={item_id}",
+                extra={"run_id": run_id, "stage": "dig-now", "item_id": item_id},
+            )
+            _notify_now(config, api, logger, run_id, _NOW_FAILED.format(item_id=item_id))
+            failures.append(f"item {item_id}: 前の実行が途中で止まった(明朝に回した)")
+        else:
+            # 作っている間に本人がパスした(依頼は取り消し済み)。作り始めた印だけを消す。残すと、
+            # 指定し直しても朝の選定がこの行を選ばない
+            close_now_request(conn, item_id, started_at, to_morning=False)
+    # 前の実行が公開・送信できなかった分(送信の失敗など)を先に進める。依頼はもう閉じているので、
+    # 下のループだけでは進まない
+    if has_unsent_cards(conn):
+        failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
+
+    completed = True
+    while has_now_requests(conn):  # 無ければ dig.lock を取りに行かない(朝の段と競わない)
+        with _dig_lock(conn, "dig-now") as acquired:
+            if not acquired:
+                logger.info(
+                    "dig-now: 別の実行が調査段を進めているので、残りの依頼は後で作る"
+                    "(poller が起動し直す)",
+                    extra={"run_id": run_id, "stage": "dig-now"},
+                )
+                completed = False
+                break
+            # 取り出しを dig.lock の中で行う。朝の選定の途中や、朝が選んで作っている item を
+            # 取り出さない(朝の dig 段は選定から公開・送信まで dig.lock を持つ)
+            day = today_jst()  # 1 件ごとの暦日(ノートの名前と、同じ日に 2 回掘らない判定)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                candidate = claim_now_request(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            dug_today = candidate is not None and dug_on(conn, candidate.item_id, day)
+        if candidate is None:
+            break
+        assert candidate.now_started_at is not None  # claim_now_request が付けた印
+        log_extra = {"run_id": run_id, "stage": "dig-now", "item_id": candidate.item_id}
+        if dug_today:
+            close_now_request(
+                conn, candidate.item_id, candidate.now_started_at, to_morning=False
+            )
+            logger.info("今日もう掘った item の今すぐの依頼を、作らずに閉じた", extra=log_extra)
+            continue
+        if not has_material(candidate.body, config):
+            close_now_request(
+                conn, candidate.item_id, candidate.now_started_at, to_morning=False
+            )
+            logger.warning("本文が無いため、今すぐの依頼を作らずに閉じた", extra=log_extra)
+            _notify_now(
+                config, api, logger, run_id, _NOW_NO_BODY.format(item_id=candidate.item_id)
+            )
+            continue
+        try:
+            _dig_one(
+                conn, config, engine_factory, review_engine_factory, candidate, day, logger,
+                run_id,
+            )
+        except Exception as e:
+            logger.error(
+                f"今すぐの深掘りの生成失敗 item={candidate.item_id}: {type(e).__name__}: {e}",
+                extra=log_extra,
+                exc_info=True,
+            )
+            failures.append(f"item {candidate.item_id}: {type(e).__name__}")
+            if close_now_request(
+                conn, candidate.item_id, candidate.now_started_at, to_morning=True
+            ):
+                _notify_now(
+                    config, api, logger, run_id, _NOW_FAILED.format(item_id=candidate.item_id)
+                )
+            continue
+        failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
+
+    if api is None and has_unsent_cards(conn):
+        logger.warning(
+            "Telegram 未設定のため、概要カードは未送信のまま",
+            extra={"run_id": run_id, "stage": "dig-now"},
+        )
+    if failures:
+        raise DigError(f"今すぐの深掘りで {len(failures)} 件失敗: " + " / ".join(failures))
+    return completed
+
+
+def _publish_and_send(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    run_id: str | None,
+    vault: VaultGuard,
+) -> list[str]:
+    """台帳の未公開のノートを公開し、未送信のカードを送る(dig.lock の中で。GH#388)。
+
+    dig.lock が取れなければ何もしない。持っている実行(朝バッチの dig 段・`intel dig`)が、
+    段の終わりに同じ台帳から公開・送信する。間に合わなかった分は、poller が送れていない
+    カード(作った経路を問わない)を見て `intel dig-now` を起動し直す。
+    """
+    with _dig_lock(conn, "dig-now") as acquired:
+        if not acquired:
+            logger.info(
+                "dig-now: 別の実行が調査段を進めているので、公開と送信はその実行か次の実行に任せる",
+                extra={"run_id": run_id, "stage": "dig-now"},
+            )
+            return []
+        failures = _publish_pending_notes(conn, config, logger, run_id, vault)
+        if api is not None:
+            failures.extend(_send_pending_cards(conn, config, api, logger, run_id))
+        return failures
+
+
+def _notify_now(
+    config: Config,
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    run_id: str | None,
+    text: str,
+) -> None:
+    """今すぐの依頼を作れなかったことを知らせる(GH#388)。知らせの失敗はログだけ残す。"""
+    if api is None:
+        return
+    try:
+        api.send_message(config.telegram.owner_chat_id, text)
+    except Exception as e:
+        logger.error(
+            f"今すぐの深掘りの知らせを送れなかった: {type(e).__name__}",
+            extra={"run_id": run_id, "stage": "dig-now"},
+        )
+
+
 def _digs_on(conn: sqlite3.Connection, day: str) -> int:
-    """その JST 暦日に実行済みの件数(created_at は UTC 保存)。"""
+    """その JST 暦日に実行済みの件数(created_at は UTC 保存)。
+
+    今すぐの依頼で作った分(on_demand)は数えない。朝の 1 日の上限の外にある(GH#388)。
+    """
     return conn.execute(
-        "SELECT count(*) AS n FROM dig_results WHERE date(created_at, '+9 hours') = ?",
+        "SELECT count(*) AS n FROM dig_results "
+        "WHERE date(created_at, '+9 hours') = ? AND on_demand = 0",
         (day,),
     ).fetchone()["n"]
 
@@ -444,14 +678,6 @@ def _notify_no_candidates(
     logger.info(
         "dig: 候補が無いので、深掘りが無いことを知らせた",
         extra={"run_id": run_id, "stage": "dig"},
-    )
-
-
-def _has_unsent_cards(conn: sqlite3.Connection) -> bool:
-    """台帳に未送信のカード(未公開のノートを含む中断分)があるか。"""
-    return (
-        conn.execute("SELECT 1 FROM dig_results WHERE message_id IS NULL LIMIT 1").fetchone()
-        is not None
     )
 
 
@@ -683,8 +909,8 @@ def _dig_one(
             INSERT INTO dig_results
               (item_id, run_id, note_name, source_note_name, angle, card_text,
                note_markdown, source_note_markdown,
-               review_status, review_findings, review_cost_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               review_status, review_findings, review_cost_usd, on_demand)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate.item_id,
@@ -698,6 +924,7 @@ def _dig_one(
                 review.status if review is not None else None,
                 review_findings,
                 review.cost_usd if review is not None else 0.0,
+                int(candidate.on_demand),
             ),
         )
         if candidate.from_digest:
@@ -707,9 +934,12 @@ def _dig_one(
             # (再指定 = queued + 新観点 / パス)、done で上書きせずユーザー操作を優先する
             # (新しい依頼は次回実行で掘られる。Codex P1)。生成物の公開・送信は行う。
             # updated_at は秒解像度で同一秒内の更新を見逃すため、status / angle /
-            # requested_at の実値も比較する(全て同値の更新は意味的に no-op。Codex P2)
+            # requested_at の実値も比較する(全て同値の更新は意味的に no-op。Codex P2)。
+            # 今すぐの依頼(GH#388)は掘れたので閉じる。依頼の印は updated_at を進めないので、
+            # 朝の生成中に押された依頼もここで閉じる(朝のカードで満たされる)
             done = conn.execute(
                 "UPDATE dig_queue SET status = 'done', "
+                "now_requested_at = NULL, now_started_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE item_id = ? AND status = 'queued' AND updated_at = ? "
                 "  AND angle IS ? AND requested_at IS ?",
@@ -720,6 +950,12 @@ def _dig_one(
                     candidate.queue_requested_at,
                 ),
             ).rowcount
+            if candidate.now_started_at is not None and done == 0:
+                # 作っている間に本人が指定し直した(観点など)。キューの状態は本人の操作のまま
+                # 残し(朝の生成中と同じ)、この依頼だけを閉じる。作り直さない
+                close_now_request(
+                    conn, candidate.item_id, candidate.now_started_at, to_morning=False
+                )
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
@@ -744,6 +980,8 @@ def _record_digest_pick(conn: sqlite3.Connection, item_id: int) -> int:
     操作(requested_at のある指定・passed)は変えず、自動投入の行(requested_at の無い queued。
     X のブックマークの取り込み)だけを done にする(掘ったばかりの item を翌朝にまた掘らない)。
     source は先にできた行の値のまま(初回投入の経路で以後不変)。どの場合も生成物は記帳する。
+    今すぐの依頼のボタンで足した行(requested_at は付かない。GH#388)も done にし、依頼を閉じる
+    (このカードで満たされる)。
     """
     inserted = conn.execute(
         "INSERT INTO dig_queue (item_id, status, source) VALUES (?, 'done', 'digest') "
@@ -754,6 +992,7 @@ def _record_digest_pick(conn: sqlite3.Connection, item_id: int) -> int:
         return 1
     return conn.execute(
         "UPDATE dig_queue SET status = 'done', "
+        "now_requested_at = NULL, now_started_at = NULL, "
         "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
         "WHERE item_id = ? AND status = 'queued' AND requested_at IS NULL",
         (item_id,),
@@ -951,10 +1190,20 @@ def _db_file(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+# dig.lock の持ち主の種類(ロックの file に書く。GH#388)
+_DigLockHolder = Literal["stage", "dig-now"]
+
+
 @contextlib.contextmanager
-def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
+def _dig_lock(
+    conn: sqlite3.Connection, holder: _DigLockHolder = "stage"
+) -> Iterator[bool]:
     """調査段の実行を、同じ台帳を使う実行どうし(朝バッチの dig 段と `intel dig`)で 1 つに絞る
-    (GH#196)。取れたら True、別の実行が握っていれば待たずに False。
+    (GH#196)。取れたら True、別の実行が握っていれば待たずに False。`intel dig-now` は依頼の
+    取り出しと、公開・送信の間だけ持つ(GH#388。run_dig_now)。
+
+    holder は持ち主の種類で、持つ間だけロックの file に書く(放す前に消す)。取れなかった朝の
+    dig 段が、持ち主が dig-now か朝の段・`intel dig` かを見分けるのに使う(_stage_dig_lock)。
 
     SQLite のロックは 1 トランザクションの間しか続かず、LLM の待ち(分オーダー)をまたいで
     書き込みのトランザクションを持つと poller の書き込みを止めるので、DB の隣の専用ファイルに
@@ -963,11 +1212,77 @@ def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
     握ったまま残っていてもデッドロックしない(公開のロックの待ちには上限がある)。メモリ上の
     DB は別の実行と台帳を共有しない。
     """
+    with _db_side_lock(conn, _DIG_LOCK_SUFFIX, holder=holder) as acquired:
+        yield acquired
+
+
+def _dig_lock_holder(conn: sqlite3.Connection) -> str:
+    """今 dig.lock の file に書かれた持ち主の種類(空 = 持ち主が書く前・放した後・読めない)。"""
+    db_file = _db_file(conn)
+    if db_file is None:
+        return ""
+    try:
+        return db_file.with_name(db_file.name + _DIG_LOCK_SUFFIX).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+@contextlib.contextmanager
+def _stage_dig_lock(
+    conn: sqlite3.Connection,
+    *,
+    wait_s: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Iterator[Literal["acquired", "busy", "dig_now"]]:
+    """朝の dig 段と `intel dig` の dig.lock(GH#196・GH#388)。
+
+    - acquired: 取れた
+    - busy: 別の朝の dig 段か `intel dig` が持っている(待たない。今までどおり)
+    - dig_now: `intel dig-now` が持ったまま、上限(既定 _DIG_NOW_YIELD_WAIT_S)まで待っても
+      取れなかった
+    dig-now は `<DB>.dig-now.lock` を持つ間だけ dig.lock を持つ(取るのは dig-now.lock の後、放すのは
+    前)。そこで先に dig-now.lock を待たずに取ってみる。取れたら dig-now は動いておらず、持つ間は
+    始まらないので、そのまま dig.lock が取れなければ持ち主は朝の dig 段か `intel dig` と決まる
+    (確かめる間に dig-now が終わっても取り違えない)。dig.lock を取ったら dig-now.lock はすぐ放す
+    (dig-now は朝の段の間に起動しても何もせずに終わる)。dig-now.lock が取れなければ dig-now が
+    動いている。そのときの dig.lock の持ち主は、ロックの file に書かれた種類で見分ける。朝の段か
+    `intel dig` なら待たない(dig-now の生成中に `intel dig` が持っているとき)。dig-now か、書く前・
+    放した後(空)なら取れるまで待つ。dig-now は依頼の取り出しと公開・送信の間だけ持ち、生成の
+    間は放すので、ふつうは数秒で取れる。
+    """
+    deadline = clock() + (_DIG_NOW_YIELD_WAIT_S if wait_s is None else wait_s)
+    while True:
+        with contextlib.ExitStack() as held:
+            guard = contextlib.ExitStack()
+            no_dig_now = guard.enter_context(_db_side_lock(conn, _DIG_NOW_LOCK_SUFFIX))
+            acquired = held.enter_context(_dig_lock(conn))
+            guard.close()
+            if acquired:
+                yield "acquired"
+                return
+            if no_dig_now or _dig_lock_holder(conn) == "stage":
+                yield "busy"
+                return
+        if clock() >= deadline:
+            yield "dig_now"
+            return
+        sleep(_DIG_LOCK_POLL_S)
+
+
+@contextlib.contextmanager
+def _db_side_lock(
+    conn: sqlite3.Connection, suffix: str, *, holder: str | None = None
+) -> Iterator[bool]:
+    """DB の隣の `<DB><suffix>` に flock を待たずに取る。取れたら True。メモリ上の DB は True。
+
+    holder があれば、持つ間だけその文字列を file に書き、放す前に消す(持ち主の種類。dig.lock)。
+    """
     db_file = _db_file(conn)
     if db_file is None:
         yield True
         return
-    lock_path = db_file.with_name(db_file.name + _DIG_LOCK_SUFFIX)
+    lock_path = db_file.with_name(db_file.name + suffix)
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         try:
@@ -975,7 +1290,14 @@ def _dig_lock(conn: sqlite3.Connection) -> Iterator[bool]:
             acquired = True
         except BlockingIOError:
             acquired = False
-        yield acquired
+        if acquired and holder is not None:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, holder.encode("ascii"), 0)
+        try:
+            yield acquired
+        finally:
+            if acquired and holder is not None:
+                os.ftruncate(fd, 0)
     finally:
         os.close(fd)  # close で flock は解放される
 
@@ -1492,6 +1814,15 @@ def _deepdive_dir(config: Config) -> VaultDir:
     return base
 
 
+def _requested_without_angle(candidate: DigCandidate) -> str:
+    """観点の無い深掘りのノートの requested(どの経路で掘ったか)。"""
+    if candidate.on_demand:
+        return _REQUESTED_NOW
+    if candidate.from_digest:
+        return _REQUESTED_DIGEST
+    return _REQUESTED_NONE
+
+
 def _explainer_note(
     candidate: DigCandidate,
     draft: DigDraft,
@@ -1506,8 +1837,7 @@ def _explainer_note(
         "url": candidate.canonical_url,
         "author": candidate.author or "",
         "published": candidate.published_at or "",
-        "requested": candidate.angle
-        or (_REQUESTED_DIGEST if candidate.from_digest else _REQUESTED_NONE),
+        "requested": candidate.angle or _requested_without_angle(candidate),
         "status": "take待ち",
     }
     if not candidate.angle:
@@ -1591,6 +1921,8 @@ def _card_text(
         original = f"({escape_and_truncate(candidate.title, _CARD_TITLE_MAX)})"
     if candidate.angle:
         label = f"観点「{escape_and_truncate(candidate.angle, 300)}」"
+    elif candidate.on_demand:  # GH#388
+        label = "⚡ 今すぐの依頼・観点なし"
     elif candidate.requested:
         label = "リプライ指定・観点なし"
     elif candidate.from_digest:  # 設計 06 §3 の ③(GH#349)

@@ -12,6 +12,9 @@
 - 朝の選定のキューの規則(①リプライ指定 ②自動キュー。設計 06 §3)もここに置き、朝の調査段
   (app.deepdive)と夜の未消化一覧の「明朝の予定」(app.delivery.surveys)が同じ関数を呼ぶ
   (GH#349。設計 06 §2)。③ の digest の上位は朝の digest で決まるので app.deepdive に残す
+- 今すぐの依頼(GH#388。設計 06 §3): 未消化一覧のボタンで受け付け(poller が呼ぶ)、
+  `intel dig-now`(app.deepdive)が 1 件ずつ取り出して作る。キューの行に依頼の印と作り始めた
+  印を持つ(migration 029)
 - 本モジュールは delivery 層に依存しない(候補集合は呼び出し側が渡す)
 """
 
@@ -139,7 +142,9 @@ def apply_instructions(
       requested_at を現在時刻に(調査段の優先順位①)。観点は指定があれば上書き、
       なければ既存を保持(「3664 も」= 優先度だけ上げる)
     - pass: status を passed に。観点・requested_at は保持する(後で request 復帰した
-      とき前回の観点が生きる)
+      とき前回の観点が生きる)。今すぐの依頼(GH#388)は取り消す。作っている途中なら、
+      作り始めた印は残し(作り終えるまで朝の選定がこの行を選ばない)、作り終えた
+      `intel dig-now` が done にせずパスを残す(朝の生成中のパスと同じ)
     - source は初回投入の経路のまま変えない(migration 009 の契約。明示指定の有無は
       requested_at / status が担う)
     - from_backlog = 未消化一覧への本人の操作か(既定)。そうなら受付の順序の印として、
@@ -155,6 +160,7 @@ def apply_instructions(
                 VALUES (?, 'passed', 'request', {_BACKLOG_MARK})
                 ON CONFLICT(item_id) DO UPDATE SET
                   status = 'passed',
+                  now_requested_at = NULL,
                   backlog_op_question_id = {_KEEP_MARK},
                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 """,
@@ -208,6 +214,65 @@ class DigCandidate:
     fetched_date: str | None = None
     # その日の digest の上位から選んだ(設計 06 §3 の ③。GH#349)。キューの行は記帳のときに足す
     from_digest: bool = False
+    # 今すぐの依頼(GH#388)。now_started_at は `intel dig-now` が作り始めた印の値で、作り終えた
+    # ときに、その印のままの依頼だけを閉じる照合に使う
+    on_demand: bool = False
+    now_started_at: str | None = None
+
+
+# キューの候補の列(朝の選定と、今すぐの依頼の取り出しが共用する。GH#349・GH#388)。
+# 続けて WHERE と ORDER BY を書く
+_QUEUE_CANDIDATE_SELECT = """
+    SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
+           i.title, i.author, i.published_at, i.canonical_url,
+           d.extracted_text, d.language,
+           date(d.extracted_at, '+9 hours') AS fetched_date,
+           a.title_ja, a.summary,
+           (SELECT r.note_name FROM dig_results r
+            WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
+            ORDER BY r.id DESC LIMIT 1) AS previous_note_name
+    FROM dig_queue q
+    JOIN items i ON i.id = q.item_id
+    LEFT JOIN documents d ON d.item_id = q.item_id
+    LEFT JOIN analyses a ON a.id = (
+        SELECT max(id) FROM analyses
+        WHERE item_id = q.item_id AND degraded = 0
+    )
+"""
+
+# その item をその JST の暦日に掘ったか(同じ日に 2 回掘らない。ノートの名前が日付と item で
+# 決まり、衝突するため。Codex P2)。q.item_id と暦日の ? を使う
+_DUG_ON_DAY = """
+    EXISTS (
+      SELECT 1 FROM dig_results r
+      WHERE r.item_id = q.item_id AND date(r.created_at, '+9 hours') = ?
+    )
+"""
+
+
+def _queue_candidate(
+    row: sqlite3.Row, *, now_started_at: str | None = None
+) -> DigCandidate:
+    """_QUEUE_CANDIDATE_SELECT の 1 行から候補を作る。now_started_at があれば今すぐの依頼。"""
+    return DigCandidate(
+        item_id=row["item_id"],
+        angle=row["angle"],
+        requested=row["requested_at"] is not None,
+        queue_updated_at=row["updated_at"],
+        queue_requested_at=row["requested_at"],
+        title=row["title"],
+        author=row["author"],
+        published_at=row["published_at"],
+        canonical_url=row["canonical_url"],
+        body=row["extracted_text"],
+        language=row["language"],
+        title_ja=row["title_ja"],
+        summary=row["summary"],
+        previous_note_name=row["previous_note_name"],
+        fetched_date=row["fetched_date"],
+        on_demand=now_started_at is not None,
+        now_started_at=now_started_at,
+    )
 
 
 def has_material(body: str | None, config: Config) -> bool:
@@ -230,29 +295,13 @@ def select_from_queue(
     ノート名が衝突し、カードが古いノートを指しうる。Codex P2。翌朝に掘られる =
     「夜選ぶ → 朝届く」のリズム通り)。
     朝の調査段と夜の未消化一覧の「明朝の予定」が共用する(GH#349。next_morning_plan)。
+    `intel dig-now` が取り出した今すぐの依頼(作り始めた印のある行)は選ばない(GH#388。2 回
+    作らない。途中で止まった依頼は、次の `intel dig-now` が明朝へ回してから選ばれる)。
     """
     rows = conn.execute(
-        """
-        SELECT q.item_id, q.angle, q.requested_at, q.updated_at,
-               i.title, i.author, i.published_at, i.canonical_url,
-               d.extracted_text, d.language,
-               date(d.extracted_at, '+9 hours') AS fetched_date,
-               a.title_ja, a.summary,
-               (SELECT r.note_name FROM dig_results r
-                WHERE r.item_id = q.item_id AND r.published_at IS NOT NULL
-                ORDER BY r.id DESC LIMIT 1) AS previous_note_name
-        FROM dig_queue q
-        JOIN items i ON i.id = q.item_id
-        LEFT JOIN documents d ON d.item_id = q.item_id
-        LEFT JOIN analyses a ON a.id = (
-            SELECT max(id) FROM analyses
-            WHERE item_id = q.item_id AND degraded = 0
-        )
-        WHERE q.status = 'queued'
-          AND NOT EXISTS (
-            SELECT 1 FROM dig_results r
-            WHERE r.item_id = q.item_id AND date(r.created_at, '+9 hours') = ?
-          )
+        _QUEUE_CANDIDATE_SELECT
+        + f"""
+        WHERE q.status = 'queued' AND q.now_started_at IS NULL AND NOT {_DUG_ON_DAY}
         ORDER BY (q.requested_at IS NULL), q.requested_at DESC, q.enqueued_at DESC
         """,
         (day,),
@@ -262,23 +311,7 @@ def select_from_queue(
     for row in rows:
         if len(selected) >= limit:
             break
-        candidate = DigCandidate(
-            item_id=row["item_id"],
-            angle=row["angle"],
-            requested=row["requested_at"] is not None,
-            queue_updated_at=row["updated_at"],
-            queue_requested_at=row["requested_at"],
-            title=row["title"],
-            author=row["author"],
-            published_at=row["published_at"],
-            canonical_url=row["canonical_url"],
-            body=row["extracted_text"],
-            language=row["language"],
-            title_ja=row["title_ja"],
-            summary=row["summary"],
-            previous_note_name=row["previous_note_name"],
-            fetched_date=row["fetched_date"],
-        )
+        candidate = _queue_candidate(row)
         if has_material(candidate.body, config):
             selected.append(candidate)
         elif candidate.requested:
@@ -346,3 +379,220 @@ def dig_states(
         else:
             states[item_id] = None
     return states
+
+
+# 今すぐの依頼(GH#388。設計 06 §3)を受け付けた結果。依頼を積むのは accepted だけで、pending と
+# running は callback の id だけを残す。ほかは書かない
+NowRequestOutcome = Literal[
+    "accepted",  # 受け付けた(poller が起動する `intel dig-now` が作る)
+    "duplicate",  # 同じ callback の再配達(依頼を閉じた後でも受け付け直さない)
+    "pending",  # 受け付け済み(二重押し)
+    "running",  # 作っている途中
+    "done",  # 掘り終えている(掘り直さない。調べ直しはカードへのリプライ。GH#137)
+    "dug_today",  # 今日もう掘った(同じ日に 2 回は掘らない。_DUG_ON_DAY)
+    "no_body",  # 本文が無い(材料不足。has_material)
+    "no_item",  # item が無い(偽造か壊れた data)
+]
+
+_NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+
+
+def dug_on(conn: sqlite3.Connection, item_id: int, day: str) -> bool:
+    """その item をその JST の暦日に掘ったか(_DUG_ON_DAY と同じ条件)。"""
+    return bool(
+        conn.execute(
+            f"SELECT {_DUG_ON_DAY} FROM (SELECT ? AS item_id) AS q", (day, item_id)
+        ).fetchone()[0]
+    )
+
+
+def request_dig_now(
+    conn: sqlite3.Connection,
+    config: Config,
+    item_id: int,
+    day: str,
+    callback_id: str,
+    *,
+    from_backlog: bool,
+) -> NowRequestOutcome:
+    """今すぐの依頼を受け付ける(GH#388。設計 06 §3)。day は押した日(JST の暦日)。
+
+    callback_id は押した callback の id。受け付けたとき(受け付け済み・作成中と答えたときも)に行に
+    残し(依頼を閉じても消さない)、同じ callback の再配達(答えた後、offset を保存する前に poller が
+    止まった)を新しい依頼にしない。再配達は止まった update から順に届くので、最後の id だけを
+    残せば足りる。
+
+    状態の確認と反映は、呼び出し側の 1 つのトランザクションの中で行う(commit も呼び出し側)。
+    - キューに行が無い: queued・source = 'request' で足す(本人の明示の依頼。source は初回投入の
+      経路で以後不変)
+    - passed: queued に戻す。本人の明示の操作なので updated_at を進める
+    - queued: 依頼の印だけを付け、updated_at・観点・requested_at は変えない。朝の生成中にその
+      item を掘っていても、done 化の compare-and-set を外さない(朝のカードで依頼が満たされ、
+      done 化が依頼の印も閉じる)
+    - done: 掘り直さない(書かない)
+    requested_at は付けない。作れなかったときに `intel dig-now` が付けて、明朝の深掘りの
+    ①(リプライ指定)へ回す(close_now_request)。
+    from_backlog = 未消化一覧のボタンか。そうなら、状態を変える操作(足す・passed から戻す)に
+    受付の順序の印を残す(apply_instructions と同じ。GH#235)。
+    """
+    item = conn.execute(
+        "SELECT d.extracted_text FROM items i "
+        "LEFT JOIN documents d ON d.item_id = i.id WHERE i.id = ?",
+        (item_id,),
+    ).fetchone()
+    if item is None:
+        return "no_item"
+    queue = conn.execute(
+        "SELECT status, now_requested_at, now_started_at, now_callback_id FROM dig_queue "
+        "WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+    status = queue["status"] if queue is not None else None
+    if queue is not None and queue["now_callback_id"] == callback_id:
+        return "duplicate"
+    if status == "done":
+        return "done"
+    if queue is not None and (
+        queue["now_started_at"] is not None or queue["now_requested_at"] is not None
+    ):
+        # 受け付け済み・作成中と答えた callback の id も残す。残さないと、その callback の再配達が
+        # 先の依頼を閉じた後に届いたとき、新しい依頼になる
+        conn.execute(
+            "UPDATE dig_queue SET now_callback_id = ? WHERE item_id = ?", (callback_id, item_id)
+        )
+        return "running" if queue["now_started_at"] is not None else "pending"
+    if dug_on(conn, item_id, day):
+        return "dug_today"
+    if not has_material(item["extracted_text"], config):
+        return "no_body"
+    if queue is None:
+        conn.execute(
+            "INSERT INTO dig_queue (item_id, status, source, now_requested_at, now_callback_id,"
+            "  backlog_op_question_id) "
+            f"VALUES (?, 'queued', 'request', {_NOW}, ?, {_BACKLOG_MARK})",
+            (item_id, callback_id, int(from_backlog)),
+        )
+    elif status == "passed":
+        conn.execute(
+            f"UPDATE dig_queue SET status = 'queued', now_requested_at = {_NOW}, "
+            "now_callback_id = ?, "
+            f"backlog_op_question_id = COALESCE({_BACKLOG_MARK}, backlog_op_question_id), "
+            f"updated_at = {_NOW} WHERE item_id = ?",
+            (callback_id, int(from_backlog), item_id),
+        )
+    else:
+        conn.execute(
+            f"UPDATE dig_queue SET now_requested_at = {_NOW}, now_callback_id = ? "
+            "WHERE item_id = ?",
+            (callback_id, item_id),
+        )
+    return "accepted"
+
+
+def has_now_requests(conn: sqlite3.Connection) -> bool:
+    """作っていない今すぐの依頼か、作り始めた印の残った行があるか。
+
+    poller が `intel dig-now` を起動する合図(GH#388)。印の残った行は、作っている途中か、前の
+    実行が途中で止まったもの(作っている途中なら、起動した dig-now は何もせずに終わる)。
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_queue "
+            "WHERE (status = 'queued' AND now_requested_at IS NOT NULL) "
+            "   OR now_started_at IS NOT NULL LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
+def has_unsent_cards(conn: sqlite3.Connection) -> bool:
+    """台帳に未送信のカード(未公開のノートを含む中断分)があるか。
+
+    朝の調査段と今すぐの深掘りが再開を決めるのに使い、poller は `intel dig-now` を起動して送り
+    直す合図にする(GH#388)。今すぐの依頼を朝の段が引き受けて作った分(on_demand = 0)も、
+    送れなかったら朝を待たずに送り直すため、作った経路を問わない。
+    """
+    return (
+        conn.execute("SELECT 1 FROM dig_results WHERE message_id IS NULL LIMIT 1").fetchone()
+        is not None
+    )
+
+
+def claim_now_request(conn: sqlite3.Connection) -> DigCandidate | None:
+    """最も早く受け付けた今すぐの依頼を 1 件取り出し、作り始めた印を付ける(GH#388)。
+
+    呼び出し側のトランザクションの中で、調査段のロックを持って呼ぶ。印は 1 回押して 1 回だけ
+    作るためのもので、印の残った依頼は作り直さない(interrupted_now_requests)。キューの
+    スナップショット(updated_at など)は印を付ける前の値で、done 化の compare-and-set に使う
+    (印は updated_at を進めない)。
+    """
+    row = conn.execute(
+        _QUEUE_CANDIDATE_SELECT
+        + """
+        WHERE q.status = 'queued' AND q.now_requested_at IS NOT NULL
+          AND q.now_started_at IS NULL
+        ORDER BY q.now_requested_at, q.id
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    started_at = conn.execute(f"SELECT {_NOW}").fetchone()[0]
+    conn.execute(
+        "UPDATE dig_queue SET now_started_at = ? WHERE item_id = ?",
+        (started_at, row["item_id"]),
+    )
+    return _queue_candidate(row, now_started_at=started_at)
+
+
+def interrupted_now_requests(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """作り始めた印が残った今すぐの依頼の (item id, 印)(GH#388)。
+
+    前の `intel dig-now` が途中で止まった依頼。調査段のロックを持って呼ぶ(ロックの外では、
+    作っている途中の依頼と見分けられない)。
+    """
+    rows = conn.execute(
+        "SELECT item_id, now_started_at FROM dig_queue "
+        "WHERE now_started_at IS NOT NULL ORDER BY now_started_at, id"
+    ).fetchall()
+    return [(row["item_id"], row["now_started_at"]) for row in rows]
+
+
+def close_now_request(
+    conn: sqlite3.Connection, item_id: int, now_started_at: str, *, to_morning: bool
+) -> bool:
+    """今すぐの依頼を閉じる(GH#388)。閉じたら True。
+
+    作り始めた印がその値のままの依頼だけを閉じる(作っている間に本人がパスした・押し直した
+    依頼は変えない)。to_morning なら、作れなかった依頼を明朝の深掘りの ①(リプライ指定)へ
+    回す(requested_at を付ける。観点はそのまま)。
+    """
+    if to_morning:
+        sql = (
+            "UPDATE dig_queue SET now_requested_at = NULL, now_started_at = NULL, "
+            f"requested_at = {_NOW}, updated_at = {_NOW} "
+            "WHERE item_id = ? AND now_started_at = ? AND status = 'queued'"
+        )
+    else:
+        sql = (
+            "UPDATE dig_queue SET now_requested_at = NULL, now_started_at = NULL "
+            "WHERE item_id = ? AND now_started_at = ?"
+        )
+    return conn.execute(sql, (item_id, now_started_at)).rowcount == 1
+
+
+def dig_now_marked(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
+    """今すぐのボタンに ✓ を付ける item(依頼を受け付けた・作っている・掘り終えた。GH#388)。"""
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return set()
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row["item_id"]
+        for row in conn.execute(
+            "SELECT item_id FROM dig_queue "
+            f"WHERE item_id IN ({placeholders}) "
+            "  AND (now_requested_at IS NOT NULL OR status = 'done')",
+            ids,
+        )
+    }

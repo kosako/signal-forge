@@ -948,7 +948,7 @@ def test_reply_to_dig_card_records_note(conn, tmp_path) -> None:
 
 
 class FakeWorker:
-    """AnswerWorker の代わり(別プロセスを起動しない)。呼び出しを記録する。"""
+    """AnswerWorker・DigNowWorker の代わり(別プロセスを起動しない)。呼び出しを記録する。"""
 
     def __init__(self):
         self.kicks = 0
@@ -1239,6 +1239,7 @@ def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path, fail_updates) -> N
             raise DeliveryError("接続失敗")
 
     worker = FakeWorker()
+    dig_now_worker = FakeWorker()  # 今すぐの深掘り(GH#388)も同じく見回る
     calls = {"n": 0}
 
     def should_stop() -> bool:
@@ -1248,8 +1249,10 @@ def test_run_poller_sweeps_answers_each_cycle(conn, tmp_path, fail_updates) -> N
     run_poller(
         conn, make_config(tmp_path), FailingApi() if fail_updates else FakeApi(), logger,
         sleep=lambda _s: None, should_stop=should_stop, answer_worker=worker,
+        dig_now_worker=dig_now_worker,
     )
     assert worker.sweeps == 2
+    assert dig_now_worker.sweeps == 2
 
 
 def test_reply_outside_item_ledger_falls_back_to_url_flow(conn, tmp_path) -> None:

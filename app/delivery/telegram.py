@@ -25,7 +25,7 @@ import random
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -476,28 +476,31 @@ def pack_line_groups(
     budget: int,
     *,
     measure: Callable[[str], int] = len,
-    counted: Collection[int] = (),
+    counted: Mapping[int, int] | None = None,
     max_counted: int | None = None,
 ) -> list[list[int]]:
     """pack_lines の分け方で、1 通ごとの行の添字を返す。
 
-    counted の行(添字)は 1 通に max_counted 行までにする(ボタンを付ける行の数を、1 通の
-    ボタンの数の上限に収める。未消化一覧の skip のボタン。GH#349)。
+    counted は行(添字)→ その行の数(ボタンの数)。1 通の合計を max_counted までにする
+    (1 通のボタンの数の上限に収める。未消化一覧の行のボタン。GH#349・GH#388)。
     """
+    counted = counted or {}
     groups: list[list[int]] = []
     current: list[int] = []
     used = 0
     in_current = 0
     for index, line in enumerate(lines):
         size = measure(line)
-        is_counted = index in counted
-        full = max_counted is not None and is_counted and in_current >= max_counted
+        weight = counted.get(index, 0)
+        full = (
+            max_counted is not None and weight > 0 and in_current + weight > max_counted
+        )
         if current and (used + 1 + size > budget or full):
             groups.append(current)
             current, used, in_current = [], 0, 0
         used = used + 1 + size if current else size
         current.append(index)
-        in_current += int(is_counted)
+        in_current += weight
     if current:
         groups.append(current)
     return groups

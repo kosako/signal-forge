@@ -344,7 +344,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `text_excerpt`(≤280字)は **TTL キャッシュのみ**(purge が `x_cache_ttl_days` で NULL 化。§6 の X 本文非保持ポリシー準拠)。恒久保存は id・著者・時刻
 - 取込コストは `x_signal_runs`(collect_runs は sources 行が前提のため独立の台帳)に記録し、doctor #9 が合算する(§9)。`backfill`(migration 023。GH#178)は `intel x-signals --backfill` の取込なら 1、通常の取込なら 0(既存の行は 0)。取込の日次の上限は同じ日(JST)の通常の取込の行の `api_reads` の合計から残りを出すので、backfill の行はそこから外す(日次の上限の外の別枠。費用の集計には入る。設計 02 §2)
 
-### 深掘りキュー(dig_queue / dig_backlog_messages / dig_backlog_replies・migration 009・022・026・027。GH#104 / 設計 06 §2〜3)
+### 深掘りキュー(dig_queue / dig_backlog_messages / dig_backlog_replies・migration 009・022・026・027・029。GH#104 / GH#388 / 設計 06 §2〜3)
 
 夜の入口の永続化。新規 🔖 の item 化時に無条件で `dig_queue` へ積み(backfill 再読取は対象外)、未消化一覧への自由文リプライ(番号 + 観点 / パス)が upsert する。深掘りカードへのリプライが調べ直しの依頼なら、`intel answer` が同じ規則で upsert する(観点 = リプライの原文。GH#137)。`source` は**初回投入の経路で以後不変**(自動投入 = `bookmark` / リプライで新規作成 = `request` / その日の digest の上位から選んで掘った = `digest`。明示指定の有無は `requested_at` と `status` で導出する)。朝の調査段(GH#105)が `status='queued'` から日次上限件数を選んで実行し `done` にする。上限に足りない分を digest の上位から選んだ item(設計 06 §3 の ③。GH#349)は、選ぶ時点では積まず、生成物を `dig_results` へ write-ahead するのと同じトランザクションで `source = 'digest'`・`status = 'done'` の行を足す。行を足すのは行が無いときだけで、生成中に poller などが同じ item の行を作っていたら、本人の明示の操作(`requested_at` のある指定・`passed`)は変えず、自動投入の行(`requested_at` が無い `queued`)だけを `done` にする(どちらも生成物は記帳する。設計 06 §3)。`digest` は migration 009 の CHECK(`bookmark` / `request`)に無かったので、migration 027 で表を作り直して足した(列・既定値・外部キー・UNIQUE・索引は 009・022 のまま。GH#349)。
 
@@ -352,10 +352,11 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `status`: `queued` / `passed`(深掘り対象外。未消化一覧の表示には影響しない。リプライのパスと、一覧の skip のボタン(設計 06 §2・GH#349)が付ける)/ `done`。パス済みへの再ブックマークでは復帰させない(明示指示を自動投入が覆さない)。リプライの再指定(request)だけが `queued` へ戻す
 - `angle` = 観点の自由文(リプライから番号・パス構文を除いた残り)。`requested_at` = 明示指定時刻(調査段の優先順位① > 新着 🔖 順)。本文の材料が無い指定は、1 回知らせた後に NULL へ戻す(状態・観点は変えない。設計 06 §3・GH#197)。戻すのは朝バッチの失敗の通知を送れた後で、調査段の中では戻さない(通知の前に止まっても指定が残り、次の実行がまた知らせる。GH#337)
 - `backlog_op_question_id`(migration 022)= 未消化一覧への本人の最後の操作(パス・skip のボタン・指定)を反映した時点で、受け付け済みだった質問(`dig_questions.id`)の最大(質問がまだ無ければ 0)。受付の順序の印で、深掘りカードへの調べ直しの依頼は、自分の id がこれ以下なら(操作より前に受け付けた)積まない(GH#235・設計 06 §6)。時刻は秒の単位で同じ秒の先後が分からないので、質問の id を目盛りにする。調べ直しの依頼と朝の深掘りの `done` は変えない。NULL = 未消化一覧での操作がまだない(migration 022 より前の操作を含む)
-- `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先と skip のボタンの押されたメッセージの認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
+- `now_requested_at` / `now_started_at` / `now_callback_id`(migration 029。GH#388)= 今すぐの依頼(未消化一覧の ⚡ のボタン。設計 06 §3)。`now_requested_at` = 依頼を受け付けた時刻(NULL = 依頼なし)、`now_started_at` = `intel dig-now` が作り始めた時刻(1 回押して 1 回だけ作るための印)。`queued` の行に依頼を付けるときは `updated_at`・観点・`requested_at` を変えない(朝の生成中の done 化の照合を外さない)。行が無ければ `source = 'request'` で足し、`passed` なら `queued` に戻す(`updated_at` を進める)。作り終えたとき(done 化)と、作れずに明朝の深掘りへ回したとき(`requested_at` を付ける)に両方を NULL に戻す。本人がパスしたときは `now_requested_at` だけを戻し、`now_started_at` は作り終えるまで残す(作っている間は朝の選定がこの行を選ばない)。`intel dig-now` のロックの中で `now_started_at` の残った行を見つけたら、前の実行が途中で止まったとみなし、作り直さずに明朝へ回す(パス済みなら印だけを消す)。`now_callback_id` = 今すぐのボタンの callback のうち、最後に受け付けた(受け付け済み・作成中と答えたものを含む)id。依頼を閉じても残し、同じ callback の再配達を新しい依頼にしない
+- `dig_backlog_messages` は一覧メッセージの message_id 台帳(リプライ先と skip・今すぐのボタンの押されたメッセージの認識。owner DM 限定のため message_id 単独で一意 = digest_messages と同じ前提)
 - `dig_backlog_replies`(migration 026。GH#335)は、指定を反映したリプライの `chat_id`・`message_id` の台帳(主キーは組。message_id は chat 単位)。poller は指定を反映した後に offset を保存するので、その間に止まると同じ update が再配達される。指定をやり直すと `requested_at` が動き、生成中の深掘りの compare-and-set が外れ、掘り終えた `done` の行も `queued` に戻る。poller は記帳(`INSERT ... ON CONFLICT DO NOTHING`)と指定の反映を同じトランザクションで行い、記帳済みなら反映も確認の返信もしない(感想の migration 019 と同じ形。設計 04 §1)。本人が別のメッセージで指定し直したときは受け付ける。番号が無く案内だけを返したリプライは記帳しない
 
-### 深掘り実行結果(dig_results・migration 010・017。GH#105 / GH#153 / 設計 06 §4〜5)
+### 深掘り実行結果(dig_results・migration 010・017・029。GH#105 / GH#153 / GH#388 / 設計 06 §4〜5)
 
 朝の調査段の実行台帳(1 実行 = 1 行)。LLM 生成物(ノート本文・カード文)を先に
 ここへ **write-ahead** し、ファイル公開(`published_at`)→ カード送信(`message_id`)を
@@ -365,7 +366,8 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `note_name` / `source_note_name` = 解説 / 原文・対訳ノートのファイル名(拡張子なし。`source_note_name` NULL = ツイート本文のみ等でソースノート無し)
 - `note_markdown` / `source_note_markdown` = 公開までの本文一時保持。公開時に NULL 化して台帳を軽く保つ(恒久保存はノート側 = ADR 0004)。既存ファイルは公開時に上書きしない(公開済みノートの take 保護)
 - `card_text` = 概要カードの確定送信文(再送時に LLM を呼ばず同一文を送る)。`message_id` NULL = 未送信(公開済みの行だけ次回 run / `intel dig` が送る)。送信後は `message_id` → item のリプライ帰属(GH#106 の take 記録)に使う(owner DM 限定のため message_id 単独で引ける)
-- `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計
+- `item_id` は UNIQUE にしない(done → リプライ再指定で別の日に再実行できる。ノート名は実行日プレフィクスで衝突しない)。日次上限の判定は `created_at` の JST 暦日集計で、`on_demand` = 1 の行は数えない
+- `on_demand`(migration 029。GH#388)= 1 なら今すぐの依頼で作った(`intel dig-now`)。朝の 1 日の上限(`[dig].daily_cap`)の外にある。同じ item を同じ JST の暦日に 2 回は掘らない(ノート名の衝突)規則は、朝と今すぐで共通
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる。digest の上位から選んだ item(キューの行が無い)は、行が無いときだけ足し、生成中にできた行は上の `dig_queue` の規則で扱う。GH#349)
 - `review_status` / `review_findings` / `review_cost_usd`(migration 017。GH#153)= 別系統の AI のレビューの結果。`review_status` NULL = レビューしていない(無効・017 より前の行)/ `clean` = 指摘なし / `revised` = 指摘あり → 書き手が 1 回直した / `revise_failed` = 直すのに失敗(本文は直す前のまま)/ `failed` = レビュー自体が失敗(未レビュー)/ `skipped` = 月の上限額に達して省いた、またはドラフトを予備の Claude が書いたので省いた(レビュー役と同じ系統。GH#180。どちらかはカード・ノートの記録の文言で分かる)。`review_findings` は指摘の JSON 配列(`clean` は空配列、`failed`・`skipped` は NULL)で、本文列と違い公開後も残す(続けるかを決める材料)。`review_cost_usd` はやり直しの分を含む API 費用の見積もりで、月の上限の判定と doctor #9 に使う(どちらも UTC の暦月)。応答の usage を受け取れず費用が分からなかった呼び出しは、課金されうる最大の額の見積もりを実額と同じ列に合算する(GH#323。設計 06 §4)
 

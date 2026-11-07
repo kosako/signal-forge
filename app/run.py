@@ -285,25 +285,63 @@ def dig_stage(
     別の実行(朝バッチか `intel dig`)が調査段を進めていれば、待たずに何もしないで False を返す
     (段の失敗にしない。GH#196)。
     """
-    from app.analysis.fallback import fallback_engine_factory
-    from app.analysis.llm import create_anthropic_engine
     from app.deepdive import run_dig_stage
 
-    api = create_api(env) if is_telegram_configured(config, env) else None
+    engine_factory, review_engine_factory = _dig_engines(conn, config, env, logger, run_id)
     return run_dig_stage(
         conn,
         config,
-        # 解説・対訳・指摘を受けた直し。主が失敗したら予備でやり直す(GH#156)
-        fallback_engine_factory(conn, config, env, logger, stage="dig", run_id=run_id),
-        api,
+        engine_factory,
+        create_api(env) if is_telegram_configured(config, env) else None,
         logger,
         run_id=run_id,
+        review_engine_factory=review_engine_factory,
+    )
+
+
+def dig_now_stage(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+) -> bool:
+    """今すぐの深掘り(GH#388)。poller が起動する `intel dig-now` が呼ぶ。
+
+    エンジンと Telegram の扱いは dig 段と同じ。別の実行が調査段を進めていれば、待たずに何もしないで
+    False を返す(依頼はキューに残り、poller が後で起動し直す)。
+    """
+    from app.deepdive import run_dig_now
+
+    engine_factory, review_engine_factory = _dig_engines(conn, config, env, logger, run_id)
+    return run_dig_now(
+        conn,
+        config,
+        engine_factory,
+        create_api(env) if is_telegram_configured(config, env) else None,
+        logger,
+        run_id=run_id,
+        review_engine_factory=review_engine_factory,
+    )
+
+
+def _dig_engines(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    logger: logging.Logger,
+    run_id: str | None,
+) -> tuple[Callable[[str], LLMEngine], Callable[[], LLMEngine] | None]:
+    """深掘りのエンジン(dig 段と今すぐの深掘りが共用する)。(書き手, レビュー役)を返す。"""
+    from app.analysis.fallback import fallback_engine_factory
+    from app.analysis.llm import create_anthropic_engine
+
+    return (
+        # 解説・対訳・指摘を受けた直し。主が失敗したら予備でやり直す(GH#156)
+        fallback_engine_factory(conn, config, env, logger, stage="dig", run_id=run_id),
         # 別系統の AI のレビュー(GH#153)。キーが無ければレビューだけが失敗し、深掘りは届く
-        review_engine_factory=(
-            (lambda: create_anthropic_engine(config.anthropic_api, env))
-            if config.dig.review
-            else None
-        ),
+        (lambda: create_anthropic_engine(config.anthropic_api, env)) if config.dig.review else None,
     )
 
 

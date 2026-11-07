@@ -1,4 +1,5 @@
-"""質問への返事の起動係(GH#126)。別プロセスは起動せず、Popen を差し替えて確かめる。"""
+"""質問への返事(GH#126)と今すぐの深掘り(GH#388)の起動係。別プロセスは起動せず、Popen を差し替えて
+確かめる。"""
 
 import logging
 import sqlite3
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.db import apply_migrations, connect
-from app.delivery.answer_worker import RETRY_UNSENT_S, AnswerWorker
+from app.delivery.answer_worker import RETRY_UNSENT_S, AnswerWorker, DigNowWorker
 
 logger = logging.getLogger("test-answer-worker")
 
@@ -196,3 +197,108 @@ def test_cli_runs_as_a_module() -> None:
     )
     assert result.returncode == 0
     assert "answer" in result.stdout
+
+
+# --- 今すぐの深掘り(GH#388) ---
+
+
+def add_now_request(conn, *, started: bool = False, status: str = "queued") -> None:
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, now_requested_at, now_started_at) "
+        "VALUES (1, ?, 'request', '2026-07-22T12:00:00Z', ?)",
+        (status, "2026-07-22T12:00:01Z" if started else None),
+    )
+    conn.commit()
+
+
+def test_dig_now_worker_starts_dig_now_in_its_own_session(conn, tmp_path) -> None:
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    add_now_request(conn)
+
+    worker.sweep(conn, logger)
+
+    [(command, kwargs)] = popen.calls
+    assert command == [
+        sys.executable, "-m", "app.cli", "dig-now", "--config-dir", str(tmp_path)
+    ]
+    assert kwargs == {"stdin": subprocess.DEVNULL, "start_new_session": True}
+
+
+@pytest.mark.parametrize(
+    ("started", "status", "starts"),
+    [
+        (False, "queued", True),  # 作っていない依頼
+        (True, "queued", True),  # 前の実行が途中で止まった(子が明朝へ回して知らせる)
+        (False, "passed", False),  # パスした(依頼は消えている前提だが、状態でも見ない)
+        (False, "done", False),
+    ],
+)
+def test_dig_now_worker_sweeps_pending_requests(conn, tmp_path, started, status, starts) -> None:
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    add_now_request(conn, started=started, status=status)
+
+    worker.sweep(conn, logger)
+
+    assert len(popen.calls) == int(starts)
+
+
+def test_dig_now_worker_restarts_after_child_exits_while_requests_remain(conn, tmp_path) -> None:
+    # 朝バッチの dig 段の間に起動した子は何もせず終わり、依頼が残る。次の周期に起動し直す
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    add_now_request(conn)
+
+    worker.sweep(conn, logger)
+    worker.sweep(conn, logger)  # 子が動いている間は起動しない
+    popen.procs[0].code = 0
+    worker.sweep(conn, logger)
+
+    assert len(popen.calls) == 2
+
+
+def test_dig_now_worker_retries_unsent_cards_at_interval(conn, tmp_path) -> None:
+    popen = FakePopen()
+    clock = Clock()
+    worker = DigNowWorker(tmp_path, popen=popen, clock=clock)
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, on_demand) "
+        "VALUES (1, 'now-note', 'カード', 1)"
+    )
+    conn.commit()
+
+    worker.sweep(conn, logger)
+    popen.procs[0].code = 0
+    clock.now += RETRY_UNSENT_S - 1
+    worker.sweep(conn, logger)
+    clock.now += 1
+    worker.sweep(conn, logger)
+
+    assert len(popen.calls) == 2
+
+
+def test_dig_now_worker_also_retries_unsent_morning_cards(conn, tmp_path) -> None:
+    # 朝の段が今すぐの依頼を引き受けて作り、送れなかった分も、朝を待たずに送り直す
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text) VALUES (1, 'n', 'カード')"
+    )
+    conn.commit()
+
+    worker.sweep(conn, logger)
+
+    assert len(popen.calls) == 1
+
+
+def test_dig_now_worker_logs_abnormal_exit(conn, tmp_path, caplog) -> None:
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    worker.kick(logger)
+    popen.procs[0].code = 1
+
+    with caplog.at_level(logging.ERROR):
+        worker.sweep(conn, logger)
+
+    assert "intel dig-now が異常終了(exit=1)" in caplog.text
