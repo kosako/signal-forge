@@ -791,10 +791,13 @@ _REACTION_CODES = {value: code for code, value in _REACTION_VALUES.items()}
 
 
 def _latest_reaction_code(conn: sqlite3.Connection, item_id: int) -> str | None:
-    """その記事に最後に付けた反応の code(盤面の ✓ を残すため。KPI と同じく最新の記録を採る)。"""
+    """その記事に最後に付けた反応の code(盤面の ✓ を残すため)。
+
+    最新は KPI の集計と同じ規則で決める(created_at の最新、同じ秒は id の大きい方。設計 01 §7)。
+    """
     row = conn.execute(
         "SELECT value FROM signals WHERE kind = 'reaction' AND item_id = ? "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
         (item_id,),
     ).fetchone()
     return _REACTION_CODES.get(row["value"]) if row is not None else None

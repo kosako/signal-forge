@@ -1924,3 +1924,23 @@ def test_digest_now_button_without_body_answers_and_writes_nothing(conn, tmp_pat
     assert conn.execute("SELECT count(*) FROM dig_queue").fetchone()[0] == 0
     assert api.answered == [("cb1", f"⚠️ {item} は本文が無いため掘れません")]
     assert worker.kicks == 0
+
+
+def test_digest_now_board_uses_latest_reaction_by_created_at(conn, tmp_path) -> None:
+    # 反応の最新は KPI と同じく created_at の最新(同じ秒は id の大きい方。設計 01 §7)。挿入の順と
+    # 時刻が逆でも、盤面の ✓ は集計上の最新に合わせる
+    [item] = add_digest_item_messages(conn)
+    history = (("useful", "2026-07-05T10:00:00Z"), ("noise", "2026-07-05T09:00:00Z"))
+    for value, created_at in history:
+        conn.execute(
+            "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+            "VALUES ('reaction', ?, ?, '2026-07-05', ?)",
+            (item, value, created_at),
+        )
+    api = FakeApi([[digest_now_press(item)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+
+    assert api.edited == [
+        (CHAT_ID, 55, reaction_keyboard(item, selected="up", with_now=True, now_marked=True))
+    ]
