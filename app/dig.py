@@ -284,6 +284,27 @@ def has_material(body: str | None, config: Config) -> bool:
     return bool(body) and len(body) >= config.dig.min_body_chars
 
 
+def items_with_material(
+    conn: sqlite3.Connection, config: Config, item_ids: Iterable[int]
+) -> set[int]:
+    """item のうち、調査段の材料(抽出本文)が足りるもの(has_material と同じ条件)。読むだけ。
+
+    朝の digest の記事に今すぐのボタンを付けるか決めるのに使う(GH#388)。
+    """
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return set()
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row["item_id"]
+        for row in conn.execute(
+            f"SELECT item_id, extracted_text FROM documents WHERE item_id IN ({placeholders})",
+            ids,
+        )
+        if has_material(row["extracted_text"], config)
+    }
+
+
 def select_from_queue(
     conn: sqlite3.Connection, config: Config, limit: int, day: str
 ) -> tuple[list[DigCandidate], list[DigCandidate]]:
