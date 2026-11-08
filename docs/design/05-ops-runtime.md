@@ -132,9 +132,9 @@ plist は `ops/launchd/` に置き、`~/Library/LaunchAgents/` に symlink せ�
 - **GitHub Issue → 小さい PR → merge** の反復。設計書 01〜05 の単位よりさらに細かく、レビュー可能な粒度(目安: 1 PR = 1 CLI サブコマンド or 1 コネクタ)で切る。
 - **相互レビュー: Claude が実装し、Codex がレビューする**(author ≠ reviewer)。commit には `Co-Authored-By: Claude ...` トレーラを必ず付け、レビュー routing の判定材料にする。
 - レビュー結果は PR 上に 🔴 must / 🟡 should / ⚪ nit の3段階で残し、**must ゼロを merge 条件**とする。should/nit の対応は author 判断。
-- CI は最小: `uv run pytest` + `ruff check` を PR ごとにローカル実行(GitHub Actions 化は拡張点。個人リポジトリで秘匿情報を送らない判断を先に行う)。
+- CI は最小: GitHub Actions(`.github/workflows/ci.yml`)が PR と main への push で `uv sync --locked`・`ruff check`・`pytest` を回す(GH#391)。secret は渡さない。テストは本物の codex や外部の API を呼ばないので、secret なしで通る。job の名前 `test` を `.github/repo-baseline.json` の `required_checks` に書き、default branch の ruleset で必須にする。手元でも PR ごとに同じ 2 つを走らせる。
 - マイグレーション(番号付き .sql)を含む PR は、バックアップ取得→適用→doctor 通過をレビューチェック項目に含める。
 
 ## 10. 拡張点(実装しない・場所だけ確保)
 
-- 通知のフォールバック経路(メール等)/ Keychain 保管 / バックアップのリモート退避 / KPI 集計の自動化(フェーズ2)/ GitHub Actions CI。
+- 通知のフォールバック経路(メール等)/ Keychain 保管 / バックアップのリモート退避 / KPI 集計の自動化(フェーズ2)。

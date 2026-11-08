@@ -1,6 +1,7 @@
 # 依存の version updates を週 1 回確かめる(GH#162)。
 # minor と patch は 1 本の PR にまとめ、major は個別の PR。security updates も 1 本にまとめる
 # (ここに groups を書くと、画面の Grouped security updates の設定よりこちらが優先される)。
+# CI の action の pin(commit の SHA)は月に 1 回確かめる(GH#391)。
 version: 2
 updates:
   - package-ecosystem: "uv"
@@ -16,3 +17,16 @@ updates:
         applies-to: security-updates
         patterns:
           - "*"
+  # cooldown: 公開から 7 日たった release だけを提案する。乗っ取られた release を、CI で動く前に
+  # 見つける時間を取るため。security updates には cooldown がかからない。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

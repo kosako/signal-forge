@@ -220,7 +220,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-- CI は無い。PR ごとに手元で pytest と ruff を走らせる。
+- CI は GitHub Actions で、PR と main への push ごとに pytest と ruff を走らせる(secret は使わない)。job の `test` は merge に必須の check。手元でも PR ごとに同じ 2 つを走らせる。
 - 流れは GitHub Issue → 小さな PR → 相互レビュー → merge。コードを書いた AI とは別の AI がレビューし、must がゼロになったら merge する。migration を含む PR は「バックアップ → 適用 → doctor」をレビュー項目に入れる([設計 05 §9](docs/design/05-ops-runtime.md))。
 
 repo 固有の決まり:
