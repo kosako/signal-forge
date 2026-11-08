@@ -12,9 +12,10 @@ on:
 permissions:
   contents: read
 
-# PR は同じ branch の古い run を止める。main への push は merge ごとの結果を残すので止めない。
+# PR は同じ PR の古い run を止める。main への push は merge ごとの結果を残すので、run ごとに別の group にする
+# (同じ group だと、cancel-in-progress が false でも、待っている run が次の run に置き換えられて消える)。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
