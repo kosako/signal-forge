@@ -526,6 +526,30 @@ def has_now_requests(conn: sqlite3.Connection) -> bool:
     )
 
 
+def now_requests_ahead(conn: sqlite3.Connection, item_id: int) -> int:
+    """その item の今すぐの依頼より先に作る依頼の数(作っている途中の依頼を含む。GH#396)。
+
+    今すぐの深掘りは 1 件ずつ順に作る(claim_now_request)ので、後ろの依頼は前の件の分だけ待つ。
+    数える順は claim_now_request と同じ(受け付けた時刻、同じ秒は行の id)。待っている依頼の無い
+    item(作り始めた・閉じた)は 0。受け付けの状態の確認と同じトランザクションの中で呼ぶ。
+    """
+    row = conn.execute(
+        "SELECT id, now_requested_at FROM dig_queue "
+        "WHERE item_id = ? AND status = 'queued' AND now_requested_at IS NOT NULL "
+        "  AND now_started_at IS NULL",
+        (item_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    return conn.execute(
+        "SELECT count(*) FROM dig_queue WHERE item_id != ? AND ("
+        "  now_started_at IS NOT NULL"
+        "  OR (status = 'queued' AND now_requested_at IS NOT NULL"
+        "      AND (now_requested_at < ? OR (now_requested_at = ? AND id < ?))))",
+        (item_id, row["now_requested_at"], row["now_requested_at"], row["id"]),
+    ).fetchone()[0]
+
+
 def has_unsent_cards(conn: sqlite3.Connection) -> bool:
     """台帳に未送信のカード(未公開のノートを含む中断分)があるか。
 
