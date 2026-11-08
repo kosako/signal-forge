@@ -1492,11 +1492,17 @@ def _item_meta_lines(candidate: DigCandidate, nonce: str) -> list[str]:
 
 
 def _prompt_body(config: Config, candidate: DigCandidate, nonce: str) -> str:
-    """解説の生成とレビューに渡す本文(同じ切り詰め。書き手と査読者が同じ範囲を読む)。"""
-    body = sanitize_body(candidate.body or "", nonce)
-    if len(body) > config.dig.body_max_chars:
-        body = body[: config.dig.body_max_chars] + "\n(…以降は長さ上限で切り詰め)"
-    return body
+    """解説の生成とレビューに渡す本文(同じ切り詰め。書き手と査読者が同じ範囲を読む)。
+
+    元の本文を先に切り詰めてから除去する。LLM に渡す範囲が元の本文の先頭 body_max_chars 字に
+    決まり、引用の照合(_verified_quotes)が同じ範囲を元の本文で見られる(GH#394。除去してから
+    切ると、除去で縮んだ分だけ範囲が元の本文の先へずれ、その量は除去の位置で変わる)。
+    """
+    body = candidate.body or ""
+    limit = config.dig.body_max_chars
+    if len(body) > limit:
+        return sanitize_body(body[:limit], nonce) + "\n(…以降は長さ上限で切り詰め)"
+    return sanitize_body(body, nonce)
 
 
 # --- 原文からの引用(GH#394) ---
@@ -1511,10 +1517,10 @@ def _verified_quotes(
 ) -> DigDraft:
     """ドラフトの引用を、本文にあるものだけに絞る(LLM が作った文を引用として載せない)。
 
-    照合の相手は元の本文の、LLM に渡した範囲(切り詰めの注記は含めない)。プロンプトに入れる前の
-    除去(sanitize_body)は掛けない: 除去で消えた字を欠いた写しを、元の本文と違う形のまま載せないため
-    (外れる側に倒れる)。除去は本文を縮めてから切り詰める(_prompt_body)ので、照合の範囲は縮んだ分
-    だけ先まで延ばす(LLM が見た範囲を必ず覆う。少し先まで覆っても、載るのは元の本文にある字だけ)。
+    照合の相手は元の本文の、LLM に渡した範囲(先頭 body_max_chars 字。_prompt_body。切り詰めの注記は
+    含めない)。プロンプトに入れる前の除去(sanitize_body)は掛けない: 除去で消えた字を欠いた写しを、
+    元の本文と違う形のまま載せないため(外れる側に倒れる)。範囲の直後の字も見て、上限で切れた英単語の
+    途中で終わる写しは採らない。
     意味の変わらない違い(空白・全角の英数字・曲がった引用符)だけを同じとみなす(_quote_match_key)。
     写しのままで本文に無ければ、全体を囲む引用符の 1 組だけを外して試す(_matched_original)。
     外すのは、本文に無い・短すぎる・同じ写しの繰り返し・一言が空・日本語以外で和訳が空の引用。
@@ -1524,16 +1530,18 @@ def _verified_quotes(
     if not draft.quotes:
         return draft
     body = candidate.body or ""
-    # nonce は本文に現れない使い捨ての値(除去で縮む字数を数えるだけ。除去した本文は照合に使わない)
-    shrunk = len(body) - len(sanitize_body(body, secrets.token_hex(4)))
-    haystack = _quote_match_key(body[: config.dig.body_max_chars + shrunk])
+    head = body[: config.dig.body_max_chars]
+    haystack = _quote_match_key(head)
+    # 範囲の直後の字(上限で英単語が切れていれば、その続き)。範囲が空白で終わるなら語は続かない
+    tail = "" if head[-1:].isspace() else body[len(head) : len(head) + 1]
+    tail = tail.translate(_QUOTE_MATCH_TRANSLATION).strip()
     is_tweet = _is_tweet_url(candidate.canonical_url)
     japanese = _is_japanese_source(candidate)
     limit = _TWEET_QUOTES_MAX if is_tweet else QUOTES_MAX
     kept: list[DigQuote] = []
     seen: set[str] = set()
     for quote in draft.quotes:
-        matched = _matched_original(quote.original, haystack)
+        matched = _matched_original(quote.original, haystack, tail)
         ja = "" if japanese else quote.ja.strip()
         if matched is None or not quote.why.strip() or (not japanese and not ja):
             continue
@@ -1553,7 +1561,7 @@ def _verified_quotes(
     return draft.model_copy(update={"quotes": kept})
 
 
-def _matched_original(original: str, haystack: str) -> tuple[str, str] | None:
+def _matched_original(original: str, haystack: str, tail: str = "") -> tuple[str, str] | None:
     """本文にある写しの形と、その照合の形。本文に無ければ None。
 
     まず写しのまま照合し、無ければ全体を囲む引用符の 1 組だけを外して試す(本文の字は削らない)。
@@ -1567,7 +1575,9 @@ def _matched_original(original: str, haystack: str) -> tuple[str, str] | None:
             break
     for candidate in candidates:
         key = _quote_match_key(candidate)
-        if len(key.replace(" ", "")) >= _QUOTE_MIN_CHARS and _at_word_boundary(haystack, key):
+        if len(key.replace(" ", "")) >= _QUOTE_MIN_CHARS and _at_word_boundary(
+            haystack, key, tail
+        ):
             return candidate, key
     return None
 
@@ -1582,13 +1592,16 @@ def _quote_match_key(text: str) -> str:
     return _SPACE_NEXT_TO_CJK.sub("", " ".join(normalized.split()))
 
 
-def _at_word_boundary(haystack: str, needle: str) -> bool:
-    """needle が haystack に、両端で英単語を切らずに現れるか(now が nowhere の頭に一致しない)。"""
+def _at_word_boundary(haystack: str, needle: str, tail: str = "") -> bool:
+    """needle が haystack に、両端で英単語を切らずに現れるか(now が nowhere の頭に一致しない)。
+
+    tail は haystack の直後の元の本文の字(haystack が本文の途中で切ったものなら、その続き)。
+    """
     start = haystack.find(needle)
     while start != -1:
         end = start + len(needle)
         before = haystack[start - 1] if start > 0 else ""
-        after = haystack[end] if end < len(haystack) else ""
+        after = haystack[end] if end < len(haystack) else tail
         if not (_in_one_word(before, needle[0]) or _in_one_word(needle[-1], after)):
             return True
         start = haystack.find(needle, start + 1)
