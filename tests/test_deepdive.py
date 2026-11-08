@@ -3561,6 +3561,34 @@ def test_verified_quotes_keep_word_boundaries(conn, config, body, original, kept
 
 
 @pytest.mark.parametrize(
+    ("original", "kept"),
+    [
+        # 上付きの数字を普通の数字にそろえない。そろえると、載せる写しの誤り(106)が通る(Codex 🔴)
+        ("必要な試行回数は106回です。", False),
+        ("必要な試行回数は10⁶回です。", True),
+        # 全角の英数字は同じとみなす(写すときに半角に変わることがある)
+        ("AIエージェントの評価は10回の試行で決まる。", True),
+        # 照合の相手は元の本文。プロンプトの前の除去で消える字(DATA-)を欠いた写しは通さない
+        ("The METAdriven approach scales well.", False),
+        ("The METADATA-driven approach scales well.", True),
+    ],
+)
+def test_verified_quotes_fold_only_meaning_preserving_variants(
+    conn, config, original, kept
+) -> None:
+    body = (
+        "必要な試行回数は10⁶回です。ＡＩエージェントの評価は１０回の試行で決まる。"
+        "The METADATA-driven approach scales well. " + BODY
+    )
+    candidate = candidate_for(conn, config, "https://blog.example/fold", body, "ja")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ([original] if kept else [])
+
+
+@pytest.mark.parametrize(
     ("original", "shown"),
     [
         # 本文の字の「 を片側だけ削らない(写しのまま本文にあれば、そのまま載せる。Codex 🟡)

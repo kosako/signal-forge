@@ -61,7 +61,6 @@ import sqlite3
 import stat
 import threading
 import time
-import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -184,8 +183,13 @@ _TWEET_QUOTES_MAX = 1  # X の投稿は必要最小限の抜粋だけ(本文非�
 _QUOTE_MIN_CHARS = 10
 _NOTE_QUOTE_MAX = 400  # ノートに出す 1 件の上限(LLM 出力を有界に保つ)
 _NOTE_QUOTE_WHY_MAX = 200
-# 写しの照合で同じ字とみなす引用符(LLM が写すときに曲がった引用符を直線に変えることがある)
-_QUOTE_MATCH_TRANSLATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+# 写しの照合で同じ字とみなすもの。意味の変わらない違いだけに限る(全角の英数字と記号・全角の
+# 空白・曲がった引用符。LLM が写すときに変えることがある)。NFKC は使わない: 上付きの数字(10⁶ →
+# 106)や丸数字のように意味の違う字までそろえ、載せる写しの側の誤りを通すため
+_QUOTE_MATCH_TRANSLATION = str.maketrans(
+    {chr(code): chr(code - 0xFEE0) for code in range(0xFF01, 0xFF5F)}
+    | {"\u3000": " ", "‘": "'", "’": "'", "“": '"', "”": '"'}
+)
 # ノートの `## 原文から` を前に置く見出し(先に見つかったもの。プロンプトの節の構成の 4 と 7)
 _NOTE_QUOTES_BEFORE = (re.compile(r"^## 根拠の強さ", re.M), re.compile(r"^## ソース", re.M))
 # CommonMark が backslash で escape できる ASCII の記号(!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~)
@@ -1507,8 +1511,10 @@ def _verified_quotes(
 ) -> DigDraft:
     """ドラフトの引用を、本文にあるものだけに絞る(LLM が作った文を引用として載せない)。
 
-    照合の相手は LLM に渡した本文と同じ範囲(_prompt_body と同じ除去と切り詰め。切り詰めの注記は
-    含めない)。空白の有無・全角と半角・曲がった引用符の違いは同じとみなす(_quote_match_key)。
+    照合の相手は元の本文の、LLM に渡したのと同じ範囲(_prompt_body と同じ切り詰め。切り詰めの注記は
+    含めない)。プロンプトに入れる前の除去(sanitize_body)は掛けない: 除去で消えた字を含む写しを、
+    元の本文と違う形のまま載せないため(外れる側に倒れる)。意味の変わらない違い(空白・全角の英数字・
+    曲がった引用符)だけを同じとみなす(_quote_match_key)。
     写しのままで本文に無ければ、全体を囲む引用符の 1 組だけを外して試す(_matched_original)。
     外すのは、本文に無い・短すぎる・同じ写しの繰り返し・一言が空・日本語以外で和訳が空の引用。
     X の投稿は 1 個までにし、ポストの半分を超える写しは外す(全文の再掲をしない = GH#2)。
@@ -1516,9 +1522,7 @@ def _verified_quotes(
     """
     if not draft.quotes:
         return draft
-    # nonce は本文に現れない使い捨ての値。除去の結果は LLM に渡した本文と同じになる
-    material = sanitize_body(candidate.body or "", secrets.token_hex(4))
-    haystack = _quote_match_key(material[: config.dig.body_max_chars])
+    haystack = _quote_match_key((candidate.body or "")[: config.dig.body_max_chars])
     is_tweet = _is_tweet_url(candidate.canonical_url)
     japanese = _is_japanese_source(candidate)
     limit = _TWEET_QUOTES_MAX if is_tweet else QUOTES_MAX
@@ -1565,12 +1569,12 @@ def _matched_original(original: str, haystack: str) -> tuple[str, str] | None:
 
 
 def _quote_match_key(text: str) -> str:
-    """写しの照合に使う形。全角と半角(NFKC)と引用符の曲がりをそろえ、空白を 1 つにまとめる。
+    """写しの照合に使う形。全角の英数字と記号・曲がった引用符をそろえ、空白を 1 つにまとめる。
 
     日本語の字の隣の空白は外す(本文の折り返しの改行や、写すときに入る・消える空白で、本物の
     引用を外さないため)。英単語の間の空白は残す(語の区切りが変わる一致を通さないため)。
     """
-    normalized = unicodedata.normalize("NFKC", text).translate(_QUOTE_MATCH_TRANSLATION)
+    normalized = text.translate(_QUOTE_MATCH_TRANSLATION)
     return _SPACE_NEXT_TO_CJK.sub("", " ".join(normalized.split()))
 
 
