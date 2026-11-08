@@ -1511,10 +1511,11 @@ def _verified_quotes(
 ) -> DigDraft:
     """ドラフトの引用を、本文にあるものだけに絞る(LLM が作った文を引用として載せない)。
 
-    照合の相手は元の本文の、LLM に渡したのと同じ範囲(_prompt_body と同じ切り詰め。切り詰めの注記は
-    含めない)。プロンプトに入れる前の除去(sanitize_body)は掛けない: 除去で消えた字を含む写しを、
-    元の本文と違う形のまま載せないため(外れる側に倒れる)。意味の変わらない違い(空白・全角の英数字・
-    曲がった引用符)だけを同じとみなす(_quote_match_key)。
+    照合の相手は元の本文の、LLM に渡した範囲(切り詰めの注記は含めない)。プロンプトに入れる前の
+    除去(sanitize_body)は掛けない: 除去で消えた字を欠いた写しを、元の本文と違う形のまま載せないため
+    (外れる側に倒れる)。除去は本文を縮めてから切り詰める(_prompt_body)ので、照合の範囲は縮んだ分
+    だけ先まで延ばす(LLM が見た範囲を必ず覆う。少し先まで覆っても、載るのは元の本文にある字だけ)。
+    意味の変わらない違い(空白・全角の英数字・曲がった引用符)だけを同じとみなす(_quote_match_key)。
     写しのままで本文に無ければ、全体を囲む引用符の 1 組だけを外して試す(_matched_original)。
     外すのは、本文に無い・短すぎる・同じ写しの繰り返し・一言が空・日本語以外で和訳が空の引用。
     X の投稿は 1 個までにし、ポストの半分を超える写しは外す(全文の再掲をしない = GH#2)。
@@ -1522,7 +1523,10 @@ def _verified_quotes(
     """
     if not draft.quotes:
         return draft
-    haystack = _quote_match_key((candidate.body or "")[: config.dig.body_max_chars])
+    body = candidate.body or ""
+    # nonce は本文に現れない使い捨ての値(除去で縮む字数を数えるだけ。除去した本文は照合に使わない)
+    shrunk = len(body) - len(sanitize_body(body, secrets.token_hex(4)))
+    haystack = _quote_match_key(body[: config.dig.body_max_chars + shrunk])
     is_tweet = _is_tweet_url(candidate.canonical_url)
     japanese = _is_japanese_source(candidate)
     limit = _TWEET_QUOTES_MAX if is_tweet else QUOTES_MAX

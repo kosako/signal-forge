@@ -3654,6 +3654,25 @@ def test_verified_quotes_ignore_text_past_the_prompt_limit(conn, config) -> None
     assert [q.original for q in verified.quotes] == ["前半の大事な文はここにあります。"]
 
 
+def test_verified_quotes_cover_what_the_prompt_showed_after_removal(conn, config) -> None:
+    # プロンプトの前の除去で本文が縮むと、LLM には元の本文の上限の字数より先まで渡る。その範囲の
+    # 正しい引用は残し、LLM に渡していない範囲の写しは外す(Codex 🟡)
+    config = replace(config, dig=replace(config.dig, body_max_chars=300))
+    near_limit = "境界の近くにある大事な文です。"
+    beyond = "見えていない後ろの大事な文です。"
+    body = "METADATA-x " * 10 + "あ" * 200 + near_limit + "あ" * 100 + beyond
+    candidate = candidate_for(conn, config, "https://blog.example/shrunk", body, "ja")
+    prompt_body = deepdive._prompt_body(config, candidate, "feedface")
+    assert near_limit in prompt_body and beyond not in prompt_body  # 前提: LLM が見た範囲
+    assert body.index(near_limit) + len(near_limit) > config.dig.body_max_chars  # 元の本文では先
+
+    verified = deepdive._verified_quotes(
+        config, candidate, draft_with([quote(beyond), quote(near_limit)]), logger, None
+    )
+
+    assert [q.original for q in verified.quotes] == [near_limit]
+
+
 def test_card_quotes_show_translation_only_and_are_escaped(conn, config) -> None:
     candidate = candidate_for(conn, config, "https://blog.example/c", EN_BODY, "en")
     draft = draft_with([
