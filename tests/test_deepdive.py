@@ -1588,10 +1588,10 @@ def _fenced(prompt: str, label: str, nonce: str) -> str:
 
 
 def test_prompt_versions_and_which_prompts_carry_the_guide() -> None:
-    assert deepdive.PROMPT_VERSION == "dig-v002"
+    assert deepdive.PROMPT_VERSION == "dig-v003"
     assert deepdive.REVISE_PROMPT_VERSION == "dig-revise-v002"
-    # レビューは元記事との照合だけを見るので、手引きを入れた版にしない
-    assert deepdive.REVIEW_PROMPT_VERSION == "dig-review-v001"
+    # レビューは元記事との照合だけを見るので、手引きを入れた版にしない(v002 は引用の扱い。GH#394)
+    assert deepdive.REVIEW_PROMPT_VERSION == "dig-review-v002"
     prompts_dir = Path(deepdive.__file__).resolve().parent.parent / "prompts"
     dig = (prompts_dir / f"{deepdive.PROMPT_VERSION}.md").read_text(encoding="utf-8")
     revise = (prompts_dir / f"{deepdive.REVISE_PROMPT_VERSION}.md").read_text(encoding="utf-8")
@@ -3474,3 +3474,406 @@ def test_dig_now_resends_morning_card_for_taken_over_request(conn, config) -> No
 
     assert len(api.sent) == 1
     assert conn.execute("SELECT on_demand, message_id FROM dig_results").fetchone()[:] == (0, 901)
+
+
+# --- 原文からの引用(GH#394) ---
+
+EN_BODY = (
+    "Most agent failures come from the eval,\nnot the model. "
+    "Teams that don’t log tool calls recover slower. " + "Filler sentence for length. " * 20
+)
+FULL_NOTE = "## 概要\n\n…\n\n## 骨子\n\n1. …\n\n## 根拠の強さ(検証)\n\n…\n\n## ソース\n\nURL"
+
+
+def quote(original: str, ja: str = "和訳", why: str = "一言") -> deepdive.DigQuote:
+    return deepdive.DigQuote(original=original, ja=ja, why=why)
+
+
+def draft_with(quotes: list, note: str = FULL_NOTE) -> DigDraft:
+    return DigDraft(
+        title_ja="見出し",
+        writer_stance="書き手",
+        for_you="あなた",
+        for_world="世の中",
+        note_markdown=note,
+        quotes=quotes,
+    )
+
+
+def candidate_for(conn, config, url: str, body: str, language: str, *, angle=None):
+    item = add_item(conn, url, body=body, language=language)
+    enqueue(conn, item, angle=angle)
+    (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
+    return candidate
+
+
+def test_draft_without_quotes_field_still_parses() -> None:
+    # 引用は上乗せ。欄を落とした出力(直しの出力など)でもドラフトを捨てない
+    draft = DigDraft.model_validate(
+        {"title_ja": "t", "writer_stance": "w", "for_you": "y", "for_world": "w",
+         "note_markdown": "n"}
+    )
+    assert draft.quotes == []
+
+
+def test_verified_quotes_keep_only_text_in_body(conn, config) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/q", EN_BODY, "en")
+    draft = draft_with([
+        # 外側の引用符を付け、本文の折り返しの改行を空白で写した
+        quote("“Most agent failures come from the eval, not the model.”"),
+        quote("Teams that don't log tool calls recover slower."),  # 曲がった ’ を直線で写した
+        quote("Agents never fail when the eval is good."),  # 本文に無い(作った文)
+        quote("the eval"),  # 短すぎて確かめにならない
+        quote("Teams that don't log tool calls recover slower."),  # 同じ写しの繰り返し
+        quote("Filler sentence for length.", ja=""),  # 日本語以外で和訳が空
+        quote("Filler sentence for length.", why=" "),  # 一言が空
+    ])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [(q.original, q.ja) for q in verified.quotes] == [
+        ("Most agent failures come from the eval, not the model.", "和訳"),
+        ("Teams that don't log tool calls recover slower.", "和訳"),
+    ]
+    # 照合を通った版をもう一度通しても変わらない(直さなかった版を 2 回通す)
+    assert deepdive._verified_quotes(config, candidate, verified, logger, None) == verified
+
+
+@pytest.mark.parametrize(
+    ("body", "original", "kept"),
+    [
+        # 英単語の間の空白は残す。語の区切りが変わる写しは通さない(Codex 🔴)
+        ("The agent is now here. " + BODY, "The agent is nowhere.", False),
+        # 写しの両端が本文の英単語の途中にかかる一致は採らない(now が nowhere の頭)
+        ("The agent is nowhere to be found. " + BODY, "The agent is now", False),
+        # 和文の折り返しの改行は空白にしない(写しには改行が無い)
+        ("これは折り返された\n日本語の文です。" + BODY, "これは折り返された日本語の文です。", True),
+        ("Claude Code を\n使う手順です。" + BODY, "Claude Codeを使う手順です。", True),
+    ],
+)
+def test_verified_quotes_keep_word_boundaries(conn, config, body, original, kept) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/wb", body, "en")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ([original] if kept else [])
+
+
+@pytest.mark.parametrize(
+    ("original", "kept"),
+    [
+        # 上付きの数字を普通の数字にそろえない。そろえると、載せる写しの誤り(106)が通る(Codex 🔴)
+        ("必要な試行回数は106回です。", False),
+        ("必要な試行回数は10⁶回です。", True),
+        # 全角の英数字は同じとみなす(写すときに半角に変わることがある)
+        ("AIエージェントの評価は10回の試行で決まる。", True),
+        # 照合の相手は元の本文。プロンプトの前の除去で消える字(DATA-)を欠いた写しは通さない
+        ("The METAdriven approach scales well.", False),
+        ("The METADATA-driven approach scales well.", True),
+    ],
+)
+def test_verified_quotes_fold_only_meaning_preserving_variants(
+    conn, config, original, kept
+) -> None:
+    body = (
+        "必要な試行回数は10⁶回です。ＡＩエージェントの評価は１０回の試行で決まる。"
+        "The METADATA-driven approach scales well. " + BODY
+    )
+    candidate = candidate_for(conn, config, "https://blog.example/fold", body, "ja")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ([original] if kept else [])
+
+
+@pytest.mark.parametrize(
+    ("original", "shown"),
+    [
+        # 本文の字の「 を片側だけ削らない(写しのまま本文にあれば、そのまま載せる。Codex 🟡)
+        ("「検索」よりも推論を重視する。", "「検索」よりも推論を重視する。"),
+        # 写しのままで無いときだけ、全体を囲む 1 組を外す
+        ("『推論を重視する理由がここにある。』", "推論を重視する理由がここにある。"),
+        (" 「 推論を重視する理由がここにある。 」 ", "推論を重視する理由がここにある。"),
+    ],
+)
+def test_verified_quotes_unwrap_only_a_whole_pair(conn, config, original, shown) -> None:
+    body = "「検索」よりも推論を重視する。推論を重視する理由がここにある。" + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/pair", body, "ja")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == [shown]
+    assert deepdive._verified_quotes(config, candidate, verified, logger, None) == verified
+
+
+def test_verified_quotes_cap_and_japanese_source_drops_translation(conn, config) -> None:
+    body = "".join(f"これは{i}番目の大事な文です。" for i in range(5)) + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/ja", body, "ja")
+    draft = draft_with([quote(f"これは{i}番目の大事な文です。", ja="余計な訳") for i in range(5)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == [
+        f"これは{i}番目の大事な文です。" for i in range(deepdive.QUOTES_MAX)
+    ]
+    assert all(q.ja == "" for q in verified.quotes)  # 日本語の元記事は原文を載せる
+
+
+def test_verified_quotes_tweet_takes_one_short_excerpt(conn, config) -> None:
+    body = (
+        "Agents need evals before prompts. Logs matter more than you think. "
+        + "Filler words for the post. " * 6
+    )
+    candidate = candidate_for(conn, config, "https://x.com/u/status/9", body, "en")
+    draft = draft_with([
+        quote(body),  # ポストの大半を写す(全文の再掲をしない = GH#2)
+        quote("Agents need evals before prompts."),
+        quote("Logs matter more than you think."),  # X の投稿は 1 個まで
+    ])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ["Agents need evals before prompts."]
+
+
+def test_verified_quotes_ignore_text_past_the_prompt_limit(conn, config) -> None:
+    config = replace(config, dig=replace(config.dig, body_max_chars=300))
+    body = "前半の大事な文はここにあります。" + "あ" * 300 + "後半の大事な文はここにあります。"
+    candidate = candidate_for(conn, config, "https://blog.example/long", body, "ja")
+    draft = draft_with([
+        quote("後半の大事な文はここにあります。"),  # LLM に渡していない範囲
+        quote("(…以降は長さ上限で切り詰め)"),  # 切り詰めの注記はシステムの文で、本文ではない
+        quote("前半の大事な文はここにあります。"),
+    ])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ["前半の大事な文はここにあります。"]
+
+
+INSIDE = "範囲の中にある大事な文です。"
+BEYOND = "後半の大事な文はここにあります。"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "METADATA-x " * 10 + INSIDE + "あ" * 300 + BEYOND,  # 除去する字が範囲の前にある
+        INSIDE + "あ" * 300 + BEYOND + "DATA-" * 20,  # 除去する字が範囲の後ろにだけある(Codex 🟡)
+    ],
+)
+def test_verified_quotes_use_the_same_range_as_the_prompt(conn, config, body) -> None:
+    # LLM に渡す範囲は元の本文の先頭 body_max_chars 字(切り詰めてから除去する)。照合も同じ範囲を
+    # 見る。除去する字がどこにあっても、範囲はずれない
+    config = replace(config, dig=replace(config.dig, body_max_chars=300))
+    candidate = candidate_for(conn, config, "https://blog.example/range", body, "ja")
+    prompt_body = deepdive._prompt_body(config, candidate, "feedface")
+    assert prompt_body == (
+        deepdive.sanitize_body(body[:300], "feedface") + "\n(…以降は長さ上限で切り詰め)"
+    )
+    assert INSIDE in prompt_body and BEYOND not in prompt_body  # 前提: LLM が見た範囲
+    assert "DATA-" not in prompt_body  # 範囲の中の除去はそのまま掛かる
+
+    verified = deepdive._verified_quotes(
+        config, candidate, draft_with([quote(BEYOND), quote(INSIDE)]), logger, None
+    )
+
+    assert [q.original for q in verified.quotes] == [INSIDE]
+
+
+@pytest.mark.parametrize(
+    ("cut_after", "kept"),
+    [
+        # 上限が nowhere の途中で切れる。語の途中で終わる写しを採らない(Codex 🔴)
+        ("The agent is now", False),
+        ("The agent is nowhere", True),  # 上限の直後が空白なら、語の終わり
+    ],
+)
+def test_verified_quotes_reject_a_word_cut_by_the_limit(conn, config, cut_after, kept) -> None:
+    prefix = "あ" * 200
+    config = replace(config, dig=replace(config.dig, body_max_chars=len(prefix) + len(cut_after)))
+    body = prefix + "The agent is nowhere to be found. " + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/cut", body, "en")
+
+    verified = deepdive._verified_quotes(
+        config, candidate, draft_with([quote(cut_after)]), logger, None
+    )
+
+    assert [q.original for q in verified.quotes] == ([cut_after] if kept else [])
+
+
+def test_card_quotes_show_translation_only_and_are_escaped(conn, config) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/c", EN_BODY, "en")
+    draft = draft_with([
+        quote(
+            "Most agent failures come from the eval, not the model.",
+            ja="失敗の多くは\n評価から <b>来る</b>",
+            why="レビューの設計 & 見直し",
+        )
+    ])
+
+    card = deepdive._card_text(config, candidate, draft, "note", None)
+
+    assert (
+        "世の中\n\n原文から\n"
+        "<blockquote>失敗の多くは 評価から &lt;b&gt;来る&lt;/b&gt;</blockquote>\n"
+        "→ レビューの設計 &amp; 見直し\n\n📄 ノート" in card
+    )
+    assert "Most agent failures" not in card  # 日本語以外の元記事は和訳だけを載せる
+    assert "原文から" not in deepdive._card_text(config, candidate, draft_with([]), "note", None)
+
+
+@pytest.mark.parametrize("unit", ["あ", "😀"])  # 😀 は Telegram の数え方(UTF-16)で 2 字
+def test_card_with_every_field_at_its_limit_fits_one_message(conn, config, unit) -> None:
+    # 引用 3 個と、どの欄も上限まで伸びた出力でも、カードは Telegram の 1 通に収まる
+    item = add_item(conn, "https://blog.example/w", title=unit * 500)
+    enqueue(conn, item, angle=unit * 600)
+    (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
+    draft = DigDraft(
+        title_ja=unit * deepdive._CARD_TITLE_MAX,
+        writer_stance=unit * 1000,
+        for_you=unit * 5000,
+        for_world=unit * 5000,
+        note_markdown="n",
+        quotes=[quote("o", ja=unit * 1000, why=unit * 1000)] * deepdive.QUOTES_MAX,
+    )
+    review = deepdive.ReviewOutcome(
+        "revised", "claude-opus-5-5", (finding(),) * REVIEW_MAX_FINDINGS
+    )
+
+    card = deepdive._card_text(
+        config, candidate, draft, "20260722-1-" + unit * 40 + "-深掘り", "対訳-x", review
+    )
+
+    assert card.count("<blockquote>") == deepdive.QUOTES_MAX
+    assert telegram_text_error(card) is None
+
+
+@pytest.mark.parametrize(
+    ("note", "after", "before"),
+    [
+        (FULL_NOTE, "## 骨子", "## 根拠の強さ"),  # 骨子の後、根拠の強さの前
+        ("## 概要\n\n…\n\n## ソース\n\nURL", "## 概要", "## ソース"),  # 根拠の強さが無い
+        ("## 概要\n\n…", "## 概要", None),  # どちらも無ければ末尾
+    ],
+)
+def test_note_quotes_section_goes_after_the_outline(conn, config, note, after, before) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/n", EN_BODY, "en")
+    draft = draft_with(
+        [quote("Most agent failures come from the eval, not the model.", ja="評価から来る",
+               why="見直しの\n手がかり")],
+        note=note,
+    )
+
+    text = deepdive._explainer_note(candidate, draft, None)
+
+    section = "## 原文から\n\n> 評価から来る\n\n→ 見直しの 手がかり"
+    assert text.count(section) == 1 and "Most agent failures" not in text
+    assert text.index(after) < text.index(section) < text.index("(この下は手書きメモ・take 領域)")
+    if before is not None:
+        assert text.index(section) < text.index(before)
+    assert "## 原文から" not in deepdive._explainer_note(candidate, draft_with([], note), None)
+
+
+def test_note_quotes_show_markdown_syntax_as_text(conn, config) -> None:
+    # 原文の写しの記法は、埋め込み・コメント・強調として解釈させず、文字として見せる(Codex 🔴)
+    body = "読む前に ![[別ノート]] と %%隠す%% と **強調** を含む文がある。" + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/md", body, "ja")
+    draft = deepdive._verified_quotes(
+        config,
+        candidate,
+        draft_with([quote("読む前に ![[別ノート]] と %%隠す%% と **強調** を含む文がある。",
+                          why="[[一言]] の <b>記法</b>")]),
+        logger,
+        None,
+    )
+
+    text = deepdive._explainer_note(candidate, draft, None)
+
+    section = text[text.index("## 原文から") : text.index("## 根拠の強さ")]
+    assert "\\!\\[\\[別ノート\\]\\]" in section and "\\%\\%隠す\\%\\%" in section
+    assert "\\*\\*強調\\*\\*" in section and "\\[\\[一言\\]\\]" in section
+    for syntax in ("![[", "%%", "**", "[[", "<b>"):
+        assert syntax not in section
+
+
+@pytest.mark.parametrize(
+    ("url", "language", "tweet", "ja_rule"),
+    [
+        ("https://blog.example/p", "en", False, "original の日本語訳"),
+        ("https://blog.example/p", "ja", False, "空文字にする"),
+        ("https://x.com/u/status/1", "en", True, "original の日本語訳"),
+    ],
+)
+def test_dig_prompt_quote_rules_follow_the_source(
+    conn, config, url, language, tweet, ja_rule
+) -> None:
+    candidate = candidate_for(conn, config, url, BODY, language)
+
+    prompt = build_dig_prompt(config, candidate, None)
+
+    assert ("X ポストなので、選ぶのは 1 個まで" in prompt) is tweet
+    assert ja_rule in prompt
+    assert '"quotes"' in prompt and re.search(r"\{\{\w+\}\}", prompt) is None
+
+
+def test_review_prompt_shows_quotes_with_original_for_translations(conn, config) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/r", EN_BODY, "en")
+    draft = draft_with([
+        quote("Most agent failures come from the eval, not the model.", ja="評価から来る",
+              why="手がかり")
+    ])
+
+    prompt = build_review_prompt(config, candidate, draft)
+
+    assert (
+        "## 原文から(概要カードと解説ノートの両方に載る)\n1. 和訳: 評価から来る / "
+        "原文: Most agent failures come from the eval, not the model. / 一言: 手がかり"
+    ) in prompt
+    assert "## 原文から" not in build_review_prompt(config, candidate, draft_with([]))
+
+
+REAL_JA_QUOTE = "本文の段落です。本文の段落です。"
+
+
+class QuoteEngine(ScriptedEngine):
+    """解説のドラフトに、本文にある引用と作った引用を付ける。直しの版は引用を出し直す。"""
+
+    def complete_structured(self, prompt, schema, timeout_s=120):
+        result = super().complete_structured(prompt, schema, timeout_s)
+        if schema is not DigDraft:
+            return result
+        if "前回のドラフトへの査読" in prompt:
+            quotes = [quote(REAL_JA_QUOTE, ja="", why="直した一言"),
+                      quote("直しで作った文はここにあります。", ja="", why="作り")]
+        else:
+            quotes = [quote(f"「{REAL_JA_QUOTE}」", ja="余計な訳", why="運用の手がかり"),
+                      quote("本文に無い文をここに作りました。", ja="", why="作り")]
+        return result.model_copy(update={"quotes": quotes})
+
+
+def test_dig_stage_puts_only_verified_quotes_on_card_and_note(conn, config) -> None:
+    row, note, card, _ = run_with_review(conn, config, None, engines={"medium": QuoteEngine()})
+
+    assert f"原文から\n<blockquote>{REAL_JA_QUOTE}</blockquote>\n→ 運用の手がかり\n" in card
+    assert f"## 原文から\n\n> {REAL_JA_QUOTE}\n\n→ 運用の手がかり" in note
+    for text in (card, note, row["card_text"]):
+        assert "本文に無い文" not in text and "余計な訳" not in text
+
+
+def test_revised_quotes_are_verified_again(conn, config) -> None:
+    review = ReviewEngine([finding()])
+
+    row, note, card, _ = run_with_review(
+        conn, config, review, engines={"medium": QuoteEngine()}
+    )
+
+    assert row["review_status"] == "revised"
+    assert "→ 直した一言" in card and "→ 直した一言" in note
+    assert "直しで作った文" not in card and "直しで作った文" not in note
+    # 査読には照合を通った引用だけを渡す
+    assert f"1. {REAL_JA_QUOTE} / 一言: 運用の手がかり" in review.prompts[0]
+    assert "本文に無い文" not in review.prompts[0]
