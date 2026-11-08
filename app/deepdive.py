@@ -61,6 +61,7 @@ import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -107,11 +108,12 @@ from app.vault_guard import VAULT_TIMEOUT_S, VaultGuard, VaultStalled
 
 # 解説とその直しには書き方の手引き(app.prompting.load_writing_guide)を入れる(GH#381)。手引きは
 # 解説のプロンプトの writing_guide に入れ、直しは解説のプロンプトを丸ごと含むので二重には入れない
-PROMPT_VERSION = "dig-v002"
+PROMPT_VERSION = "dig-v003"  # 原文からの引用(quotes)を足した(GH#394)
 TRANSLATE_PROMPT_VERSION = "dig-translate-v001"
 # レビューには手引きを入れない(GH#381)。元記事との食い違いだけを見る役で、文の書き方を指摘の
 # 対象にしない(手引きを渡すと、書き方の好みが事実の指摘に混ざりうる)
-REVIEW_PROMPT_VERSION = "dig-review-v001"  # 別系統の AI のレビュー(GH#153)
+# 別系統の AI のレビュー(GH#153)。v002 は引用の一言を指摘しないものに足した(GH#394)
+REVIEW_PROMPT_VERSION = "dig-review-v002"
 REVISE_PROMPT_VERSION = "dig-revise-v002"  # 指摘を受けて書き手が 1 回直す
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -166,11 +168,28 @@ _OVERSIZED_BOUNDARIES = (
 # 対訳の effort は low 固定(翻訳は推論負荷が低く、時間コストだけが増える)
 _TRANSLATE_EFFORT = "low"
 
-# カード各欄の上限(合計が Telegram 4096 字を構造的に超えないための予算)
+# カード各欄の上限(合計が Telegram 4096 字を構造的に超えないための予算)。引用(GH#394)の分は
+# 2 方面の欄から回した(2026-11 の実物のカードは最大 613 字で、欄の上限は異常な出力を切る安全網)
 _CARD_TITLE_MAX = 200
 _CARD_STANCE_MAX = 300
-_CARD_FOR_YOU_MAX = 1500
-_CARD_FOR_WORLD_MAX = 1200
+_CARD_FOR_YOU_MAX = 1000
+_CARD_FOR_WORLD_MAX = 800
+_CARD_QUOTE_MAX = 200
+_CARD_QUOTE_WHY_MAX = 100
+
+# 原文からの引用(GH#394)。数の上限と、照合を通す長さの下限(短すぎる写しは、どの本文にも
+# 含まれやすく、本文にある文の確かめにならない。空白を除いた字数)
+QUOTES_MAX = 3
+_TWEET_QUOTES_MAX = 1  # X の投稿は必要最小限の抜粋だけ(本文非保持 = GH#2)
+_QUOTE_MIN_CHARS = 10
+_NOTE_QUOTE_MAX = 400  # ノートに出す 1 件の上限(LLM 出力を有界に保つ)
+_NOTE_QUOTE_WHY_MAX = 200
+# 写しの照合で同じ字とみなす引用符(LLM が写すときに曲がった引用符を直線に変えることがある)
+_QUOTE_MATCH_TRANSLATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+# ノートの `## 原文から` を前に置く見出し(先に見つかったもの。プロンプトの節の構成の 4 と 7)
+_NOTE_QUOTES_BEFORE = (re.compile(r"^## 根拠の強さ", re.M), re.compile(r"^## ソース", re.M))
+# 写しの外側に LLM が付けがちな括弧(カードとノートは blockquote で引用を示すので外す)
+_QUOTE_OUTER_MARKS = "\"'“”‘’「」『』"
 
 # レビューの指摘の上限件数と、ノート・カードに出す各欄の上限(LLM 出力を有界に保つ)
 REVIEW_MAX_FINDINGS = 8
@@ -215,14 +234,28 @@ class DigError(Exception):
         self.material_requests: tuple[DigCandidate, ...] = tuple(material_requests)
 
 
+class DigQuote(BaseModel):
+    """原文からの引用 1 件(GH#394)。
+
+    欄の形だけを決め、中身の確かめ(本文にあるか・数・長さ)は _verified_quotes が行う。1 件の
+    不備で解説のドラフト全体を捨てない(引用は上乗せ)ため、空の値もここでは通す。
+    """
+
+    original: str  # 本文の文を一字一句そのまま(本文にあるかを確かめる用)
+    ja: str  # 日本語以外の元記事のときの和訳(カードとノートにはこれだけを載せる)。日本語なら空
+    why: str  # なぜ気になるか・何の役に立つかの一言
+
+
 class DigDraft(BaseModel):
-    """解説ノート + カードの構造化出力(prompts/dig-v002.md)。"""
+    """解説ノート + カードの構造化出力(prompts/dig-v003.md)。"""
 
     title_ja: str = Field(min_length=1, max_length=_CARD_TITLE_MAX)
     writer_stance: str = Field(min_length=1)
     for_you: str = Field(min_length=1)
     for_world: str = Field(min_length=1)
     note_markdown: str = Field(min_length=1)
+    # 欄が無い出力も通す(引用は 0 個でよい。直しの出力が欄ごと落としても、ドラフトは捨てない)
+    quotes: list[DigQuote] = Field(default_factory=list)
 
 
 class TranslationChunk(BaseModel):
@@ -878,6 +911,8 @@ def _dig_one(
             )
 
     draft, draft_engine = _generate_draft(config, engine_factory, candidate, source_note_name)
+    # 引用は本文と照合してから査読に渡す(外す引用を査読させない。GH#394)
+    draft = _verified_quotes(config, candidate, draft, logger, run_id)
     review: ReviewOutcome | None = None
     if review_engine_factory is not None:
         draft, review = _review_and_revise(
@@ -892,6 +927,8 @@ def _dig_one(
             logger,
             run_id,
         )
+        # 直した版は引用も出し直すので、もう一度照合する(直さなかった版には何もしない)
+        draft = _verified_quotes(config, candidate, draft, logger, run_id)
     note_body = _explainer_note(candidate, draft, source_note_name, review)
     card_text = _card_text(config, candidate, draft, note_name, source_note_name, review)
     review_findings = None
@@ -1399,6 +1436,21 @@ def build_dig_prompt(
         )
     else:
         quote_policy = "引用は必要な範囲で可(出典を明示)。"
+    # 原文からの引用(quotes)の規則(GH#394)。数と長さの上限は _verified_quotes でも守らせる
+    if _is_tweet_url(candidate.canonical_url):
+        quote_limit = (
+            f"この本文は X ポストなので、選ぶのは {_TWEET_QUOTES_MAX} 個まで、ポストの一部の"
+            "短い抜粋だけにする(全文や大半を写さない)。"
+        )
+    else:
+        quote_limit = ""
+    if _is_japanese_source(candidate):
+        quote_ja_rule = "元記事は日本語なので、空文字にする(original をそのまま載せる)。"
+    else:
+        quote_ja_rule = (
+            "original の日本語訳。カードとノートには和訳だけを載せるので、原文を読まなくても"
+            "意味が通る自然な日本語にする。訳に推測を足さない。"
+        )
 
     return fill_template(
         template,
@@ -1410,6 +1462,8 @@ def build_dig_prompt(
             "body": body,
             "source_note_link": source_note_link,
             "quote_policy": quote_policy,
+            "quote_limit": quote_limit,
+            "quote_ja_rule": quote_ja_rule,
             "schema": json.dumps(DigDraft.model_json_schema(), ensure_ascii=False),
             "nonce": nonce,
         },
@@ -1431,6 +1485,75 @@ def _prompt_body(config: Config, candidate: DigCandidate, nonce: str) -> str:
     if len(body) > config.dig.body_max_chars:
         body = body[: config.dig.body_max_chars] + "\n(…以降は長さ上限で切り詰め)"
     return body
+
+
+# --- 原文からの引用(GH#394) ---
+
+
+def _verified_quotes(
+    config: Config,
+    candidate: DigCandidate,
+    draft: DigDraft,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> DigDraft:
+    """ドラフトの引用を、本文にあるものだけに絞る(LLM が作った文を引用として載せない)。
+
+    照合の相手は LLM に渡した本文と同じ範囲(_prompt_body と同じ除去と切り詰め。切り詰めの注記は
+    含めない)。空白の有無・全角と半角・曲がった引用符の違いは同じとみなす(_quote_match_key)。
+    外すのは、本文に無い・短すぎる・同じ写しの繰り返し・一言が空・日本語以外で和訳が空の引用。
+    X の投稿は 1 個までにし、ポストの半分を超える写しは外す(全文の再掲をしない = GH#2)。
+    日本語の元記事では ja を空にそろえる(載せるのは原文。_quote_text)。
+    """
+    if not draft.quotes:
+        return draft
+    # nonce は本文に現れない使い捨ての値。除去の結果は LLM に渡した本文と同じになる
+    material = sanitize_body(candidate.body or "", secrets.token_hex(4))
+    haystack = _quote_match_key(material[: config.dig.body_max_chars])
+    is_tweet = _is_tweet_url(candidate.canonical_url)
+    japanese = _is_japanese_source(candidate)
+    limit = _TWEET_QUOTES_MAX if is_tweet else QUOTES_MAX
+    kept: list[DigQuote] = []
+    seen: set[str] = set()
+    for quote in draft.quotes:
+        original = quote.original.strip().strip(_QUOTE_OUTER_MARKS).strip()
+        key = _quote_match_key(original)
+        ja = "" if japanese else quote.ja.strip()
+        if (
+            len(key) < _QUOTE_MIN_CHARS
+            or key not in haystack
+            or key in seen
+            or (is_tweet and len(key) * 2 > len(haystack))
+            or not quote.why.strip()
+            or (not japanese and not ja)
+        ):
+            continue
+        seen.add(key)
+        kept.append(DigQuote(original=original, ja=ja, why=quote.why.strip()))
+        if len(kept) == limit:
+            break
+    if len(kept) < len(draft.quotes):
+        logger.info(
+            f"引用 {len(draft.quotes)} 件のうち {len(kept)} 件を載せる"
+            f"(本文に無い・上限を超えたなどを外した) item={candidate.item_id}",
+            extra={"run_id": run_id, "stage": "dig", "item_id": candidate.item_id},
+        )
+    return draft.model_copy(update={"quotes": kept})
+
+
+def _quote_match_key(text: str) -> str:
+    """写しの照合に使う形。全角と半角(NFKC)と引用符の曲がりをそろえ、空白をすべて除く。
+
+    空白を除くのは、本文の折り返しの改行や、写すときに入る・消える空白で本物の引用を外さない
+    ため(除いても、写しの字の並びが本文に続けて現れることは確かめられる)。
+    """
+    normalized = unicodedata.normalize("NFKC", text).translate(_QUOTE_MATCH_TRANSLATION)
+    return "".join(normalized.split())
+
+
+def _quote_text(quote: DigQuote) -> str:
+    """カードとノートに載せる文。日本語以外の元記事は和訳だけ(GH#394 で本人が決めた)。"""
+    return quote.ja or quote.original
 
 
 # --- 別系統の AI のレビュー(GH#153 / 設計 06 §4) ---
@@ -1571,6 +1694,7 @@ def build_review_prompt(config: Config, candidate: DigCandidate, draft: DigDraft
         f"- 書き手: {draft.writer_stance}\n"
         f"- あなたにとって: {draft.for_you}\n"
         f"- 世の中にとって: {draft.for_world}\n\n"
+        f"{_review_quotes(draft)}"
         "## 解説ノート\n"
         f"{draft.note_markdown}"
     )
@@ -1585,6 +1709,20 @@ def build_review_prompt(config: Config, candidate: DigCandidate, draft: DigDraft
             "nonce": nonce,
         },
     )
+
+
+def _review_quotes(draft: DigDraft) -> str:
+    """査読に渡す引用(GH#394)。カードとノートの両方に載るので 1 つの節にまとめる。
+
+    和訳のあるものは原文も添える(載せるのは和訳だけだが、誤訳を元記事と照らして見つけるため)。
+    """
+    if not draft.quotes:
+        return ""
+    lines = ["## 原文から(概要カードと解説ノートの両方に載る)"]
+    for index, quote in enumerate(draft.quotes, start=1):
+        shown = f"和訳: {quote.ja} / 原文: {quote.original}" if quote.ja else quote.original
+        lines.append(f"{index}. {shown} / 一言: {quote.why}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _revise_draft(
@@ -1850,13 +1988,33 @@ def _explainer_note(
         frontmatter["previous"] = f"[[{candidate.previous_note_name}]]"
     if review is not None:
         frontmatter["review"] = review.status  # 別 AI のレビューの結果(GH#153)
-    body = draft.note_markdown.strip()
+    body = _with_quotes_section(draft.note_markdown.strip(), draft)
     review_block = f"\n\n{_review_callout(review)}" if review is not None else "\n"
     # LLM の本文とレビューの指摘は untrusted。本文の側をまとめて直す(GH#377。テンプレートの
     # 部分は直す対象の形を含まないので変わらない)
     return render_frontmatter(frontmatter) + neutralize_markdown(
         "\n" + body + review_block + "\n---\n\n(この下は手書きメモ・take 領域)\n"
     )
+
+
+def _with_quotes_section(note: str, draft: DigDraft) -> str:
+    """解説ノートに `## 原文から` の節を入れる(GH#394)。置くのは骨子の後(根拠の強さの前)。
+
+    LLM の見出しが構成どおりでないときは、ソースの節の前、それも無ければ末尾に置く(節が
+    見つからないだけで引用を落とさない)。
+    """
+    if not draft.quotes:
+        return note
+    parts = ["## 原文から"]
+    for quote in draft.quotes:
+        text = _one_line(_quote_text(quote), _NOTE_QUOTE_MAX)
+        parts.append(f"> {text}\n\n→ {_one_line(quote.why, _NOTE_QUOTE_WHY_MAX)}")
+    section = "\n\n".join(parts)
+    for heading in _NOTE_QUOTES_BEFORE:
+        match = heading.search(note)
+        if match is not None:
+            return f"{note[: match.start()]}{section}\n\n{note[match.start() :]}"
+    return f"{note}\n\n{section}"
 
 
 def _source_note_ja(candidate: DigCandidate, explainer_note_name: str) -> str:
@@ -1914,7 +2072,7 @@ def _card_text(
     source_note_name: str | None,
     review: ReviewOutcome | None = None,
 ) -> str:
-    """概要カード v3(設計 06 §5.3)。1 通・分割しない。parse_mode=HTML 前提で escape。"""
+    """概要カード v4(設計 06 §5.3)。1 通・分割しない。parse_mode=HTML 前提で escape。"""
     title = escape_and_truncate(draft.title_ja, _CARD_TITLE_MAX)
     original = ""
     if candidate.title and candidate.title.strip() and candidate.title != draft.title_ja:
@@ -1954,9 +2112,23 @@ def _card_text(
         "世の中にとって\n"
         f"{escape_and_truncate(draft.for_world, _CARD_FOR_WORLD_MAX)}\n"
         "\n"
+        f"{_card_quotes(draft)}"
         f"{note_line}\n"
         f"{guide}"
     )
+
+
+def _card_quotes(draft: DigDraft) -> str:
+    """カードの「原文から」の欄(GH#394)。引用は Telegram の blockquote、一言はその下の 1 行。"""
+    if not draft.quotes:
+        return ""
+    lines = ["原文から"]
+    for quote in draft.quotes:
+        text = escape_and_truncate(" ".join(_quote_text(quote).split()), _CARD_QUOTE_MAX)
+        why = escape_and_truncate(" ".join(quote.why.split()), _CARD_QUOTE_WHY_MAX)
+        lines.append(f"<blockquote>{text}</blockquote>")
+        lines.append(f"→ {why}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _note_slug(candidate: DigCandidate) -> str:
