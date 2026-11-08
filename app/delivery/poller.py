@@ -58,6 +58,7 @@ from app.dig import (
     NowRequestOutcome,
     apply_instructions,
     dig_now_marked,
+    now_requests_ahead,
     parse_dig_reply,
     queue_item_ids,
     request_dig_now,
@@ -659,6 +660,25 @@ _NOW_ANSWERS: dict[NowRequestOutcome, str] = {
     "no_body": "⚠️ {item_id} は本文が無いため掘れません",
     "no_item": "⚠️ この番号の記事が見つかりません",
 }
+# 前に待っている依頼があるときの answer(GH#396)。今すぐの深掘りは 1 件ずつ順に作るので、後ろの
+# 依頼は前の件の分だけ待つ。前の件が無いときは _NOW_ANSWERS のまま
+_NOW_QUEUED_ANSWERS: dict[NowRequestOutcome, str] = {
+    "accepted": "⚡ {item_id} を受け付けました。前に {ahead} 件あり、順番に作ります"
+    "({minutes} 分ほどで届きます)",
+    "pending": "⚡ {item_id} は受け付け済みです(前に {ahead} 件。{minutes} 分ほどで届きます)",
+}
+# 届く目安の 1 件あたりの分。2026-11 の実測は 1 件 2〜4 分(下書き・別の AI のレビュー・直し)で、
+# その上側に置く(目安を短く言って待たせるより、早く届く方がよい)
+_NOW_MINUTES_PER_REQUEST = 4
+
+
+def _now_answer(outcome: NowRequestOutcome, item_id: int, ahead: int) -> str:
+    """今すぐのボタンの answer。前に待っている依頼があれば、その数と届く目安を添える(GH#396)。"""
+    queued = _NOW_QUEUED_ANSWERS.get(outcome)
+    if ahead > 0 and queued is not None:
+        minutes = (ahead + 1) * _NOW_MINUTES_PER_REQUEST
+        return queued.format(item_id=item_id, ahead=ahead, minutes=minutes)
+    return _NOW_ANSWERS[outcome].format(item_id=item_id)
 
 
 def _record_backlog_now(
@@ -765,6 +785,8 @@ def _accept_dig_now(
             outcome = request_dig_now(
                 conn, config, item_id, today, callback_id, from_backlog=from_backlog
             )
+            # 受け付けと同じトランザクションで数える(数えた後に前の件が増減しない)
+            ahead = now_requests_ahead(conn, item_id) if outcome in _NOW_QUEUED_ANSWERS else 0
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -780,7 +802,7 @@ def _accept_dig_now(
         logger.warning("item の無い今すぐのボタンを破棄", extra=log_extra)
     else:
         logger.info(f"今すぐのボタン: {outcome}", extra=log_extra)
-    api.answer_callback_query(callback_id, text=_NOW_ANSWERS[outcome].format(item_id=item_id))
+    api.answer_callback_query(callback_id, text=_now_answer(outcome, item_id, ahead))
     if outcome == "accepted" and dig_now_worker is not None:
         dig_now_worker.kick(logger)
     return True

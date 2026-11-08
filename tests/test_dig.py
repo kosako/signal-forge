@@ -19,6 +19,7 @@ from app.dig import (
     has_now_requests,
     has_unsent_cards,
     interrupted_now_requests,
+    now_requests_ahead,
     parse_dig_reply,
     queue_item_ids,
     request_dig_now,
@@ -282,6 +283,37 @@ def add_question_row(conn: sqlite3.Connection) -> int:
         "VALUES (?, '質問', 81)",
         (dig_id,),
     ).lastrowid
+
+
+def test_now_requests_ahead_follow_the_claim_order(conn, config) -> None:
+    # 前に待っている依頼の数は、作る順(claim_now_request)と同じ順で数える(GH#396)。受け付けた
+    # 時刻が先のもの、同じ秒なら行の id が先のもの、作っている途中のもの
+    items = [add_item_with_body(conn, f"https://a/{i}") for i in range(4)]
+    for item in items:
+        assert press_now(conn, config, item) == "accepted"
+    conn.execute(  # items[3] を最も早く受け付けたことにする(行の id は最後)
+        "UPDATE dig_queue SET now_requested_at = '2000-01-01T00:00:00Z' WHERE item_id = ?",
+        (items[3],),
+    )
+    conn.execute(
+        "UPDATE dig_queue SET now_requested_at = '2026-07-22T00:00:00Z' WHERE item_id != ?",
+        (items[3],),
+    )
+
+    assert [now_requests_ahead(conn, item) for item in items] == [1, 2, 3, 0]
+    # 作る順の先頭が作り始めても、待っている件の数は変わらない(作っている途中も前に数える)
+    claimed = claim_now_request(conn)
+    assert claimed is not None and claimed.item_id == items[3]
+    assert [now_requests_ahead(conn, item) for item in items] == [1, 2, 3, 0]
+    # 作っている途中に本人がパスしても、作り終えるまでは前に数える(パスは受け付けの印だけを消し、
+    # 作っている途中の印は残す)
+    apply_instructions(conn, [DigInstruction(items[3], "pass")])
+    assert queue_row(conn, items[3])["now_requested_at"] is None
+    assert [now_requests_ahead(conn, item) for item in items[:3]] == [1, 2, 3]
+    # 閉じた依頼は数えない
+    assert close_now_request(conn, items[3], claimed.now_started_at, to_morning=False)
+    assert [now_requests_ahead(conn, item) for item in items] == [0, 1, 2, 0]
+    assert now_requests_ahead(conn, add_item_with_body(conn, "https://a/none")) == 0
 
 
 def test_now_request_on_queued_row_only_marks_request(conn, config) -> None:

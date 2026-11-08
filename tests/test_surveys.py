@@ -2019,6 +2019,43 @@ def test_now_button_twice_answers_accepted_once(conn, tmp_path) -> None:
     assert worker.kicks == 1
 
 
+def test_now_button_answer_shows_requests_ahead(conn, tmp_path) -> None:
+    # 今すぐの深掘りは 1 件ずつ順に作る。続けて押した 2 件目以降は、前に待っている件数と
+    # 届く目安を答える(GH#396)。前の件が無いときは今までの答えのまま
+    silence_watchdog(conn)
+    items = [
+        add_queued_bookmark(conn, f"https://a/{i}", enqueued_at=f"2026-07-0{i}T00:00:00Z")
+        for i in (1, 2, 3)
+    ]
+    config = config_with_cap(tmp_path, 1)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    worker = FakeWorker()
+    first, second, third = items
+
+    presses = [first, second, third, third]
+    api = FakeApi([
+        [now_press(item, message_id, markup, update_id=index)]
+        for index, item in enumerate(presses, start=1)
+    ])
+    for _ in presses:
+        poll_once(conn, config, api, logger, dig_now_worker=worker)
+    conn.execute(  # 先頭を作り始めた(作っている途中も前の件に数える)
+        "UPDATE dig_queue SET now_started_at = '2026-07-22T00:00:00Z' WHERE item_id = ?",
+        (first,),
+    )
+    later = FakeApi([[now_press(second, message_id, markup, update_id=5)]])
+    poll_once(conn, config, later, logger, dig_now_worker=worker)
+
+    assert [text for _, text in api.answered + later.answered] == [
+        f"⚡ {first} を今すぐ掘ります。数分でカードが届きます",
+        f"⚡ {second} を受け付けました。前に 1 件あり、順番に作ります(8 分ほどで届きます)",
+        f"⚡ {third} を受け付けました。前に 2 件あり、順番に作ります(12 分ほどで届きます)",
+        f"⚡ {third} は受け付け済みです(前に 2 件。12 分ほどで届きます)",
+        f"⚡ {second} は受け付け済みです(前に 1 件。8 分ほどで届きます)",
+    ]
+    assert worker.kicks == 3  # 起動するのは受け付けたときだけ
+
+
 def test_skip_after_now_cancels_request(conn, tmp_path) -> None:
     silence_watchdog(conn)
     item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
