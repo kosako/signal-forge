@@ -3539,6 +3539,48 @@ def test_verified_quotes_keep_only_text_in_body(conn, config) -> None:
     assert deepdive._verified_quotes(config, candidate, verified, logger, None) == verified
 
 
+@pytest.mark.parametrize(
+    ("body", "original", "kept"),
+    [
+        # 英単語の間の空白は残す。語の区切りが変わる写しは通さない(Codex 🔴)
+        ("The agent is now here. " + BODY, "The agent is nowhere.", False),
+        # 写しの両端が本文の英単語の途中にかかる一致は採らない(now が nowhere の頭)
+        ("The agent is nowhere to be found. " + BODY, "The agent is now", False),
+        # 和文の折り返しの改行は空白にしない(写しには改行が無い)
+        ("これは折り返された\n日本語の文です。" + BODY, "これは折り返された日本語の文です。", True),
+        ("Claude Code を\n使う手順です。" + BODY, "Claude Codeを使う手順です。", True),
+    ],
+)
+def test_verified_quotes_keep_word_boundaries(conn, config, body, original, kept) -> None:
+    candidate = candidate_for(conn, config, "https://blog.example/wb", body, "en")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == ([original] if kept else [])
+
+
+@pytest.mark.parametrize(
+    ("original", "shown"),
+    [
+        # 本文の字の「 を片側だけ削らない(写しのまま本文にあれば、そのまま載せる。Codex 🟡)
+        ("「検索」よりも推論を重視する。", "「検索」よりも推論を重視する。"),
+        # 写しのままで無いときだけ、全体を囲む 1 組を外す
+        ("『推論を重視する理由がここにある。』", "推論を重視する理由がここにある。"),
+        (" 「 推論を重視する理由がここにある。 」 ", "推論を重視する理由がここにある。"),
+    ],
+)
+def test_verified_quotes_unwrap_only_a_whole_pair(conn, config, original, shown) -> None:
+    body = "「検索」よりも推論を重視する。推論を重視する理由がここにある。" + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/pair", body, "ja")
+    draft = draft_with([quote(original)])
+
+    verified = deepdive._verified_quotes(config, candidate, draft, logger, None)
+
+    assert [q.original for q in verified.quotes] == [shown]
+    assert deepdive._verified_quotes(config, candidate, verified, logger, None) == verified
+
+
 def test_verified_quotes_cap_and_japanese_source_drops_translation(conn, config) -> None:
     body = "".join(f"これは{i}番目の大事な文です。" for i in range(5)) + BODY
     candidate = candidate_for(conn, config, "https://blog.example/ja", body, "ja")
@@ -3605,25 +3647,26 @@ def test_card_quotes_show_translation_only_and_are_escaped(conn, config) -> None
     assert "原文から" not in deepdive._card_text(config, candidate, draft_with([]), "note", None)
 
 
-def test_card_with_every_field_at_its_limit_fits_one_message(conn, config) -> None:
+@pytest.mark.parametrize("unit", ["あ", "😀"])  # 😀 は Telegram の数え方(UTF-16)で 2 字
+def test_card_with_every_field_at_its_limit_fits_one_message(conn, config, unit) -> None:
     # 引用 3 個と、どの欄も上限まで伸びた出力でも、カードは Telegram の 1 通に収まる
-    item = add_item(conn, "https://blog.example/w", title="T" * 500)
-    enqueue(conn, item, angle="観" * 600)
+    item = add_item(conn, "https://blog.example/w", title=unit * 500)
+    enqueue(conn, item, angle=unit * 600)
     (candidate,), _ = _select_candidates(conn, config, 1, "2026-07-22")
     draft = DigDraft(
-        title_ja="見" * deepdive._CARD_TITLE_MAX,
-        writer_stance="書" * 1000,
-        for_you="あ" * 5000,
-        for_world="世" * 5000,
+        title_ja=unit * deepdive._CARD_TITLE_MAX,
+        writer_stance=unit * 1000,
+        for_you=unit * 5000,
+        for_world=unit * 5000,
         note_markdown="n",
-        quotes=[quote("o", ja="訳" * 1000, why="理" * 1000)] * deepdive.QUOTES_MAX,
+        quotes=[quote("o", ja=unit * 1000, why=unit * 1000)] * deepdive.QUOTES_MAX,
     )
     review = deepdive.ReviewOutcome(
         "revised", "claude-opus-5-5", (finding(),) * REVIEW_MAX_FINDINGS
     )
 
     card = deepdive._card_text(
-        config, candidate, draft, "20260722-1-" + "名" * 40 + "-深掘り", "対訳-x", review
+        config, candidate, draft, "20260722-1-" + unit * 40 + "-深掘り", "対訳-x", review
     )
 
     assert card.count("<blockquote>") == deepdive.QUOTES_MAX
@@ -3654,6 +3697,28 @@ def test_note_quotes_section_goes_after_the_outline(conn, config, note, after, b
     if before is not None:
         assert text.index(section) < text.index(before)
     assert "## 原文から" not in deepdive._explainer_note(candidate, draft_with([], note), None)
+
+
+def test_note_quotes_show_markdown_syntax_as_text(conn, config) -> None:
+    # 原文の写しの記法は、埋め込み・コメント・強調として解釈させず、文字として見せる(Codex 🔴)
+    body = "読む前に ![[別ノート]] と %%隠す%% と **強調** を含む文がある。" + BODY
+    candidate = candidate_for(conn, config, "https://blog.example/md", body, "ja")
+    draft = deepdive._verified_quotes(
+        config,
+        candidate,
+        draft_with([quote("読む前に ![[別ノート]] と %%隠す%% と **強調** を含む文がある。",
+                          why="[[一言]] の <b>記法</b>")]),
+        logger,
+        None,
+    )
+
+    text = deepdive._explainer_note(candidate, draft, None)
+
+    section = text[text.index("## 原文から") : text.index("## 根拠の強さ")]
+    assert "\\!\\[\\[別ノート\\]\\]" in section and "\\%\\%隠す\\%\\%" in section
+    assert "\\*\\*強調\\*\\*" in section and "\\[\\[一言\\]\\]" in section
+    for syntax in ("![[", "%%", "**", "[[", "<b>"):
+        assert syntax not in section
 
 
 @pytest.mark.parametrize(

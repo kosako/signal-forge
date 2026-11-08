@@ -435,19 +435,26 @@ def escape_and_truncate(raw: str, budget: int) -> str:
 
     エスケープ済み文字列の任意位置 slice は HTML entity(&amp; 等)を分断し、
     Telegram の parse_mode=HTML が 400 を返しうるため、raw 1文字単位で積む。
+    長さは Telegram と同じ UTF-16 の code unit で数える(絵文字などは 1 字で 2。GH#394。
+    文字数で数えると、上限の予算を組んだ本文でも 4096 の上限を超えうる)。
     """
     escaped = escape_text(raw)
-    if len(escaped) <= budget:
+    if _utf16_len(escaped) <= budget:
         return escaped
     parts: list[str] = []
     used = 0
     for char in raw:
         piece = escape_text(char)
-        if used + len(piece) > budget - 1:  # 「…」1文字分を確保
+        if used + _utf16_len(piece) > budget - 1:  # 「…」1文字分を確保
             break
         parts.append(piece)
-        used += len(piece)
+        used += _utf16_len(piece)
     return "".join(parts) + "…"
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram が数える長さ(UTF-16 の code unit 数)。"""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 _TAG_RE = re.compile(r"<[^>]*>")
@@ -460,8 +467,7 @@ def visible_length(html_text: str) -> int:
     本モジュールが組み立てる本文(escape_text・escape_attr を通した値と固定のタグ)が前提。
     属性値の < > は escape 済みなので、タグの範囲を > で閉じてよい。
     """
-    visible = html.unescape(_TAG_RE.sub("", html_text))
-    return len(visible.encode("utf-16-le", "surrogatepass")) // 2
+    return _utf16_len(html.unescape(_TAG_RE.sub("", html_text)))
 
 
 def pack_lines(

@@ -178,7 +178,7 @@ _CARD_QUOTE_MAX = 200
 _CARD_QUOTE_WHY_MAX = 100
 
 # 原文からの引用(GH#394)。数の上限と、照合を通す長さの下限(短すぎる写しは、どの本文にも
-# 含まれやすく、本文にある文の確かめにならない。空白を除いた字数)
+# 含まれやすく、本文にある文の確かめにならない。照合の形の、空白を除いた字数)
 QUOTES_MAX = 3
 _TWEET_QUOTES_MAX = 1  # X の投稿は必要最小限の抜粋だけ(本文非保持 = GH#2)
 _QUOTE_MIN_CHARS = 10
@@ -188,8 +188,16 @@ _NOTE_QUOTE_WHY_MAX = 200
 _QUOTE_MATCH_TRANSLATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
 # ノートの `## 原文から` を前に置く見出し(先に見つかったもの。プロンプトの節の構成の 4 と 7)
 _NOTE_QUOTES_BEFORE = (re.compile(r"^## 根拠の強さ", re.M), re.compile(r"^## ソース", re.M))
-# 写しの外側に LLM が付けがちな括弧(カードとノートは blockquote で引用を示すので外す)
-_QUOTE_OUTER_MARKS = "\"'“”‘’「」『』"
+# CommonMark が backslash で escape できる ASCII の記号(!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~)
+_MARKDOWN_PUNCTUATION = re.compile(r"([!-/:-@\[-`{-~])")
+# 写しの全体を囲む引用符の組(LLM が付けがちな括弧。写しのままで本文に無いときだけ 1 組を外して
+# 照合し直す。片側だけを外すと「検索」よりも… の「 のように、本文の字を削った形で載る)
+_QUOTE_WRAPPERS = (("「", "」"), ("『", "』"), ("“", "”"), ("‘", "’"), ('"', '"'), ("'", "'"))
+# 照合の形で空白を外す、日本語の字の隣(和文の折り返しの改行が空白になったもの)。英単語の間の
+# 空白は残す(外すと now here と nowhere のように、意味の違う文が一致する)
+_CJK_CHAR = r"[\u3000-\u303f\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]"
+_CJK_CHAR_RE = re.compile(_CJK_CHAR)
+_SPACE_NEXT_TO_CJK = re.compile(rf"(?<={_CJK_CHAR}) | (?={_CJK_CHAR})")
 
 # レビューの指摘の上限件数と、ノート・カードに出す各欄の上限(LLM 出力を有界に保つ)
 REVIEW_MAX_FINDINGS = 8
@@ -1501,6 +1509,7 @@ def _verified_quotes(
 
     照合の相手は LLM に渡した本文と同じ範囲(_prompt_body と同じ除去と切り詰め。切り詰めの注記は
     含めない)。空白の有無・全角と半角・曲がった引用符の違いは同じとみなす(_quote_match_key)。
+    写しのままで本文に無ければ、全体を囲む引用符の 1 組だけを外して試す(_matched_original)。
     外すのは、本文に無い・短すぎる・同じ写しの繰り返し・一言が空・日本語以外で和訳が空の引用。
     X の投稿は 1 個までにし、ポストの半分を超える写しは外す(全文の再掲をしない = GH#2)。
     日本語の元記事では ja を空にそろえる(載せるのは原文。_quote_text)。
@@ -1516,17 +1525,12 @@ def _verified_quotes(
     kept: list[DigQuote] = []
     seen: set[str] = set()
     for quote in draft.quotes:
-        original = quote.original.strip().strip(_QUOTE_OUTER_MARKS).strip()
-        key = _quote_match_key(original)
+        matched = _matched_original(quote.original, haystack)
         ja = "" if japanese else quote.ja.strip()
-        if (
-            len(key) < _QUOTE_MIN_CHARS
-            or key not in haystack
-            or key in seen
-            or (is_tweet and len(key) * 2 > len(haystack))
-            or not quote.why.strip()
-            or (not japanese and not ja)
-        ):
+        if matched is None or not quote.why.strip() or (not japanese and not ja):
+            continue
+        original, key = matched
+        if key in seen or (is_tweet and len(key) * 2 > len(haystack)):
             continue
         seen.add(key)
         kept.append(DigQuote(original=original, ja=ja, why=quote.why.strip()))
@@ -1541,14 +1545,51 @@ def _verified_quotes(
     return draft.model_copy(update={"quotes": kept})
 
 
-def _quote_match_key(text: str) -> str:
-    """写しの照合に使う形。全角と半角(NFKC)と引用符の曲がりをそろえ、空白をすべて除く。
+def _matched_original(original: str, haystack: str) -> tuple[str, str] | None:
+    """本文にある写しの形と、その照合の形。本文に無ければ None。
 
-    空白を除くのは、本文の折り返しの改行や、写すときに入る・消える空白で本物の引用を外さない
-    ため(除いても、写しの字の並びが本文に続けて現れることは確かめられる)。
+    まず写しのまま照合し、無ければ全体を囲む引用符の 1 組だけを外して試す(本文の字は削らない)。
+    写しの両端が英単語の途中にかかる一致は採らない(_at_word_boundary)。
+    """
+    text = original.strip()
+    candidates = [text]
+    for opening, closing in _QUOTE_WRAPPERS:
+        if len(text) > 2 and text.startswith(opening) and text.endswith(closing):
+            candidates.append(text[len(opening) : -len(closing)].strip())
+            break
+    for candidate in candidates:
+        key = _quote_match_key(candidate)
+        if len(key.replace(" ", "")) >= _QUOTE_MIN_CHARS and _at_word_boundary(haystack, key):
+            return candidate, key
+    return None
+
+
+def _quote_match_key(text: str) -> str:
+    """写しの照合に使う形。全角と半角(NFKC)と引用符の曲がりをそろえ、空白を 1 つにまとめる。
+
+    日本語の字の隣の空白は外す(本文の折り返しの改行や、写すときに入る・消える空白で、本物の
+    引用を外さないため)。英単語の間の空白は残す(語の区切りが変わる一致を通さないため)。
     """
     normalized = unicodedata.normalize("NFKC", text).translate(_QUOTE_MATCH_TRANSLATION)
-    return "".join(normalized.split())
+    return _SPACE_NEXT_TO_CJK.sub("", " ".join(normalized.split()))
+
+
+def _at_word_boundary(haystack: str, needle: str) -> bool:
+    """needle が haystack に、両端で英単語を切らずに現れるか(now が nowhere の頭に一致しない)。"""
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        before = haystack[start - 1] if start > 0 else ""
+        after = haystack[end] if end < len(haystack) else ""
+        if not (_in_one_word(before, needle[0]) or _in_one_word(needle[-1], after)):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _in_one_word(left: str, right: str) -> bool:
+    """隣り合う 2 字(端なら空)が、1 つの英単語の中で続いているか(日本語の字は語の境目を見ない)。"""
+    return all(ch.isalnum() and _CJK_CHAR_RE.match(ch) is None for ch in (left, right))
 
 
 def _quote_text(quote: DigQuote) -> str:
@@ -2001,20 +2042,32 @@ def _with_quotes_section(note: str, draft: DigDraft) -> str:
     """解説ノートに `## 原文から` の節を入れる(GH#394)。置くのは骨子の後(根拠の強さの前)。
 
     LLM の見出しが構成どおりでないときは、ソースの節の前、それも無ければ末尾に置く(節が
-    見つからないだけで引用を落とさない)。
+    見つからないだけで引用を落とさない)。引用と一言は記号ごと文字として見せる(_markdown_literal)。
     """
     if not draft.quotes:
         return note
     parts = ["## 原文から"]
     for quote in draft.quotes:
-        text = _one_line(_quote_text(quote), _NOTE_QUOTE_MAX)
-        parts.append(f"> {text}\n\n→ {_one_line(quote.why, _NOTE_QUOTE_WHY_MAX)}")
+        text = _markdown_literal(_one_line(_quote_text(quote), _NOTE_QUOTE_MAX))
+        why = _markdown_literal(_one_line(quote.why, _NOTE_QUOTE_WHY_MAX))
+        parts.append(f"> {text}\n\n→ {why}")
     section = "\n\n".join(parts)
     for heading in _NOTE_QUOTES_BEFORE:
         match = heading.search(note)
         if match is not None:
             return f"{note[: match.start()]}{section}\n\n{note[match.start() :]}"
     return f"{note}\n\n{section}"
+
+
+def _markdown_literal(text: str) -> str:
+    """ASCII の記号をすべて backslash で escape し、Markdown と Obsidian の記法として読ませない。
+
+    引用は原文の写しなので、原文の `![[…]]`(埋め込み)・`%%…%%`(コメント)・強調・リンクなどを
+    そのまま文字として見せる(GH#394)。neutralize_markdown は外への読み込みを止めるだけで、
+    記法を文字にはしない。backslash で escape した ASCII の記号は、その字として表示される
+    (CommonMark)。
+    """
+    return _MARKDOWN_PUNCTUATION.sub(r"\\\1", text)
 
 
 def _source_note_ja(candidate: DigCandidate, explainer_note_name: str) -> str:
