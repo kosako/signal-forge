@@ -1,0 +1,45 @@
+# PR と main への push で、pytest と ruff を回す(GH#391)。
+# secret は使わない。テストは本物の codex・Telegram・X・Claude API を呼ばない(tests/conftest.py と各テストの偽物)。
+# 本番は macOS の launchd で動くが、テストは OS に依らないので ubuntu の runner で回す。
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# PR は同じ branch の古い run を止める。main への push は merge ごとの結果を残すので止めない。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # job の名前(check の名前)は .github/repo-baseline.json の required_checks が指す。変えたら一覧も合わせる。
+  test:
+    runs-on: ubuntu-24.04
+    # 手元のテストは約 30 秒(2026-11 実測)。止まらなくなった job が既定の 360 分を使い切らないための上限。
+    timeout-minutes: 15
+    steps:
+      # 外部の action は full commit SHA で pin する(tag の付け替え対策)。更新は Dependabot が出す。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 後続の step は git の認証を使わない。依存の install やテストから token を読めないようにする。
+          persist-credentials: false
+
+      # Python は .python-version(3.12)を uv が入れる。uv の版は固定し、新しい版を CI で先に使わない。
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.12.21"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q
