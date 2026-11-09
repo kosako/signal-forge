@@ -11,7 +11,8 @@
   followup_dig = yes は「深掘りした」の記録なので、🔖 の付いたアイテムでは KPI 06(フェーズ2
   境界の実施率)の分子に入る(🔖 の無いアイテムは KPI 06 が数えない)
 - 返事を送れた行だけを記録する(返事が届く前に未消化一覧から消さない)
-- 深掘りカードの ✅ 読んだ(GH#398)も、同じ followup_dig を記録する(mark_read。take は要らない)
+- 深掘りカードの ✅ 読んだ(GH#398)と、週 1 回の読んだのまとめ確認(GH#399)も、同じ followup_dig を
+  記録する(mark_read。take は要らない)
 - 公開済みのノートは本人のもの(Obsidian で開いて編集していることもある)なので、**追記だけ**を
   行い、書き換えない。末尾への追記(O_APPEND)は今ある中身に触れないので、本人の編集を消す
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
@@ -35,6 +36,7 @@ import logging
 import os
 import sqlite3
 import stat
+from collections.abc import Iterable
 
 from app.config import Config
 from app.vault_dir import VaultPathError, folder_dir
@@ -237,11 +239,20 @@ def mark_read(conn: sqlite3.Connection, item_id: int, read: bool, day: str) -> b
     取り消しは読んだの後だけにする。signal_date は take と同じ規則で、🔖 が無ければ day
     (押した日の JST)。呼び出し側のトランザクションの中で呼ぶ(最新の確認と記録を 1 つにする)。
     """
-    latest = _latest_followup(conn, item_id)
-    if read == (latest is not None and latest["value"] == "yes"):
+    if read == _is_read(conn, item_id):
         return False
     _insert_followup(conn, item_id, "yes" if read else "no", day)
     return True
+
+
+def read_items(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
+    """item のうち、最新の followup_dig が yes のもの(読んだにしてある。GH#399)。読むだけ。"""
+    return {item_id for item_id in dict.fromkeys(item_ids) if _is_read(conn, item_id)}
+
+
+def _is_read(conn: sqlite3.Connection, item_id: int) -> bool:
+    latest = _latest_followup(conn, item_id)
+    return latest is not None and latest["value"] == "yes"
 
 
 def _latest_followup(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:

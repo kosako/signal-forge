@@ -1,4 +1,5 @@
-"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知(設計 04 §4 / 05 §1.2, §4)。
+"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認
+(設計 04 §4 / 05 §1.2, §4)。
 
 - 起動は受信デーモン(intel poll)の内蔵タイマー(送信経路をポーラーに集約)。
   時刻は config([telegram].survey_time / watchdog_time。JST)
@@ -10,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Collection, Mapping, Sequence
@@ -36,6 +38,7 @@ STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
 STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
 STATE_SOURCE_REPORT_SENT = "source_report_sent_date"
+STATE_READ_CONFIRM_SENT = "read_confirm_sent_date"
 
 READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
 
@@ -70,6 +73,13 @@ DIG_STATE_MARKS: dict[DigState, str] = {
 # 失敗し、watchdog が届かない。GH#124 でソースの行が可変長になった)
 WATCHDOG_TEXT_MAX_CHARS = 4000
 SOURCE_REPORT_MAX_CHARS = 4000
+
+# 週 1 回の読んだのまとめ確認(GH#399。設計 04 §4・06 §2)。日曜の夜アンケート(未消化一覧)の後に
+# 1 通。載せる行は未消化一覧と同じく 15 件まで(行のボタン 15 個と全部のボタン 1 個)
+READ_CONFIRM_WEEKDAY = 6  # datetime.weekday() の日曜
+READ_CONFIRM_MAX_ITEMS = 15
+READ_CONFIRM_BUTTONS_PER_ROW = 3
+READ_CONFIRM_ALL_LABEL = "✅ 全部読んだにする"
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -159,7 +169,8 @@ def run_due_timers(
     logger: logging.Logger,
     now: datetime,
 ) -> None:
-    """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断)を実行する。
+    """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断と読んだのまとめ
+    確認)を実行する。
     poll ループから毎周期呼ぶ(失敗した後は受信と別に間を空けて試し直す。poller の
     TIMER_RETRY_S。GH#224)。
 
@@ -200,6 +211,15 @@ def run_due_timers(
         )
         set_state(conn, STATE_SOURCE_REPORT_SENT, today)
         logger.info("ソースの健康診断を送った", extra={"stage": "poll"})
+    # 週 1 回の読んだのまとめ確認(GH#399)。日曜の夜アンケート(未消化一覧)の後。日曜を逃したら
+    # その週は送らない。送れた後に state を立てる(健康診断と同じ。対象が無い週も立てる)
+    if (
+        now.weekday() == READ_CONFIRM_WEEKDAY
+        and _is_due(now, config.telegram.survey_time)
+        and get_state(conn, STATE_READ_CONFIRM_SENT) != today
+    ):
+        send_read_confirm(conn, config, api, logger, today)
+        set_state(conn, STATE_READ_CONFIRM_SENT, today)
 
 
 def send_evening_survey(
@@ -267,6 +287,84 @@ def send_evening_survey(
     )
     if backlog_failure is not None:
         raise backlog_failure
+
+
+def read_confirm_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """読んだのまとめ確認の対象(GH#399): 未消化(pending_dig_items)のうち、Telegram の感想
+    (item_notes。digest の記事や深掘りカードへのリプライ)がある item。並びは未消化一覧と同じ。"""
+    rows = pending_dig_items(conn)
+    if not rows:
+        return []
+    placeholders = ", ".join("?" for _ in rows)
+    noted = {
+        row["item_id"]
+        for row in conn.execute(
+            f"SELECT DISTINCT item_id FROM item_notes WHERE item_id IN ({placeholders})",
+            [row["item_id"] for row in rows],
+        )
+    }
+    return [row for row in rows if row["item_id"] in noted]
+
+
+def read_confirm_keyboard(item_ids: Sequence[int], read: Collection[int]) -> dict:
+    """読んだのまとめ確認の 1 通のボタン(GH#399)。行ごとの ✅ {id} と、最後の行に全部。
+
+    読んだにしてある item(read)の行は ✓ を付け、押すと取り消す(c:{id}:u)。押していない行は
+    読んだにする(c:{id}:r)。全部(c:0:a)は、載せた item のうち読んでいないものを読んだにする。
+    """
+    buttons = [
+        {"text": _mark(f"✅ {item_id}", item_id in read),
+         "callback_data": f"c:{item_id}:{'u' if item_id in read else 'r'}"}
+        for item_id in item_ids
+    ]
+    rows = [
+        buttons[i:i + READ_CONFIRM_BUTTONS_PER_ROW]
+        for i in range(0, len(buttons), READ_CONFIRM_BUTTONS_PER_ROW)
+    ]
+    all_read = bool(item_ids) and all(item_id in read for item_id in item_ids)
+    rows.append([{"text": _mark(READ_CONFIRM_ALL_LABEL, all_read), "callback_data": "c:0:a"}])
+    return {"inline_keyboard": rows}
+
+
+def _read_confirm_message(rows: Sequence[Mapping]) -> tuple[str, list[int]]:
+    """読んだのまとめ確認の本文と、載せた item の id(載せた順)。"""
+    shown = list(rows[:READ_CONFIRM_MAX_ITEMS])
+    lines = [
+        f"📝 感想を書いた未消化({len(rows)}件)",
+        "感想をリプライした記事です。読み終えたものは ✅ を押すと、未消化一覧から外れます",
+        "",
+        *(f"{row['item_id']}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}" for row in shown),
+    ]
+    if len(rows) > len(shown):
+        lines.append(f"(他 {len(rows) - len(shown)} 件は来週の確認に回します)")
+    return "\n".join(lines), [row["item_id"] for row in shown]
+
+
+def send_read_confirm(
+    conn: sqlite3.Connection, config: Config, api: TelegramApi, logger: logging.Logger, day: str
+) -> None:
+    """読んだのまとめ確認を 1 通送り、載せた item を台帳に記録する(GH#399)。対象が無ければ送らない。
+
+    台帳(read_confirm_messages)は、ボタンを受け付けるときの照合と盤面の作り直しに使う。
+    """
+    rows = read_confirm_items(conn)
+    if not rows:
+        logger.info("読んだのまとめ確認の対象なし(送らない)", extra={"stage": "poll"})
+        return
+    text, item_ids = _read_confirm_message(rows)
+    message_id = api.send_message(
+        _require_chat_id(config), text, reply_markup=read_confirm_keyboard(item_ids, ())
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO read_confirm_messages (message_id, sent_date, item_ids) "
+        "VALUES (?, ?, ?)",
+        (message_id, day, json.dumps(item_ids)),
+    )
+    conn.commit()
+    logger.info(
+        "読んだのまとめ確認を送った",
+        extra={"stage": "poll", "extra": {"items": len(item_ids), "candidates": len(rows)}},
+    )
 
 
 def _linked_title(row: Mapping, budget: int) -> str:
