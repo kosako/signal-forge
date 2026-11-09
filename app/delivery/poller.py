@@ -49,6 +49,7 @@ from app.delivery.surveys import (
 from app.delivery.telegram import (
     DeliveryError,
     TelegramApi,
+    dig_card_keyboard,
     escape_and_truncate,
     pack_lines,
     reaction_keyboard,
@@ -64,6 +65,7 @@ from app.dig import (
     request_dig_now,
 )
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
+from app.dig_take import mark_read
 from app.export.obsidian import note_projection_date
 from app.jst import JST
 from app.normalize import (
@@ -371,6 +373,12 @@ def _handle_callback(
                 now_fn(), answer_worker,
             )
             return
+        if prefix == "d" and arg.isdigit() and code in _DIG_READ_CODES:
+            _record_dig_read(
+                conn, config, api, callback, callback_id, int(arg), _DIG_READ_CODES[code],
+                logger, now_fn(),
+            )
+            return
         if prefix == "b" and arg.isdigit() and code == "p":
             _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
             return
@@ -509,15 +517,8 @@ def _record_dig_request(
     だけを信じない)。同じカードの同じボタンは 1 回だけ受け付ける(再配達・二重押し)。
     """
     request, accepted_text = _DIG_REQUESTS[code]
-    message = callback.get("message")
-    message_id = message.get("message_id") if isinstance(message, dict) else None
-    chat = message.get("chat") if isinstance(message, dict) else None
-    chat_id = chat.get("id") if isinstance(chat, dict) else None
-    card = conn.execute(
-        "SELECT item_id FROM dig_results WHERE id = ? AND message_id = ?",
-        (dig_result_id, message_id if type(message_id) is int else None),
-    ).fetchone()
-    if card is None or chat_id != config.telegram.owner_chat_id:
+    card = _pressed_dig_card(conn, config, callback, dig_result_id)
+    if card is None:
         logger.warning("カードと結び付かない深掘りのボタンを破棄", extra={"stage": "poll"})
         api.answer_callback_query(callback_id, text="⚠️ このカードには対応できません")
         return
@@ -559,6 +560,89 @@ def _record_dig_request(
     api.answer_callback_query(callback_id, text=accepted_text)
     if answer_worker is not None:
         answer_worker.kick(logger)
+
+
+def _pressed_dig_card(
+    conn: sqlite3.Connection, config: Config, callback: dict, dig_result_id: int
+) -> sqlite3.Row | None:
+    """押されたメッセージが、その深掘りカードとして owner の chat に送ったメッセージなら、その行。
+
+    callback_data だけを信じない(GH#141)。行は item_id と、盤面を作り直すための canonical_url。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    if chat_id != config.telegram.owner_chat_id:
+        return None
+    return conn.execute(
+        "SELECT r.item_id, i.canonical_url FROM dig_results r "
+        "JOIN items i ON i.id = r.item_id WHERE r.id = ? AND r.message_id = ?",
+        (dig_result_id, message_id if type(message_id) is int else None),
+    ).fetchone()
+
+
+# 深掘りカードの読んだのボタン(GH#398)の code → 読んだにするか(False = 取り消す)
+_DIG_READ_CODES = {"r": True, "u": False}
+# 読んだのボタンの answer。(読んだにするか, 書いたか) で決める
+_DIG_READ_ANSWERS = {
+    (True, True): "✅ 読んだにしました(未消化一覧から外れます)",
+    (True, False): "✅ 読んだにしてあります",
+    (False, True): "↩️ 読んだを取り消しました(未消化一覧に戻ります)",
+    (False, False): "↩️ 読んだにはしていません",
+}
+
+
+def _record_dig_read(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    dig_result_id: int,
+    read: bool,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """深掘りカードの ✅ 読んだ・↩️ 読んだを取り消す(GH#398)。followup_dig を記録する。
+
+    押されたメッセージがそのカードであることを確かめる(📝 要約・📖 詳しく と同じ)。最新の記録の
+    確認と記録は 1 つのトランザクションで行い(mark_read)、再配達・二重押しで同じ値を 2 回
+    書かない。盤面は押した後の状態のボタンに差し替える(読んだ ⇄ 取り消す)。
+    """
+    card = _pressed_dig_card(conn, config, callback, dig_result_id)
+    if card is None:
+        logger.warning("カードと結び付かない読んだのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ このカードには対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": card["item_id"], "extra": {"read": read}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            written = mark_read(
+                conn, card["item_id"], read, now.astimezone(JST).date().isoformat()
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(f"読んだのボタンを記録できなかった: {type(e).__name__}: {e}", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "読んだのボタンを記録した" if written else "読んだのボタン(記録済み。書かない)",
+        extra=log_extra,
+    )
+    api.answer_callback_query(callback_id, text=_DIG_READ_ANSWERS[(read, written)])
+    keyboard = dig_card_keyboard(
+        dig_result_id,
+        card["canonical_url"],
+        with_requests=config.dig.answer_daily_cap > 0,
+        read=read,
+    )
+    _edit_markup_best_effort(api, callback, keyboard, logger)
 
 
 # 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。

@@ -561,17 +561,21 @@ def reaction_keyboard(
 
 # 深掘りカードのボタン(GH#141。callback_data 形式の正本は設計 04 §3)
 _DIG_REQUEST_BUTTONS = (("📝 要約", "s"), ("📖 詳しく", "m"))
+# 2 行目の読んだのボタン(GH#398)。読んだにした後は、取り消すボタンに替える
+_DIG_READ_BUTTONS = {False: ("✅ 読んだ", "r"), True: ("↩️ 読んだを取り消す", "u")}
 _URL_BUTTON_MAX = 2048  # 送信が恒久失敗しないよう、変な長さの URL にはボタンを付けない
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+")
 
 
 def dig_card_keyboard(
-    dig_result_id: int, url: str | None, *, with_requests: bool
-) -> dict | None:
-    """深掘りカードのボタン: 🔗 元記事(URL ボタン)/ 📝 要約 / 📖 詳しく(GH#141)。
+    dig_result_id: int, url: str | None, *, with_requests: bool, read: bool = False
+) -> dict:
+    """深掘りカードのボタン。1 行目は 🔗 元記事(URL ボタン)/ 📝 要約 / 📖 詳しく(GH#141)。
 
     URL ボタンは http(s) の URL のときだけ付ける(不正な URL があると sendMessage 自体が
     400 になり、カードが届かなくなるため)。要約・詳しくは返事をする設定のときだけ付ける。
+    2 行目は ✅ 読んだ(GH#398)。read(読んだにしてある)なら ↩️ 読んだを取り消す に替える。
+    返事をしない設定でも付ける(読んだの記録は返事を作らない)。
     """
     row: list[dict] = []
     if _is_button_url(url):
@@ -581,7 +585,9 @@ def dig_card_keyboard(
             {"text": label, "callback_data": f"d:{dig_result_id}:{code}"}
             for label, code in _DIG_REQUEST_BUTTONS
         )
-    return {"inline_keyboard": [row]} if row else None
+    label, code = _DIG_READ_BUTTONS[read]
+    read_row = [{"text": label, "callback_data": f"d:{dig_result_id}:{code}"}]
+    return {"inline_keyboard": [row, read_row] if row else [read_row]}
 
 
 def _is_button_url(url: str | None) -> bool:

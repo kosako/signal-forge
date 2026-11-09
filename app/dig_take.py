@@ -11,6 +11,7 @@
   followup_dig = yes は「深掘りした」の記録なので、🔖 の付いたアイテムでは KPI 06(フェーズ2
   境界の実施率)の分子に入る(🔖 の無いアイテムは KPI 06 が数えない)
 - 返事を送れた行だけを記録する(返事が届く前に未消化一覧から消さない)
+- 深掘りカードの ✅ 読んだ(GH#398)も、同じ followup_dig を記録する(mark_read。take は要らない)
 - 公開済みのノートは本人のもの(Obsidian で開いて編集していることもある)なので、**追記だけ**を
   行い、書き換えない。末尾への追記(O_APPEND)は今ある中身に触れないので、本人の編集を消す
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
@@ -217,29 +218,56 @@ def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     先後は受付の時点の signals.id の最大(received_signal_id。migration 025)で見る(時刻は
     同じ秒の先後が分からない)。印の無い行(この経路の外で作った行)は従来どおり yes を足す
     """
-    latest = conn.execute(
-        """
-        SELECT id, value FROM signals
-        WHERE kind = 'followup_dig' AND item_id = ?
-        ORDER BY created_at DESC, id DESC LIMIT 1
-        """,
-        (row["item_id"],),
-    ).fetchone()
+    latest = _latest_followup(conn, row["item_id"])
     if latest is not None and latest["value"] == "yes":
         return
     mark = row["received_signal_id"]
     if latest is not None and mark is not None and latest["id"] > mark:
         return  # take の受付の後に本人が「いいえ」と答えた
+    _insert_followup(conn, row["item_id"], "yes", row["take_date"])
+
+
+def mark_read(conn: sqlite3.Connection, item_id: int, read: bool, day: str) -> bool:
+    """深掘りカードの ✅ 読んだ・↩️ 読んだを取り消す(GH#398)。書いたら True。
+
+    読んだ = followup_dig = yes。take と同じ「深掘りした」の記録で、未消化一覧から消え、🔖 の
+    付いたアイテムでは KPI 06 の分子に入る。取り消す = no で、一覧に戻る(追い掛けの「いいえ」と
+    同じ)。最新の記録が yes なら読んだを書かず、yes でなければ取り消しを書かない(再配達・
+    二重押し・古い盤面のボタン)。記録の無い 🔖 に no を書くと、その夜の追い掛けが来なくなるため、
+    取り消しは読んだの後だけにする。signal_date は take と同じ規則で、🔖 が無ければ day
+    (押した日の JST)。呼び出し側のトランザクションの中で呼ぶ(最新の確認と記録を 1 つにする)。
+    """
+    latest = _latest_followup(conn, item_id)
+    if read == (latest is not None and latest["value"] == "yes"):
+        return False
+    _insert_followup(conn, item_id, "yes" if read else "no", day)
+    return True
+
+
+def _latest_followup(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:
+    """item の最新の followup_dig(未消化一覧と KPI 06 と同じ順序)。"""
+    return conn.execute(
+        """
+        SELECT id, value FROM signals
+        WHERE kind = 'followup_dig' AND item_id = ?
+        ORDER BY created_at DESC, id DESC LIMIT 1
+        """,
+        (item_id,),
+    ).fetchone()
+
+
+def _insert_followup(conn: sqlite3.Connection, item_id: int, value: str, day: str) -> None:
+    """followup_dig を 1 行足す。signal_date は 🔖 の reaction と同じ配信日、無ければ day。"""
     dig = conn.execute(
         """
         SELECT signal_date FROM signals
         WHERE kind = 'reaction' AND item_id = ? AND value = 'dig'
         ORDER BY created_at DESC, id DESC LIMIT 1
         """,
-        (row["item_id"],),
+        (item_id,),
     ).fetchone()
     conn.execute(
         "INSERT INTO signals (kind, item_id, value, signal_date) "
-        "VALUES ('followup_dig', ?, 'yes', ?)",
-        (row["item_id"], dig["signal_date"] if dig is not None else row["take_date"]),
+        "VALUES ('followup_dig', ?, ?, ?)",
+        (item_id, value, dig["signal_date"] if dig is not None else day),
     )

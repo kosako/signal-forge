@@ -17,6 +17,7 @@ from app.delivery.poller import (
     RECONNECT_BACKOFF_S,
     TRANSIENT_RETRIES,
 )
+from app.delivery.surveys import pending_dig_items
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
 from app.export import export_pending_notes
 from app.jst import JST
@@ -1773,7 +1774,122 @@ def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
     buttons = keyboard["inline_keyboard"][0]
     assert ("url" in buttons[0]) is has_url_button
     assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:s", "d:5:m"]
-    assert dig_card_keyboard(5, None, with_requests=False) is None
+
+
+def test_dig_card_keyboard_has_read_row() -> None:
+    # GH#398: 2 行目は ✅ 読んだ。読んだにした後は取り消すボタン。返事をしない設定でも付ける
+    read_row = [{"text": "✅ 読んだ", "callback_data": "d:5:r"}]
+    undo_row = [{"text": "↩️ 読んだを取り消す", "callback_data": "d:5:u"}]
+    assert dig_card_keyboard(5, "https://a.example/1", with_requests=True)[
+        "inline_keyboard"
+    ][1] == read_row
+    assert dig_card_keyboard(5, None, with_requests=False) == {"inline_keyboard": [read_row]}
+    assert dig_card_keyboard(5, None, with_requests=False, read=True) == {
+        "inline_keyboard": [undo_row]
+    }
+
+
+# --- 深掘りカードの読んだのボタン(GH#398。設計 04 §3・06 §6) ---
+
+
+def followups(conn) -> list[tuple]:
+    rows = conn.execute(
+        "SELECT item_id, value, signal_date FROM signals WHERE kind = 'followup_dig' ORDER BY id"
+    )
+    return [tuple(r) for r in rows]
+
+
+def add_bookmark(conn, item_id: int) -> None:
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id) VALUES ('bookmark', ?, ?)",
+        (f"t{item_id}", item_id),
+    )
+    conn.commit()
+
+
+def test_read_button_records_read_and_undo(conn, tmp_path) -> None:
+    # 読んだ = followup_dig = yes で未消化一覧から外れ、取り消す = no で戻る。🔖 の無い item は
+    # 押した日(JST)
+    item_id, dig_id = add_dig_card(conn)
+    add_bookmark(conn, item_id)
+    today = datetime.now(JST).date().isoformat()
+    assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
+
+    api = FakeApi([[dig_button(dig_id, "r")]])
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert followups(conn) == [(item_id, "yes", today)]
+    assert pending_dig_items(conn) == []
+    assert api.answered == [("cb1", "✅ 読んだにしました(未消化一覧から外れます)")]
+    assert api.edited == [
+        (CHAT_ID, 700, dig_card_keyboard(dig_id, "https://a/dig/700", with_requests=True,
+                                         read=True)),
+    ]
+
+    api = FakeApi([[dig_button(dig_id, "u", update_id=2)]])
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert followups(conn) == [(item_id, "yes", today), (item_id, "no", today)]
+    assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
+    assert api.answered == [("cb2", "↩️ 読んだを取り消しました(未消化一覧に戻ります)")]
+    assert api.edited[0][2]["inline_keyboard"][1] == [
+        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"}
+    ]
+
+
+def test_read_button_twice_or_undo_first_writes_nothing_new(conn, tmp_path) -> None:
+    # 再配達・二重押し・古い盤面: 最新の記録と同じ値は書かない。読んでいないのに取り消しても
+    # no は書かない(🔖 なら、その夜の追い掛けが来なくなる)
+    item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[
+        dig_button(dig_id, "u"),
+        dig_button(dig_id, "r", update_id=2),
+        dig_button(dig_id, "r", update_id=3),
+    ]])
+
+    poll_once(conn, answer_config(tmp_path, cap=0), api, logger)
+
+    assert [value for _, value, _ in followups(conn)] == ["yes"]
+    assert api.answered == [
+        ("cb1", "↩️ 読んだにはしていません"),
+        ("cb2", "✅ 読んだにしました(未消化一覧から外れます)"),
+        ("cb3", "✅ 読んだにしてあります"),
+    ]
+    # 返事をしない設定でも記録でき、盤面は読んだの行だけ
+    assert api.edited[-1][2] == dig_card_keyboard(dig_id, "https://a/dig/700",
+                                                  with_requests=False, read=True)
+
+
+def test_read_button_uses_the_bookmark_reaction_day(conn, tmp_path) -> None:
+    # 🔖 の付いた item は 🔖 の reaction と同じ配信日(KPI 06 の帰属。take と同じ)
+    item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('reaction', ?, 'dig', '2026-07-20')",
+        (item_id,),
+    )
+    conn.commit()
+
+    poll_once(conn, answer_config(tmp_path), FakeApi([[dig_button(dig_id, "r")]]), logger)
+
+    assert followups(conn) == [(item_id, "yes", "2026-07-20")]
+
+
+@pytest.mark.parametrize(
+    ("card_message_id", "chat_id"),
+    [(701, CHAT_ID), (700, 999)],  # 別のメッセージ / owner の chat 以外
+)
+def test_read_button_not_bound_to_the_card_is_rejected(
+    conn, tmp_path, card_message_id, chat_id
+) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "r", card_message_id=card_message_id, chat_id=chat_id)]])
+
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert followups(conn) == []
+    assert api.answered == [("cb1", "⚠️ このカードには対応できません")]
+    assert api.edited == []
 
 
 
