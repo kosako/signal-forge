@@ -53,6 +53,10 @@ DIG_BACKLOG_MAX_BUTTONS = 50
 # 今すぐのボタンを付ける行の状態(本文があり、掘り終えておらず、パスもしていない。GH#388)。
 # 明朝の予定の行(planned)は skip のボタンと並べる
 DIG_NOW_STATES: frozenset[DigState | None] = frozenset({"planned", "waiting", None})
+# 一覧から消える操作の案内(GH#398)。深掘りの段が動いているときだけ、注記の最後に置く
+DIG_BACKLOG_READ_NOTE = (
+    "✅ 読み終えたら、深掘りカードの「✅ 読んだ」か感想のリプライで一覧から外れます"
+)
 # 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
 DIG_STATE_MARKS: dict[DigState, str] = {
     "planned": "🗓 明朝",
@@ -367,6 +371,9 @@ def _dig_backlog_text(
         notes.append("🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります")
     if digest_fill > 0:
         notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
+    if with_buttons:
+        # 何をすると一覧から消えるか(GH#398)。カードが届いただけでは消えない(✅ 掘った)
+        notes.append(DIG_BACKLOG_READ_NOTE)
     example_id = (plan_rows or rows)[0]["item_id"]
     hint = (
         f"↩️ このメッセージへのリプライで指定: 「{example_id} を◯◯の観点で」= "

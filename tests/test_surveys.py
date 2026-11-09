@@ -14,6 +14,7 @@ from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poll
 from app.delivery.poller import TIMER_RETRY_S
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
+    DIG_BACKLOG_READ_NOTE,
     STATE_RUN_FAILURE_NOTIFIED,
     STATE_SOURCE_REPORT_SENT,
     STATE_SURVEY_SENT,
@@ -1313,8 +1314,10 @@ def test_dig_backlog_caveat_lines(conn, tmp_path) -> None:
     none_planned = send_backlog(conn, config_with_cap(tmp_path, 2), now)
     assert swap_note not in none_planned
     lines = none_planned.splitlines()
-    # 注記は行の後に空行で区切って置き、リプライの案内は最後
-    assert lines[-4:-2] == ["", "残り 2 件は明朝のダイジェストの上位から選びます"]
+    # 注記は行の後に空行で区切って置き、最後に消化のしかた(GH#398)。リプライの案内は最後
+    assert lines[-5:-2] == [
+        "", "残り 2 件は明朝のダイジェストの上位から選びます", DIG_BACKLOG_READ_NOTE
+    ]
     assert lines[-2] == ""
     assert lines[-1].startswith("↩️ ")
 

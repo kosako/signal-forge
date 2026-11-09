@@ -1797,6 +1797,10 @@ def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily
         ]
     else:
         assert buttons[1:] == []  # 返事をしない設定では要約・詳しくを出さない
+    # 2 行目は ✅ 読んだ(GH#398。返事をしない設定でも付ける)
+    assert api.markups[0]["inline_keyboard"][1] == [
+        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"}
+    ]
 
 
 
