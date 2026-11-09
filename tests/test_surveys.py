@@ -2435,3 +2435,109 @@ def test_read_confirm_button_not_bound_is_rejected(
     assert latest_followups(conn) == {}
     assert api.answered == [("cb1", "⚠️ この確認には対応できません")]
     assert api.edited == []
+
+
+class LockAfterSendApi(FakeApi):
+    """送れた直後に別の接続が書き込みのロックを取る(台帳への記録をロック競合で失敗させる)。"""
+
+    def __init__(self, db_path: Path):
+        super().__init__()
+        self.other = sqlite3.connect(db_path, isolation_level=None)
+
+    def send_message(self, chat_id, text, *, reply_markup=None):
+        message_id = super().send_message(chat_id, text, reply_markup=reply_markup)
+        self.other.execute("BEGIN IMMEDIATE")
+        return message_id
+
+    def release(self) -> None:
+        self.other.execute("ROLLBACK")
+        self.other.close()
+
+
+def test_read_confirm_record_failure_is_retried_without_resending(conn, tmp_path) -> None:
+    # 送れたのに台帳へ記録できなかった(ロック競合)。次の周期は送り直さず、記録だけを試し直す。
+    # 記録すれば、その 1 通のボタンを受け付ける
+    only_read_confirm_due(conn, SUNDAY)
+    item = add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z")
+    add_note(conn, item)
+    conn.execute("PRAGMA busy_timeout=0")
+    api = LockAfterSendApi(tmp_path / "intel.db")
+    config = make_config(tmp_path)
+    unrecorded: list = []
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        run_due_timers(conn, config, api, logger, SUNDAY, unrecorded_read_confirms=unrecorded)
+    assert [sent.message_id for sent in unrecorded] == [901]
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) is None
+
+    api.release()
+    later = SUNDAY + timedelta(minutes=5)
+    run_due_timers(conn, config, api, logger, later, unrecorded_read_confirms=unrecorded)
+
+    assert len(api.sent) == 1  # 送り直さない
+    assert unrecorded == []
+    assert conn.execute("SELECT message_id FROM read_confirm_messages").fetchall()[0][0] == 901
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+    press = FakeApi([[confirm_button(f"c:{item}:r")]])
+    poll_once(conn, config, press, logger)
+    assert latest_followups(conn) == {item: "yes"}
+
+
+def test_read_confirm_not_resent_when_only_state_failed(conn, tmp_path, monkeypatch) -> None:
+    # 台帳に記録した後、送信済みの state だけを立てられなかった。次の周期は、その日の台帳を見て
+    # 送らない
+    from app.delivery import surveys
+
+    only_read_confirm_due(conn, SUNDAY)
+    add_note(conn, add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z"))
+    real_set_state = surveys.set_state
+
+    def failing_set_state(conn_, key, value):
+        if key == STATE_READ_CONFIRM_SENT:
+            raise sqlite3.OperationalError("database is locked")
+        real_set_state(conn_, key, value)
+
+    monkeypatch.setattr(surveys, "set_state", failing_set_state)
+    api = FakeApi()
+    config = make_config(tmp_path)
+    with pytest.raises(sqlite3.OperationalError):
+        run_due_timers(conn, config, api, logger, SUNDAY)
+    monkeypatch.setattr(surveys, "set_state", real_set_state)
+
+    run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=5))
+
+    assert len(api.sent) == 1
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+
+
+def test_read_confirm_ignores_card_questions(conn, tmp_path) -> None:
+    # 深掘りカードへの質問として積んだリプライ(dig_questions)は感想に数えない。返事をしない
+    # 設定などで質問として積まなかったカードへのリプライは感想として数える
+    only_read_confirm_due(conn, SUNDAY)
+    asked = add_bookmarked(conn, "https://c/asked", "2026-10-24T01:00:00Z")
+    noted = add_bookmarked(conn, "https://c/noted", "2026-10-24T00:00:00Z")
+    for item_id, message_id in ((asked, 81), (noted, 82)):
+        dig_id = conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+            "VALUES (?, 'note', 'カード', ?)",
+            (item_id, 700 + message_id),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO item_notes (item_id, note, chat_id, message_id) "
+            "VALUES (?, 'リプライ', ?, ?)",
+            (item_id, CHAT_ID, message_id),
+        )
+        if item_id == asked:
+            conn.execute(
+                "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+                "VALUES (?, 'リプライ', ?)",
+                (dig_id, message_id),
+            )
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    assert api.sent[0][1].startswith("📝 感想を書いた未消化(1件)")
+    assert json.loads(
+        conn.execute("SELECT item_ids FROM read_confirm_messages").fetchone()[0]
+    ) == [noted]
