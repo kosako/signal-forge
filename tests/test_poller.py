@@ -854,7 +854,7 @@ def test_run_poller_timer_db_error_boundary(conn, tmp_path, monkeypatch, error, 
 
     timer_calls: list[datetime] = []
 
-    def run_due_timers(conn, config, api, logger, now):
+    def run_due_timers(conn, config, api, logger, now, *, unrecorded_read_confirms=None):
         timer_calls.append(now)
         raise sqlite3.OperationalError(error)
 

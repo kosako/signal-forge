@@ -1,4 +1,5 @@
-"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知(設計 04 §4 / 05 §1.2, §4)。
+"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認
+(設計 04 §4 / 05 §1.2, §4)。
 
 - 起動は受信デーモン(intel poll)の内蔵タイマー(送信経路をポーラーに集約)。
   時刻は config([telegram].survey_time / watchdog_time。JST)
@@ -10,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Collection, Mapping, Sequence
@@ -36,6 +38,7 @@ STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
 STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
 STATE_SOURCE_REPORT_SENT = "source_report_sent_date"
+STATE_READ_CONFIRM_SENT = "read_confirm_sent_date"
 
 READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
 
@@ -70,6 +73,13 @@ DIG_STATE_MARKS: dict[DigState, str] = {
 # 失敗し、watchdog が届かない。GH#124 でソースの行が可変長になった)
 WATCHDOG_TEXT_MAX_CHARS = 4000
 SOURCE_REPORT_MAX_CHARS = 4000
+
+# 週 1 回の読んだのまとめ確認(GH#399。設計 04 §4・06 §2)。日曜の夜アンケート(未消化一覧)の後に
+# 1 通。載せる行は未消化一覧と同じく 15 件まで(行のボタン 15 個と全部のボタン 1 個)
+READ_CONFIRM_WEEKDAY = 6  # datetime.weekday() の日曜
+READ_CONFIRM_MAX_ITEMS = 15
+READ_CONFIRM_BUTTONS_PER_ROW = 3
+READ_CONFIRM_ALL_LABEL = "✅ 全部読んだにする"
 
 
 def _mark(text: str, is_selected: bool) -> str:
@@ -158,15 +168,22 @@ def run_due_timers(
     api: TelegramApi,
     logger: logging.Logger,
     now: datetime,
+    *,
+    unrecorded_read_confirms: list[SentReadConfirm] | None = None,
 ) -> None:
-    """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断)を実行する。
+    """期限が来たタイマー(夜アンケート・watchdog・週 1 回のソースの健康診断と読んだのまとめ
+    確認)を実行する。
     poll ループから毎周期呼ぶ(失敗した後は受信と別に間を空けて試し直す。poller の
     TIMER_RETRY_S。GH#224)。
 
     now は JST aware。ポーラー停止中に時刻を跨いだ場合は次の起動周期で送る(遅延送信)。
     日付を跨いだ分は送らない(昨日の夜アンケートを今日送っても回答が汚れるだけ)。
+    unrecorded_read_confirms は、送れたのに台帳へ記録できなかったまとめ確認(GH#399)。run_poller が
+    周期をまたいで持ち、ここで記録だけを試し直す(送り直さない)。
     """
     today = now.strftime("%Y-%m-%d")
+    if unrecorded_read_confirms is None:
+        unrecorded_read_confirms = []
     if _is_due(now, config.telegram.survey_time) and get_state(conn, STATE_SURVEY_SENT) != today:
         set_state(conn, STATE_SURVEY_SENT, today)
         send_evening_survey(conn, config, api, logger, now)
@@ -200,6 +217,17 @@ def run_due_timers(
         )
         set_state(conn, STATE_SOURCE_REPORT_SENT, today)
         logger.info("ソースの健康診断を送った", extra={"stage": "poll"})
+    # 週 1 回の読んだのまとめ確認(GH#399)。日曜の夜アンケート(未消化一覧)の後。日曜を逃したら
+    # その週は送らない。送れた後に state を立てる(健康診断と同じ。対象が無い週も立てる)。
+    # 送れたのに記録できなかった分は、曜日を問わず先に記録する(日付を跨いでも 1 通のボタンを生かす)
+    record_unrecorded_read_confirms(conn, unrecorded_read_confirms)
+    if (
+        now.weekday() == READ_CONFIRM_WEEKDAY
+        and _is_due(now, config.telegram.survey_time)
+        and get_state(conn, STATE_READ_CONFIRM_SENT) != today
+    ):
+        send_read_confirm(conn, config, api, logger, today, unrecorded_read_confirms)
+        set_state(conn, STATE_READ_CONFIRM_SENT, today)
 
 
 def send_evening_survey(
@@ -267,6 +295,129 @@ def send_evening_survey(
     )
     if backlog_failure is not None:
         raise backlog_failure
+
+
+def read_confirm_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """読んだのまとめ確認の対象(GH#399): 未消化(pending_dig_items)のうち、Telegram の感想が
+    ある item。並びは未消化一覧と同じ。
+
+    感想は item_notes のリプライで、深掘りカードへの質問・依頼として台帳(dig_questions)に
+    積んだリプライは除く(質問は読んだ印にしない。ユーザーの判断)。返事をしない設定・上限を超えた
+    日のカードへのリプライは、質問として積まずに感想として残るので含む。
+    """
+    rows = pending_dig_items(conn)
+    if not rows:
+        return []
+    placeholders = ", ".join("?" for _ in rows)
+    noted = {
+        row["item_id"]
+        for row in conn.execute(
+            "SELECT DISTINCT n.item_id FROM item_notes n "
+            f"WHERE n.item_id IN ({placeholders}) AND NOT EXISTS ("
+            "  SELECT 1 FROM dig_questions q WHERE q.question_message_id = n.message_id)",
+            [row["item_id"] for row in rows],
+        )
+    }
+    return [row for row in rows if row["item_id"] in noted]
+
+
+def read_confirm_keyboard(item_ids: Sequence[int], read: Collection[int]) -> dict:
+    """読んだのまとめ確認の 1 通のボタン(GH#399)。行ごとの ✅ {id} と、最後の行に全部。
+
+    読んだにしてある item(read)の行は ✓ を付け、押すと取り消す(c:{id}:u)。押していない行は
+    読んだにする(c:{id}:r)。全部(c:0:a)は、載せた item のうち読んでいないものを読んだにする。
+    """
+    buttons = [
+        {"text": _mark(f"✅ {item_id}", item_id in read),
+         "callback_data": f"c:{item_id}:{'u' if item_id in read else 'r'}"}
+        for item_id in item_ids
+    ]
+    rows = [
+        buttons[i:i + READ_CONFIRM_BUTTONS_PER_ROW]
+        for i in range(0, len(buttons), READ_CONFIRM_BUTTONS_PER_ROW)
+    ]
+    all_read = bool(item_ids) and all(item_id in read for item_id in item_ids)
+    rows.append([{"text": _mark(READ_CONFIRM_ALL_LABEL, all_read), "callback_data": "c:0:a"}])
+    return {"inline_keyboard": rows}
+
+
+def _read_confirm_message(rows: Sequence[Mapping]) -> tuple[str, list[int]]:
+    """読んだのまとめ確認の本文と、載せた item の id(載せた順)。"""
+    shown = list(rows[:READ_CONFIRM_MAX_ITEMS])
+    lines = [
+        f"📝 感想を書いた未消化({len(rows)}件)",
+        "感想をリプライした記事です。読み終えたものは ✅ を押すと、未消化一覧から外れます",
+        "",
+        *(f"{row['item_id']}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}" for row in shown),
+    ]
+    if len(rows) > len(shown):
+        lines.append(f"(他 {len(rows) - len(shown)} 件は来週の確認に回します)")
+    return "\n".join(lines), [row["item_id"] for row in shown]
+
+
+class SentReadConfirm(NamedTuple):
+    """送れたまとめ確認の 1 通(台帳 read_confirm_messages の 1 行。GH#399)。"""
+
+    message_id: int
+    sent_date: str
+    item_ids: list[int]
+
+
+def send_read_confirm(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    day: str,
+    unrecorded: list[SentReadConfirm],
+) -> None:
+    """読んだのまとめ確認を 1 通送り、載せた item を台帳に記録する(GH#399)。対象が無ければ送らない。
+
+    台帳(read_confirm_messages)は、ボタンを受け付けるときの照合と盤面の作り直しに使う。
+    送り直さない: その日の台帳の行があれば送らない(送って記録した後、送信済みの state だけを
+    立てられなかったとき)。送れたのに記録できなかったとき(DB のロック競合)は、unrecorded に
+    残して投げ直し、次の周期の record_unrecorded_read_confirms が記録だけを試し直す。
+    """
+    if conn.execute(
+        "SELECT 1 FROM read_confirm_messages WHERE sent_date = ? LIMIT 1", (day,)
+    ).fetchone() is not None or any(sent.sent_date == day for sent in unrecorded):
+        logger.info("読んだのまとめ確認は送り済み(送り直さない)", extra={"stage": "poll"})
+        return
+    rows = read_confirm_items(conn)
+    if not rows:
+        logger.info("読んだのまとめ確認の対象なし(送らない)", extra={"stage": "poll"})
+        return
+    text, item_ids = _read_confirm_message(rows)
+    message_id = api.send_message(
+        _require_chat_id(config), text, reply_markup=read_confirm_keyboard(item_ids, ())
+    )
+    unrecorded.append(SentReadConfirm(message_id, day, item_ids))
+    logger.info(
+        "読んだのまとめ確認を送った",
+        extra={"stage": "poll", "extra": {"items": len(item_ids), "candidates": len(rows)}},
+    )
+    record_unrecorded_read_confirms(conn, unrecorded)
+
+
+def record_unrecorded_read_confirms(
+    conn: sqlite3.Connection, unrecorded: list[SentReadConfirm]
+) -> None:
+    """送れたのに台帳へ記録していないまとめ確認を記録する(GH#399)。記録できた分は unrecorded から
+    除く。
+
+    DB の失敗は投げる(内蔵タイマーの失敗として、次の周期に試し直す)。poller が止まると
+    unrecorded は失われ、その 1 通のボタンは受け付けなくなる(稀。無配信より二重送信の方針の
+    範囲で、次の起動がその日の分を送り直す)。
+    """
+    while unrecorded:
+        sent = unrecorded[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO read_confirm_messages (message_id, sent_date, item_ids) "
+            "VALUES (?, ?, ?)",
+            (sent.message_id, sent.sent_date, json.dumps(sent.item_ids)),
+        )
+        conn.commit()
+        unrecorded.pop(0)
 
 
 def _linked_title(row: Mapping, budget: int) -> str:

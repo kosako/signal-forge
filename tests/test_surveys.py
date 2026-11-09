@@ -15,6 +15,7 @@ from app.delivery.poller import TIMER_RETRY_S
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     DIG_BACKLOG_READ_NOTE,
+    STATE_READ_CONFIRM_SENT,
     STATE_RUN_FAILURE_NOTIFIED,
     STATE_SOURCE_REPORT_SENT,
     STATE_SURVEY_SENT,
@@ -22,6 +23,7 @@ from app.delivery.surveys import (
     BacklogButtons,
     backlog_keyboard,
     pending_dig_items,
+    read_confirm_keyboard,
 )
 from app.delivery.telegram import DeliveryError
 from app.jst import JST, today_jst
@@ -2216,3 +2218,326 @@ def test_redelivered_now_press_after_request_closed_is_not_new(conn, tmp_path) -
     assert again.answered == [("cb7", f"⚡ {item} は受け付け済みです")]
     assert queue_row(conn, item)["now_requested_at"] is None
     assert worker.kicks == 1
+
+
+# --- 週 1 回の読んだのまとめ確認(GH#399。設計 04 §4・06 §2) ---
+
+
+def only_read_confirm_due(conn, now: datetime) -> None:
+    """同じ時刻に動く夜アンケート・watchdog・健康診断は送信済みにする(まとめ確認単体の検証用)。"""
+    day = now.strftime("%Y-%m-%d")
+    for key in (STATE_SURVEY_SENT, STATE_WATCHDOG_NOTIFIED, STATE_SOURCE_REPORT_SENT):
+        set_state(conn, key, day)
+
+
+def add_note(conn, item_id: int, note: str = "感想") -> None:
+    conn.execute("INSERT INTO item_notes (item_id, note) VALUES (?, ?)", (item_id, note))
+
+
+def add_bookmarked(conn, url: str, observed_at: str, *, title: str = "記事") -> int:
+    item_id = add_item(conn, url, title=title)
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, item_id, observed_at) "
+        "VALUES ('bookmark', ?, ?, ?)",
+        (url, item_id, observed_at),
+    )
+    return item_id
+
+
+def confirm_button(data: str, *, message_id: int = 901, chat_id: int = CHAT_ID,
+                   update_id: int = 1) -> dict:
+    update = make_callback_update(0, data=data, update_id=update_id)
+    update["callback_query"]["message"] = {"message_id": message_id, "chat": {"id": chat_id}}
+    return update
+
+
+def latest_followups(conn) -> dict[int, str]:
+    rows = conn.execute(
+        "SELECT item_id, value FROM signals WHERE kind = 'followup_dig' ORDER BY created_at, id"
+    )
+    return {row["item_id"]: row["value"] for row in rows}
+
+
+def test_read_confirm_lists_unread_items_with_notes_on_sunday(conn, tmp_path) -> None:
+    # 対象は未消化で感想のある item だけ。感想の無い未消化と、読んだにした item は載せない
+    only_read_confirm_due(conn, SUNDAY)
+    newer = add_bookmarked(conn, "https://c/newer", "2026-10-24T00:00:00Z", title="新しい方")
+    older = add_item(conn, "https://c/older", title="古い方")
+    add_dig_reaction(conn, older, "2026-10-20")
+    no_note = add_bookmarked(conn, "https://c/no-note", "2026-10-24T01:00:00Z")
+    done = add_bookmarked(conn, "https://c/done", "2026-10-24T02:00:00Z")
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', '2026-10-24')",
+        (done,),
+    )
+    for item_id in (newer, older, done):
+        add_note(conn, item_id)
+    add_note(conn, newer, "2 つ目の感想")
+    assert no_note  # 感想の無い未消化
+    api = FakeApi()
+    config = make_config(tmp_path)
+
+    run_due_timers(conn, config, api, logger, SUNDAY)
+    run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=1))  # 同じ日は 1 通
+
+    assert len(api.sent) == 1
+    assert api.sent[0][1] == (
+        "📝 感想を書いた未消化(2件)\n"
+        "感想をリプライした記事です。読み終えたものは ✅ を押すと、未消化一覧から外れます\n"
+        "\n"
+        f'{newer}. <a href="https://c/newer">新しい方</a>\n'
+        f'{older}. <a href="https://c/older">古い方</a>'
+    )
+    assert api.markups[0] == read_confirm_keyboard([newer, older], ())
+    ledger = conn.execute("SELECT * FROM read_confirm_messages").fetchone()
+    assert (ledger["message_id"], ledger["sent_date"]) == (901, "2026-10-25")
+    assert json.loads(ledger["item_ids"]) == [newer, older]
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+
+
+@pytest.mark.parametrize(
+    "now", [SUNDAY - timedelta(days=1), SUNDAY.replace(hour=20)]  # 土曜 / 夜の時刻の前
+)
+def test_read_confirm_not_sent_other_times(conn, tmp_path, now) -> None:
+    only_read_confirm_due(conn, now)
+    add_note(conn, add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z"))
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+
+    assert api.sent == []
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) is None
+
+
+def test_read_confirm_skipped_without_candidates(conn, tmp_path) -> None:
+    # 対象が無い週は送らず、その日はもう見ない
+    only_read_confirm_due(conn, SUNDAY)
+    add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z")  # 感想なし
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    assert api.sent == []
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+
+
+def test_read_confirm_caps_rows_and_buttons(conn, tmp_path) -> None:
+    only_read_confirm_due(conn, SUNDAY)
+    ids = [
+        add_bookmarked(conn, f"https://c/{n}", f"2026-10-24T00:{59 - n:02d}:00Z")
+        for n in range(17)
+    ]
+    for item_id in ids:
+        add_note(conn, item_id)
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    text = api.sent[0][1]
+    assert text.startswith("📝 感想を書いた未消化(17件)")
+    assert text.endswith("(他 2 件は来週の確認に回します)")
+    keyboard = api.markups[0]["inline_keyboard"]
+    assert [len(row) for row in keyboard] == [3, 3, 3, 3, 3, 1]
+    assert keyboard[0][0] == {"text": f"✅ {ids[0]}", "callback_data": f"c:{ids[0]}:r"}
+    assert keyboard[-1] == [{"text": "✅ 全部読んだにする", "callback_data": "c:0:a"}]
+    assert json.loads(
+        conn.execute("SELECT item_ids FROM read_confirm_messages").fetchone()[0]
+    ) == ids[:15]
+
+
+def sent_read_confirm(conn, tmp_path) -> tuple[int, int]:
+    """まとめ確認を 1 通送り(message_id 901)、載せた 2 件の item id を返す。"""
+    only_read_confirm_due(conn, SUNDAY)
+    a = add_bookmarked(conn, "https://c/a", "2026-10-24T01:00:00Z")
+    b = add_item(conn, "https://c/b")
+    add_dig_reaction(conn, b, "2026-10-20")
+    add_note(conn, a)
+    add_note(conn, b)
+    run_due_timers(conn, make_config(tmp_path), FakeApi(), logger, SUNDAY)
+    return a, b
+
+
+def test_read_confirm_row_button_marks_and_undoes(conn, tmp_path) -> None:
+    a, b = sent_read_confirm(conn, tmp_path)
+
+    api = FakeApi([[confirm_button(f"c:{a}:r")]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert latest_followups(conn) == {a: "yes"}
+    assert [row["item_id"] for row in pending_dig_items(conn)] == [b]
+    assert api.answered == [("cb1", f"✅ {a} を読んだにしました(未消化一覧から外れます)")]
+    assert api.edited == [(CHAT_ID, 901, read_confirm_keyboard([a, b], {a}))]
+    assert api.edited[0][2]["inline_keyboard"][0][0] == {
+        "text": f"✅ {a} ✓", "callback_data": f"c:{a}:u"
+    }
+
+    api = FakeApi([[confirm_button(f"c:{a}:u", update_id=2), confirm_button(f"c:{a}:u",
+                                                                              update_id=3)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert latest_followups(conn) == {a: "no"}
+    signals = conn.execute("SELECT count(*) FROM signals WHERE kind = 'followup_dig'")
+    assert signals.fetchone()[0] == 2  # 二重押しで no を 2 回書かない
+    assert api.answered == [
+        ("cb2", f"↩️ {a} の読んだを取り消しました(未消化一覧に戻ります)"),
+        ("cb3", f"↩️ {a} は読んだにしていません"),
+    ]
+    assert api.edited[-1][2] == read_confirm_keyboard([a, b], set())
+
+
+def test_read_confirm_all_button_marks_every_listed_item(conn, tmp_path) -> None:
+    a, b = sent_read_confirm(conn, tmp_path)
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', '2026-10-24')",
+        (a,),
+    )
+    conn.commit()
+
+    api = FakeApi([[confirm_button("c:0:a"), confirm_button("c:0:a", update_id=2)]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert latest_followups(conn) == {a: "yes", b: "yes"}
+    b_date = conn.execute(
+        "SELECT signal_date FROM signals WHERE kind = 'followup_dig' AND item_id = ?", (b,)
+    ).fetchone()[0]
+    assert b_date == "2026-10-20"  # 🔖 の配信日(KPI 06 の帰属)
+    assert pending_dig_items(conn) == []
+    assert api.answered == [
+        ("cb1", "✅ 1 件を読んだにしました"),
+        ("cb2", "✅ 全部読んだにしてあります"),
+    ]
+    all_row = api.edited[-1][2]["inline_keyboard"][-1]
+    assert all_row == [{"text": "✅ 全部読んだにする ✓", "callback_data": "c:0:a"}]
+
+
+@pytest.mark.parametrize(
+    ("data", "message_id", "chat_id"),
+    [
+        ("c:{other}:r", 901, CHAT_ID),  # 載せていない item
+        ("c:{a}:r", 902, CHAT_ID),  # まとめ確認として送っていないメッセージ
+        ("c:0:a", 902, CHAT_ID),
+        ("c:{a}:r", 901, 999),  # owner の chat 以外
+    ],
+)
+def test_read_confirm_button_not_bound_is_rejected(
+    conn, tmp_path, data, message_id, chat_id
+) -> None:
+    a, _b = sent_read_confirm(conn, tmp_path)
+    other = add_item(conn, "https://c/other")
+    add_note(conn, other)
+    button = confirm_button(data.format(a=a, other=other), message_id=message_id, chat_id=chat_id)
+    api = FakeApi([[button]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+
+    assert latest_followups(conn) == {}
+    assert api.answered == [("cb1", "⚠️ この確認には対応できません")]
+    assert api.edited == []
+
+
+class LockAfterSendApi(FakeApi):
+    """送れた直後に別の接続が書き込みのロックを取る(台帳への記録をロック競合で失敗させる)。"""
+
+    def __init__(self, db_path: Path):
+        super().__init__()
+        self.other = sqlite3.connect(db_path, isolation_level=None)
+
+    def send_message(self, chat_id, text, *, reply_markup=None):
+        message_id = super().send_message(chat_id, text, reply_markup=reply_markup)
+        self.other.execute("BEGIN IMMEDIATE")
+        return message_id
+
+    def release(self) -> None:
+        self.other.execute("ROLLBACK")
+        self.other.close()
+
+
+def test_read_confirm_record_failure_is_retried_without_resending(conn, tmp_path) -> None:
+    # 送れたのに台帳へ記録できなかった(ロック競合)。次の周期は送り直さず、記録だけを試し直す。
+    # 記録すれば、その 1 通のボタンを受け付ける
+    only_read_confirm_due(conn, SUNDAY)
+    item = add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z")
+    add_note(conn, item)
+    conn.execute("PRAGMA busy_timeout=0")
+    api = LockAfterSendApi(tmp_path / "intel.db")
+    config = make_config(tmp_path)
+    unrecorded: list = []
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        run_due_timers(conn, config, api, logger, SUNDAY, unrecorded_read_confirms=unrecorded)
+    assert [sent.message_id for sent in unrecorded] == [901]
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) is None
+
+    api.release()
+    later = SUNDAY + timedelta(minutes=5)
+    run_due_timers(conn, config, api, logger, later, unrecorded_read_confirms=unrecorded)
+
+    assert len(api.sent) == 1  # 送り直さない
+    assert unrecorded == []
+    assert conn.execute("SELECT message_id FROM read_confirm_messages").fetchall()[0][0] == 901
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+    press = FakeApi([[confirm_button(f"c:{item}:r")]])
+    poll_once(conn, config, press, logger)
+    assert latest_followups(conn) == {item: "yes"}
+
+
+def test_read_confirm_not_resent_when_only_state_failed(conn, tmp_path, monkeypatch) -> None:
+    # 台帳に記録した後、送信済みの state だけを立てられなかった。次の周期は、その日の台帳を見て
+    # 送らない
+    from app.delivery import surveys
+
+    only_read_confirm_due(conn, SUNDAY)
+    add_note(conn, add_bookmarked(conn, "https://c/1", "2026-10-24T00:00:00Z"))
+    real_set_state = surveys.set_state
+
+    def failing_set_state(conn_, key, value):
+        if key == STATE_READ_CONFIRM_SENT:
+            raise sqlite3.OperationalError("database is locked")
+        real_set_state(conn_, key, value)
+
+    monkeypatch.setattr(surveys, "set_state", failing_set_state)
+    api = FakeApi()
+    config = make_config(tmp_path)
+    with pytest.raises(sqlite3.OperationalError):
+        run_due_timers(conn, config, api, logger, SUNDAY)
+    monkeypatch.setattr(surveys, "set_state", real_set_state)
+
+    run_due_timers(conn, config, api, logger, SUNDAY + timedelta(minutes=5))
+
+    assert len(api.sent) == 1
+    assert get_state(conn, STATE_READ_CONFIRM_SENT) == "2026-10-25"
+
+
+def test_read_confirm_ignores_card_questions(conn, tmp_path) -> None:
+    # 深掘りカードへの質問として積んだリプライ(dig_questions)は感想に数えない。返事をしない
+    # 設定などで質問として積まなかったカードへのリプライは感想として数える
+    only_read_confirm_due(conn, SUNDAY)
+    asked = add_bookmarked(conn, "https://c/asked", "2026-10-24T01:00:00Z")
+    noted = add_bookmarked(conn, "https://c/noted", "2026-10-24T00:00:00Z")
+    for item_id, message_id in ((asked, 81), (noted, 82)):
+        dig_id = conn.execute(
+            "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+            "VALUES (?, 'note', 'カード', ?)",
+            (item_id, 700 + message_id),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO item_notes (item_id, note, chat_id, message_id) "
+            "VALUES (?, 'リプライ', ?, ?)",
+            (item_id, CHAT_ID, message_id),
+        )
+        if item_id == asked:
+            conn.execute(
+                "INSERT INTO dig_questions (dig_result_id, question, question_message_id) "
+                "VALUES (?, 'リプライ', ?)",
+                (dig_id, message_id),
+            )
+    api = FakeApi()
+
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    assert api.sent[0][1].startswith("📝 感想を書いた未消化(1件)")
+    assert json.loads(
+        conn.execute("SELECT item_ids FROM read_confirm_messages").fetchone()[0]
+    ) == [noted]

@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -38,11 +39,13 @@ from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     READ_MIN_CHOICES,
     BacklogButtons,
+    SentReadConfirm,
     backlog_keyboard,
     followup_keyboard,
     pending_dig_items,
     q1_keyboard,
     q2_keyboard,
+    read_confirm_keyboard,
     run_due_timers,
     survey_deadline,
 )
@@ -65,7 +68,7 @@ from app.dig import (
     request_dig_now,
 )
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
-from app.dig_take import mark_read
+from app.dig_take import mark_read, read_items
 from app.export.obsidian import note_projection_date
 from app.jst import JST
 from app.normalize import (
@@ -142,6 +145,8 @@ def run_poller(
     transient_failures: dict[int, int] = {}
     # 内蔵タイマーが最後に失敗した時刻(clock の値。成功したら None。GH#224)
     timer_failed_at: float | None = None
+    # 送れたのに台帳へ記録できなかった読んだのまとめ確認(周期をまたいで持つ。GH#399)
+    unrecorded_read_confirms: list[SentReadConfirm] = []
     while not should_stop():
         try:
             # 質問への返事の取りこぼしを拾う(GH#126)。受信やタイマーが失敗する周期でも
@@ -151,7 +156,9 @@ def run_poller(
             # 後の周期で作る
             dig_now_worker.sweep(conn, logger)
             if timer_failed_at is None or clock() - timer_failed_at >= TIMER_RETRY_S:
-                timer_ok = _run_timers(conn, config, api, logger, now_fn())
+                timer_ok = _run_timers(
+                    conn, config, api, logger, now_fn(), unrecorded_read_confirms
+                )
                 timer_failed_at = None if timer_ok else clock()
             poll_once(
                 conn, config, api, logger, now_fn=now_fn, answer_worker=answer_worker,
@@ -180,6 +187,7 @@ def _run_timers(
     api: TelegramApi,
     logger: logging.Logger,
     now: datetime,
+    unrecorded_read_confirms: list[SentReadConfirm] | None = None,
 ) -> bool:
     """内蔵タイマーを実行し、成功したかを返す(GH#224)。
 
@@ -189,7 +197,9 @@ def _run_timers(
     恒久的な DB エラーは握らず投げる(run_poller が落とす)。
     """
     try:
-        run_due_timers(conn, config, api, logger, now)
+        run_due_timers(
+            conn, config, api, logger, now, unrecorded_read_confirms=unrecorded_read_confirms
+        )
     except DeliveryError as e:
         logger.error(
             f"内蔵タイマーの送信失敗({TIMER_RETRY_S}s 後に再試行): {e}", extra={"stage": "poll"}
@@ -381,6 +391,12 @@ def _handle_callback(
             return
         if prefix == "b" and arg.isdigit() and code == "p":
             _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
+            return
+        if prefix == "c" and (
+            (arg.isdigit() and code in _READ_CONFIRM_CODES) or (arg == "0" and code == "a")
+        ):
+            _record_read_confirm(conn, config, api, callback, callback_id, arg, code, logger,
+                                 now_fn())
             return
         if prefix == "b" and arg.isdigit() and code == "n":
             _record_backlog_now(
@@ -643,6 +659,92 @@ def _record_dig_read(
         read=read,
     )
     _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+# 読んだのまとめ確認(GH#399)の行のボタンの code → 読んだにするか(False = 取り消す)。全部は c:0:a
+_READ_CONFIRM_CODES = {"r": True, "u": False}
+
+
+def _record_read_confirm(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    arg: str,
+    code: str,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """読んだのまとめ確認の ✅ {id}・全部(GH#399。設計 04 §3)。followup_dig を記録する(mark_read)。
+
+    押されたメッセージが、まとめ確認として owner の chat に送った 1 通(read_confirm_messages)で
+    あることと、行のボタンならその 1 通に載せた item であることを確かめる。最新の記録の確認と
+    記録は 1 つのトランザクションで行い、再配達・二重押しで同じ値を 2 回書かない。盤面は台帳の
+    item の順で、今の記録から作り直す(読んだにしてある行に ✓)。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    ledger = (
+        conn.execute(
+            "SELECT item_ids FROM read_confirm_messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        if type(message_id) is int and chat_id == config.telegram.owner_chat_id
+        else None
+    )
+    item_ids = [int(item_id) for item_id in json.loads(ledger["item_ids"])] if ledger else []
+    targets = item_ids if code == "a" else [int(arg)] if int(arg) in item_ids else []
+    if not targets:
+        logger.warning("まとめ確認と結び付かない読んだのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この確認には対応できません")
+        return
+    read = code != "u"
+    day = now.astimezone(JST).date().isoformat()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            written = [item_id for item_id in targets if mark_read(conn, item_id, read, day)]
+            now_read = read_items(conn, item_ids)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"まとめ確認の読んだを記録できなかった: {type(e).__name__}: {e}",
+            extra={"stage": "poll"},
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "まとめ確認の読んだを記録した",
+        extra={"stage": "poll", "extra": {"code": code, "written": len(written)}},
+    )
+    api.answer_callback_query(callback_id, text=_read_confirm_answer(code, targets, written))
+    _edit_markup_best_effort(api, callback, read_confirm_keyboard(item_ids, now_read), logger)
+
+
+def _read_confirm_answer(code: str, targets: list[int], written: list[int]) -> str:
+    """まとめ確認のボタンの answer(GH#399)。"""
+    if code == "a":
+        return (
+            f"✅ {len(written)} 件を読んだにしました" if written else "✅ 全部読んだにしてあります"
+        )
+    item_id = targets[0]
+    if code == "r":
+        return (
+            f"✅ {item_id} を読んだにしました(未消化一覧から外れます)"
+            if written
+            else f"✅ {item_id} は読んだにしてあります"
+        )
+    return (
+        f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
+        if written
+        else f"↩️ {item_id} は読んだにしていません"
+    )
 
 
 # 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。
