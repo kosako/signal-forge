@@ -1791,9 +1791,12 @@ def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily
     buttons = api.markups[0]["inline_keyboard"][0]
     assert buttons[0] == {"text": "🔗 元記事", "url": "https://a.example/1"}
     if answer_daily_cap > 0:
-        assert buttons[1:] == [{"text": "📖 詳しく", "callback_data": f"d:{dig_id}:m"}]
+        assert buttons[1:] == [
+            {"text": "📖 詳しく", "callback_data": f"d:{dig_id}:m"},
+            {"text": "💬 話す", "callback_data": f"d:{dig_id}:t"},  # GH#407
+        ]
     else:
-        assert buttons[1:] == []  # 返事をしない設定では詳しくを出さない
+        assert buttons[1:] == []  # 返事をしない設定では詳しく・話すを出さない
     # 2 行目は ✅ 読んだ(GH#398)と 👎 不要(GH#403)。返事をしない設定でも付ける
     assert api.markups[0]["inline_keyboard"][1] == [
         {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"},

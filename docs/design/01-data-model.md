@@ -30,6 +30,7 @@ dig_backlog_messages                           (未消化一覧の message_id �
 dig_backlog_replies                            (未消化一覧へのリプライの受信の冪等キー。GH#335)
 read_confirm_messages                          (週 1 回の読んだのまとめ確認の message_id と載せた item。GH#399)
 dig_dismissals                                 (深掘りカードの 👎 不要で未消化一覧から外した item。GH#403)
+dig_discussions ──> dig_results                (深掘りカードの 💬 話す で開いた議論。GH#407)
 digests ──(item_ids JSON)──> items             (結合表なし。json_each で展開)
 digests 1 ──< digest_messages >── items        (送信済み Telegram message_id。部分再送・リプライの帰属用)
 digests 1 ──< digest_notes                     (日次感想 = ヘッダへのリプライ。GH#96)
@@ -248,7 +249,7 @@ CREATE UNIQUE INDEX ux_digest_notes_message ON digest_notes(chat_id, message_id)
 INSERT INTO sources (type, name) VALUES ('manual', 'manual');
 ```
 
-共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`read_confirm_messages`(週 1 回の読んだのまとめ確認の台帳。GH#399 / migration 030。§7 末尾)、`dig_dismissals`(深掘りカードの 👎 不要の台帳。GH#403 / migration 031。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)、`budget_cuts`(collect・extract の段の上限で打ち切り、残りを次の実行へ回した記録。1 回の打ち切り = 1 行で、種類(`rss_items` / `collect_time` / `extract_time`)・RSS のときのソース・回した数・朝バッチの run_id を持つ。週 1 回のソースの健康診断が直近 7 日を読む。GH#340 / migration 028)、`short_url_resolutions`(collect が解決した短縮 URL と、その先の canonical_url。鍵はソースと記事の識別子(`guid:` + guid、無ければ `url:` + 元の URL。種別で名前空間を分け、URL と同じ文字列の guid の記事が guid の無い記事の結果を使わない)で、同じソースの同じ記事を次の実行で読み直すときだけ、解決し直さずに既知の判定と正規化に使う。新しい記事やほかのソースは同じ短縮 URL でも解決し直す(転送先が後で変わったとき、新しい記事を古い先との重複として捨てないため)。ほかのソースと同じ先の記事は保存で無視され、元の URL と記事の対応が items に残らないため。確定した正規化のエラー(解決先を分解できない等)は canonical_url を NULL で残し、次の実行は HTTP の前に error の行で取り込み済みと分かる。通信の失敗は一時的なので残さず、次の実行で解決し直す。§6 の削除ジョブが 30 日より前の行を消す。GH#340 / migration 028)の 17。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
+共通語彙6テーブルに加える運用系テーブルは `collect_runs`(X 従量コストと doctor 月次見込みに必要な読み取り件数の時系列)、`telegram_state`(getUpdates offset の永続化)、`digest_messages`(部分再送の判定とリプライの帰属の台帳。GH#190)、`item_notes`(記事感想。GH#92 / migration 005)、`digest_notes`(日次感想。GH#96 / migration 006)、`dig_queue`(深掘りキュー。GH#104 / migration 009。§7 末尾)、`dig_backlog_messages`(未消化一覧のリプライ先台帳。同)、`dig_backlog_replies`(未消化一覧へのリプライの受信の冪等キー。GH#335 / migration 026。§7 末尾)、`read_confirm_messages`(週 1 回の読んだのまとめ確認の台帳。GH#399 / migration 030。§7 末尾)、`dig_dismissals`(深掘りカードの 👎 不要の台帳。GH#403 / migration 031。§7 末尾)、`dig_discussions`(深掘りカードの議論。GH#407 / migration 032。§7 末尾)、`dig_results`(深掘り実行結果の台帳。GH#105 / migration 010。§7 末尾)、`dig_questions`(深掘りカードへの質問と返事の台帳。GH#126 / migration 011。§7 末尾)、`x_signals`(X の興味シグナル)・`x_signal_cursors`(自 RT の取込の since_id カーソル。ブックマーク・いいねは既知の id に着いたら打ち切るのでカーソルを持たない)・`x_signal_runs`(シグナル取込の読取件数とコスト。GH#58 / migration 004。backfill の印は migration 023。§7)、`budget_cuts`(collect・extract の段の上限で打ち切り、残りを次の実行へ回した記録。1 回の打ち切り = 1 行で、種類(`rss_items` / `collect_time` / `extract_time`)・RSS のときのソース・回した数・朝バッチの run_id を持つ。週 1 回のソースの健康診断が直近 7 日を読む。GH#340 / migration 028)、`short_url_resolutions`(collect が解決した短縮 URL と、その先の canonical_url。鍵はソースと記事の識別子(`guid:` + guid、無ければ `url:` + 元の URL。種別で名前空間を分け、URL と同じ文字列の guid の記事が guid の無い記事の結果を使わない)で、同じソースの同じ記事を次の実行で読み直すときだけ、解決し直さずに既知の判定と正規化に使う。新しい記事やほかのソースは同じ短縮 URL でも解決し直す(転送先が後で変わったとき、新しい記事を古い先との重複として捨てないため)。ほかのソースと同じ先の記事は保存で無視され、元の URL と記事の対応が items に残らないため。確定した正規化のエラー(解決先を分解できない等)は canonical_url を NULL で残し、次の実行は HTTP の前に error の行で取り込み済みと分かる。通信の失敗は一時的なので残さず、次の実行で解決し直す。§6 の削除ジョブが 30 日より前の行を消す。GH#340 / migration 028)の 18。認可拒否 update の記録はテーブル化せず poller.log への WARN 1行とする(設計 04 §6。1人運用で照会頻度がほぼゼロのデータにマイグレーションを増やさない)。
 
 ### items.status の状態遷移
 
@@ -375,7 +376,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - キューの done 化は選定時 `updated_at` の compare-and-set(生成中の poller 再指定・パスを done で上書きしない。後発の依頼が次回実行で生きる。digest の上位から選んだ item(キューの行が無い)は、行が無いときだけ足し、生成中にできた行は上の `dig_queue` の規則で扱う。GH#349)
 - `review_status` / `review_findings` / `review_cost_usd`(migration 017。GH#153)= 別系統の AI のレビューの結果。`review_status` NULL = レビューしていない(無効・017 より前の行)/ `clean` = 指摘なし / `revised` = 指摘あり → 書き手が 1 回直した / `revise_failed` = 直すのに失敗(本文は直す前のまま)/ `failed` = レビュー自体が失敗(未レビュー)/ `skipped` = 月の上限額に達して省いた、またはドラフトを予備の Claude が書いたので省いた(レビュー役と同じ系統。GH#180。どちらかはカード・ノートの記録の文言で分かる)。`review_findings` は指摘の JSON 配列(`clean` は空配列、`failed`・`skipped` は NULL)で、本文列と違い公開後も残す(続けるかを決める材料)。`review_cost_usd` はやり直しの分を含む API 費用の見積もりで、月の上限の判定と doctor #9 に使う(どちらも UTC の暦月)。応答の usage を受け取れず費用が分からなかった呼び出しは、課金されうる最大の額の見積もりを実額と同じ列に合算する(GH#323。設計 06 §4)
 
-### 深掘りカードへの質問と返事(dig_questions・migration 011〜015・020・025。GH#126 / GH#141 / GH#137 / GH#236 / GH#336 / ADR 0005 / 設計 06 §6)
+### 深掘りカードへの質問と返事(dig_questions・dig_discussions・migration 011〜015・020・025・032。GH#126 / GH#141 / GH#137 / GH#236 / GH#336 / GH#407 / ADR 0005 / 設計 06 §6)
 
 概要カードへのリプライ(質問・感想)と、それへの返事の台帳(1 リプライ = 1 行)。返事は
 **write-ahead** で作る: 答え(または失敗)を先に記帳し(`status` を `answered` / `failed` へ)、
@@ -391,6 +392,9 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `redig`(migration 015)= 1 なら、意図の判定(GH#245)が調べ直しの依頼と分け、`dig_queue` に積んだ(返事の末尾に知らせが付く)。返事の記録と同じトランザクションで積む。0 = 依頼でない・積まなかった(深掘りの段が止まっている・ボタンからの依頼・キューに積めなかった・質問を受け付けた後に本人がそのアイテムをパス・指定し直していた(GH#235)・元記事の本文が保存の期間を過ぎて材料が無い(返事の末尾に理由が付く。GH#197))
 - `status='failed'` も失敗の知らせを送る(本人を待たせたままにしない)。`error` は理由(ログと同じ要約)
 - `retry_of`(migration 020)= 失敗の知らせへのリプライなら、答えられなかった元の質問の id(GH#236)。poller が返信先の message_id(失敗の行の `answer_message_id`)から引いて積む。返事の材料に元の質問を添える(やり直しも失敗していれば最初の質問まで辿る。最初の質問は必ず渡し、途中のやり直しは直近の分だけで合わせて 5 件まで。元がボタンからの依頼なら材料もボタンと同じ元記事の本文)。NULL = カード・返事へのリプライ、ボタンからの依頼
+- `discussion_id`(migration 032)= 議論の中のリプライなら、その議論(`dig_discussions.id`。GH#407)。NULL = 今までどおりの質問・感想・ボタンの依頼。議論の一手は意図の判定を呼ばずに `kind = question` にし、take としては記録しない。返事の材料のやり取りは、その議論の行だけ(直近 20 件)
+- `discussion_wrap`(migration 032)= 1 なら「まとめて」(議論を閉じるまとめ)。まとめは、議論の中に本人の発言があれば `kind = take` にし、返事を送った後に、議論の中の発言(`discussion_wrap = 0` の行の `question`)の原文を古い順に並べて 1 つの take として記録する(記録番号はまとめの行の id)
+- `dig_discussions`(migration 032。GH#407)= 深掘りカードの議論。`dig_result_id`(議論しているカード)・`started_at`(「💬 話す」で開いた時刻)・`closed_at`(「まとめて」を受け付けて閉じた時刻。NULL = 議論中)。1 枚のカードで同時に開く議論は 1 つ(`closed_at IS NULL` の部分 UNIQUE。再配達・二重押しで 2 つ開かない)。まとめを作れなかったら `closed_at` を NULL に戻して開き直す(その間に次の議論を開いていれば戻さない)
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
 
 ## 8. digests

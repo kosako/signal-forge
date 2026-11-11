@@ -68,7 +68,14 @@ from app.dig import (
     queue_item_ids,
     request_dig_now,
 )
-from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
+from app.dig_answer import (
+    discussion_of_reply,
+    enqueue_question,
+    enqueue_request,
+    question_received,
+    questions_on,
+    start_discussion,
+)
 from app.dig_take import is_dismissed, is_read, mark_dismissed, mark_read, read_items
 from app.export.obsidian import note_projection_date
 from app.jst import JST
@@ -384,6 +391,9 @@ def _handle_callback(
                 now_fn(), answer_worker,
             )
             return
+        if prefix == "d" and arg.isdigit() and code == "t":
+            _record_dig_discuss(conn, config, api, callback, callback_id, int(arg), logger)
+            return
         if prefix == "d" and arg.isdigit() and code in _DIG_READ_CODES:
             _record_dig_read(
                 conn, config, api, callback, callback_id, int(arg), _DIG_READ_CODES[code],
@@ -604,6 +614,59 @@ def _pressed_dig_card(
         "JOIN items i ON i.id = r.item_id WHERE r.id = ? AND r.message_id = ?",
         (dig_result_id, message_id if type(message_id) is int else None),
     ).fetchone()
+
+
+# 深掘りカードの「💬 話す」(GH#407)の answer。開いた / もう開いている
+_DIG_DISCUSS_ANSWERS = {
+    True: (
+        "💬 議論を始めました。カードか返事にリプライしてください。"
+        "終えるときは「まとめて」と送ってください"
+    ),
+    False: "💬 議論中です。リプライで続け、終えるときは「まとめて」と送ってください",
+}
+
+
+def _record_dig_discuss(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    dig_result_id: int,
+    logger: logging.Logger,
+) -> None:
+    """深掘りカードの「💬 話す」(GH#407)。そのカードで議論を開く(返事はまだ作らない)。
+
+    押されたメッセージがそのカードであることを確かめる(読んだのボタンと同じ)。1 枚のカードで
+    同時に開く議論は 1 つ(再配達・二重押しで 2 つ開かない)。返事をしない設定では開かない
+    (議論の返事を作れないため)。開いた後のカードと返事へのリプライは、議論の一手になる
+    (_handle_dig_card_reply)。盤面は変えない(議論を閉じるのは別のプロセスのまとめなので、
+    ボタンの表示を議論の状態に合わせて保てないため)。
+    """
+    card = _pressed_dig_card(conn, config, callback, dig_result_id)
+    if card is None:
+        logger.warning("カードと結び付かない話すのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ このカードには対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": card["item_id"]}
+    if config.dig.answer_daily_cap <= 0:
+        api.answer_callback_query(callback_id, text="返事をしない設定です")
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            started = start_discussion(conn, dig_result_id)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(f"議論を開けなかった: {type(e).__name__}: {e}", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info("議論を開いた" if started else "議論は開いている(書かない)", extra=log_extra)
+    api.answer_callback_query(callback_id, text=_DIG_DISCUSS_ANSWERS[started])
 
 
 # 深掘りカードの読んだのボタン(GH#398)の code → 読んだにするか(False = 取り消す)
@@ -1710,6 +1773,10 @@ def _handle_dig_card_reply(
     digest に記事メッセージとして送った item だけ。設計 04 §5)。そのうえで質問として台帳に
     積み、別プロセスの `intel answer` が返事を作って送る(LLM の待ちで受信を止めない)。
     上限を超えた日・上限 0 は記録だけ。
+
+    カードで議論を開いていれば(GH#407)、議論の一手として積む。本文が議論を終える言葉なら
+    まとめとして積み、議論を閉じる。まとめは 1 日の上限で止めない(上限で議論を閉じられなく
+    ならないように。上限 0 では返事を作れないので受けない)。
     """
     dig_result_id, item_id = thread
     message_id = message.get("message_id")
@@ -1718,6 +1785,9 @@ def _handle_dig_card_reply(
         # 受け付け済みなら何もしない(感想も返事も二重にしない)
         logger.info("受け付け済みの質問の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
         return
+    replied_id = message["reply_to_message"]["message_id"]
+    discussion = discussion_of_reply(conn, dig_result_id, text, replied_id)
+    wrap = discussion is not None and discussion[1]
     cap = config.dig.answer_daily_cap
     if cap <= 0 or type(message_id) is not int:
         accept = False
@@ -1728,7 +1798,7 @@ def _handle_dig_card_reply(
             if note_projection_date(conn, item_id) is not None
             else "📝 感想を記録しました"
         )
-    elif questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
+    elif not wrap and questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
         accept = False
         notice = f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません"
         logger.warning(
@@ -1737,7 +1807,13 @@ def _handle_dig_card_reply(
         )
     else:
         accept = True
-        notice = "📝 記録しました。返事を作っています(数分かかることがあります)"
+        notice = (
+            "🧾 議論をまとめています(数分かかることがあります)"
+            if wrap
+            else "💬 返事を作っています(数分かかることがあります)"
+            if discussion is not None
+            else "📝 記録しました。返事を作っています(数分かかることがあります)"
+        )
     # 感想と質問は一緒に記帳する(接続は autocommit。間で止まると、再配達で感想だけ二重になる)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1746,7 +1822,9 @@ def _handle_dig_card_reply(
             # 返信先(形は _replied_dig_thread が確かめ済み)も渡す。失敗の知らせへのリプライを
             # 答えられなかった元の質問に結び付けるため(GH#236)
             enqueue_question(
-                conn, dig_result_id, text, message_id, message["reply_to_message"]["message_id"]
+                conn, dig_result_id, text, message_id, replied_id,
+                discussion_id=discussion[0] if discussion is not None else None,
+                wrap=wrap,
             )
         conn.execute("COMMIT")
     except BaseException:
@@ -1758,7 +1836,9 @@ def _handle_dig_card_reply(
         logger.info("記録済みの感想の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
         return
     logger.info(
-        "質問を受け付けた" if accept else "感想を記録", extra={"stage": "poll", "item_id": item_id}
+        ("議論のまとめを受け付けた" if wrap else "議論の一手を受け付けた" if discussion else
+         "質問を受け付けた") if accept else "感想を記録",
+        extra={"stage": "poll", "item_id": item_id},
     )
     reply(notice)
     if accept and answer_worker is not None:

@@ -16,6 +16,10 @@
 - 返事の形は依頼の種類ごとに分ける(GH#381)。質問・感想への答え方と、カードのボタンの 📝 要約・
   📖 詳しく の形を、別のファイル(prompts/<版>-<形>.md)に置き、枠のプロンプトの form に入れる。
   どの形にも、共通の書き方の手引き(app.prompting.load_writing_guide)を入れる
+- 議論のモード(GH#407): カードの「💬 話す」で開いた議論の中のリプライは、議論の一手として
+  答える(意図の判定をせず、take として記録せず、調べ直しも積まない)。返事にはその議論の
+  やり取りを長めに渡す。「まとめて」で閉じ、まとめを返す。議論の中の本人の発言は、まとめを送った
+  後に原文のまま take として記録する(app.dig_take。ノートには本人の原文だけを書く = ADR 0003)
 """
 
 from __future__ import annotations
@@ -34,16 +38,19 @@ from app.analysis.llm import LLMEngine, complete_with_retry
 from app.analysis.profile import load_interest_profile
 from app.config import Config
 from app.dig import DigInstruction, apply_instructions
+from app.dig_take import discussion_turns
 from app.prompting import fill_template, load_writing_guide, sanitize_body
 from app.vault_dir import VaultDir, folder_dir, open_regular
 from app.vault_guard import VaultGuard, VaultStalled
 
-# 枠のプロンプトと返事の形は同じ版で揃える(GH#381。prompts/dig-answer-v006.md と -question・
-# -summary・-more)。どれかを変えるときは、まとめて次の版を足す。v005 は、書き方の手引きの v002 で
-# 外した読む場所の規則(Telegram で読む・Markdown の記号を使わない・箇条書きと区切り)を枠の
-# 「返事の前提」に移した版(形のファイルは v004 と同じ文)。v006 は、質問・感想への返事を同意者
-# ではなく批判的な助言者の姿勢にした版(GH#405。枠と要約・詳しくの形は v005 と同じ文)
-PROMPT_VERSION = "dig-answer-v006"
+# 枠のプロンプトと返事の形は同じ版で揃える(GH#381。prompts/dig-answer-v007.md と -question・
+# -summary・-more・-discussion・-wrap)。どれかを変えるときは、まとめて次の版を足す。
+# v005 は、書き方の手引きの v002 で外した読む場所の規則(Telegram で読む・Markdown の記号を
+# 使わない・箇条書きと区切り)を枠の「返事の前提」に移した版(形のファイルは v004 と同じ文)。
+# v006 は、質問・感想への返事を同意者ではなく批判的な助言者の姿勢にした版(GH#405。枠と
+# 要約・詳しくの形は v005 と同じ文)。v007 は、議論とそのまとめの形を足した版(GH#407。枠と
+# 質問・要約・詳しくの形は v006 と同じ文)
+PROMPT_VERSION = "dig-answer-v007"
 INTENT_PROMPT_VERSION = "dig-intent-v001"  # 本人のリプライの意図の判定(GH#245)
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -53,6 +60,10 @@ ANSWER_MAX_CHARS = 3_000
 QUESTION_MAX_CHARS = 2_000  # 1 リプライの上限(プロンプトに渡す長さ)
 EXPLAINER_MAX_CHARS = 20_000  # 解説ノート(平均 3,500 字。本人の追記で伸びても抑える)
 HISTORY_TURNS = 5  # 材料に含めるそれまでのやり取り(直近から)
+# 議論(GH#407)の材料に含める、その議論のやり取り(直近から)。まとめも同じ件数まで振り返る。
+# 議論の返事は短い(形の目安 200〜600 字)ので、件数を長くしても材料は伸びすぎない
+DISCUSSION_HISTORY_TURNS = 20
+DISCUSSION_ANSWER_MAX_CHARS = 1_500  # やり取りに入れる、議論の 1 つの返事の長さ
 
 FAILURE_TEXT = "⚠️ 答えを作れませんでした。時間をおいて、もう一度リプライしてください"
 # それまでのやり取りで、答えを作れなかった回に返事の代わりに置く文(GH#236)
@@ -76,6 +87,20 @@ REDIG_NO_MATERIAL_NOTICE = (
     "\n\n⚠️ 元記事の本文の保存の期間が過ぎて材料が無いため、この記事は調べ直せません"
 )
 
+# 議論(GH#407)の返事の末尾に付ける案内(返事を作る呼び出しの出力ではなく、決まった文)
+DISCUSSION_FOOTER = (
+    "\n\n💬 続けるときはこの返事にリプライ、終えるときは「まとめて」と送ってください"
+)
+WRAP_FOOTER_TAKE = "\n\n🧾 議論を終えました。あなたの発言は take としてノートに残します"
+WRAP_FOOTER_EMPTY = "\n\n🧾 議論を終えました"
+# 議論を終える言葉(GH#407)。前後の空白と句読点・感嘆符を除いて、どれかとちょうど一致するときだけ
+# まとめにする(「まとめてから考えたい」のような発言を議論の終わりと取り違えない)
+WRAP_WORDS = frozenset(
+    {"まとめて", "まとめ", "まとめる", "まとめてください", "まとめて下さい", "おわり", "終わり",
+     "終了"}
+)
+_WRAP_STRIP = " \t\n\u3000。、.,!！?？"
+
 # カードのボタンからの依頼(GH#141)。台帳の question にこの文を入れ、質問と同じ流れで答える
 # (返事はカードへのリプライ。それまでのやり取りにもこの文で残る)。返事の形(何をどの順で
 # 書くか)は依頼の文に書かず、プロンプトの返事の形(_FORMS)に持たせる(GH#381。2 か所に書いて
@@ -88,6 +113,8 @@ REQUESTS = {
 # 質問・感想には今までの答え方を、ボタンには要約・詳しくの専用の形を使う(質問の規則の「未検証と
 # 明記」「材料が短ければ一言」などを要約に混ぜない)
 _FORMS = {None: "question", "summary": "summary", "more": "more"}
+# 議論の中のリプライ(GH#407)の返事の形。discussion_wrap(まとめか)から
+_DISCUSSION_FORMS = {False: "discussion", True: "wrap"}
 
 _NOW_UTC = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 # 受付の順序の印(GH#336。migration 025)。質問を受け付けた時点で記帳済みの signals.id の最大。
@@ -99,7 +126,7 @@ SendReply = Callable[[int, str], int]
 
 
 class DigAnswer(BaseModel):
-    """返事の構造化出力(prompts/dig-answer-v006.md)。
+    """返事の構造化出力(prompts/dig-answer-v007.md)。
 
     リプライの種類と調べ直しの依頼かは返させない(DigIntent で別に決める。GH#245)。
     """
@@ -126,20 +153,81 @@ def enqueue_question(
     question: str,
     question_message_id: int,
     replied_message_id: int,
+    *,
+    discussion_id: int | None = None,
+    wrap: bool = False,
 ) -> int:
     """質問を台帳に積む(返事は answer_pending が作る)。トランザクションは呼び出し側が張る。
 
     replied_message_id = そのリプライの返信先(カード・返事・失敗の知らせ)。失敗の知らせへの
     リプライなら、答えられなかった元の質問に結び付ける(retry_of。GH#236)。
+    discussion_id = 議論の中のリプライならその議論(GH#407)。wrap = 議論を閉じるまとめ。まとめを
+    積んだら議論を閉じる(その後のリプライは議論の外の質問・感想になる)。
     """
-    return conn.execute(
+    question_id = conn.execute(
         "INSERT INTO dig_questions "
-        "(dig_result_id, question, question_message_id, retry_of, received_signal_id) "
+        "(dig_result_id, question, question_message_id, retry_of, received_signal_id, "
+        "discussion_id, discussion_wrap) "
         "VALUES (?, ?, ?, (SELECT id FROM dig_questions "
         "WHERE dig_result_id = ? AND answer_message_id = ? AND status = 'failed'), "
-        f"{_RECEIVED_SIGNAL_MARK})",
-        (dig_result_id, question, question_message_id, dig_result_id, replied_message_id),
+        f"{_RECEIVED_SIGNAL_MARK}, ?, ?)",
+        (
+            dig_result_id, question, question_message_id, dig_result_id, replied_message_id,
+            discussion_id, int(wrap),
+        ),
     ).lastrowid
+    if wrap and discussion_id is not None:
+        conn.execute(
+            f"UPDATE dig_discussions SET closed_at = {_NOW_UTC} "
+            "WHERE id = ? AND closed_at IS NULL",
+            (discussion_id,),
+        )
+    return question_id
+
+
+def start_discussion(conn: sqlite3.Connection, dig_result_id: int) -> bool:
+    """カードの「💬 話す」(GH#407)。議論を開いたら True、もう開いていれば False。
+
+    1 枚のカードで同時に開く議論は 1 つ(migration 032 の部分 UNIQUE。再配達・二重押しで 2 つ
+    開かない)。トランザクションは呼び出し側が張る。
+    """
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO dig_discussions (dig_result_id) VALUES (?)", (dig_result_id,)
+    )
+    return cursor.rowcount == 1
+
+
+def open_discussion(conn: sqlite3.Connection, dig_result_id: int) -> int | None:
+    """そのカードで開いている議論の id(GH#407)。無ければ None。"""
+    row = conn.execute(
+        "SELECT id FROM dig_discussions WHERE dig_result_id = ? AND closed_at IS NULL",
+        (dig_result_id,),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def discussion_of_reply(
+    conn: sqlite3.Connection, dig_result_id: int, text: str, replied_message_id: int
+) -> tuple[int, bool] | None:
+    """カード・返事へのリプライが議論の中のものなら (議論の id, まとめか)。議論の外なら None。
+
+    - まとめを作れなかった知らせへのリプライ(「もう一度」など)は、その議論のまとめのやり直し
+      (議論が閉じていても。作れなかったまとめは議論を開き直すが、その間に次の議論を開いていると
+      開き直せないため)
+    - 開いている議論があれば、その議論の一手。本文が議論を終える言葉(WRAP_WORDS)ならまとめ
+    """
+    failed_wrap = conn.execute(
+        "SELECT discussion_id FROM dig_questions "
+        "WHERE dig_result_id = ? AND answer_message_id = ? AND status = 'failed' "
+        "AND discussion_wrap = 1",
+        (dig_result_id, replied_message_id),
+    ).fetchone()
+    if failed_wrap is not None:
+        return failed_wrap["discussion_id"], True
+    discussion_id = open_discussion(conn, dig_result_id)
+    if discussion_id is None:
+        return None
+    return discussion_id, text.strip(_WRAP_STRIP) in WRAP_WORDS
 
 
 def enqueue_request(conn: sqlite3.Connection, dig_result_id: int, request: str) -> bool:
@@ -216,6 +304,7 @@ def _next_pending(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT q.id, q.dig_result_id, q.question, q.request, q.retry_of,
+               q.discussion_id, q.discussion_wrap,
                r.item_id, r.note_name, r.source_note_name, r.card_text
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'pending'
@@ -234,20 +323,39 @@ def _answer_one(
 ) -> None:
     """1 件を pending から answered / failed へ必ず進める(残すと answer_pending が回り続ける)。"""
     log_extra = {"stage": "answer", "extra": {"question_id": row["id"]}}
+    discussion = row["discussion_id"] is not None
     try:
         engine = engine_factory(config.dig.answer_reasoning_effort)
-        intent = _intent(engine, config, row)
+        # 議論の一手は take でも調べ直しの依頼でもないので、意図を判定しない(GH#407)
+        intent = (
+            DigIntent(kind="question", redig=False) if discussion else _intent(engine, config, row)
+        )
         prompt = build_answer_prompt(conn, config, row, vault)
         result = complete_with_retry(engine, prompt, DigAnswer, timeout_s=config.dig.timeout_s)
     except Exception as e:
         # 想定外の例外も 1 件に閉じ、失敗として本人に知らせる(返事を待たせたままにしない)
-        conn.execute(
-            f"UPDATE dig_questions SET status = 'failed', error = ?, answered_at = {_NOW_UTC} "
-            "WHERE id = ?",
-            (f"{type(e).__name__}: {e}"[:500], row["id"]),
-        )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")  # 接続は autocommit
+        try:
+            conn.execute(
+                f"UPDATE dig_questions SET status = 'failed', error = ?, "
+                f"answered_at = {_NOW_UTC} WHERE id = ?",
+                (f"{type(e).__name__}: {e}"[:500], row["id"]),
+            )
+            if row["discussion_wrap"]:
+                _reopen_discussion(conn, row)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         logger.error(f"返事を作れなかった: {type(e).__name__}: {e}", extra=log_extra)
+        return
+    if discussion:
+        _record_discussion_answer(conn, row, result.answer)
+        logger.info(
+            "議論のまとめを作った" if row["discussion_wrap"] else "議論の返事を作った",
+            extra=log_extra,
+        )
         return
     kind = intent.kind
     answer = result.answer
@@ -266,6 +374,38 @@ def _answer_one(
     if not redig:
         _record_answer(conn, row["id"], kind, answer, redig=False)
     logger.info(f"返事を作った(kind={kind}・調べ直し={redig})", extra=log_extra)
+
+
+def _record_discussion_answer(conn: sqlite3.Connection, row: sqlite3.Row, answer: str) -> None:
+    """議論の返事を記録する(GH#407)。末尾に決まった案内を付ける。
+
+    まとめは、議論の中に本人の発言があれば kind = take にする(返事を送った後に app.dig_take が
+    その発言の原文を take として記録する)。発言が無ければ記録するものが無いので question のまま。
+    """
+    if not row["discussion_wrap"]:
+        _record_answer(conn, row["id"], "question", answer + DISCUSSION_FOOTER, redig=False)
+        return
+    has_turns = discussion_turns(conn, row["discussion_id"]) != []
+    _record_answer(
+        conn,
+        row["id"],
+        "take" if has_turns else "question",
+        answer + (WRAP_FOOTER_TAKE if has_turns else WRAP_FOOTER_EMPTY),
+        redig=False,
+    )
+
+
+def _reopen_discussion(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    """まとめを作れなかった議論を開き直す(GH#407。「まとめて」をもう一度受けられるように)。
+
+    その間に同じカードで次の議論を開いていれば開き直さない(同時に開く議論は 1 つ)。その場合も、
+    作れなかった知らせへのリプライはこの議論のまとめのやり直しになる(discussion_of_reply)。
+    """
+    conn.execute(
+        "UPDATE dig_discussions SET closed_at = NULL WHERE id = ? AND NOT EXISTS ("
+        "SELECT 1 FROM dig_discussions WHERE dig_result_id = ? AND closed_at IS NULL)",
+        (row["discussion_id"], row["dig_result_id"]),
+    )
 
 
 def _has_dig_material(conn: sqlite3.Connection, config: Config, item_id: int) -> bool:
@@ -427,7 +567,14 @@ def build_answer_prompt(
     # ボタンからの依頼のやり直しは、材料と返事の形もボタンと同じにする(元記事の本文。
     # GH#141・GH#236・GH#381)
     request = retried[0]["request"] if retried else row["request"]
-    form = (_PROMPTS_DIR / f"{PROMPT_VERSION}-{_FORMS[request]}.md").read_text(encoding="utf-8")
+    # 議論の中のリプライ(GH#407)は議論・まとめの形で答え、その議論のやり取りを渡す
+    discussion_id = row["discussion_id"]
+    form_name = (
+        _DISCUSSION_FORMS[bool(row["discussion_wrap"])]
+        if discussion_id is not None
+        else _FORMS[request]
+    )
+    form = (_PROMPTS_DIR / f"{PROMPT_VERSION}-{form_name}.md").read_text(encoding="utf-8")
     return fill_template(
         template,
         {
@@ -439,7 +586,11 @@ def build_answer_prompt(
                 if request is not None
                 else _materials(config, row, nonce, vault)
             ),
-            "history": _history(conn, row["dig_result_id"], row["id"], nonce),
+            "history": (
+                _discussion_history(conn, discussion_id, row["id"], nonce)
+                if discussion_id is not None
+                else _history(conn, row["dig_result_id"], row["id"], nonce)
+            ),
             "question": question,
             "schema": json.dumps(DigAnswer.model_json_schema(), ensure_ascii=False),
             "nonce": nonce,
@@ -567,6 +718,35 @@ def _history(conn: sqlite3.Connection, dig_result_id: int, before_id: int, nonce
         question = sanitize_body(r["question"], nonce)[:QUESTION_MAX_CHARS]
         if r["status"] == "answered":
             answer = sanitize_body(r["answer"], nonce)[:ANSWER_MAX_CHARS]
+        else:
+            answer = FAILED_TURN_TEXT
+        turns.append(f"私: {question}\nあなた: {answer}")
+    return "\n\n".join(turns)
+
+
+def _discussion_history(
+    conn: sqlite3.Connection, discussion_id: int, before_id: int, nonce: str
+) -> str:
+    """その議論のそれまでのやり取り(直近 DISCUSSION_HISTORY_TURNS 件を古い順。GH#407)。
+
+    議論の外のやり取り(議論を始める前の質問・感想)は入れない。返事の末尾の決まった案内は除く。
+    """
+    rows = conn.execute(
+        """
+        SELECT question, status, answer FROM dig_questions
+        WHERE discussion_id = ? AND id < ? AND status IN ('answered', 'failed')
+        ORDER BY id DESC LIMIT ?
+        """,
+        (discussion_id, before_id, DISCUSSION_HISTORY_TURNS),
+    ).fetchall()
+    if not rows:
+        return "(なし。議論の最初のリプライ)"
+    turns = []
+    for r in reversed(rows):
+        question = sanitize_body(r["question"], nonce)[:QUESTION_MAX_CHARS]
+        if r["status"] == "answered":
+            answer = r["answer"].removesuffix(DISCUSSION_FOOTER)
+            answer = sanitize_body(answer, nonce)[:DISCUSSION_ANSWER_MAX_CHARS]
         else:
             answer = FAILED_TURN_TEXT
         turns.append(f"私: {question}\nあなた: {answer}")

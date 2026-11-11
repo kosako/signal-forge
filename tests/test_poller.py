@@ -1109,7 +1109,7 @@ def test_note_and_question_are_recorded_together(conn, tmp_path, monkeypatch) ->
     config = answer_config(tmp_path)
     real_enqueue_question = poller.enqueue_question
 
-    def locked_once(*args):
+    def locked_once(*args, **kwargs):
         monkeypatch.setattr(poller, "enqueue_question", real_enqueue_question)
         raise sqlite3.OperationalError("database is locked")
 
@@ -1774,8 +1774,8 @@ def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
     keyboard = dig_card_keyboard(5, url, with_requests=True)
     buttons = keyboard["inline_keyboard"][0]
     assert ("url" in buttons[0]) is has_url_button
-    # 📝 要約は付けない(GH#403)
-    assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:m"]
+    # 📝 要約は付けない(GH#403)。💬 話す(GH#407)
+    assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:m", "d:5:t"]
 
 
 READ = {"text": "✅ 読んだ", "callback_data": "d:5:r"}
@@ -2055,6 +2055,98 @@ def test_dismiss_button_not_bound_to_the_card_is_rejected(
     assert dismissals(conn) == []
     assert api.answered == [("cb1", "⚠️ このカードには対応できません")]
     assert api.edited == []
+
+
+# --- 深掘りカードの議論(GH#407。設計 06 §6・04 §3) ---
+
+
+def discussions(conn) -> list[tuple]:
+    rows = conn.execute(
+        "SELECT dig_result_id, closed_at IS NULL AS open FROM dig_discussions ORDER BY id"
+    )
+    return [tuple(r) for r in rows]
+
+
+def test_discuss_button_opens_one_discussion(conn, tmp_path) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "t"), dig_button(dig_id, "t", update_id=2)]])
+
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert discussions(conn) == [(dig_id, 1)]
+    assert api.answered == [
+        ("cb1", "💬 議論を始めました。カードか返事にリプライしてください。"
+                "終えるときは「まとめて」と送ってください"),
+        ("cb2", "💬 議論中です。リプライで続け、終えるときは「まとめて」と送ってください"),
+    ]
+    assert api.edited == []  # 盤面は変えない
+
+
+@pytest.mark.parametrize(
+    ("card_message_id", "chat_id", "cap", "answer"),
+    [
+        (701, CHAT_ID, 20, "⚠️ このカードには対応できません"),  # 別のメッセージ
+        (700, 999, 20, "⚠️ このカードには対応できません"),  # owner の chat 以外
+        (700, CHAT_ID, 0, "返事をしない設定です"),  # 議論の返事を作れない
+    ],
+)
+def test_discuss_button_rejected(conn, tmp_path, card_message_id, chat_id, cap, answer) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "t", card_message_id=card_message_id, chat_id=chat_id)]])
+
+    poll_once(conn, answer_config(tmp_path, cap=cap), api, logger)
+
+    assert discussions(conn) == []
+    assert api.answered == [("cb1", answer)]
+
+
+def test_reply_in_discussion_is_a_turn_and_wrap_closes_it(conn, tmp_path) -> None:
+    # 議論中のカードへのリプライは議論の一手。「まとめて」で閉じ、その後は今までどおりの質問
+    item_id, dig_id = add_dig_card(conn)
+    api, worker = FakeApi([[dig_button(dig_id, "t")]]), FakeWorker()
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+    api = RedeliveringApi([
+        card_reply("費用が本質では", 700, message_id=81, update_id=2),
+        card_reply("まとめて", 700, message_id=82, update_id=3),
+        card_reply("別の質問", 700, message_id=83, update_id=4),
+    ])
+
+    poll_once(conn, answer_config(tmp_path), api, logger, answer_worker=worker)
+
+    queued = conn.execute(
+        "SELECT question, discussion_id IS NOT NULL, discussion_wrap FROM dig_questions ORDER BY id"
+    ).fetchall()
+    assert [tuple(r) for r in queued] == [
+        ("費用が本質では", 1, 0), ("まとめて", 1, 1), ("別の質問", 0, 0)
+    ]
+    assert discussions(conn) == [(dig_id, 0)]
+    assert [text for _, text in api.sent] == [
+        "💬 返事を作っています(数分かかることがあります)",
+        "🧾 議論をまとめています(数分かかることがあります)",
+        "📝 記録しました。返事を作っています(数分かかることがあります)",
+    ]
+    # 感想としても今までどおり記録する(原文は item_notes に残る)
+    notes = conn.execute("SELECT note FROM item_notes WHERE item_id = ? ORDER BY id", (item_id,))
+    assert [r[0] for r in notes] == ["費用が本質では", "まとめて", "別の質問"]
+    assert worker.kicks == 3
+
+
+def test_wrap_is_accepted_over_the_daily_cap(conn, tmp_path) -> None:
+    # 1 日の上限を超えた日も、まとめは受ける(議論を閉じられなくならないように)
+    _item_id, dig_id = add_dig_card(conn)
+    poll_once(conn, answer_config(tmp_path, cap=1), FakeApi([[dig_button(dig_id, "t")]]), logger)
+    api = RedeliveringApi([
+        card_reply("一手目", 700, message_id=81, update_id=2),
+        card_reply("二手目", 700, message_id=82, update_id=3),
+        card_reply("まとめて", 700, message_id=83, update_id=4),
+    ])
+
+    poll_once(conn, answer_config(tmp_path, cap=1), api, logger)
+
+    queued = conn.execute("SELECT question FROM dig_questions ORDER BY id").fetchall()
+    assert [r[0] for r in queued] == ["一手目", "まとめて"]
+    assert api.sent[1][1] == "📝 記録しました。今日の返事の上限(1 件)に達したため、返事は作りません"
+    assert discussions(conn) == [(dig_id, 0)]
 
 
 # --- 朝の digest の記事の今すぐのボタン(GH#388。設計 06 §2〜3・04 §3) ---
