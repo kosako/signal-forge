@@ -59,7 +59,9 @@ DIG_NOW_STATES: frozenset[DigState | None] = frozenset({"planned", "waiting", No
 # 一覧から消える操作の案内(GH#398)。深掘りの段が動いているときだけ、注記の最後に置く。カードへの
 # リプライは、返事をしない設定・返事の上限を超えた日は感想として残るだけで take にならず、一覧から
 # 外れない。どの設定でも確かに外れるボタンだけを案内する
-DIG_BACKLOG_READ_NOTE = "✅ 読み終えたら、深掘りカードの「✅ 読んだ」を押すと一覧から外れます"
+DIG_BACKLOG_READ_NOTE = (
+    "✅ 読み終えたら深掘りカードの「✅ 読んだ」、要らなければ「👎 不要」を押すと一覧から外れます"
+)
 # 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
 DIG_STATE_MARKS: dict[DigState, str] = {
     "planned": "🗓 明朝",
@@ -653,6 +655,7 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     - どちらも深掘り実施(最新の followup_dig が yes)の記録で消える。「はい」から
       「いいえ」への訂正で一覧に戻る(GH#195)。両方に該当する item は 1 行(マーク時刻は
       新しい方)。新しいマークが上(直近の関心を先頭に)
+    - 深掘りカードの 👎 不要(台帳 dig_dismissals。GH#403)の item も消える。取り消すと戻る
     """
     return conn.execute(
         """
@@ -682,6 +685,7 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             WHERE f.kind = 'followup_dig' AND f.item_id = marked.item_id
             ORDER BY f.created_at DESC, f.id DESC LIMIT 1
           ) IS NOT 'yes'
+          AND NOT EXISTS (SELECT 1 FROM dig_dismissals AS d WHERE d.item_id = marked.item_id)
         GROUP BY items.id
         ORDER BY marked_at DESC, items.id DESC
         """

@@ -1773,20 +1773,35 @@ def test_dig_card_keyboard_only_links_safe_urls(url, has_url_button) -> None:
     keyboard = dig_card_keyboard(5, url, with_requests=True)
     buttons = keyboard["inline_keyboard"][0]
     assert ("url" in buttons[0]) is has_url_button
-    assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:s", "d:5:m"]
+    # 📝 要約は付けない(GH#403)
+    assert [b["callback_data"] for b in buttons if "callback_data" in b] == ["d:5:m"]
 
 
-def test_dig_card_keyboard_has_read_row() -> None:
-    # GH#398: 2 行目は ✅ 読んだ。読んだにした後は取り消すボタン。返事をしない設定でも付ける
-    read_row = [{"text": "✅ 読んだ", "callback_data": "d:5:r"}]
-    undo_row = [{"text": "↩️ 読んだを取り消す", "callback_data": "d:5:u"}]
-    assert dig_card_keyboard(5, "https://a.example/1", with_requests=True)[
-        "inline_keyboard"
-    ][1] == read_row
-    assert dig_card_keyboard(5, None, with_requests=False) == {"inline_keyboard": [read_row]}
-    assert dig_card_keyboard(5, None, with_requests=False, read=True) == {
-        "inline_keyboard": [undo_row]
-    }
+READ = {"text": "✅ 読んだ", "callback_data": "d:5:r"}
+UNREAD = {"text": "↩️ 読んだを取り消す", "callback_data": "d:5:u"}
+DISMISS = {"text": "👎 不要", "callback_data": "d:5:x"}
+UNDISMISS = {"text": "↩️ 不要を取り消す", "callback_data": "d:5:y"}
+
+
+@pytest.mark.parametrize(
+    ("read", "dismissed", "row"),
+    [
+        (False, False, [READ, DISMISS]),
+        (True, False, [UNREAD, DISMISS]),
+        (False, True, [READ, UNDISMISS]),
+        (True, True, [UNREAD, UNDISMISS]),
+    ],
+)
+def test_dig_card_keyboard_has_read_and_dismiss_row(read, dismissed, row) -> None:
+    # GH#398・GH#403: 2 行目は ✅ 読んだ / 👎 不要。押した後はそれぞれ取り消すボタン。返事を
+    # しない設定でも付ける
+    keyboard = dig_card_keyboard(
+        5, "https://a.example/1", with_requests=True, read=read, dismissed=dismissed
+    )
+    assert keyboard["inline_keyboard"][1] == row
+    assert dig_card_keyboard(
+        5, None, with_requests=False, read=read, dismissed=dismissed
+    ) == {"inline_keyboard": [row]}
 
 
 # --- 深掘りカードの読んだのボタン(GH#398。設計 04 §3・06 §6) ---
@@ -1833,7 +1848,8 @@ def test_read_button_records_read_and_undo(conn, tmp_path) -> None:
     assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
     assert api.answered == [("cb2", "↩️ 読んだを取り消しました(未消化一覧に戻ります)")]
     assert api.edited[0][2]["inline_keyboard"][1] == [
-        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"}
+        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"},
+        {"text": "👎 不要", "callback_data": f"d:{dig_id}:x"},
     ]
 
 
@@ -1891,6 +1907,117 @@ def test_read_button_not_bound_to_the_card_is_rejected(
     assert api.answered == [("cb1", "⚠️ このカードには対応できません")]
     assert api.edited == []
 
+
+# --- 深掘りカードの不要のボタン(GH#403。設計 04 §3・06 §5.3) ---
+
+
+def dismissals(conn) -> list[tuple]:
+    rows = conn.execute("SELECT item_id, dig_result_id FROM dig_dismissals ORDER BY item_id")
+    return [tuple(r) for r in rows]
+
+
+@pytest.mark.parametrize("mark", ["bookmark", "reaction"])
+def test_dismiss_button_records_dismissal_and_undo(conn, tmp_path, mark) -> None:
+    # 不要 = 台帳 dig_dismissals の 1 行で未消化一覧から外れ、取り消すと戻る。X のブックマークでも
+    # 🔖 でも外れる。反応・followup_dig(signals)には書かない
+    item_id, dig_id = add_dig_card(conn)
+    if mark == "bookmark":
+        add_bookmark(conn, item_id)
+    else:
+        conn.execute(
+            "INSERT INTO signals (kind, item_id, value, signal_date) "
+            "VALUES ('reaction', ?, 'dig', '2026-07-20')",
+            (item_id,),
+        )
+        conn.commit()
+    signals_before = conn.execute("SELECT count(*) FROM signals").fetchone()[0]
+    assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
+
+    api = FakeApi([[dig_button(dig_id, "x")]])
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert dismissals(conn) == [(item_id, dig_id)]
+    assert pending_dig_items(conn) == []
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == signals_before
+    assert api.answered == [("cb1", "👎 不要にしました(未消化一覧に載りません)")]
+    assert api.edited == [
+        (CHAT_ID, 700, dig_card_keyboard(dig_id, "https://a/dig/700", with_requests=True,
+                                         dismissed=True)),
+    ]
+
+    api = FakeApi([[dig_button(dig_id, "y", update_id=2)]])
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert dismissals(conn) == []
+    assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
+    assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == signals_before
+    assert api.answered == [("cb2", "↩️ 不要を取り消しました")]
+    assert api.edited == [
+        (CHAT_ID, 700, dig_card_keyboard(dig_id, "https://a/dig/700", with_requests=True)),
+    ]
+
+
+def test_dismiss_button_twice_or_undo_first_writes_nothing_new(conn, tmp_path) -> None:
+    # 再配達・二重押し・古い盤面: 今の状態と同じなら書かない。返事をしない設定でも記録できる
+    item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[
+        dig_button(dig_id, "y"),
+        dig_button(dig_id, "x", update_id=2),
+        dig_button(dig_id, "x", update_id=3),
+    ]])
+
+    poll_once(conn, answer_config(tmp_path, cap=0), api, logger)
+
+    assert dismissals(conn) == [(item_id, dig_id)]
+    assert api.answered == [
+        ("cb1", "↩️ 不要にはしていません"),
+        ("cb2", "👎 不要にしました(未消化一覧に載りません)"),
+        ("cb3", "👎 不要にしてあります"),
+    ]
+    assert api.edited[-1][2] == dig_card_keyboard(dig_id, "https://a/dig/700",
+                                                  with_requests=False, dismissed=True)
+
+
+def test_read_and_dismiss_buttons_keep_each_others_state(conn, tmp_path) -> None:
+    # 片方を押しても、もう片方のボタンは今の状態のまま。不要にしてある item の読んだを取り消しても
+    # 一覧には戻らないので、そう知らせる
+    item_id, dig_id = add_dig_card(conn)
+    add_bookmark(conn, item_id)
+    api = FakeApi([[
+        dig_button(dig_id, "x"),
+        dig_button(dig_id, "r", update_id=2),
+        dig_button(dig_id, "u", update_id=3),
+    ]])
+
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    url = "https://a/dig/700"
+    assert [markup for _, _, markup in api.edited] == [
+        dig_card_keyboard(dig_id, url, with_requests=True, dismissed=True),
+        dig_card_keyboard(dig_id, url, with_requests=True, read=True, dismissed=True),
+        dig_card_keyboard(dig_id, url, with_requests=True, dismissed=True),
+    ]
+    assert api.answered[2] == (
+        "cb3", "↩️ 読んだを取り消しました(不要にしてあるので、一覧には載りません)"
+    )
+    assert pending_dig_items(conn) == []
+
+
+@pytest.mark.parametrize(
+    ("card_message_id", "chat_id"),
+    [(701, CHAT_ID), (700, 999)],  # 別のメッセージ / owner の chat 以外
+)
+def test_dismiss_button_not_bound_to_the_card_is_rejected(
+    conn, tmp_path, card_message_id, chat_id
+) -> None:
+    _item_id, dig_id = add_dig_card(conn)
+    api = FakeApi([[dig_button(dig_id, "x", card_message_id=card_message_id, chat_id=chat_id)]])
+
+    poll_once(conn, answer_config(tmp_path), api, logger)
+
+    assert dismissals(conn) == []
+    assert api.answered == [("cb1", "⚠️ このカードには対応できません")]
+    assert api.edited == []
 
 
 # --- 朝の digest の記事の今すぐのボタン(GH#388。設計 06 §2〜3・04 §3) ---

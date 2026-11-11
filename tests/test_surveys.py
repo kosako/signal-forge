@@ -2541,3 +2541,28 @@ def test_read_confirm_ignores_card_questions(conn, tmp_path) -> None:
     assert json.loads(
         conn.execute("SELECT item_ids FROM read_confirm_messages").fetchone()[0]
     ) == [noted]
+
+
+def test_read_confirm_and_backlog_skip_dismissed_items(conn, tmp_path) -> None:
+    # GH#403: 深掘りカードの 👎 不要にした item は、未消化一覧にも日曜のまとめ確認にも載せない
+    only_read_confirm_due(conn, SUNDAY)
+    kept = add_bookmarked(conn, "https://c/kept", "2026-10-24T00:00:00Z")
+    dismissed = add_bookmarked(conn, "https://c/dismissed", "2026-10-24T01:00:00Z")
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', 700)",
+        (dismissed,),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (?, ?)", (dismissed, dig_id)
+    )
+    for item_id in (kept, dismissed):
+        add_note(conn, item_id)
+    api = FakeApi()
+
+    assert [row["item_id"] for row in pending_dig_items(conn)] == [kept]
+    run_due_timers(conn, make_config(tmp_path), api, logger, SUNDAY)
+
+    assert json.loads(
+        conn.execute("SELECT item_ids FROM read_confirm_messages").fetchone()[0]
+    ) == [kept]
