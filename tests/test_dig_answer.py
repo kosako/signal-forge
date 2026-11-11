@@ -1264,13 +1264,14 @@ def test_v006_changes_only_the_question_form() -> None:
     # GH#405: 枠と要約・詳しくの形は v005 と同じ文。変えたのは質問・感想への返事の形だけ
     prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
 
-    def read(name: str) -> str:
-        return (prompts_dir / f"{name}.md").read_text(encoding="utf-8")
+    def read(name: str) -> bytes:
+        # バイトで比べる(read_text は改行を正規化し、CRLF の違いを見逃すため)
+        return (prompts_dir / f"{name}.md").read_bytes()
 
     for suffix in ("", "-summary", "-more"):
         assert read(f"dig-answer-v006{suffix}") == read(f"dig-answer-v005{suffix}")
-    question = read("dig-answer-v006-question")
-    assert question != read("dig-answer-v005-question")
+    assert read("dig-answer-v006-question") != read("dig-answer-v005-question")
+    question = read("dig-answer-v006-question").decode("utf-8")
     assert "同意できる点" not in question  # 同意から入る書き方をやめた
     for rule in ("前提は正しいか", "見落としているリスク", "次に見ること・試すこと", "「仮説」"):
         assert rule in question
