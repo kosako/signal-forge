@@ -213,8 +213,13 @@ def discussion_of_reply(
 
     - まとめを作れなかった知らせへのリプライ(「もう一度」など)は、その議論のまとめのやり直し
       (議論が閉じていても。作れなかったまとめは議論を開き直すが、その間に次の議論を開いていると
-      開き直せないため)
+      開き直せないため)。ただし、その議論のまとめが既に積まれている(作っている・作れた)なら
+      やり直しにしない(「もう一度」を 2 回送った・まとめた後に古い知らせへ返信した。同じ発言を
+      2 回 take にしない)。そのときは議論の外の返信として扱う
     - 開いている議論があれば、その議論の一手。本文が議論を終える言葉(WRAP_WORDS)ならまとめ
+
+    poller が受付のトランザクションの中で呼ぶ(作れなかったまとめの議論を開き直す `intel answer`
+    と競わない)。
     """
     failed_wrap = conn.execute(
         "SELECT discussion_id FROM dig_questions "
@@ -223,6 +228,8 @@ def discussion_of_reply(
         (dig_result_id, replied_message_id),
     ).fetchone()
     if failed_wrap is not None:
+        if _has_live_wrap(conn, failed_wrap["discussion_id"]):
+            return None
         return failed_wrap["discussion_id"], True
     discussion_id = open_discussion(conn, dig_result_id)
     if discussion_id is None:
@@ -376,16 +383,35 @@ def _answer_one(
     logger.info(f"返事を作った(kind={kind}・調べ直し={redig})", extra=log_extra)
 
 
+def _has_live_wrap(conn: sqlite3.Connection, discussion_id: int) -> bool:
+    """その議論のまとめが積まれているか(作っている・作れた。作れなかったものは除く)。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM dig_questions WHERE discussion_id = ? AND discussion_wrap = 1 "
+            "AND status IN ('pending', 'answered')",
+            (discussion_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _record_discussion_answer(conn: sqlite3.Connection, row: sqlite3.Row, answer: str) -> None:
     """議論の返事を記録する(GH#407)。末尾に決まった案内を付ける。
 
     まとめは、議論の中に本人の発言があれば kind = take にする(返事を送った後に app.dig_take が
     その発言の原文を take として記録する)。発言が無ければ記録するものが無いので question のまま。
+    同じ議論の別のまとめが先に take になっていれば、take にしない(議論ごとに 1 回だけ記録する。
+    受付で重複は防いでいるが、記録の側でも 2 回書かない)。
     """
     if not row["discussion_wrap"]:
         _record_answer(conn, row["id"], "question", answer + DISCUSSION_FOOTER, redig=False)
         return
-    has_turns = discussion_turns(conn, row["discussion_id"]) != []
+    already = conn.execute(
+        "SELECT 1 FROM dig_questions WHERE discussion_id = ? AND discussion_wrap = 1 "
+        "AND kind = 'take' AND id <> ?",
+        (row["discussion_id"], row["id"]),
+    ).fetchone()
+    has_turns = already is None and discussion_turns(conn, row["discussion_id"]) != []
     _record_answer(
         conn,
         row["id"],

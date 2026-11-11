@@ -640,8 +640,9 @@ def _record_dig_discuss(
     押されたメッセージがそのカードであることを確かめる(読んだのボタンと同じ)。1 枚のカードで
     同時に開く議論は 1 つ(再配達・二重押しで 2 つ開かない)。返事をしない設定では開かない
     (議論の返事を作れないため)。開いた後のカードと返事へのリプライは、議論の一手になる
-    (_handle_dig_card_reply)。盤面は変えない(議論を閉じるのは別のプロセスのまとめなので、
-    ボタンの表示を議論の状態に合わせて保てないため)。
+    (_handle_dig_card_reply)。盤面は変えない(議論は「まとめて」を受け付けた poller が閉じるが、
+    まとめを作れなかったときに開き直すのは別のプロセスの `intel answer` なので、ボタンの表示を
+    議論の状態に合わせて保てないため)。
     """
     card = _pressed_dig_card(conn, config, callback, dig_result_id)
     if card is None:
@@ -1786,37 +1787,40 @@ def _handle_dig_card_reply(
         logger.info("受け付け済みの質問の再配達を破棄", extra={"stage": "poll", "item_id": item_id})
         return
     replied_id = message["reply_to_message"]["message_id"]
-    discussion = discussion_of_reply(conn, dig_result_id, text, replied_id)
-    wrap = discussion is not None and discussion[1]
-    cap = config.dig.answer_daily_cap
-    if cap <= 0 or type(message_id) is not int:
-        accept = False
-        # Obsidian への反映は、export が感想を投影する item のときだけ案内する。🔖 保存節にだけ
-        # 載った X ブックマークのカードなど、対象外の item への感想は item_notes に残るだけ(GH#229)
-        notice = (
-            "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
-            if note_projection_date(conn, item_id) is not None
-            else "📝 感想を記録しました"
-        )
-    elif not wrap and questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
-        accept = False
-        notice = f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません"
-        logger.warning(
-            f"質問の上限({cap} 件/日)に達したため返事を作らない",
-            extra={"stage": "poll", "item_id": item_id},
-        )
-    else:
-        accept = True
-        notice = (
-            "🧾 議論をまとめています(数分かかることがあります)"
-            if wrap
-            else "💬 返事を作っています(数分かかることがあります)"
-            if discussion is not None
-            else "📝 記録しました。返事を作っています(数分かかることがあります)"
-        )
-    # 感想と質問は一緒に記帳する(接続は autocommit。間で止まると、再配達で感想だけ二重になる)
+    # 感想と質問は一緒に記帳する(接続は autocommit。間で止まると、再配達で感想だけ二重になる)。
+    # 議論の中かの判定も同じトランザクションで行う(別のプロセスの `intel answer` が、作れなかった
+    # まとめの議論を開き直すのと競わない。GH#407)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        discussion = discussion_of_reply(conn, dig_result_id, text, replied_id)
+        wrap = discussion is not None and discussion[1]
+        cap = config.dig.answer_daily_cap
+        if cap <= 0 or type(message_id) is not int:
+            accept = False
+            # Obsidian への反映は、export が感想を投影する item のときだけ案内する。🔖 保存節に
+            # だけ載った X ブックマークのカードなど、対象外の item への感想は item_notes に残る
+            # だけ(GH#229)
+            notice = (
+                "📝 感想を記録しました。明朝の export で Obsidian ノートに反映します"
+                if note_projection_date(conn, item_id) is not None
+                else "📝 感想を記録しました"
+            )
+        elif not wrap and questions_on(conn, now.astimezone(JST).date().isoformat()) >= cap:
+            accept = False
+            notice = f"📝 記録しました。今日の返事の上限({cap} 件)に達したため、返事は作りません"
+            logger.warning(
+                f"質問の上限({cap} 件/日)に達したため返事を作らない",
+                extra={"stage": "poll", "item_id": item_id},
+            )
+        else:
+            accept = True
+            notice = (
+                "🧾 議論をまとめています(数分かかることがあります)"
+                if wrap
+                else "💬 返事を作っています(数分かかることがあります)"
+                if discussion is not None
+                else "📝 記録しました。返事を作っています(数分かかることがあります)"
+            )
         recorded = _insert_note(conn, _ITEM_NOTE_SQL, item_id, text, chat_id, message)
         if recorded and accept:
             # 返信先(形は _replied_dig_thread が確かめ済み)も渡す。失敗の知らせへのリプライを

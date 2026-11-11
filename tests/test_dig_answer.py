@@ -1408,6 +1408,48 @@ def test_failed_wrap_reopens_discussion_and_retry_wraps_again(conn, config) -> N
     assert open_discussion(conn, dig_id) is None
 
 
+@pytest.mark.parametrize("after", ["second_retry", "wrapped"])
+def test_failure_notice_reply_retries_wrap_only_once(conn, config, after) -> None:
+    # 作れなかったまとめの知らせへの返信は 1 回だけまとめのやり直しにする。2 回目の「もう一度」と、
+    # まとめた後に古い知らせへ返信したものは、議論の外の返信(同じ発言を 2 回 take にしない)
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    say(conn, dig_id, "まとめて", 72)
+    answer_pending(conn, config, Engine(fail_on={2, 3}).factory, Sender(), logger)
+    notice = rows(conn)[-1]["answer_message_id"]
+    say(conn, dig_id, "もう一度", 73, replied=notice)
+    if after == "wrapped":
+        answer_pending(conn, config, Engine().factory, Sender(), logger)
+        assert rows(conn)[-1]["kind"] == "take"
+
+    assert discussion_of_reply(conn, dig_id, "もう一度", notice) is None
+    late = say(conn, dig_id, "もう一度", 74, replied=notice)
+    late_row = conn.execute("SELECT * FROM dig_questions WHERE id = ?", (late,)).fetchone()
+    assert (late_row["discussion_id"], late_row["discussion_wrap"]) == (None, 0)
+    wraps = conn.execute(
+        "SELECT count(*) FROM dig_questions WHERE discussion_id = ? AND discussion_wrap = 1 "
+        "AND status <> 'failed'",
+        (discussion_id,),
+    )
+    assert wraps.fetchone()[0] == 1
+
+
+def test_second_wrap_of_a_discussion_is_not_a_take(conn, config) -> None:
+    # 受付で防いでいるが、記録の側でも議論ごとに 1 回だけ take にする
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    for message_id in (72, 73):
+        enqueue_question(conn, dig_id, "まとめて", message_id, 0,
+                         discussion_id=discussion_id, wrap=True)
+    conn.commit()
+
+    answer_pending(conn, config, Engine().factory, Sender(), logger)
+
+    assert [r["kind"] for r in rows(conn)[1:]] == ["take", "question"]
+
+
 def test_failed_wrap_does_not_reopen_when_next_discussion_is_open(conn, config) -> None:
     dig_id = add_dig(conn, config)
     first = discuss(conn, dig_id)
