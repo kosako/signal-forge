@@ -184,6 +184,30 @@ def apply_instructions(
             )
 
 
+def dismiss_from_queue(conn: sqlite3.Connection, item_id: int) -> bool:
+    """深掘りカードの 👎 不要(GH#403)のキューへの反映(commit は呼び出し側)。パスにしたら True。
+
+    - queued(調べ直し・今すぐの依頼などで掘る予定): 未消化一覧の ⏭️ 外すと同じくパスにする
+      (明朝の予定に載せて掘り直さない。受付の順序の印も今の時点に進む)
+    - それ以外(done・passed): 状態は変えず、受付の順序の印(backlog_op_question_id)だけを今の
+      時点に進める。返事を作っている間の調べ直しの依頼(不要の前に受け付けたもの)を、作り終えた
+      後にキューへ戻させないため(GH#235 と同じ照合)。不要の後に受け付けた依頼は今どおり積む。
+      updated_at は進めない(done 化の compare-and-set は queued の行だけが使う)
+    - キューに無い: 何もしない
+    """
+    row = conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item_id,)).fetchone()
+    if row is None:
+        return False
+    if row["status"] == "queued":
+        apply_instructions(conn, [DigInstruction(item_id, "pass")])
+        return True
+    conn.execute(
+        f"UPDATE dig_queue SET backlog_op_question_id = ({_BACKLOG_MARK}) WHERE item_id = ?",
+        (1, item_id),
+    )
+    return False
+
+
 def queue_item_ids(conn: sqlite3.Connection) -> set[int]:
     """キュー在籍の item id 集合(リプライで指定可能な番号の一部)。"""
     return {row["item_id"] for row in conn.execute("SELECT item_id FROM dig_queue")}

@@ -62,6 +62,7 @@ from app.dig import (
     NowRequestOutcome,
     apply_instructions,
     dig_now_marked,
+    dismiss_from_queue,
     now_requests_ahead,
     parse_dig_reply,
     queue_item_ids,
@@ -713,8 +714,9 @@ def _record_dig_dismiss(
     状態のボタンに差し替える(不要 ⇄ 取り消す。読んだのボタンは今の状態のまま)。
 
     不要にするとき、調べ直しの依頼などでキューに戻っている(queued)item は、未消化一覧の
-    「⏭️ 外す」と同じくパスにする(明朝の予定に載せて掘り直さない)。取り消してもパスは戻さない
-    (掘り直すなら、また頼む)。
+    「⏭️ 外す」と同じくパスにする(明朝の予定に載せて掘り直さない)。ほかの状態でも受付の順序の
+    印を進め、返事を作っている間の調べ直しの依頼でキューに戻させない(dismiss_from_queue)。
+    取り消してもパスと印は戻さない(掘り直すなら、また頼む)。
     """
     card = _pressed_dig_card(conn, config, callback, dig_result_id)
     if card is None:
@@ -726,12 +728,7 @@ def _record_dig_dismiss(
         conn.execute("BEGIN IMMEDIATE")
         try:
             written = mark_dismissed(conn, card["item_id"], dig_result_id, dismissed)
-            queue = conn.execute(
-                "SELECT status FROM dig_queue WHERE item_id = ?", (card["item_id"],)
-            ).fetchone()
-            passed = dismissed and queue is not None and queue["status"] == "queued"
-            if passed:
-                apply_instructions(conn, [DigInstruction(card["item_id"], "pass")])
+            passed = dismissed and dismiss_from_queue(conn, card["item_id"])
             read = is_read(conn, card["item_id"])
             conn.execute("COMMIT")
         except BaseException:

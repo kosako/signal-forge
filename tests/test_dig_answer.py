@@ -16,7 +16,7 @@ from app import dig_answer
 from app.analysis.llm import CodexCliEngine, LLMError, parse_structured
 from app.config import Config, DigConfig, ObsidianConfig, TelegramConfig
 from app.db import apply_migrations, connect
-from app.dig import apply_instructions, parse_dig_reply
+from app.dig import apply_instructions, dismiss_from_queue, parse_dig_reply
 from app.dig_answer import (
     FAILED_TURN_TEXT,
     FAILURE_TEXT,
@@ -867,6 +867,47 @@ def test_redig_is_queued_without_operation_after_acceptance(conn, config, tmp_pa
     assert (queue["status"], queue["angle"]) == ("queued", "コストの観点で調べ直して")
     assert sender.sent == [(71, "返事1" + dig_answer.REDIG_NOTICE)]
     assert rows(conn)[0]["redig"] == 1
+
+
+def card_dismiss(db_path: Path, item_id: int) -> None:
+    """深掘りカードの 👎 不要のキューへの反映(poller と同じ。別のプロセスなので別の接続で)。"""
+    other = connect(db_path)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        dismiss_from_queue(other, item_id)
+        other.execute("COMMIT")
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize("dismissed", ["during_answer", "before_question"])
+def test_redig_respects_card_dismissal_order(conn, config, tmp_path, dismissed) -> None:
+    # GH#403: 返事を作る間にカードで不要にしたら、不要の前に受け付けた調べ直しは積まない
+    # (キューは done のまま。知らせも付けない)。不要の後に受け付けた調べ直しは今どおり積む
+    dig_id = add_dig_with_body(conn, config)
+    item_id = put_queue(conn, dig_id, "done")
+    if dismissed == "before_question":
+        card_dismiss(tmp_path / "intel.db", item_id)
+    question_id = ask(conn, dig_id, "コストの観点で調べ直して", 71)
+    pin_queue(conn, item_id)
+    pin_question(conn, question_id)
+
+    def operate() -> None:
+        if dismissed == "during_answer":
+            card_dismiss(tmp_path / "intel.db", item_id)
+
+    sender = Sender()
+
+    answer_pending(conn, config, OperateDuringAnswer(operate, redig_on={1}).factory, sender, logger)
+
+    queue = queue_of(conn, dig_id)
+    if dismissed == "during_answer":
+        assert (queue["status"], queue["angle"]) == ("done", "前の観点")
+        assert sender.sent == [(71, "返事1")]
+    else:
+        assert (queue["status"], queue["angle"]) == ("queued", "コストの観点で調べ直して")
+        assert sender.sent == [(71, "返事1" + dig_answer.REDIG_NOTICE)]
+    assert not conn.in_transaction
 
 
 def test_later_redig_on_same_card_is_queued_after_earlier_one(conn, config) -> None:
