@@ -688,6 +688,11 @@ _DIG_DISMISS_ANSWERS = {
     (False, True): "↩️ 不要を取り消しました",
     (False, False): "↩️ 不要にはしていません",
 }
+# 調べ直しを頼んでキューに戻っていた item を不要にしたとき(深掘りの予定も外す)
+_DIG_DISMISS_PASSED_ANSWERS = {
+    True: "👎 不要にしました(未消化一覧に載りません。深掘りの予定も外しました)",
+    False: "👎 不要にしてあります(深掘りの予定は外しました)",
+}
 
 
 def _record_dig_dismiss(
@@ -706,6 +711,10 @@ def _record_dig_dismiss(
     記録は 1 つのトランザクションで行い(mark_dismissed)、再配達・二重押しで 2 回書かない。
     反応(signals)には書かない(ダイジェストの 👎 とは別の操作。ユーザーの判断)。盤面は押した後の
     状態のボタンに差し替える(不要 ⇄ 取り消す。読んだのボタンは今の状態のまま)。
+
+    不要にするとき、調べ直しの依頼などでキューに戻っている(queued)item は、未消化一覧の
+    「⏭️ 外す」と同じくパスにする(明朝の予定に載せて掘り直さない)。取り消してもパスは戻さない
+    (掘り直すなら、また頼む)。
     """
     card = _pressed_dig_card(conn, config, callback, dig_result_id)
     if card is None:
@@ -717,6 +726,12 @@ def _record_dig_dismiss(
         conn.execute("BEGIN IMMEDIATE")
         try:
             written = mark_dismissed(conn, card["item_id"], dig_result_id, dismissed)
+            queue = conn.execute(
+                "SELECT status FROM dig_queue WHERE item_id = ?", (card["item_id"],)
+            ).fetchone()
+            passed = dismissed and queue is not None and queue["status"] == "queued"
+            if passed:
+                apply_instructions(conn, [DigInstruction(card["item_id"], "pass")])
             read = is_read(conn, card["item_id"])
             conn.execute("COMMIT")
         except BaseException:
@@ -729,9 +744,14 @@ def _record_dig_dismiss(
         return
     logger.info(
         "不要のボタンを記録した" if written else "不要のボタン(記録済み。書かない)",
-        extra=log_extra,
+        extra={**log_extra, "extra": {"dismissed": dismissed, "passed": passed}},
     )
-    api.answer_callback_query(callback_id, text=_DIG_DISMISS_ANSWERS[(dismissed, written)])
+    answer = (
+        _DIG_DISMISS_PASSED_ANSWERS[written]
+        if passed
+        else _DIG_DISMISS_ANSWERS[(dismissed, written)]
+    )
+    api.answer_callback_query(callback_id, text=answer)
     keyboard = dig_card_keyboard(
         dig_result_id,
         card["canonical_url"],
@@ -788,6 +808,8 @@ def _record_read_confirm(
         try:
             written = [item_id for item_id in targets if mark_read(conn, item_id, read, day)]
             now_read = read_items(conn, item_ids)
+            # 不要にしてある item は、読んだを取り消しても一覧に戻らない(GH#403)
+            dismissed = code == "u" and is_dismissed(conn, targets[0])
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -804,12 +826,19 @@ def _record_read_confirm(
         "まとめ確認の読んだを記録した",
         extra={"stage": "poll", "extra": {"code": code, "written": len(written)}},
     )
-    api.answer_callback_query(callback_id, text=_read_confirm_answer(code, targets, written))
+    api.answer_callback_query(
+        callback_id, text=_read_confirm_answer(code, targets, written, dismissed=dismissed)
+    )
     _edit_markup_best_effort(api, callback, read_confirm_keyboard(item_ids, now_read), logger)
 
 
-def _read_confirm_answer(code: str, targets: list[int], written: list[int]) -> str:
-    """まとめ確認のボタンの answer(GH#399)。"""
+def _read_confirm_answer(
+    code: str, targets: list[int], written: list[int], *, dismissed: bool = False
+) -> str:
+    """まとめ確認のボタンの answer(GH#399)。
+
+    dismissed = 取り消した item が不要にしてある(GH#403。一覧には戻らない)。
+    """
     if code == "a":
         return (
             f"✅ {len(written)} 件を読んだにしました" if written else "✅ 全部読んだにしてあります"
@@ -821,11 +850,11 @@ def _read_confirm_answer(code: str, targets: list[int], written: list[int]) -> s
             if written
             else f"✅ {item_id} は読んだにしてあります"
         )
-    return (
-        f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
-        if written
-        else f"↩️ {item_id} は読んだにしていません"
-    )
+    if not written:
+        return f"↩️ {item_id} は読んだにしていません"
+    if dismissed:
+        return f"↩️ {item_id} の読んだを取り消しました(不要にしてあるので、一覧には載りません)"
+    return f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
 
 
 # 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。

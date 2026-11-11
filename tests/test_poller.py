@@ -2,7 +2,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -19,6 +19,7 @@ from app.delivery.poller import (
 )
 from app.delivery.surveys import pending_dig_items
 from app.delivery.telegram import LONG_POLL_S, dig_card_keyboard, reaction_keyboard
+from app.dig import next_morning_plan
 from app.export import export_pending_notes
 from app.jst import JST
 from tests.test_delivery import add_digest, add_item, telegram_text_error
@@ -2001,6 +2002,42 @@ def test_read_and_dismiss_buttons_keep_each_others_state(conn, tmp_path) -> None
         "cb3", "↩️ 読んだを取り消しました(不要にしてあるので、一覧には載りません)"
     )
     assert pending_dig_items(conn) == []
+
+
+def test_dismiss_button_passes_a_requeued_item(conn, tmp_path) -> None:
+    # 調べ直しを頼んでキューに戻っていた item を不要にすると、⏭️ 外すと同じくパスにし、明朝の
+    # 予定(夜の一覧の 🗓 明朝)に載せない。取り消してもパスは戻さない
+    item_id, dig_id = add_dig_card(conn)
+    conn.execute(
+        "INSERT INTO documents (item_id, extracted_text, language, extraction_status,"
+        " expires_at) VALUES (?, ?, 'ja', 'ok', '2099-01-01T00:00:00Z')",
+        (item_id, "本文の段落です。" * 50),
+    )
+    conn.execute(
+        "INSERT INTO dig_queue (item_id, status, source, requested_at) "
+        "VALUES (?, 'queued', 'request', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        (item_id,),
+    )
+    conn.commit()
+    config = answer_config(tmp_path)
+    tomorrow = (datetime.now(JST) + timedelta(days=1)).date().isoformat()
+    assert [c.item_id for c in next_morning_plan(conn, config, tomorrow)] == [item_id]
+
+    api = FakeApi([[
+        dig_button(dig_id, "x"),
+        dig_button(dig_id, "x", update_id=2),
+        dig_button(dig_id, "y", update_id=3),
+    ]])
+    poll_once(conn, config, api, logger)
+
+    assert api.answered == [
+        ("cb1", "👎 不要にしました(未消化一覧に載りません。深掘りの予定も外しました)"),
+        ("cb2", "👎 不要にしてあります"),
+        ("cb3", "↩️ 不要を取り消しました"),
+    ]
+    status = conn.execute("SELECT status FROM dig_queue WHERE item_id = ?", (item_id,))
+    assert status.fetchone()[0] == "passed"
+    assert next_morning_plan(conn, config, tomorrow) == []
 
 
 @pytest.mark.parametrize(
