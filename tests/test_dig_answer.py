@@ -1154,13 +1154,15 @@ def test_retry_of_failed_button_request_uses_the_article_body(conn, config) -> N
 
 # --- 返事の形と書き方の手引き(GH#381) ---
 
-# 形ごとの見分けの印(prompts/dig-answer-v005-<形>.md の見出し)と、質問の答え方の規則
+# 形ごとの見分けの印(prompts/dig-answer-v006-<形>.md の見出し)と、質問の答え方の規則
 FORM_HEADINGS = {
     "question": "# 返事の形(質問・感想へのリプライ)",
     "summary": "# 返事の形(📝 要約のボタン)",
     "more": "# 返事の形(📖 詳しくのボタン)",
 }
 QA_RULE = "外部照合が要る主張は「未検証」と明記する"
+# 質問・感想への返事の姿勢(GH#405。同意者ではなく批判的な助言者)
+CRITIC_RULE = "私の同意者ではなく、率直な助言者として返す。"
 
 
 def prompt_for(conn, config, kind: str, url: str = "https://a.example/1") -> str:
@@ -1186,8 +1188,10 @@ def test_each_request_gets_the_writing_guide_and_only_its_own_form(conn, config,
     assert "<!--" not in prompt  # 手引きの先頭の出典のコメントは LLM に渡さない
     for other, heading in FORM_HEADINGS.items():
         assert (heading in prompt) == (other == kind)
-    # 質問の答え方の規則(未検証の明記など)は、質問にだけ当てる(要約・詳しくに混ぜない)
+    # 質問の答え方の規則(未検証の明記など)と批判的な姿勢(GH#405)は、質問にだけ当てる
+    # (要約・詳しくに混ぜない)
     assert (QA_RULE in prompt) == (kind == "question")
+    assert (CRITIC_RULE in prompt) == (kind == "question")
     # プレースホルダはすべて埋まり、囲みは材料とやり取りの 2 つだけ
     assert re.search(r"\{\{\w+\}\}", prompt) is None
     nonce = re.search(r"<<<DATA-(\w+)", prompt).group(1)
@@ -1243,7 +1247,7 @@ def test_retry_of_failed_button_request_keeps_the_button_form(conn, config) -> N
 
 
 def test_prompt_versions_and_form_files() -> None:
-    assert dig_answer.PROMPT_VERSION == "dig-answer-v005"
+    assert dig_answer.PROMPT_VERSION == "dig-answer-v006"
     assert WRITING_GUIDE_VERSION == "writing-guide-ja-v002"
     prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
     frame = (prompts_dir / f"{dig_answer.PROMPT_VERSION}.md").read_text(encoding="utf-8")
@@ -1254,3 +1258,20 @@ def test_prompt_versions_and_form_files() -> None:
         text = (prompts_dir / f"{dig_answer.PROMPT_VERSION}-{form}.md").read_text(encoding="utf-8")
         assert text.startswith(FORM_HEADINGS[form])
         assert "{{" not in text and "DATA-" not in text  # 形の文が囲みやプレースホルダを作らない
+
+
+def test_v006_changes_only_the_question_form() -> None:
+    # GH#405: 枠と要約・詳しくの形は v005 と同じ文。変えたのは質問・感想への返事の形だけ
+    prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
+
+    def read(name: str) -> bytes:
+        # バイトで比べる(read_text は改行を正規化し、CRLF の違いを見逃すため)
+        return (prompts_dir / f"{name}.md").read_bytes()
+
+    for suffix in ("", "-summary", "-more"):
+        assert read(f"dig-answer-v006{suffix}") == read(f"dig-answer-v005{suffix}")
+    assert read("dig-answer-v006-question") != read("dig-answer-v005-question")
+    question = read("dig-answer-v006-question").decode("utf-8")
+    assert "同意できる点" not in question  # 同意から入る書き方をやめた
+    for rule in ("前提は正しいか", "見落としているリスク", "次に見ること・試すこと", "「仮説」"):
+        assert rule in question
