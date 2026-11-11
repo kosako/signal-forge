@@ -1775,7 +1775,7 @@ def test_translate_body_keeps_each_chunk_within_limit(config) -> None:
 
 @pytest.mark.parametrize("answer_daily_cap", [20, 0])
 def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily_cap) -> None:
-    # GH#141: スマホの Telegram で完結させる。🔗 元記事 / 📝 要約 / 📖 詳しく
+    # GH#141: スマホの Telegram で完結させる。🔗 元記事 / 📖 詳しく(📝 要約は付けない。GH#403)
     item = add_item(conn, "https://a.example/1")
     dig_id = conn.execute(
         "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
@@ -1791,15 +1791,45 @@ def test_card_is_sent_with_source_and_request_buttons(conn, config, answer_daily
     buttons = api.markups[0]["inline_keyboard"][0]
     assert buttons[0] == {"text": "🔗 元記事", "url": "https://a.example/1"}
     if answer_daily_cap > 0:
-        assert buttons[1:] == [
-            {"text": "📝 要約", "callback_data": f"d:{dig_id}:s"},
-            {"text": "📖 詳しく", "callback_data": f"d:{dig_id}:m"},
-        ]
+        assert buttons[1:] == [{"text": "📖 詳しく", "callback_data": f"d:{dig_id}:m"}]
     else:
-        assert buttons[1:] == []  # 返事をしない設定では要約・詳しくを出さない
-    # 2 行目は ✅ 読んだ(GH#398。返事をしない設定でも付ける)
+        assert buttons[1:] == []  # 返事をしない設定では詳しくを出さない
+    # 2 行目は ✅ 読んだ(GH#398)と 👎 不要(GH#403)。返事をしない設定でも付ける
     assert api.markups[0]["inline_keyboard"][1] == [
-        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"}
+        {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"},
+        {"text": "👎 不要", "callback_data": f"d:{dig_id}:x"},
+    ]
+
+
+def test_redug_card_shows_the_current_read_and_dismiss_state(conn, config) -> None:
+    # GH#403: 掘り直したカードは、前のカードで付けた読んだ・不要の今の状態のボタンで送る
+    item = add_item(conn, "https://a.example/1")
+    old_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id)"
+        " VALUES (?, 'n', '前のカード', 600)",
+        (item,),
+    ).lastrowid
+    dig_id = conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, published_at)"
+        " VALUES (?, 'n2', 'カード本文', '2026-07-22T21:40:00Z')",
+        (item,),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date)"
+        " VALUES ('followup_dig', ?, 'yes', '2026-07-22')",
+        (item,),
+    )
+    conn.execute(
+        "INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (?, ?)", (item, old_id)
+    )
+    conn.commit()
+    api = FakeApi()
+
+    run_dig_stage(conn, config, make_factory({}), api, logger, today="2026-07-23")
+
+    assert api.markups[0]["inline_keyboard"][1] == [
+        {"text": "↩️ 読んだを取り消す", "callback_data": f"d:{dig_id}:u"},
+        {"text": "↩️ 不要を取り消す", "callback_data": f"d:{dig_id}:y"},
     ]
 
 

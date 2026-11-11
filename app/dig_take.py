@@ -13,6 +13,8 @@
 - 返事を送れた行だけを記録する(返事が届く前に未消化一覧から消さない)
 - 深掘りカードの ✅ 読んだ(GH#398)と、週 1 回の読んだのまとめ確認(GH#399)も、同じ followup_dig を
   記録する(mark_read。take は要らない)
+- 深掘りカードの 👎 不要(GH#403)は followup_dig ではなく台帳 dig_dismissals に記録する
+  (mark_dismissed。未消化一覧から外すだけで、反応・KPI には書かない)
 - 公開済みのノートは本人のもの(Obsidian で開いて編集していることもある)なので、**追記だけ**を
   行い、書き換えない。末尾への追記(O_APPEND)は今ある中身に触れないので、本人の編集を消す
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
@@ -239,7 +241,7 @@ def mark_read(conn: sqlite3.Connection, item_id: int, read: bool, day: str) -> b
     取り消しは読んだの後だけにする。signal_date は take と同じ規則で、🔖 が無ければ day
     (押した日の JST)。呼び出し側のトランザクションの中で呼ぶ(最新の確認と記録を 1 つにする)。
     """
-    if read == _is_read(conn, item_id):
+    if read == is_read(conn, item_id):
         return False
     _insert_followup(conn, item_id, "yes" if read else "no", day)
     return True
@@ -247,12 +249,41 @@ def mark_read(conn: sqlite3.Connection, item_id: int, read: bool, day: str) -> b
 
 def read_items(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
     """item のうち、最新の followup_dig が yes のもの(読んだにしてある。GH#399)。読むだけ。"""
-    return {item_id for item_id in dict.fromkeys(item_ids) if _is_read(conn, item_id)}
+    return {item_id for item_id in dict.fromkeys(item_ids) if is_read(conn, item_id)}
 
 
-def _is_read(conn: sqlite3.Connection, item_id: int) -> bool:
+def is_read(conn: sqlite3.Connection, item_id: int) -> bool:
+    """最新の followup_dig が yes か(読んだにしてある)。読むだけ。"""
     latest = _latest_followup(conn, item_id)
     return latest is not None and latest["value"] == "yes"
+
+
+def mark_dismissed(
+    conn: sqlite3.Connection, item_id: int, dig_result_id: int, dismissed: bool
+) -> bool:
+    """深掘りカードの 👎 不要・↩️ 不要を取り消す(GH#403)。書いたら True。
+
+    不要 = 台帳 dig_dismissals に 1 行(未消化一覧と日曜のまとめ確認に載せない)。取り消す = 行を
+    消す。反応(signals)には書かない(ダイジェストの 👎 とは別の操作で、🔖 の数・ソースの健康診断・
+    KPI の定義を変えない)。今の状態と同じなら書かない(再配達・二重押し・古い盤面のボタン)。
+    呼び出し側のトランザクションの中で呼ぶ。
+    """
+    if dismissed:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO dig_dismissals (item_id, dig_result_id) VALUES (?, ?)",
+            (item_id, dig_result_id),
+        )
+    else:
+        cur = conn.execute("DELETE FROM dig_dismissals WHERE item_id = ?", (item_id,))
+    return cur.rowcount == 1
+
+
+def is_dismissed(conn: sqlite3.Connection, item_id: int) -> bool:
+    """カードの 👎 不要にしてあるか(GH#403)。読むだけ。"""
+    return (
+        conn.execute("SELECT 1 FROM dig_dismissals WHERE item_id = ?", (item_id,)).fetchone()
+        is not None
+    )
 
 
 def _latest_followup(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:

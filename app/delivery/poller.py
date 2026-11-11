@@ -62,13 +62,14 @@ from app.dig import (
     NowRequestOutcome,
     apply_instructions,
     dig_now_marked,
+    dismiss_from_queue,
     now_requests_ahead,
     parse_dig_reply,
     queue_item_ids,
     request_dig_now,
 )
 from app.dig_answer import enqueue_question, enqueue_request, question_received, questions_on
-from app.dig_take import mark_read, read_items
+from app.dig_take import is_dismissed, is_read, mark_dismissed, mark_read, read_items
 from app.export.obsidian import note_projection_date
 from app.jst import JST
 from app.normalize import (
@@ -389,6 +390,12 @@ def _handle_callback(
                 logger, now_fn(),
             )
             return
+        if prefix == "d" and arg.isdigit() and code in _DIG_DISMISS_CODES:
+            _record_dig_dismiss(
+                conn, config, api, callback, callback_id, int(arg), _DIG_DISMISS_CODES[code],
+                logger,
+            )
+            return
         if prefix == "b" and arg.isdigit() and code == "p":
             _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
             return
@@ -527,7 +534,8 @@ def _record_dig_request(
     answer_worker: AnswerWorker | None,
 ) -> None:
     """深掘りカードの 📝 要約・📖 詳しく(GH#141)。依頼を台帳に積み、返事は `intel answer` が
-    カードへのリプライで送る(質問と同じ流れ・同じ 1 日の上限)。
+    カードへのリプライで送る(質問と同じ流れ・同じ 1 日の上限)。新しいカードには要約を付けない
+    (GH#403)が、既に送ったカードの要約のボタンは今までどおり受け付ける。
 
     押されたメッセージが、そのカードとして送ったメッセージであることを確かめる(callback_data
     だけを信じない)。同じカードの同じボタンは 1 回だけ受け付ける(再配達・二重押し)。
@@ -607,6 +615,8 @@ _DIG_READ_ANSWERS = {
     (False, True): "↩️ 読んだを取り消しました(未消化一覧に戻ります)",
     (False, False): "↩️ 読んだにはしていません",
 }
+# 読んだを取り消しても、不要にしてある item は一覧に戻らない(GH#403)
+_DIG_READ_UNDO_DISMISSED = "↩️ 読んだを取り消しました(不要にしてあるので、一覧には載りません)"
 
 
 def _record_dig_read(
@@ -624,7 +634,8 @@ def _record_dig_read(
 
     押されたメッセージがそのカードであることを確かめる(📝 要約・📖 詳しく と同じ)。最新の記録の
     確認と記録は 1 つのトランザクションで行い(mark_read)、再配達・二重押しで同じ値を 2 回
-    書かない。盤面は押した後の状態のボタンに差し替える(読んだ ⇄ 取り消す)。
+    書かない。盤面は押した後の状態のボタンに差し替える(読んだ ⇄ 取り消す。不要のボタンは
+    今の状態のまま。GH#403)。
     """
     card = _pressed_dig_card(conn, config, callback, dig_result_id)
     if card is None:
@@ -638,6 +649,7 @@ def _record_dig_read(
             written = mark_read(
                 conn, card["item_id"], read, now.astimezone(JST).date().isoformat()
             )
+            dismissed = is_dismissed(conn, card["item_id"])
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -651,12 +663,98 @@ def _record_dig_read(
         "読んだのボタンを記録した" if written else "読んだのボタン(記録済み。書かない)",
         extra=log_extra,
     )
-    api.answer_callback_query(callback_id, text=_DIG_READ_ANSWERS[(read, written)])
+    answer = (
+        _DIG_READ_UNDO_DISMISSED
+        if (read, written, dismissed) == (False, True, True)
+        else _DIG_READ_ANSWERS[(read, written)]
+    )
+    api.answer_callback_query(callback_id, text=answer)
     keyboard = dig_card_keyboard(
         dig_result_id,
         card["canonical_url"],
         with_requests=config.dig.answer_daily_cap > 0,
         read=read,
+        dismissed=dismissed,
+    )
+    _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+# 深掘りカードの不要のボタン(GH#403)の code → 不要にするか(False = 取り消す)
+_DIG_DISMISS_CODES = {"x": True, "y": False}
+# 不要のボタンの answer。(不要にするか, 書いたか) で決める。一覧に載っていない item(🔖 も
+# ブックマークも無い深掘り)もあるので、「外れます」ではなく「載りません」と言う
+_DIG_DISMISS_ANSWERS = {
+    (True, True): "👎 不要にしました(未消化一覧に載りません)",
+    (True, False): "👎 不要にしてあります",
+    (False, True): "↩️ 不要を取り消しました",
+    (False, False): "↩️ 不要にはしていません",
+}
+# 調べ直しを頼んでキューに戻っていた item を不要にしたとき(深掘りの予定も外す)
+_DIG_DISMISS_PASSED_ANSWERS = {
+    True: "👎 不要にしました(未消化一覧に載りません。深掘りの予定も外しました)",
+    False: "👎 不要にしてあります(深掘りの予定は外しました)",
+}
+
+
+def _record_dig_dismiss(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    dig_result_id: int,
+    dismissed: bool,
+    logger: logging.Logger,
+) -> None:
+    """深掘りカードの 👎 不要・↩️ 不要を取り消す(GH#403)。台帳 dig_dismissals に記録する。
+
+    押されたメッセージがそのカードであることを確かめる(読んだのボタンと同じ)。今の状態の確認と
+    記録は 1 つのトランザクションで行い(mark_dismissed)、再配達・二重押しで 2 回書かない。
+    反応(signals)には書かない(ダイジェストの 👎 とは別の操作。ユーザーの判断)。盤面は押した後の
+    状態のボタンに差し替える(不要 ⇄ 取り消す。読んだのボタンは今の状態のまま)。
+
+    不要にするとき、調べ直しの依頼などでキューに戻っている(queued)item は、未消化一覧の
+    「⏭️ 外す」と同じくパスにする(明朝の予定に載せて掘り直さない)。ほかの状態でも受付の順序の
+    印を進め、返事を作っている間の調べ直しの依頼でキューに戻させない(dismiss_from_queue)。
+    取り消してもパスと印は戻さない(掘り直すなら、また頼む)。
+    """
+    card = _pressed_dig_card(conn, config, callback, dig_result_id)
+    if card is None:
+        logger.warning("カードと結び付かない不要のボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ このカードには対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": card["item_id"], "extra": {"dismissed": dismissed}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            written = mark_dismissed(conn, card["item_id"], dig_result_id, dismissed)
+            passed = dismissed and dismiss_from_queue(conn, card["item_id"])
+            read = is_read(conn, card["item_id"])
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(f"不要のボタンを記録できなかった: {type(e).__name__}: {e}", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "不要のボタンを記録した" if written else "不要のボタン(記録済み。書かない)",
+        extra={**log_extra, "extra": {"dismissed": dismissed, "passed": passed}},
+    )
+    answer = (
+        _DIG_DISMISS_PASSED_ANSWERS[written]
+        if passed
+        else _DIG_DISMISS_ANSWERS[(dismissed, written)]
+    )
+    api.answer_callback_query(callback_id, text=answer)
+    keyboard = dig_card_keyboard(
+        dig_result_id,
+        card["canonical_url"],
+        with_requests=config.dig.answer_daily_cap > 0,
+        read=read,
+        dismissed=dismissed,
     )
     _edit_markup_best_effort(api, callback, keyboard, logger)
 
@@ -707,6 +805,8 @@ def _record_read_confirm(
         try:
             written = [item_id for item_id in targets if mark_read(conn, item_id, read, day)]
             now_read = read_items(conn, item_ids)
+            # 不要にしてある item は、読んだを取り消しても一覧に戻らない(GH#403)
+            dismissed = code == "u" and is_dismissed(conn, targets[0])
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -723,12 +823,19 @@ def _record_read_confirm(
         "まとめ確認の読んだを記録した",
         extra={"stage": "poll", "extra": {"code": code, "written": len(written)}},
     )
-    api.answer_callback_query(callback_id, text=_read_confirm_answer(code, targets, written))
+    api.answer_callback_query(
+        callback_id, text=_read_confirm_answer(code, targets, written, dismissed=dismissed)
+    )
     _edit_markup_best_effort(api, callback, read_confirm_keyboard(item_ids, now_read), logger)
 
 
-def _read_confirm_answer(code: str, targets: list[int], written: list[int]) -> str:
-    """まとめ確認のボタンの answer(GH#399)。"""
+def _read_confirm_answer(
+    code: str, targets: list[int], written: list[int], *, dismissed: bool = False
+) -> str:
+    """まとめ確認のボタンの answer(GH#399)。
+
+    dismissed = 取り消した item が不要にしてある(GH#403。一覧には戻らない)。
+    """
     if code == "a":
         return (
             f"✅ {len(written)} 件を読んだにしました" if written else "✅ 全部読んだにしてあります"
@@ -740,11 +847,11 @@ def _read_confirm_answer(code: str, targets: list[int], written: list[int]) -> s
             if written
             else f"✅ {item_id} は読んだにしてあります"
         )
-    return (
-        f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
-        if written
-        else f"↩️ {item_id} は読んだにしていません"
-    )
+    if not written:
+        return f"↩️ {item_id} は読んだにしていません"
+    if dismissed:
+        return f"↩️ {item_id} の読んだを取り消しました(不要にしてあるので、一覧には載りません)"
+    return f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
 
 
 # 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。
