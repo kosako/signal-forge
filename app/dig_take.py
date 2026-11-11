@@ -15,6 +15,9 @@
   記録する(mark_read。take は要らない)
 - 深掘りカードの 👎 不要(GH#403)は followup_dig ではなく台帳 dig_dismissals に記録する
   (mark_dismissed。未消化一覧から外すだけで、反応・KPI には書かない)
+- 議論(GH#407)の中の本人の発言は、一手ごとには記録しない。「まとめて」のまとめを送った後に、
+  議論の中の発言の原文を古い順に並べて 1 つの take として記録する(まとめの行の記録番号で 1 回だけ。
+  LLM のまとめはノートに書かない = ADR 0003)
 - 公開済みのノートは本人のもの(Obsidian で開いて編集していることもある)なので、**追記だけ**を
   行い、書き換えない。末尾への追記(O_APPEND)は今ある中身に触れないので、本人の編集を消す
   ことは無い(エディタが古い内容で保存し直したときに消えうるのは、こちらが足した take だけ)。
@@ -38,7 +41,7 @@ import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from app.config import Config
 from app.vault_dir import VaultPathError, folder_dir
@@ -74,13 +77,15 @@ def record_takes(
         """
         SELECT q.id, q.question, date(q.created_at, '+9 hours') AS take_date,
                strftime('%Y-%m-%d %H:%M', q.created_at, '+9 hours') AS take_time,
-               q.received_signal_id, r.item_id, r.note_name
+               q.received_signal_id, q.discussion_id, q.discussion_wrap,
+               r.item_id, r.note_name
         FROM dig_questions q JOIN dig_results r ON r.id = q.dig_result_id
         WHERE q.status = 'answered' AND q.kind IN ('take', 'both')
           AND q.answer_message_id IS NOT NULL AND q.take_recorded_at IS NULL
         ORDER BY q.id
         """
     ).fetchall()
+    rows = [_take_row(conn, row) for row in rows]
     recorded = 0
     for row in rows:
         log_extra = {"stage": "answer", "item_id": row["item_id"],
@@ -125,7 +130,7 @@ def record_takes(
     return recorded
 
 
-def _append_to_note(config: Config, row: sqlite3.Row) -> None:
+def _append_to_note(config: Config, row: Mapping) -> None:
     """ノートの末尾に take を足す(今ある中身は書き換えない)。"""
     name = f"{row['note_name']}.md"
     if os.sep in name or name.startswith("."):
@@ -174,13 +179,36 @@ def _open_deepdive(config: Config) -> int:
         raise _NoteMissing(f"DeepDive までのフォルダ: {e}") from e
 
 
-def _take_body(row: sqlite3.Row) -> bytes:
+def _take_row(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """記録する take の行。議論のまとめ(GH#407)は、議論の中の本人の発言の原文を本文にする。
+
+    発言は古い順に空行で区切って並べる(まとめの「まとめて」自体は含めない)。
+    """
+    take = dict(row)
+    take["source"] = "Telegram のリプライ"
+    if row["discussion_wrap"]:
+        take["question"] = "\n\n".join(discussion_turns(conn, row["discussion_id"]))
+        take["source"] = "Telegram の議論"
+    return take
+
+
+def discussion_turns(conn: sqlite3.Connection, discussion_id: int) -> list[str]:
+    """議論の中の本人の発言の原文(まとめを除く。古い順。GH#407)。まとめの take に使う。"""
+    rows = conn.execute(
+        "SELECT question FROM dig_questions "
+        "WHERE discussion_id = ? AND discussion_wrap = 0 ORDER BY id",
+        (discussion_id,),
+    ).fetchall()
+    return [row["question"] for row in rows]
+
+
+def _take_body(row: Mapping) -> bytes:
     """ノートに足す take の節。見出しの記録番号(質問 id)で、書いたかどうかを見分ける。
 
     印に HTML コメントを使わない: 途中まで書いて止まると閉じていない `<!--` が残り、Obsidian で
     その後ろが全部隠れるため。見出しの断片が残っても、ただの文字列で済む。
     """
-    heading = f"**take**({row['take_time']}・Telegram のリプライ・記録番号 {row['id']})"
+    heading = f"**take**({row['take_time']}・{row['source']}・記録番号 {row['id']})"
     return f"{heading}\n\n{row['question']}\n".encode()
 
 
@@ -211,7 +239,7 @@ def _read_all(fd: int) -> bytes:
     return b"".join(chunks)
 
 
-def _record_followup(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+def _record_followup(conn: sqlite3.Connection, row: Mapping) -> None:
     """followup_dig = yes(最新の記録が yes なら足さない)。signal_date は 🔖 の reaction と
     同じ配信日(設計 01 §7)。
 

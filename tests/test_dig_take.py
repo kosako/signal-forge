@@ -576,3 +576,44 @@ def test_partial_write_into_empty_note_is_completed(conn, config, monkeypatch, c
     assert text.startswith("**take**(") and text.count("記録番号") == 1
     assert text.endswith("空のノートへの結論\n")
 
+
+
+def test_discussion_wrap_records_own_turns_as_one_take(conn, config) -> None:
+    # GH#407: 議論の一手は記録しない。まとめを送った後に、議論の中の本人の発言の原文を古い順に
+    # 1 つの take として記録する(LLM のまとめはノートに書かない = ADR 0003)
+    from app.dig_answer import (
+        discussion_of_reply,
+        enqueue_question,
+        open_discussion,
+        start_discussion,
+    )
+
+    dig_id = add_dig(conn, config, note=NOTE)
+    start_discussion(conn, dig_id)
+    discussion_id = open_discussion(conn, dig_id)
+    ids = []
+    for text, message_id in (("常駐型が筋がよい", 71), ("いや、費用が本質", 72), ("まとめて", 73)):
+        _, wrap = discussion_of_reply(conn, dig_id, text, 0)
+        ids.append(
+            enqueue_question(
+                conn, dig_id, text, message_id, 0, discussion_id=discussion_id, wrap=wrap
+            )
+        )
+    conn.execute(
+        "UPDATE dig_questions SET status = 'answered', answer = '返事', "
+        "created_at = '2026-10-18T13:00:55Z', answer_message_id = 10000 + id, "
+        "kind = CASE WHEN discussion_wrap = 1 THEN 'take' ELSE 'question' END"
+    )
+    conn.commit()
+
+    assert record_takes(conn, config, logger) == 1
+
+    text = note_path(config, conn, dig_id).read_text(encoding="utf-8")
+    assert text.endswith(
+        "(この下は手書きメモ・take 領域)\n"
+        f"\n**take**(2026-10-18 22:00・Telegram の議論・記録番号 {ids[2]})\n\n"
+        "常駐型が筋がよい\n\nいや、費用が本質\n"
+    )
+    assert "まとめて" not in text and "返事" not in text
+    assert followups(conn, item_of(conn, dig_id)) == [("yes", "2026-10-18")]
+    assert record_takes(conn, config, logger) == 0  # 記録番号で 1 回だけ

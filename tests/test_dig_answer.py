@@ -26,8 +26,11 @@ from app.dig_answer import (
     DigAnswer,
     DigIntent,
     answer_pending,
+    discussion_of_reply,
     enqueue_question,
     enqueue_request,
+    open_discussion,
+    start_discussion,
 )
 from app.dig_take import record_takes
 from app.prompting import WRITING_GUIDE_VERSION, load_writing_guide
@@ -1154,11 +1157,13 @@ def test_retry_of_failed_button_request_uses_the_article_body(conn, config) -> N
 
 # --- 返事の形と書き方の手引き(GH#381) ---
 
-# 形ごとの見分けの印(prompts/dig-answer-v006-<形>.md の見出し)と、質問の答え方の規則
+# 形ごとの見分けの印(prompts/dig-answer-v007-<形>.md の見出し)と、質問の答え方の規則
 FORM_HEADINGS = {
     "question": "# 返事の形(質問・感想へのリプライ)",
     "summary": "# 返事の形(📝 要約のボタン)",
     "more": "# 返事の形(📖 詳しくのボタン)",
+    "discussion": "# 返事の形(記事についての議論)",
+    "wrap": "# 返事の形(議論のまとめ)",
 }
 QA_RULE = "外部照合が要る主張は「未検証」と明記する"
 # 質問・感想への返事の姿勢(GH#405。同意者ではなく批判的な助言者)
@@ -1247,14 +1252,14 @@ def test_retry_of_failed_button_request_keeps_the_button_form(conn, config) -> N
 
 
 def test_prompt_versions_and_form_files() -> None:
-    assert dig_answer.PROMPT_VERSION == "dig-answer-v006"
+    assert dig_answer.PROMPT_VERSION == "dig-answer-v007"
     assert WRITING_GUIDE_VERSION == "writing-guide-ja-v002"
     prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
     frame = (prompts_dir / f"{dig_answer.PROMPT_VERSION}.md").read_text(encoding="utf-8")
     assert "{{writing_guide}}" in frame and "{{form}}" in frame
     # 形は依頼の種類(dig_questions.request の値と、本人のリプライ = None)をすべて覆う
     assert set(dig_answer._FORMS) == {None, *REQUESTS}
-    for form in dig_answer._FORMS.values():
+    for form in [*dig_answer._FORMS.values(), *dig_answer._DISCUSSION_FORMS.values()]:
         text = (prompts_dir / f"{dig_answer.PROMPT_VERSION}-{form}.md").read_text(encoding="utf-8")
         assert text.startswith(FORM_HEADINGS[form])
         assert "{{" not in text and "DATA-" not in text  # 形の文が囲みやプレースホルダを作らない
@@ -1275,3 +1280,192 @@ def test_v006_changes_only_the_question_form() -> None:
     assert "同意できる点" not in question  # 同意から入る書き方をやめた
     for rule in ("前提は正しいか", "見落としているリスク", "次に見ること・試すこと", "「仮説」"):
         assert rule in question
+
+
+def test_v007_adds_discussion_forms_only() -> None:
+    # GH#407: 枠と質問・要約・詳しくの形は v006 とバイトで同じ。足したのは議論とまとめの形だけ
+    prompts_dir = Path(dig_answer.__file__).resolve().parent.parent / "prompts"
+    for suffix in ("", "-question", "-summary", "-more"):
+        assert (prompts_dir / f"dig-answer-v007{suffix}.md").read_bytes() == (
+            prompts_dir / f"dig-answer-v006{suffix}.md"
+        ).read_bytes()
+    assert dig_answer._DISCUSSION_FORMS == {False: "discussion", True: "wrap"}
+
+
+# --- 議論のモード(GH#407。設計 06 §6) ---
+
+
+def discuss(conn, dig_id: int) -> int:
+    """カードの「💬 話す」で議論を開き、その id を返す(poller と同じ関数)。"""
+    assert start_discussion(conn, dig_id)
+    conn.commit()
+    return open_discussion(conn, dig_id)
+
+
+def say(conn, dig_id: int, text: str, message_id: int, *, replied: int = 0) -> int:
+    """カード・返事へのリプライを poller と同じ振り分けで積む(議論の外なら今までどおり)。"""
+    discussion_id, wrap = discussion_of_reply(conn, dig_id, text, replied) or (None, False)
+    question_id = enqueue_question(
+        conn, dig_id, text, message_id, replied, discussion_id=discussion_id, wrap=wrap
+    )
+    conn.commit()
+    return question_id
+
+
+def test_discussion_turn_uses_discussion_form_and_history_without_intent(conn, config) -> None:
+    # 議論の一手は意図を判定せず(take・調べ直しにしない)、議論の形と、その議論のやり取りだけで
+    # 答える。返事には決まった案内を付ける(やり取りに入れるときは除く)
+    dig_id = add_dig(conn, config)
+    ask(conn, dig_id, "議論の前の質問", 70)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "常駐型の方が筋がよいのでは", 71)
+    say(conn, dig_id, "でも費用は?", 72)
+    engine, sender = Engine(redig_on={1, 2, 3}), Sender()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    assert len(engine.intent_prompts) == 1  # 議論の前の質問だけ
+    first, second = engine.prompts[1], engine.prompts[2]
+    for prompt in (first, second):
+        assert FORM_HEADINGS["discussion"] in prompt
+        assert FORM_HEADINGS["question"] not in prompt
+        assert "議論の前の質問" not in prompt  # 議論の外のやり取りは渡さない
+    assert "(なし。議論の最初のリプライ)" in first
+    assert "私: 常駐型の方が筋がよいのでは\nあなた: 返事2\n" in second + "\n"
+    assert dig_answer.DISCUSSION_FOOTER.strip() not in second  # 案内はやり取りから除く
+    turns = [r for r in rows(conn) if r["discussion_id"] == discussion_id]
+    assert [(r["kind"], r["redig"], r["answer"]) for r in turns] == [
+        ("question", 0, "返事2" + dig_answer.DISCUSSION_FOOTER),
+        ("question", 0, "返事3" + dig_answer.DISCUSSION_FOOTER),
+    ]
+    assert queue_of(conn, dig_id) is None  # 調べ直しを積まない
+
+
+@pytest.mark.parametrize("text", ["まとめて", " まとめて。", "おわり!", "終了"])
+def test_wrap_word_closes_discussion_and_wraps(conn, config, text) -> None:
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    wrap_id = say(conn, dig_id, text, 72)
+    assert open_discussion(conn, dig_id) is None  # まとめを積んだら閉じる
+    later = say(conn, dig_id, "まとめてから考えたい", 73)  # 閉じた後は議論の外
+    engine, sender = Engine(), Sender()
+
+    answer_pending(conn, config, engine.factory, sender, logger)
+
+    wrap_prompt = engine.prompts[1]
+    assert FORM_HEADINGS["wrap"] in wrap_prompt
+    assert "私: コストが本質では\nあなた: 返事1" in wrap_prompt
+    wrap = conn.execute("SELECT * FROM dig_questions WHERE id = ?", (wrap_id,)).fetchone()
+    assert (wrap["discussion_id"], wrap["discussion_wrap"], wrap["kind"]) == (
+        discussion_id, 1, "take"
+    )
+    assert wrap["answer"] == "返事2" + dig_answer.WRAP_FOOTER_TAKE
+    later_row = conn.execute("SELECT * FROM dig_questions WHERE id = ?", (later,)).fetchone()
+    assert later_row["discussion_id"] is None
+    assert len(engine.intent_prompts) == 1  # 閉じた後の質問だけ意図を判定する
+
+
+def test_wrap_word_inside_a_sentence_is_a_turn(conn, config) -> None:
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    assert discussion_of_reply(conn, dig_id, "まとめてから考えたい", 0) == (discussion_id, False)
+    assert discussion_of_reply(conn, dig_id, "まとめて", 0) == (discussion_id, True)
+
+
+def test_wrap_without_turns_has_nothing_to_record(conn, config) -> None:
+    dig_id = add_dig(conn, config)
+    discuss(conn, dig_id)
+    say(conn, dig_id, "まとめて", 71)
+
+    answer_pending(conn, config, Engine().factory, Sender(), logger)
+
+    wrap = rows(conn)[0]
+    assert (wrap["kind"], wrap["answer"]) == ("question", "返事1" + dig_answer.WRAP_FOOTER_EMPTY)
+
+
+def test_failed_wrap_reopens_discussion_and_retry_wraps_again(conn, config) -> None:
+    # まとめを作れなかったら議論を開き直す(「まとめて」をもう一度受けられる)。作れなかった
+    # 知らせへのリプライ(「もう一度」)も、その議論のまとめのやり直しになる
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    say(conn, dig_id, "まとめて", 72)
+    sender = Sender()
+    # 返事の呼び出しは 1 回やり直すので、2 回目(まとめ)とそのやり直しを失敗させる
+    answer_pending(conn, config, Engine(fail_on={2, 3}).factory, sender, logger)
+    assert open_discussion(conn, dig_id) == discussion_id
+    failure_message = sender.sent[-1]
+    assert failure_message[1] == dig_answer.FAILURE_TEXT
+    failed = rows(conn)[-1]
+
+    assert discussion_of_reply(conn, dig_id, "もう一度", failed["answer_message_id"]) == (
+        discussion_id, True
+    )
+    retry_id = say(conn, dig_id, "もう一度", 73, replied=failed["answer_message_id"])
+    retry = conn.execute("SELECT * FROM dig_questions WHERE id = ?", (retry_id,)).fetchone()
+    assert (retry["retry_of"], retry["discussion_wrap"]) == (failed["id"], 1)
+    assert open_discussion(conn, dig_id) is None
+
+
+@pytest.mark.parametrize("after", ["second_retry", "wrapped"])
+def test_failure_notice_reply_retries_wrap_only_once(conn, config, after) -> None:
+    # 作れなかったまとめの知らせへの返信は 1 回だけまとめのやり直しにする。2 回目の「もう一度」と、
+    # まとめた後に古い知らせへ返信したものは、議論の外の返信(同じ発言を 2 回 take にしない)
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    say(conn, dig_id, "まとめて", 72)
+    answer_pending(conn, config, Engine(fail_on={2, 3}).factory, Sender(), logger)
+    notice = rows(conn)[-1]["answer_message_id"]
+    say(conn, dig_id, "もう一度", 73, replied=notice)
+    if after == "wrapped":
+        answer_pending(conn, config, Engine().factory, Sender(), logger)
+        assert rows(conn)[-1]["kind"] == "take"
+
+    assert discussion_of_reply(conn, dig_id, "もう一度", notice) is None
+    late = say(conn, dig_id, "もう一度", 74, replied=notice)
+    late_row = conn.execute("SELECT * FROM dig_questions WHERE id = ?", (late,)).fetchone()
+    assert (late_row["discussion_id"], late_row["discussion_wrap"]) == (None, 0)
+    wraps = conn.execute(
+        "SELECT count(*) FROM dig_questions WHERE discussion_id = ? AND discussion_wrap = 1 "
+        "AND status <> 'failed'",
+        (discussion_id,),
+    )
+    assert wraps.fetchone()[0] == 1
+
+
+def test_second_wrap_of_a_discussion_is_not_a_take(conn, config) -> None:
+    # 受付で防いでいるが、記録の側でも議論ごとに 1 回だけ take にする
+    dig_id = add_dig(conn, config)
+    discussion_id = discuss(conn, dig_id)
+    say(conn, dig_id, "コストが本質では", 71)
+    for message_id in (72, 73):
+        enqueue_question(conn, dig_id, "まとめて", message_id, 0,
+                         discussion_id=discussion_id, wrap=True)
+    conn.commit()
+
+    answer_pending(conn, config, Engine().factory, Sender(), logger)
+
+    assert [r["kind"] for r in rows(conn)[1:]] == ["take", "question"]
+
+
+def test_failed_wrap_does_not_reopen_when_next_discussion_is_open(conn, config) -> None:
+    dig_id = add_dig(conn, config)
+    first = discuss(conn, dig_id)
+    say(conn, dig_id, "まとめて", 71)
+    second = discuss(conn, dig_id)  # まとめを作る前に次の議論を開いた
+
+    answer_pending(conn, config, Engine(fail_on={1, 2}).factory, Sender(), logger)
+
+    assert rows(conn)[0]["status"] == "failed"
+    assert open_discussion(conn, dig_id) == second
+    closed = conn.execute("SELECT closed_at FROM dig_discussions WHERE id = ?", (first,))
+    assert closed.fetchone()[0] is not None
+
+
+def test_start_discussion_opens_one_per_card(conn, config) -> None:
+    dig_id = add_dig(conn, config)
+    assert start_discussion(conn, dig_id)
+    assert not start_discussion(conn, dig_id)  # 二重押し・再配達
+    assert conn.execute("SELECT count(*) FROM dig_discussions").fetchone()[0] == 1

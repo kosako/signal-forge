@@ -1374,8 +1374,9 @@ def _send_pending_cards(
         "WHERE r.message_id IS NULL AND r.published_at IS NOT NULL ORDER BY r.id"
     ).fetchall()
     for row in rows:
-        # 🔗 元記事 / 📖 詳しく(GH#141。スマホの Telegram で完結させる)と ✅ 読んだ / 👎 不要
-        # (GH#398・GH#403)。掘り直したカードでは、前のカードで付けた今の状態を出す
+        # 🔗 元記事 / 📖 詳しく / 💬 話す(GH#141・GH#407。スマホの Telegram で完結させる)と
+        # ✅ 読んだ / 👎 不要(GH#398・GH#403)。掘り直したカードでは、前のカードで付けた
+        # 今の状態を出す
         keyboard = dig_card_keyboard(
             row["id"],
             row["canonical_url"],
