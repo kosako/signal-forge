@@ -1836,7 +1836,7 @@ def test_read_button_records_read_and_undo(conn, tmp_path) -> None:
 
     assert followups(conn) == [(item_id, "yes", today)]
     assert pending_dig_items(conn) == []
-    assert api.answered == [("cb1", "✅ 読んだにしました(未消化一覧から外れます)")]
+    assert api.answered == [("cb1", "✅ 読んだにしました(夜の一覧から外れます)")]
     assert api.edited == [
         (CHAT_ID, 700, dig_card_keyboard(dig_id, "https://a/dig/700", with_requests=True,
                                          read=True)),
@@ -1847,7 +1847,7 @@ def test_read_button_records_read_and_undo(conn, tmp_path) -> None:
 
     assert followups(conn) == [(item_id, "yes", today), (item_id, "no", today)]
     assert [r["item_id"] for r in pending_dig_items(conn)] == [item_id]
-    assert api.answered == [("cb2", "↩️ 読んだを取り消しました(未消化一覧に戻ります)")]
+    assert api.answered == [("cb2", "↩️ 読んだを取り消しました(夜の一覧に戻ります)")]
     assert api.edited[0][2]["inline_keyboard"][1] == [
         {"text": "✅ 読んだ", "callback_data": f"d:{dig_id}:r"},
         {"text": "👎 不要", "callback_data": f"d:{dig_id}:x"},
@@ -1869,7 +1869,7 @@ def test_read_button_twice_or_undo_first_writes_nothing_new(conn, tmp_path) -> N
     assert [value for _, value, _ in followups(conn)] == ["yes"]
     assert api.answered == [
         ("cb1", "↩️ 読んだにはしていません"),
-        ("cb2", "✅ 読んだにしました(未消化一覧から外れます)"),
+        ("cb2", "✅ 読んだにしました(夜の一覧から外れます)"),
         ("cb3", "✅ 読んだにしてあります"),
     ]
     # 返事をしない設定でも記録でき、盤面は読んだの行だけ
@@ -1940,7 +1940,7 @@ def test_dismiss_button_records_dismissal_and_undo(conn, tmp_path, mark) -> None
     assert dismissals(conn) == [(item_id, dig_id)]
     assert pending_dig_items(conn) == []
     assert conn.execute("SELECT count(*) FROM signals").fetchone()[0] == signals_before
-    assert api.answered == [("cb1", "👎 不要にしました(未消化一覧に載りません)")]
+    assert api.answered == [("cb1", "👎 不要にしました(夜の一覧に載りません)")]
     assert api.edited == [
         (CHAT_ID, 700, dig_card_keyboard(dig_id, "https://a/dig/700", with_requests=True,
                                          dismissed=True)),
@@ -1972,7 +1972,7 @@ def test_dismiss_button_twice_or_undo_first_writes_nothing_new(conn, tmp_path) -
     assert dismissals(conn) == [(item_id, dig_id)]
     assert api.answered == [
         ("cb1", "↩️ 不要にはしていません"),
-        ("cb2", "👎 不要にしました(未消化一覧に載りません)"),
+        ("cb2", "👎 不要にしました(夜の一覧に載りません)"),
         ("cb3", "👎 不要にしてあります"),
     ]
     assert api.edited[-1][2] == dig_card_keyboard(dig_id, "https://a/dig/700",
@@ -2031,7 +2031,7 @@ def test_dismiss_button_passes_a_requeued_item(conn, tmp_path) -> None:
     poll_once(conn, config, api, logger)
 
     assert api.answered == [
-        ("cb1", "👎 不要にしました(未消化一覧に載りません。深掘りの予定も外しました)"),
+        ("cb1", "👎 不要にしました(夜の一覧に載りません。深掘りの予定も外しました)"),
         ("cb2", "👎 不要にしてあります"),
         ("cb3", "↩️ 不要を取り消しました"),
     ]

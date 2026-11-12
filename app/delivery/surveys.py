@@ -30,7 +30,14 @@ from app.delivery.telegram import (
     pack_line_groups,
     visible_length,
 )
-from app.dig import DigCandidate, DigState, dig_states, dug_on, next_morning_plan
+from app.dig import (
+    DigCandidate,
+    DigState,
+    dig_states,
+    dug_on,
+    items_with_cards,
+    next_morning_plan,
+)
 from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
@@ -48,25 +55,29 @@ DIG_BACKLOG_TITLE_MAX_CHARS = 80
 # 1 通の可視の長さの上限(Telegram の 4096 字に余裕を残す)。明朝の予定の行は上限 15 件に
 # 数えないので、超えたら行の単位で次の 1 通に分ける(GH#349)
 DIG_BACKLOG_TEXT_MAX_CHARS = 4000
-DIG_BACKLOG_CONTINUED = "🔖 未消化の深掘り候補(続き)"
-# 一覧の行のボタン(明朝の予定の行の skip = GH#349、今すぐ = GH#388。設計 06 §2・04 §3)。1 通の
-# ボタンの数の上限は、Telegram の inline keyboard の上限(約 100)に余裕を残す。超えるなら行の
-# 単位で次の 1 通に分ける
+# 見出しは「まだ読んでいない記事」(GH#409。消えるのは読んだ・不要にしたとき。掘っただけでは消えない)
+DIG_BACKLOG_TITLE = "🔖 まだ読んでいない記事"
+DIG_BACKLOG_CONTINUED = f"{DIG_BACKLOG_TITLE}(続き)"
+# 一覧の行のボタン(明朝の予定の行の skip = GH#349、今すぐ = GH#388、読んだ・不要 = GH#409。
+# 設計 06 §2・04 §3)。1 通のボタンの数の上限は、Telegram の inline keyboard の上限(約 100)に
+# 余裕を残す。超えるなら行の単位で次の 1 通に分ける
 DIG_BACKLOG_MAX_BUTTONS = 50
 # 今すぐのボタンを付ける行の状態(本文があり、掘り終えておらず、パスもしていない。GH#388)。
 # 明朝の予定の行(planned)は skip のボタンと並べる
 DIG_NOW_STATES: frozenset[DigState | None] = frozenset({"planned", "waiting", None})
-# 一覧から消える操作の案内(GH#398)。深掘りの段が動いているときだけ、注記の最後に置く。カードへの
-# リプライは、返事をしない設定・返事の上限を超えた日は感想として残るだけで take にならず、一覧から
-# 外れない。どの設定でも確かに外れるボタンだけを案内する
+# 一覧から消える操作の案内(GH#398・GH#409)。深掘りの段が動いているときだけ、注記の最後に置く。
+# カードへのリプライは、返事をしない設定・返事の上限を超えた日は感想として残るだけで take に
+# ならず、一覧から外れない。どの設定でも確かに外れるボタンだけを案内する
 DIG_BACKLOG_READ_NOTE = (
-    "✅ 読み終えたら深掘りカードの「✅ 読んだ」、要らなければ「👎 不要」を押すと一覧から外れます"
+    "✅ 読み終えたら「✅ 読んだ」、要らなければ「👎 不要」を押すと一覧から外れます"
+    "(この一覧のボタンでも、深掘りカードのボタンでも)"
 )
-# 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)は印なし
+# 未消化一覧の各行の深掘りの状態の印(GH#349。設計 06 §2)。None(キューに無く本文もある)と
+# done(掘り終えた)は印なし。掘ったかどうかは本人にとって意味がなく、読む材料があることは行の
+# ✅ 読んだのボタンで分かる(GH#409。ユーザーの判断)
 DIG_STATE_MARKS: dict[DigState, str] = {
     "planned": "🗓 明朝",
     "waiting": "⏳ 待ち",
-    "done": "✅ 掘った",
     "passed": "⏭️ パス",
     "no_body": "⚠️ 本文なし",
 }
@@ -124,16 +135,19 @@ def followup_keyboard(item_id: int, *, selected: str | None = None) -> dict:
 class BacklogButtons(NamedTuple):
     """未消化一覧の 1 行のボタン。
 
-    now = ⚡ 今すぐ(GH#388)、skip = ⏭️ 外す(明朝の予定の行。GH#349)。
+    now = ⚡ 今すぐ(GH#388)、skip = ⏭️ 外す(明朝の予定の行。GH#349)、read = ✅ 読んだ(カードを
+    送ったことがある行)、dismiss = 👎 不要(どの行にも。GH#409)。
     """
 
     item_id: int
     now: bool
     skip: bool
+    read: bool = False
+    dismiss: bool = False
 
     @property
     def count(self) -> int:
-        return int(self.now) + int(self.skip)
+        return int(self.now) + int(self.skip) + int(self.read) + int(self.dismiss)
 
 
 def backlog_keyboard(
@@ -141,11 +155,16 @@ def backlog_keyboard(
     *,
     passed: Collection[int] = (),
     now_marked: Collection[int] = (),
+    read: Collection[int] = (),
+    dismissed: Collection[int] = (),
 ) -> dict:
-    """未消化一覧の 1 通のボタン。その 1 通に載せた行ごとに 1 列(⚡ 今すぐ・⏭️ 外す の順)。
+    """未消化一覧の 1 通のボタン。その 1 通に載せた行ごとに 1 列(⚡ 今すぐ・⏭️ 外す・✅ 読んだ・
+    👎 不要 の順)。
 
     押した後の盤面(設計 04 §3)では、外した item(passed)の skip と、今すぐの依頼を受け付けた・
-    掘り終えた item(now_marked)の今すぐに ✓ を付ける。
+    掘り終えた item(now_marked)の今すぐに ✓ を付ける。読んだにしてある item(read)の読んだと、
+    不要にしてある item(dismissed)の不要には ✓ を付け、押すと取り消す(b:{id}:u・b:{id}:y。
+    日曜のまとめ確認と同じ形。GH#409)。
     """
     keyboard: list[list[dict]] = []
     for row in rows:
@@ -159,6 +178,18 @@ def backlog_keyboard(
             buttons.append({
                 "text": _mark(f"⏭️ {row.item_id} を外す", row.item_id in passed),
                 "callback_data": f"b:{row.item_id}:p",
+            })
+        if row.read:
+            is_read = row.item_id in read
+            buttons.append({
+                "text": _mark(f"✅ {row.item_id} を読んだ", is_read),
+                "callback_data": f"b:{row.item_id}:{'u' if is_read else 'r'}",
+            })
+        if row.dismiss:
+            is_dismissed = row.item_id in dismissed
+            buttons.append({
+                "text": _mark(f"👎 {row.item_id} は不要", is_dismissed),
+                "callback_data": f"b:{row.item_id}:{'y' if is_dismissed else 'x'}",
             })
         keyboard.append(buttons)
     return {"inline_keyboard": keyboard}
@@ -348,7 +379,7 @@ def _read_confirm_message(rows: Sequence[Mapping]) -> tuple[str, list[int]]:
     shown = list(rows[:READ_CONFIRM_MAX_ITEMS])
     lines = [
         f"📝 感想を書いた未消化({len(rows)}件)",
-        "感想をリプライした記事です。読み終えたものは ✅ を押すと、未消化一覧から外れます",
+        "感想をリプライした記事です。読み終えたものは ✅ を押すと、夜の一覧から外れます",
         "",
         *(f"{row['item_id']}. {_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}" for row in shown),
     ]
@@ -440,7 +471,8 @@ def _dig_backlog_message(
     """未消化一覧の本文とボタン(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
 
     today は一覧を送る日(JST)。今日もう掘った item には今すぐのボタンを付けない(同じ日に 2 回は
-    掘らない。押しても受け付けないため。GH#388)。
+    掘らない。押しても受け付けないため。GH#388)。深掘りカードを送ったことがある item の行には
+    ✅ 読んだを付ける(GH#409)。
 
     `[dig].daily_cap = 0`(深掘りの段が止まっている)なら印も予定も出さず、今までの一覧のまま
     にする(GH#349。設計 06 §2)。予定の行は先頭に置いて上限(DIG_BACKLOG_MAX_ITEMS)に数えず、
@@ -474,6 +506,7 @@ def _dig_backlog_message(
         dug_today={
             item_id for item_id in [*planned_ids, *shown_ids] if dug_on(conn, item_id, today)
         },
+        carded=items_with_cards(conn, [*planned_ids, *shown_ids]),
     )
 
 
@@ -485,8 +518,10 @@ def _dig_backlog_text(
     digest_fill: int = 0,
     with_buttons: bool = False,
     dug_today: Collection[int] = (),
+    carded: Collection[int] = (),
 ) -> list[tuple[str, dict | None]]:
-    """未消化 🔖 一覧。新しい 🔖 順・上限超過分は件数だけ示す(GH#88)。
+    """未消化 🔖 一覧(見出しは「まだ読んでいない記事」。GH#409)。新しい 🔖 順・上限超過分は
+    件数だけ示す(GH#88)。
 
     番号は item id(GH#104)。表示位置の連番だと日ごとに変わり、リプライ指定
     「3664 を◯◯の観点で」が翌日以降の一覧や記憶と食い違うため、安定な id を使う。
@@ -500,10 +535,11 @@ def _dig_backlog_text(
     with_buttons なら行のボタンを、その行を載せた 1 通に付ける(他の 1 通の行のボタンは付けない。
     1 通のボタンは DIG_BACKLOG_MAX_BUTTONS 個まで)。予定の行は ⚡ 今すぐと ⏭️ 外す(GH#349)、
     残りの行は状態が DIG_NOW_STATES のときだけ ⚡ 今すぐ(GH#388)。dug_today(今日もう掘った)の
-    行には今すぐを付けない。ボタンの無い 1 通はボタンなし。
+    行には今すぐを付けない。carded(深掘りカードを送ったことがある)の行には ✅ 読んだを、どの行にも
+    👎 不要を付ける(GH#409)。ボタンの無い 1 通はボタンなし。
     """
     states = states or {}
-    lines = [f"🔖 未消化の深掘り候補({len(plan_rows) + len(rows)}件)"]
+    lines = [f"{DIG_BACKLOG_TITLE}({len(plan_rows) + len(rows)}件)"]
     lines += [
         f"{row['item_id']}. {DIG_STATE_MARKS['planned']} "
         f"{_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
@@ -511,7 +547,8 @@ def _dig_backlog_text(
     ]
     for row in rows[:DIG_BACKLOG_MAX_ITEMS]:
         state = states.get(row["item_id"])
-        mark = f"{DIG_STATE_MARKS[state]} " if state is not None else ""
+        label = DIG_STATE_MARKS.get(state) if state is not None else None
+        mark = f"{label} " if label is not None else ""
         lines.append(
             f"{row['item_id']}. {mark}{_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
         )
@@ -525,7 +562,7 @@ def _dig_backlog_text(
     if digest_fill > 0:
         notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
     if with_buttons:
-        # 何をすると一覧から消えるか(GH#398)。カードが届いただけでは消えない(✅ 掘った)
+        # 何をすると一覧から消えるか(GH#398・GH#409)。カードが届いただけでは消えない
         notes.append(DIG_BACKLOG_READ_NOTE)
     example_id = (plan_rows or rows)[0]["item_id"]
     hint = (
@@ -539,14 +576,23 @@ def _dig_backlog_text(
     if with_buttons:
         buttons_at = {
             index: BacklogButtons(
-                row["item_id"], now=row["item_id"] not in dug_today, skip=True
+                row["item_id"],
+                now=row["item_id"] not in dug_today,
+                skip=True,
+                read=row["item_id"] in carded,
+                dismiss=True,
             )
             for index, row in enumerate(plan_rows, start=1)
         }
         for index, row in enumerate(rows[:DIG_BACKLOG_MAX_ITEMS], start=len(plan_rows) + 1):
             item_id = row["item_id"]
-            if states.get(item_id) in DIG_NOW_STATES and item_id not in dug_today:
-                buttons_at[index] = BacklogButtons(item_id, now=True, skip=False)
+            buttons_at[index] = BacklogButtons(
+                item_id,
+                now=states.get(item_id) in DIG_NOW_STATES and item_id not in dug_today,
+                skip=False,
+                read=item_id in carded,
+                dismiss=True,
+            )
     groups = pack_line_groups(
         lines,
         DIG_BACKLOG_TEXT_MAX_CHARS - visible_length(DIG_BACKLOG_CONTINUED) - 1,

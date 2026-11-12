@@ -64,6 +64,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (30, "030_read_confirm_messages.sql"),
         (31, "031_dig_dismissals.sql"),
         (32, "032_dig_discussions.sql"),
+        (33, "033_dig_dismissals_from_backlog.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -547,4 +548,60 @@ def test_dig_queue_digest_source_migration_keeps_rows_and_rules(tmp_path: Path) 
         conn.execute("INSERT INTO dig_queue (item_id, source) VALUES (99, 'digest')")
     conn.execute("DELETE FROM items WHERE id = 4")  # items の削除で行も消える
     assert conn.execute("SELECT count(*) AS n FROM dig_queue").fetchone()["n"] == 3
+    conn.close()
+
+
+def test_dig_dismissals_from_backlog_migration_keeps_rows_and_allows_no_card(
+    tmp_path: Path,
+) -> None:
+    # GH#409(migration 033): 表を作り直しても既存の行・外部キーは残り、カードの列を空にできる
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 32:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")
+    for item_id in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO items (id, source_id, url, canonical_url, content_hash) "
+            "VALUES (?, 2, ?, ?, 'sha256:x')",
+            (item_id, f"https://a/{item_id}", f"https://a/{item_id}"),
+        )
+    conn.execute(
+        "INSERT INTO dig_results (id, item_id, note_name, card_text, message_id) "
+        "VALUES (7, 1, 'note', 'カード', 700)"
+    )
+    conn.execute(
+        "INSERT INTO dig_dismissals (item_id, dig_result_id, dismissed_at) "
+        "VALUES (1, 7, '2026-11-11T00:00:00Z')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):  # 032 まではカードが要る(前提)
+        conn.execute("INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (2, NULL)")
+
+    assert apply_migrations(conn, db) == ["033_dig_dismissals_from_backlog.sql"]
+
+    kept = conn.execute("SELECT item_id, dig_result_id, dismissed_at FROM dig_dismissals")
+    assert [tuple(row) for row in kept] == [(1, 7, "2026-11-11T00:00:00Z")]
+    fks = {
+        (fk["table"], fk["from"], fk["to"])
+        for fk in conn.execute("PRAGMA foreign_key_list(dig_dismissals)")
+    }
+    assert fks == {("items", "item_id", "id"), ("dig_results", "dig_result_id", "id")}
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert "STRICT" in conn.execute(
+        "SELECT sql FROM sqlite_schema WHERE name = 'dig_dismissals'"
+    ).fetchone()["sql"]
+
+    conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (2)")  # 一覧の行から(カードなし)
+    added = conn.execute("SELECT * FROM dig_dismissals WHERE item_id = 2").fetchone()
+    assert added["dig_result_id"] is None and added["dismissed_at"]  # 既定値
+    with pytest.raises(sqlite3.IntegrityError):  # 1 item 1 行のまま
+        conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (2)")
+    with pytest.raises(sqlite3.IntegrityError):  # items に無い item は書けない
+        conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (99)")
+    with pytest.raises(sqlite3.IntegrityError):  # 無いカードは指せない
+        conn.execute("INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (3, 99)")
     conn.close()

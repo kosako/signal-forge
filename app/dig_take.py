@@ -13,8 +13,8 @@
 - 返事を送れた行だけを記録する(返事が届く前に未消化一覧から消さない)
 - 深掘りカードの ✅ 読んだ(GH#398)と、週 1 回の読んだのまとめ確認(GH#399)も、同じ followup_dig を
   記録する(mark_read。take は要らない)
-- 深掘りカードの 👎 不要(GH#403)は followup_dig ではなく台帳 dig_dismissals に記録する
-  (mark_dismissed。未消化一覧から外すだけで、反応・KPI には書かない)
+- 深掘りカードと夜の一覧の行の 👎 不要(GH#403・GH#409)は followup_dig ではなく台帳 dig_dismissals に
+  記録する(mark_dismissed。未消化一覧から外すだけで、反応・KPI には書かない)
 - 議論(GH#407)の中の本人の発言は、一手ごとには記録しない。「まとめて」のまとめを送った後に、
   議論の中の発言の原文を古い順に並べて 1 つの take として記録する(まとめの行の記録番号で 1 回だけ。
   LLM のまとめはノートに書かない = ADR 0003)
@@ -287,14 +287,15 @@ def is_read(conn: sqlite3.Connection, item_id: int) -> bool:
 
 
 def mark_dismissed(
-    conn: sqlite3.Connection, item_id: int, dig_result_id: int, dismissed: bool
+    conn: sqlite3.Connection, item_id: int, dig_result_id: int | None, dismissed: bool
 ) -> bool:
-    """深掘りカードの 👎 不要・↩️ 不要を取り消す(GH#403)。書いたら True。
+    """👎 不要・↩️ 不要を取り消す(深掘りカード = GH#403、夜の一覧の行 = GH#409)。書いたら True。
 
     不要 = 台帳 dig_dismissals に 1 行(未消化一覧と日曜のまとめ確認に載せない)。取り消す = 行を
-    消す。反応(signals)には書かない(ダイジェストの 👎 とは別の操作で、🔖 の数・ソースの健康診断・
-    KPI の定義を変えない)。今の状態と同じなら書かない(再配達・二重押し・古い盤面のボタン)。
-    呼び出し側のトランザクションの中で呼ぶ。
+    消す。dig_result_id は押したカードで、一覧の行から押したなら None(カードの無い記事もある。
+    migration 033)。反応(signals)には書かない(ダイジェストの 👎 とは別の操作で、🔖 の数・
+    ソースの健康診断・KPI の定義を変えない)。今の状態と同じなら書かない(再配達・二重押し・
+    古い盤面のボタン)。呼び出し側のトランザクションの中で呼ぶ。
     """
     if dismissed:
         cur = conn.execute(
@@ -307,11 +308,16 @@ def mark_dismissed(
 
 
 def is_dismissed(conn: sqlite3.Connection, item_id: int) -> bool:
-    """カードの 👎 不要にしてあるか(GH#403)。読むだけ。"""
+    """👎 不要にしてあるか(カードでも一覧の行でも。GH#403・GH#409)。読むだけ。"""
     return (
         conn.execute("SELECT 1 FROM dig_dismissals WHERE item_id = ?", (item_id,)).fetchone()
         is not None
     )
+
+
+def dismissed_items(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
+    """item のうち、👎 不要にしてあるもの(GH#409。一覧の盤面の ✓ に使う)。読むだけ。"""
+    return {item_id for item_id in dict.fromkeys(item_ids) if is_dismissed(conn, item_id)}
 
 
 def _latest_followup(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:
