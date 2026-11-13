@@ -997,7 +997,8 @@ def _record_backlog_skip(
 ) -> None:
     """未消化一覧の「⏭️ {id} を外す」(GH#349。設計 06 §2)。リプライのパスと同じ関数でキューから外す。
 
-    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。
+    押されたメッセージが未消化一覧で、その 1 通の盤面にその行の skip のボタンがあることを確かめる
+    (_pressed_backlog_row。GH#411 でボタンを上の行だけに付けたので、ボタンの無い行は受け付けない)。
     - queued: パスにする(apply_instructions。観点・requested_at は残り、受付の順序の印も
       リプライのパスと同じく残す。GH#235)。朝の生成中でも、done 化の compare-and-set が外れて
       パスが残る(app.deepdive)。今すぐの依頼も取り消す(GH#388)
@@ -1007,7 +1008,7 @@ def _record_backlog_skip(
     - キューに無い: 書かない(予定の行はキューにあるので、偽造か壊れた data)
     外した後は、押したメッセージのボタンのうち外した item に ✓ を付けた盤面に差し替える。
     """
-    if not _is_backlog_message(conn, config, callback):
+    if not _pressed_backlog_row(conn, config, callback, item_id, "p"):
         logger.warning("未消化一覧と結び付かない skip のボタンを破棄", extra={"stage": "poll"})
         api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
         return
@@ -1056,9 +1057,10 @@ def _pressed_backlog_row(
 ) -> bool:
     """押されたメッセージが未消化一覧で、その 1 通の盤面に、その item のその種類のボタンがあるか。
 
-    読んだ・不要のボタン(GH#409)は item の記録を書くので、callback_data の item id だけを信じず、
-    一覧の 1 通に載せた行のボタンであることを確かめる(カードのボタンの _pressed_dig_card と
-    同じ考え)。
+    callback_data の item id だけを信じず、一覧の 1 通に載せた行のボタンであることを確かめる
+    (カードのボタンの _pressed_dig_card と同じ考え)。読んだ・不要(GH#409)に加え、今すぐ・外すも
+    確かめる(GH#411。ボタンは上の行にだけ付けるので、ボタンの無い行は受け付けない)。盤面を
+    読めないときも受け付けない(Telegram は押されたメッセージの盤面を必ず付けて送る)。
     """
     return _is_backlog_message(conn, config, callback) and kind in _backlog_board(callback).get(
         item_id, set()
@@ -1271,11 +1273,11 @@ def _record_backlog_now(
 ) -> None:
     """未消化一覧の「⚡ {id} を今すぐ」(GH#388。設計 06 §2〜3)。今すぐの依頼を台帳に積む。
 
-    押されたメッセージが未消化一覧であることを確かめる(_is_backlog_message)。受け付けは
-    _accept_dig_now(朝の digest の記事のボタンと共通)。押した後は盤面を差し替え、今すぐに ✓ を
-    付ける。
+    押されたメッセージが未消化一覧で、その 1 通の盤面にその行の今すぐのボタンがあることを確かめる
+    (_pressed_backlog_row。GH#411)。受け付けは _accept_dig_now(朝の digest の記事のボタンと
+    共通)。押した後は盤面を差し替え、今すぐに ✓ を付ける。
     """
-    if not _is_backlog_message(conn, config, callback):
+    if not _pressed_backlog_row(conn, config, callback, item_id, "n"):
         logger.warning("未消化一覧と結び付かない今すぐのボタンを破棄", extra={"stage": "poll"})
         api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
         return
