@@ -42,6 +42,7 @@ from app.delivery.surveys import (
     SentReadConfirm,
     backlog_keyboard,
     followup_keyboard,
+    on_backlog,
     pending_dig_items,
     q1_keyboard,
     q2_keyboard,
@@ -915,7 +916,7 @@ def _record_read_confirm(
 def _read_confirm_answer(
     code: str, targets: list[int], written: list[int], *, dismissed: bool = False
 ) -> str:
-    """まとめ確認のボタンの answer(GH#399)。夜の一覧の行の ✅ 読んだ(GH#409)も同じ文を使う。
+    """まとめ確認のボタンの answer(GH#399)。
 
     dismissed = 取り消した item が不要にしてある(GH#403。一覧には戻らない)。
     """
@@ -1079,8 +1080,9 @@ def _record_backlog_read(
 
     深掘りカードの ✅ 読んだと同じ記録(mark_read = followup_dig)。押されたメッセージが一覧で、
     その行のボタンであることを確かめる(_pressed_backlog_row)。最新の記録の確認と記録は 1 つの
-    トランザクションで行い、再配達・二重押しで同じ値を 2 回書かない。answer は日曜のまとめ確認と
-    同じ文(_read_confirm_answer)。押した後は盤面を差し替え、読んだに ✓ を付ける(押すと取り消す)。
+    トランザクションで行い、再配達・二重押しで同じ値を 2 回書かない。answer は、押した前後で
+    一覧(on_backlog)に載るかで言い分ける(_backlog_mark_answer)。押した後は盤面を差し替え、
+    読んだに ✓ を付ける(押すと取り消す)。
     """
     if not _pressed_backlog_row(conn, config, callback, item_id, "r"):
         logger.warning("未消化一覧と結び付かない読んだのボタンを破棄", extra={"stage": "poll"})
@@ -1090,9 +1092,11 @@ def _record_backlog_read(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            listed_before = on_backlog(conn, item_id)
             written = mark_read(conn, item_id, read, now.astimezone(JST).date().isoformat())
+            listed_after = on_backlog(conn, item_id)
             # 不要にしてある item は、読んだを取り消しても一覧に戻らない(GH#403)
-            dismissed = not read and is_dismissed(conn, item_id)
+            dismissed = is_dismissed(conn, item_id)
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1110,33 +1114,58 @@ def _record_backlog_read(
     )
     api.answer_callback_query(
         callback_id,
-        text=_read_confirm_answer(
-            "r" if read else "u", [item_id], [item_id] if written else [], dismissed=dismissed
+        text=_backlog_mark_answer(
+            item_id, "read", read, written,
+            listed=(listed_before, listed_after), other_mark=dismissed,
         ),
     )
     _refresh_backlog_board(conn, api, callback, logger)
 
 
-def _backlog_dismiss_answer(
-    item_id: int, dismissed: bool, written: bool, *, passed: bool, read: bool
-) -> str:
-    """未消化一覧の 👎 不要のボタンの answer(GH#409)。
+# 一覧の行の読んだ・不要のボタンの answer の語(GH#409)。(付けた, 記録済み, 取り消した, していない,
+# 取り消してももう片方で一覧に載らないときの理由)
+_BACKLOG_MARK_WORDS = {
+    "read": ("✅ {id} を読んだにしました", "✅ {id} は読んだにしてあります",
+             "↩️ {id} の読んだを取り消しました", "↩️ {id} は読んだにしていません", "不要にしてある"),
+    "dismiss": ("👎 {id} を不要にしました", "👎 {id} は不要にしてあります",
+                "↩️ {id} の不要を取り消しました", "↩️ {id} は不要にしていません", "読んだにしてある"),
+}
 
-    passed = キューに戻っていた item をパスにした(深掘りの予定も外した)。read = 取り消した item が
-    読んだにしてある(一覧には戻らない)。
+
+def _backlog_mark_answer(
+    item_id: int,
+    kind: str,
+    marked: bool,
+    written: bool,
+    *,
+    listed: tuple[bool, bool],
+    other_mark: bool,
+    passed: bool = False,
+) -> str:
+    """一覧の行の ✅ 読んだ・👎 不要のボタンの answer(GH#409。文言は設計 04 §3)。
+
+    listed = 押す前と後に、未消化 🔖 の一覧に載るか(on_backlog)。外れる・戻ると言うのは、実際に
+    そうなるときだけ(予定の行だけで載った item は、🔖 もブックマークも無いので、どちらでもない)。
+    other_mark = もう片方(読んだなら不要、不要なら読んだ)にしてある(取り消しても一覧に戻らない)。
+    passed = 不要にしたとき、キューの item をパスにした(深掘りの予定も外した)。
     """
-    if dismissed:
-        if not written:
-            kept = f"👎 {item_id} は不要にしてあります"
-            return kept + ("(深掘りの予定は外しました)" if passed else "")
-        return f"👎 {item_id} を不要にしました(夜の一覧から外れます" + (
-            "。深掘りの予定も外しました)" if passed else ")"
+    done, kept, undone, not_marked, reason = _BACKLOG_MARK_WORDS[kind]
+    before, after = listed
+    plan = "深掘りの予定も外しました" if written else "深掘りの予定は外しました"
+    if marked:
+        notes = (["夜の一覧から外れます"] if written and before and not after else []) + (
+            [plan] if passed else []
         )
+        text = (done if written else kept).format(id=item_id)
+        return text + (f"({'。'.join(notes)})" if notes else "")
     if not written:
-        return f"↩️ {item_id} は不要にしていません"
-    if read:
-        return f"↩️ {item_id} の不要を取り消しました(読んだにしてあるので、一覧には載りません)"
-    return f"↩️ {item_id} の不要を取り消しました(夜の一覧に戻ります)"
+        return not_marked.format(id=item_id)
+    text = undone.format(id=item_id)
+    if after and not before:
+        return text + "(夜の一覧に戻ります)"
+    if other_mark:
+        return text + f"({reason}ので、一覧には載りません)"
+    return text
 
 
 def _record_backlog_dismiss(
@@ -1167,9 +1196,11 @@ def _record_backlog_dismiss(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            listed_before = on_backlog(conn, item_id)
             written = mark_dismissed(conn, item_id, None, dismissed)
             passed = dismissed and dismiss_from_queue(conn, item_id)
-            read = not dismissed and is_read(conn, item_id)
+            listed_after = on_backlog(conn, item_id)
+            read = is_read(conn, item_id)
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1187,7 +1218,10 @@ def _record_backlog_dismiss(
     )
     api.answer_callback_query(
         callback_id,
-        text=_backlog_dismiss_answer(item_id, dismissed, written, passed=passed, read=read),
+        text=_backlog_mark_answer(
+            item_id, "dismiss", dismissed, written,
+            listed=(listed_before, listed_after), other_mark=read, passed=passed,
+        ),
     )
     _refresh_backlog_board(conn, api, callback, logger)
 

@@ -38,6 +38,7 @@ from app.dig import (
     items_with_cards,
     next_morning_plan,
 )
+from app.dig_take import dismissed_items, read_items
 from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
 
@@ -472,7 +473,9 @@ def _dig_backlog_message(
 
     today は一覧を送る日(JST)。今日もう掘った item には今すぐのボタンを付けない(同じ日に 2 回は
     掘らない。押しても受け付けないため。GH#388)。深掘りカードを送ったことがある item の行には
-    ✅ 読んだを付ける(GH#409)。
+    ✅ 読んだを付ける(GH#409)。読んだ・不要のボタンは今の記録で ✓ を付けて送る(🔖 の一覧の行は
+    読んだ・不要なら載らないが、予定の行は、不要や読んだの後に調べ直しでキューへ戻った item でも
+    載るため。✓ が無いと、不要を取り消すつもりで押して予定から外してしまう)。
 
     `[dig].daily_cap = 0`(深掘りの段が止まっている)なら印も予定も出さず、今までの一覧のまま
     にする(GH#349。設計 06 §2)。予定の行は先頭に置いて上限(DIG_BACKLOG_MAX_ITEMS)に数えず、
@@ -507,6 +510,8 @@ def _dig_backlog_message(
             item_id for item_id in [*planned_ids, *shown_ids] if dug_on(conn, item_id, today)
         },
         carded=items_with_cards(conn, [*planned_ids, *shown_ids]),
+        read_marked=read_items(conn, [*planned_ids, *shown_ids]),
+        dismissed=dismissed_items(conn, [*planned_ids, *shown_ids]),
     )
 
 
@@ -519,6 +524,8 @@ def _dig_backlog_text(
     with_buttons: bool = False,
     dug_today: Collection[int] = (),
     carded: Collection[int] = (),
+    read_marked: Collection[int] = (),
+    dismissed: Collection[int] = (),
 ) -> list[tuple[str, dict | None]]:
     """未消化 🔖 一覧(見出しは「まだ読んでいない記事」。GH#409)。新しい 🔖 順・上限超過分は
     件数だけ示す(GH#88)。
@@ -536,7 +543,8 @@ def _dig_backlog_text(
     1 通のボタンは DIG_BACKLOG_MAX_BUTTONS 個まで)。予定の行は ⚡ 今すぐと ⏭️ 外す(GH#349)、
     残りの行は状態が DIG_NOW_STATES のときだけ ⚡ 今すぐ(GH#388)。dug_today(今日もう掘った)の
     行には今すぐを付けない。carded(深掘りカードを送ったことがある)の行には ✅ 読んだを、どの行にも
-    👎 不要を付ける(GH#409)。ボタンの無い 1 通はボタンなし。
+    👎 不要を付ける(GH#409)。read_marked・dismissed(読んだ・不要にしてある)の行のボタンには ✓ を
+    付ける(押すと取り消す)。ボタンの無い 1 通はボタンなし。
     """
     states = states or {}
     lines = [f"{DIG_BACKLOG_TITLE}({len(plan_rows) + len(rows)}件)"]
@@ -607,7 +615,10 @@ def _dig_backlog_text(
             # 注記の塊が 2 通目以降の頭に来たときは、先頭の空行を続きの見出しで置き換える
             text = DIG_BACKLOG_CONTINUED + "\n" + text.removeprefix("\n")
         buttons = [buttons_at[index] for index in group if index in buttons_at]
-        messages.append((text, backlog_keyboard(buttons) if buttons else None))
+        keyboard = (
+            backlog_keyboard(buttons, read=read_marked, dismissed=dismissed) if buttons else None
+        )
+        messages.append((text, keyboard))
     return messages
 
 
@@ -736,6 +747,16 @@ def pending_dig_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         ORDER BY marked_at DESC, items.id DESC
         """
     ).fetchall()
+
+
+def on_backlog(conn: sqlite3.Connection, item_id: int) -> bool:
+    """item が未消化 🔖 の一覧(pending_dig_items)に載るか。読むだけ。
+
+    夜の一覧の行の読んだ・不要のボタン(GH#409)の answer で、押した後に一覧から外れる・戻るかを
+    言い分けるのに使う(予定の行だけで載った item は、🔖 もブックマークも無いので戻らない)。
+    条件を写さないよう、一覧と同じ問い合わせから探す(一覧は数百行の規模)。
+    """
+    return any(row["item_id"] == item_id for row in pending_dig_items(conn))
 
 
 def _watchdog_problems(conn: sqlite3.Connection, config: Config, today: str) -> list[str]:

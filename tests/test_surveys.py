@@ -2817,9 +2817,10 @@ def test_backlog_undo_says_when_the_other_mark_keeps_it_off(conn, tmp_path) -> N
     for _ in range(5):
         poll_once(conn, config, api, logger)
 
-    assert [text for _, text in api.answered][2:] == [
+    assert [text for _, text in api.answered][1:] == [
+        f"👎 {item} を不要にしました",  # 読んだで、もう一覧に載っていない
         f"↩️ {item} の不要を取り消しました(読んだにしてあるので、一覧には載りません)",
-        f"👎 {item} を不要にしました(夜の一覧から外れます)",
+        f"👎 {item} を不要にしました",
         f"↩️ {item} の読んだを取り消しました(不要にしてあるので、一覧には載りません)",
     ]
     assert listed_ids(conn) == []
@@ -2859,3 +2860,63 @@ def test_backlog_read_and_dismiss_need_the_row_on_the_pressed_list(conn, tmp_pat
     assert api.edited == []
     assert followups(conn, shown) == [] and followups(conn, other) == []
     assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+def test_backlog_plan_rows_show_current_read_and_dismiss_marks(conn, tmp_path) -> None:
+    # 不要・読んだの後に調べ直しでキューへ戻った item は、予定の行として載る。ボタンには今の記録の
+    # ✓ を付けて送る(✓ が無いと、不要を取り消すつもりで押して予定から外してしまう。Codex 指摘)
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    dismissed = add_queued_bookmark(conn, "https://a/dismissed", enqueued_at="2026-07-03T00:00:00Z")
+    read = add_queued_bookmark(conn, "https://a/read", enqueued_at="2026-07-02T00:00:00Z")
+    card = add_card(conn, read)
+    # 前の日に掘った(今日もう掘った行には ⚡ 今すぐを付けないため)
+    conn.execute("UPDATE dig_results SET created_at = '2026-07-01T00:00:00Z' WHERE id = ?", (card,))
+    conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (?)", (dismissed,))
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', ?)",
+        (read, day),
+    )
+    config = config_with_cap(tmp_path, 2)
+
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+
+    assert planned_ids_in(text) == [dismissed, read]
+    assert markup == {"inline_keyboard": [
+        plan_buttons(dismissed, dismissed=True), plan_buttons(read, read=True),
+    ]}
+    undo = FakeApi([[backlog_press(f"b:{dismissed}:y", message_id, markup, update_id=1)]])
+    poll_once(conn, config, undo, logger)
+    assert queue_row(conn, dismissed)["status"] == "queued"  # 予定は外さない
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+def test_backlog_answers_do_not_claim_a_plan_only_row_leaves_or_returns(conn, tmp_path) -> None:
+    # 🔖 もブックマークも無く、予定の行だけで載った item(カードからの調べ直しなど)は、一覧から
+    # 外れる・戻るとは言わない。不要にすると予定から外れ、取り消しても予定には戻らない(Codex 指摘)
+    silence_watchdog(conn)
+    item = add_item(conn, "https://a/plan-only", title="予定だけ")
+    add_body(conn, item)
+    add_queue(conn, item, enqueued_at="2026-07-03T00:00:00Z")
+    add_card(conn, item)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+    assert planned_ids_in(text) == [item]
+
+    api = FakeApi([
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=1)],
+        [backlog_press(f"b:{item}:u", message_id, markup, update_id=2)],
+        [backlog_press(f"b:{item}:x", message_id, markup, update_id=3)],
+        [backlog_press(f"b:{item}:y", message_id, markup, update_id=4)],
+    ])
+    for _ in range(4):
+        poll_once(conn, config, api, logger)
+
+    assert [text for _, text in api.answered] == [
+        f"✅ {item} を読んだにしました",
+        f"↩️ {item} の読んだを取り消しました",
+        f"👎 {item} を不要にしました(深掘りの予定も外しました)",
+        f"↩️ {item} の不要を取り消しました",
+    ]
+    assert queue_row(conn, item)["status"] == "passed"
