@@ -42,6 +42,7 @@ from app.delivery.surveys import (
     SentReadConfirm,
     backlog_keyboard,
     followup_keyboard,
+    on_backlog,
     pending_dig_items,
     q1_keyboard,
     q2_keyboard,
@@ -76,7 +77,14 @@ from app.dig_answer import (
     questions_on,
     start_discussion,
 )
-from app.dig_take import is_dismissed, is_read, mark_dismissed, mark_read, read_items
+from app.dig_take import (
+    dismissed_items,
+    is_dismissed,
+    is_read,
+    mark_dismissed,
+    mark_read,
+    read_items,
+)
 from app.export.obsidian import note_projection_date
 from app.jst import JST
 from app.normalize import (
@@ -409,6 +417,18 @@ def _handle_callback(
         if prefix == "b" and arg.isdigit() and code == "p":
             _record_backlog_skip(conn, config, api, callback, callback_id, int(arg), logger)
             return
+        if prefix == "b" and arg.isdigit() and code in _BACKLOG_READ_CODES:
+            _record_backlog_read(
+                conn, config, api, callback, callback_id, int(arg), _BACKLOG_READ_CODES[code],
+                logger, now_fn(),
+            )
+            return
+        if prefix == "b" and arg.isdigit() and code in _BACKLOG_DISMISS_CODES:
+            _record_backlog_dismiss(
+                conn, config, api, callback, callback_id, int(arg),
+                _BACKLOG_DISMISS_CODES[code], logger,
+            )
+            return
         if prefix == "c" and (
             (arg.isdigit() and code in _READ_CONFIRM_CODES) or (arg == "0" and code == "a")
         ):
@@ -674,9 +694,9 @@ def _record_dig_discuss(
 _DIG_READ_CODES = {"r": True, "u": False}
 # 読んだのボタンの answer。(読んだにするか, 書いたか) で決める
 _DIG_READ_ANSWERS = {
-    (True, True): "✅ 読んだにしました(未消化一覧から外れます)",
+    (True, True): "✅ 読んだにしました(夜の一覧から外れます)",
     (True, False): "✅ 読んだにしてあります",
-    (False, True): "↩️ 読んだを取り消しました(未消化一覧に戻ります)",
+    (False, True): "↩️ 読んだを取り消しました(夜の一覧に戻ります)",
     (False, False): "↩️ 読んだにはしていません",
 }
 # 読んだを取り消しても、不要にしてある item は一覧に戻らない(GH#403)
@@ -748,14 +768,14 @@ _DIG_DISMISS_CODES = {"x": True, "y": False}
 # 不要のボタンの answer。(不要にするか, 書いたか) で決める。一覧に載っていない item(🔖 も
 # ブックマークも無い深掘り)もあるので、「外れます」ではなく「載りません」と言う
 _DIG_DISMISS_ANSWERS = {
-    (True, True): "👎 不要にしました(未消化一覧に載りません)",
+    (True, True): "👎 不要にしました(夜の一覧に載りません)",
     (True, False): "👎 不要にしてあります",
     (False, True): "↩️ 不要を取り消しました",
     (False, False): "↩️ 不要にはしていません",
 }
 # 調べ直しを頼んでキューに戻っていた item を不要にしたとき(深掘りの予定も外す)
 _DIG_DISMISS_PASSED_ANSWERS = {
-    True: "👎 不要にしました(未消化一覧に載りません。深掘りの予定も外しました)",
+    True: "👎 不要にしました(夜の一覧に載りません。深掘りの予定も外しました)",
     False: "👎 不要にしてあります(深掘りの予定は外しました)",
 }
 
@@ -907,7 +927,7 @@ def _read_confirm_answer(
     item_id = targets[0]
     if code == "r":
         return (
-            f"✅ {item_id} を読んだにしました(未消化一覧から外れます)"
+            f"✅ {item_id} を読んだにしました(夜の一覧から外れます)"
             if written
             else f"✅ {item_id} は読んだにしてあります"
         )
@@ -915,12 +935,37 @@ def _read_confirm_answer(
         return f"↩️ {item_id} は読んだにしていません"
     if dismissed:
         return f"↩️ {item_id} の読んだを取り消しました(不要にしてあるので、一覧には載りません)"
-    return f"↩️ {item_id} の読んだを取り消しました(未消化一覧に戻ります)"
+    return f"↩️ {item_id} の読んだを取り消しました(夜の一覧に戻ります)"
 
 
-# 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388。設計 04 §3)。
-# 盤面を作り直すときに、押されたメッセージのボタンから item id とボタンの種類を読む
-_BACKLOG_DATA_RE = re.compile(r"b:(\d+):([pn])")
+# 未消化一覧の行のボタンの callback_data(skip = p は GH#349、今すぐ = n は GH#388、読んだ = r|u と
+# 不要 = x|y は GH#409。設計 04 §3)。盤面を作り直すときに、押されたメッセージのボタンから item id と
+# ボタンの種類を読む
+_BACKLOG_DATA_RE = re.compile(r"b:(\d+):([pnruxy])")
+# ボタンの種類。読んだと不要は、押す前(r・x)と取り消し(u・y)を同じ種類として読む
+_BACKLOG_KINDS = {"p": "p", "n": "n", "r": "r", "u": "r", "x": "x", "y": "x"}
+# 一覧の行の読んだ・不要のボタンの code → 読んだ・不要にするか(False = 取り消す。GH#409)
+_BACKLOG_READ_CODES = {"r": True, "u": False}
+_BACKLOG_DISMISS_CODES = {"x": True, "y": False}
+
+
+def _backlog_board(callback: dict) -> dict[int, set[str]]:
+    """押された未消化一覧の 1 通のボタンから、行の item id → ボタンの種類(_BACKLOG_KINDS の値)。
+
+    行の順(dict の挿入順)を保つ。読めないボタンは飛ばす。値は Telegram が送る押されたメッセージの
+    盤面で、callback_data だけを信じないための照合と、盤面の作り直しに使う。
+    """
+    message = callback.get("message")
+    markup = message.get("reply_markup") if isinstance(message, dict) else None
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    kinds: dict[int, set[str]] = {}
+    for buttons in rows if isinstance(rows, list) else []:
+        for button in buttons if isinstance(buttons, list) else []:
+            data = button.get("callback_data") if isinstance(button, dict) else None
+            match = _BACKLOG_DATA_RE.fullmatch(data) if isinstance(data, str) else None
+            if match is not None:
+                kinds.setdefault(int(match.group(1)), set()).add(_BACKLOG_KINDS[match.group(2)])
+    return kinds
 
 
 def _is_backlog_message(conn: sqlite3.Connection, config: Config, callback: dict) -> bool:
@@ -1003,6 +1048,181 @@ def _record_backlog_skip(
             callback_id,
             text=f"⏭️ {item_id} を外しました(戻すときは一覧へ「{item_id} も」とリプライ)",
         )
+    _refresh_backlog_board(conn, api, callback, logger)
+
+
+def _pressed_backlog_row(
+    conn: sqlite3.Connection, config: Config, callback: dict, item_id: int, kind: str
+) -> bool:
+    """押されたメッセージが未消化一覧で、その 1 通の盤面に、その item のその種類のボタンがあるか。
+
+    読んだ・不要のボタン(GH#409)は item の記録を書くので、callback_data の item id だけを信じず、
+    一覧の 1 通に載せた行のボタンであることを確かめる(カードのボタンの _pressed_dig_card と
+    同じ考え)。
+    """
+    return _is_backlog_message(conn, config, callback) and kind in _backlog_board(callback).get(
+        item_id, set()
+    )
+
+
+def _record_backlog_read(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    read: bool,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """未消化一覧の「✅ {id} を読んだ」と、その取り消し(GH#409。設計 06 §2)。
+
+    深掘りカードの ✅ 読んだと同じ記録(mark_read = followup_dig)。押されたメッセージが一覧で、
+    その行のボタンであることを確かめる(_pressed_backlog_row)。最新の記録の確認と記録は 1 つの
+    トランザクションで行い、再配達・二重押しで同じ値を 2 回書かない。answer は、押した前後で
+    一覧(on_backlog)に載るかで言い分ける(_backlog_mark_answer)。押した後は盤面を差し替え、
+    読んだに ✓ を付ける(押すと取り消す)。
+    """
+    if not _pressed_backlog_row(conn, config, callback, item_id, "r"):
+        logger.warning("未消化一覧と結び付かない読んだのボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": item_id, "extra": {"read": read}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            listed_before = on_backlog(conn, item_id)
+            written = mark_read(conn, item_id, read, now.astimezone(JST).date().isoformat())
+            listed_after = on_backlog(conn, item_id)
+            # 不要にしてある item は、読んだを取り消しても一覧に戻らない(GH#403)
+            dismissed = is_dismissed(conn, item_id)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"一覧の読んだのボタンを記録できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "一覧の読んだのボタンを記録した" if written else "一覧の読んだのボタン(記録済み。書かない)",
+        extra=log_extra,
+    )
+    api.answer_callback_query(
+        callback_id,
+        text=_backlog_mark_answer(
+            item_id, "read", read, written,
+            listed=(listed_before, listed_after), other_mark=dismissed,
+        ),
+    )
+    _refresh_backlog_board(conn, api, callback, logger)
+
+
+# 一覧の行の読んだ・不要のボタンの answer の語(GH#409)。(付けた, 記録済み, 取り消した, していない,
+# 取り消してももう片方で一覧に載らないときの理由)
+_BACKLOG_MARK_WORDS = {
+    "read": ("✅ {id} を読んだにしました", "✅ {id} は読んだにしてあります",
+             "↩️ {id} の読んだを取り消しました", "↩️ {id} は読んだにしていません", "不要にしてある"),
+    "dismiss": ("👎 {id} を不要にしました", "👎 {id} は不要にしてあります",
+                "↩️ {id} の不要を取り消しました", "↩️ {id} は不要にしていません", "読んだにしてある"),
+}
+
+
+def _backlog_mark_answer(
+    item_id: int,
+    kind: str,
+    marked: bool,
+    written: bool,
+    *,
+    listed: tuple[bool, bool],
+    other_mark: bool,
+    passed: bool = False,
+) -> str:
+    """一覧の行の ✅ 読んだ・👎 不要のボタンの answer(GH#409。文言は設計 04 §3)。
+
+    listed = 押す前と後に、未消化 🔖 の一覧に載るか(on_backlog)。外れる・戻ると言うのは、実際に
+    そうなるときだけ(予定の行だけで載った item は、🔖 もブックマークも無いので、どちらでもない)。
+    other_mark = もう片方(読んだなら不要、不要なら読んだ)にしてある(取り消しても一覧に戻らない)。
+    passed = 不要にしたとき、キューの item をパスにした(深掘りの予定も外した)。
+    """
+    done, kept, undone, not_marked, reason = _BACKLOG_MARK_WORDS[kind]
+    before, after = listed
+    plan = "深掘りの予定も外しました" if written else "深掘りの予定は外しました"
+    if marked:
+        notes = (["夜の一覧から外れます"] if written and before and not after else []) + (
+            [plan] if passed else []
+        )
+        text = (done if written else kept).format(id=item_id)
+        return text + (f"({'。'.join(notes)})" if notes else "")
+    if not written:
+        return not_marked.format(id=item_id)
+    text = undone.format(id=item_id)
+    if after and not before:
+        return text + "(夜の一覧に戻ります)"
+    if other_mark:
+        return text + f"({reason}ので、一覧には載りません)"
+    return text
+
+
+def _record_backlog_dismiss(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    item_id: int,
+    dismissed: bool,
+    logger: logging.Logger,
+) -> None:
+    """未消化一覧の「👎 {id} は不要」と、その取り消し(GH#409。設計 06 §2)。
+
+    深掘りカードの 👎 不要と同じ台帳 dig_dismissals に書く(カードの列は NULL = 一覧の行から。
+    カードの無い記事もある。migration 033)。反応(signals)には書かない。押されたメッセージが一覧で、
+    その行のボタンであることを確かめる(_pressed_backlog_row)。今の状態の確認と記録は 1 つの
+    トランザクションで行い、再配達・二重押しで 2 回書かない。不要にするとき、キューに積んである
+    (queued)item はパスにして明朝の予定から外し、ほかの状態でも受付の順序の印を進める
+    (dismiss_from_queue。カードの 👎 不要と同じ)。取り消してもパスと印は戻さない。押した後は
+    盤面を差し替え、不要に ✓ を付ける(押すと取り消す)。
+    """
+    if not _pressed_backlog_row(conn, config, callback, item_id, "x"):
+        logger.warning("未消化一覧と結び付かない不要のボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
+        return
+    log_extra = {"stage": "poll", "item_id": item_id, "extra": {"dismissed": dismissed}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            listed_before = on_backlog(conn, item_id)
+            written = mark_dismissed(conn, item_id, None, dismissed)
+            passed = dismissed and dismiss_from_queue(conn, item_id)
+            listed_after = on_backlog(conn, item_id)
+            read = is_read(conn, item_id)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"一覧の不要のボタンを記録できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "一覧の不要のボタンを記録した" if written else "一覧の不要のボタン(記録済み。書かない)",
+        extra={**log_extra, "extra": {"dismissed": dismissed, "passed": passed}},
+    )
+    api.answer_callback_query(
+        callback_id,
+        text=_backlog_mark_answer(
+            item_id, "dismiss", dismissed, written,
+            listed=(listed_before, listed_after), other_mark=read, passed=passed,
+        ),
+    )
     _refresh_backlog_board(conn, api, callback, logger)
 
 
@@ -1210,24 +1430,18 @@ def _digest_item_keyboard(
 def _refresh_backlog_board(
     conn: sqlite3.Connection, api: TelegramApi, callback: dict, logger: logging.Logger
 ) -> None:
-    """押された未消化一覧の 1 通のボタンを、今の状態の ✓ を付けて差し替える(GH#349・GH#388)。
+    """押された未消化一覧の 1 通のボタンを、今の状態の ✓ を付けて差し替える(GH#349・GH#388・
+    GH#409)。
 
     その 1 通にどの行を載せたかは台帳に残していないので、押されたメッセージのボタン
     (callback の message.reply_markup)から item id とボタンの種類だけを読み、盤面は自前で作り直す
-    (Telegram の値の文言は使わない)。✓ はキューの今の状態で付けるので(外した = passed、今すぐ =
-    依頼を受け付けた・掘り終えた)、同じ 1 通の前に押したボタンの ✓ も残る。本文の印(🗓 明朝)は
+    (Telegram の値の文言は使わない)。✓ はキューと記録の今の状態で付けるので(外した = passed、
+    今すぐ = 依頼を受け付けた・掘り終えた、読んだ = 最新の followup_dig が yes、不要 = 台帳
+    dig_dismissals に行がある)、同じ 1 通の前に押したボタンの ✓ も残る。カードやまとめ確認で
+    読んだ・不要にした記事も、この 1 通を差し替えるときに ✓ が付く。本文の印(🗓 明朝)は
     書き換えない。読めなければ差し替えない。
     """
-    message = callback.get("message")
-    markup = message.get("reply_markup") if isinstance(message, dict) else None
-    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
-    kinds: dict[int, set[str]] = {}  # 行の順(dict の挿入順)を保つ
-    for buttons in rows if isinstance(rows, list) else []:
-        for button in buttons if isinstance(buttons, list) else []:
-            data = button.get("callback_data") if isinstance(button, dict) else None
-            match = _BACKLOG_DATA_RE.fullmatch(data) if isinstance(data, str) else None
-            if match is not None:
-                kinds.setdefault(int(match.group(1)), set()).add(match.group(2))
+    kinds = _backlog_board(callback)
     if not kinds:
         logger.warning("一覧のボタンを読めないため盤面の差し替えを skip", extra={"stage": "poll"})
         return
@@ -1242,13 +1456,21 @@ def _refresh_backlog_board(
         )
     }
     board = [
-        BacklogButtons(item_id, now="n" in found, skip="p" in found)
+        BacklogButtons(
+            item_id, now="n" in found, skip="p" in found, read="r" in found, dismiss="x" in found
+        )
         for item_id, found in kinds.items()
     ]
     _edit_markup_best_effort(
         api,
         callback,
-        backlog_keyboard(board, passed=passed, now_marked=dig_now_marked(conn, item_ids)),
+        backlog_keyboard(
+            board,
+            passed=passed,
+            now_marked=dig_now_marked(conn, item_ids),
+            read=read_items(conn, item_ids),
+            dismissed=dismissed_items(conn, item_ids),
+        ),
         logger,
     )
 

@@ -442,6 +442,25 @@ NowRequestOutcome = Literal[
 _NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 
 
+def items_with_cards(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
+    """item のうち、深掘りカードを送ったことがあるもの(dig_results の message_id がある)。読むだけ。
+
+    夜の一覧の行に ✅ 読んだを付けるか決めるのに使う(読む材料がもうある。GH#409)。
+    """
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return set()
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row["item_id"]
+        for row in conn.execute(
+            "SELECT DISTINCT item_id FROM dig_results "
+            f"WHERE message_id IS NOT NULL AND item_id IN ({placeholders})",
+            ids,
+        )
+    }
+
+
 def dug_on(conn: sqlite3.Connection, item_id: int, day: str) -> bool:
     """その item をその JST の暦日に掘ったか(_DUG_ON_DAY と同じ条件)。"""
     return bool(

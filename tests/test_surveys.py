@@ -295,7 +295,7 @@ def test_dig_backlog_list_sent_before_followups(conn, tmp_path) -> None:
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
     texts = [t for _, t in api.sent]
-    backlog = next(t for t in texts if "未消化の深掘り候補" in t)
+    backlog = next(t for t in texts if "まだ読んでいない記事" in t)
     assert "(2件)" in backlog
     assert backlog.index("昨日の🔖") < backlog.index("いいえ回答済み")  # 新しい 🔖 が上
     assert "深掘り済み" not in backlog
@@ -326,7 +326,7 @@ def test_dig_backlog_follows_latest_followup_answer(conn, tmp_path) -> None:
     api = FakeApi()
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
-    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert "(1件)" in backlog
     assert "はいからいいえへ" in backlog
     assert "いいえからはいへ" not in backlog
@@ -375,7 +375,7 @@ def test_dig_backlog_not_sent_when_empty(conn, tmp_path) -> None:
     api = FakeApi()
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
-    assert not any("未消化の深掘り候補" in t for _, t in api.sent)
+    assert not any("まだ読んでいない記事" in t for _, t in api.sent)
 
 
 def test_dig_backlog_caps_at_max_items(conn, tmp_path) -> None:
@@ -390,7 +390,7 @@ def test_dig_backlog_caps_at_max_items(conn, tmp_path) -> None:
     api = FakeApi()
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
-    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert "(17件)" in backlog
     assert backlog.count("<a href=") == 15
     assert "(他 2 件)" in backlog
@@ -1066,7 +1066,7 @@ def test_dig_backlog_includes_x_bookmarks(conn, tmp_path) -> None:
     api = FakeApi()
     run_due_timers(conn, make_config(tmp_path), api, logger, jst_now("21:30"))
 
-    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert "(2件)" in backlog  # dedupe 済み(bm_only + both)
     assert "ブクマのみ" in backlog
     assert "ブクマと🔖両方" in backlog
@@ -1087,7 +1087,7 @@ def test_dig_backlog_uses_item_ids_and_reply_hint(conn, tmp_path) -> None:
     api = FakeApi()
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
-    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert f"{item}. " in backlog  # item id が行頭の番号
     assert f"「{item} を◯◯の観点で」" in backlog  # 実在 id でリプライ例を示す
     assert f"「{item} はパス」" in backlog
@@ -1105,7 +1105,7 @@ def test_dig_backlog_message_id_recorded_in_ledger(conn, tmp_path) -> None:
     run_due_timers(conn, make_config(tmp_path), api, logger, now)
 
     texts = [t for _, t in api.sent]
-    backlog_position = next(i for i, t in enumerate(texts) if "未消化の深掘り候補" in t)
+    backlog_position = next(i for i, t in enumerate(texts) if "まだ読んでいない記事" in t)
     rows = conn.execute("SELECT * FROM dig_backlog_messages").fetchall()
     assert len(rows) == 1
     # FakeApi の message_id は 900 + 送信順(1始まり)
@@ -1149,7 +1149,7 @@ def send_backlog(conn, config: Config, now: datetime | None = None) -> str | Non
     """夜アンケートを送り、未消化一覧の本文を返す(送らなければ None)。"""
     api = FakeApi()
     run_due_timers(conn, config, api, logger, now or jst_now("21:30"))
-    return next((t for _, t in api.sent if "未消化の深掘り候補" in t), None)
+    return next((t for _, t in api.sent if "まだ読んでいない記事" in t), None)
 
 
 def backlog_line(text: str, item_id: int) -> str:
@@ -1157,7 +1157,8 @@ def backlog_line(text: str, item_id: int) -> str:
 
 
 def test_dig_backlog_marks_each_state(conn, tmp_path) -> None:
-    # 各行の番号の後に深掘りの状態の印を添える。上限 1 件なので 2 件目の queued は ⏳ 待ち
+    # 各行の番号の後に深掘りの状態の印を添える。上限 1 件なので 2 件目の queued は ⏳ 待ち。
+    # 掘り終えた(done)行は印なし(掘ったかどうかは本人にとって意味がない。GH#409)
     now = jst_now("21:30")
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     silence_watchdog(conn)
@@ -1180,7 +1181,7 @@ def test_dig_backlog_marks_each_state(conn, tmp_path) -> None:
     expected = {
         "planned": "🗓 明朝 ",
         "waiting": "⏳ 待ち ",
-        "done": "✅ 掘った ",
+        "done": "",
         "passed": "⏭️ パス ",
         "queued_no_body": "⚠️ 本文なし ",
         "gone": "⚠️ 本文なし ",
@@ -1189,10 +1190,11 @@ def test_dig_backlog_marks_each_state(conn, tmp_path) -> None:
     for name, mark in expected.items():
         assert backlog_line(backlog, items[name]).startswith(f"{items[name]}. {mark}<a "), name
     assert "(7件)" in backlog
+    assert "掘った" not in backlog
 
 
 def test_dig_backlog_done_and_passed_marks_ignore_missing_body(conn, tmp_path) -> None:
-    # done・passed はキューの状態のまま示す(本文が消えていても ⚠️ にしない)
+    # done・passed はキューの状態のまま示す(本文が消えていても ⚠️ にしない。done は印なし。GH#409)
     now = jst_now("21:30")
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     silence_watchdog(conn)
@@ -1204,7 +1206,7 @@ def test_dig_backlog_done_and_passed_marks_ignore_missing_body(conn, tmp_path) -
 
     backlog = send_backlog(conn, config_with_cap(tmp_path, 2), now)
 
-    assert "✅ 掘った <a " in backlog_line(backlog, done)
+    assert backlog_line(backlog, done).startswith(f"{done}. <a ")
     assert "⏭️ パス <a " in backlog_line(backlog, passed)
 
 
@@ -1223,7 +1225,7 @@ def test_dig_backlog_plan_rows_on_top_and_not_counted_in_limit(conn, tmp_path) -
     backlog = send_backlog(conn, config_with_cap(tmp_path, 1), now)
 
     lines = backlog.splitlines()
-    assert lines[0] == "🔖 未消化の深掘り候補(17件)"
+    assert lines[0] == "🔖 まだ読んでいない記事(17件)"
     assert lines[1].startswith(f"{planned}. 🗓 明朝 ")
     assert backlog.count("<a href=") == 16  # 予定 1 + 残りの上限 15
     assert sum(line.startswith(f"{planned}. ") for line in lines) == 1  # 残りの行に重ねない
@@ -1245,7 +1247,7 @@ def test_dig_backlog_adds_plan_rows_outside_bookmarks(conn, tmp_path) -> None:
     backlog = send_backlog(conn, config_with_cap(tmp_path, 2), now)
 
     lines = backlog.splitlines()
-    assert lines[0] == "🔖 未消化の深掘り候補(2件)"
+    assert lines[0] == "🔖 まだ読んでいない記事(2件)"
     assert lines[1] == f'{redig}. 🗓 明朝 <a href="https://a/redig">調べ直し(和題)</a>'
     assert lines[2].startswith(f"{bookmarked}. 🗓 明朝 ")
     assert "ダイジェストの上位" not in backlog  # 予定が上限に届いている
@@ -1265,7 +1267,7 @@ def test_dig_backlog_sent_with_plan_only_and_reply_accepts_plan_id(conn, tmp_pat
     run_due_timers(conn, config, api, logger, now)
 
     texts = [t for _, t in api.sent]
-    position = next(i for i, t in enumerate(texts) if "未消化の深掘り候補" in t)
+    position = next(i for i, t in enumerate(texts) if "まだ読んでいない記事" in t)
     backlog = texts[position]
     assert "(1件)" in backlog
     assert backlog_line(backlog, redig).startswith(f"{redig}. 🗓 明朝 ")
@@ -1339,7 +1341,7 @@ def test_dig_backlog_unchanged_when_daily_cap_zero(conn, tmp_path) -> None:
     backlog = send_backlog(conn, config_with_cap(tmp_path, 0), now)
 
     assert backlog == (
-        "🔖 未消化の深掘り候補(1件)\n"
+        "🔖 まだ読んでいない記事(1件)\n"
         f'{item}. <a href="https://a/fresh">候補記事</a>\n'
         "\n"
         f"↩️ このメッセージへのリプライで指定: 「{item} を◯◯の観点で」= "
@@ -1442,11 +1444,11 @@ def test_dig_backlog_splits_many_plan_rows_into_messages(conn, tmp_path) -> None
     run_due_timers(conn, config, api, logger, now)
 
     texts = [t for _, t in api.sent]
-    positions = [i for i, t in enumerate(texts) if "未消化の深掘り候補" in t]
+    positions = [i for i, t in enumerate(texts) if "まだ読んでいない記事" in t]
     assert len(positions) >= 2
     backlog = [texts[i] for i in positions]
-    assert backlog[0].startswith("🔖 未消化の深掘り候補(61件)\n")
-    assert all(t.startswith("🔖 未消化の深掘り候補(続き)\n") for t in backlog[1:])
+    assert backlog[0].startswith("🔖 まだ読んでいない記事(61件)\n")
+    assert all(t.startswith("🔖 まだ読んでいない記事(続き)\n") for t in backlog[1:])
     joined = "\n".join(backlog)
     for item in planned:
         assert sum(line.startswith(f"{item}. 🗓 明朝 ") for line in joined.splitlines()) == 1
@@ -1471,7 +1473,7 @@ def test_dig_backlog_send_failure_does_not_skip_followups(conn, tmp_path) -> Non
 
     class BacklogFailingApi(FakeApi):
         def send_message(self, chat_id, text, *, reply_markup=None):
-            if "未消化の深掘り候補" in text:
+            if "まだ読んでいない記事" in text:
                 raise DeliveryError("Telegram sendMessage が失敗: HTTP 400")
             return super().send_message(chat_id, text, reply_markup=reply_markup)
 
@@ -1506,7 +1508,7 @@ def test_dig_backlog_plans_item_dug_today_and_requested_again(conn, tmp_path) ->
 
     send_evening_survey(conn, config_with_cap(tmp_path, 2), api, logger, now)
 
-    backlog = next(t for _, t in api.sent if "未消化の深掘り候補" in t)
+    backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert backlog_line(backlog, item).startswith(f"{item}. 🗓 明朝 ")
 
 
@@ -1521,7 +1523,7 @@ def sent_backlog(conn, config: Config, now: datetime | None = None):
     return [
         (900 + position + 1, text, markup)
         for position, ((_, text), markup) in enumerate(zip(api.sent, api.markups, strict=True))
-        if "未消化の深掘り候補" in text
+        if "まだ読んでいない記事" in text
     ]
 
 
@@ -1562,17 +1564,45 @@ def _button(text: str, data: str, checked: bool) -> dict:
     return {"text": text + (" ✓" if checked else ""), "callback_data": data}
 
 
-def plan_buttons(item_id: int, *, passed: bool = False, now: bool = False) -> list[dict]:
-    """明朝の予定の行のボタン(⚡ 今すぐ・⏭️ 外す。GH#349・GH#388)。"""
+def read_button(item_id: int, *, read: bool = False) -> dict:
+    """一覧の行の ✅ 読んだ(カードを送ったことがある行。GH#409)。読んだなら ✓ で取り消し。"""
+    return _button(f"✅ {item_id} を読んだ", f"b:{item_id}:{'u' if read else 'r'}", read)
+
+
+def dismiss_button(item_id: int, *, dismissed: bool = False) -> dict:
+    """一覧の行の 👎 不要(どの行にも。GH#409)。不要にしてあれば ✓ で取り消し。"""
+    return _button(f"👎 {item_id} は不要", f"b:{item_id}:{'y' if dismissed else 'x'}", dismissed)
+
+
+def plan_buttons(
+    item_id: int,
+    *,
+    passed: bool = False,
+    now: bool = False,
+    read: bool | None = None,
+    dismissed: bool = False,
+) -> list[dict]:
+    """明朝の予定の行のボタン(⚡ 今すぐ・⏭️ 外す・✅ 読んだ・👎 不要。GH#349・GH#388・GH#409)。
+
+    read = None はカードの無い行(✅ 読んだを付けない)。
+    """
     return [
         _button(f"⚡ {item_id} を今すぐ", f"b:{item_id}:n", now),
         _button(f"⏭️ {item_id} を外す", f"b:{item_id}:p", passed),
+        *([] if read is None else [read_button(item_id, read=read)]),
+        dismiss_button(item_id, dismissed=dismissed),
     ]
 
 
-def now_buttons(item_id: int, *, now: bool = False) -> list[dict]:
-    """予定でない行の今すぐのボタン(GH#388)。"""
-    return [_button(f"⚡ {item_id} を今すぐ", f"b:{item_id}:n", now)]
+def now_buttons(
+    item_id: int, *, now: bool = False, read: bool | None = None, dismissed: bool = False
+) -> list[dict]:
+    """予定でない行の今すぐのボタン(GH#388)と、✅ 読んだ・👎 不要(GH#409)。"""
+    return [
+        _button(f"⚡ {item_id} を今すぐ", f"b:{item_id}:n", now),
+        *([] if read is None else [read_button(item_id, read=read)]),
+        dismiss_button(item_id, dismissed=dismissed),
+    ]
 
 
 def add_queued_bookmark(conn, url: str, *, enqueued_at: str, **queue) -> int:
@@ -1612,7 +1642,8 @@ def queue_row(conn, item_id: int) -> sqlite3.Row:
 
 
 def test_skip_buttons_only_on_plan_rows(conn, tmp_path) -> None:
-    # skip は「明朝」の行ごとに 1 つ。⏳ 待ちの行は今すぐだけ(GH#388)、⚠️ 本文なしの行には付けない
+    # skip は「明朝」の行ごとに 1 つ。⏳ 待ちの行は今すぐだけ(GH#388)、⚠️ 本文なしの行には付けない。
+    # 👎 不要はどの行にも付く(本文の無い行も一覧から消せる。GH#409)
     silence_watchdog(conn)
     first = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-03T00:00:00Z")
     second = add_queued_bookmark(conn, "https://a/2", enqueued_at="2026-07-02T00:00:00Z")
@@ -1626,11 +1657,15 @@ def test_skip_buttons_only_on_plan_rows(conn, tmp_path) -> None:
     assert "⏳ 待ち " in backlog_line(text, waiting)
     assert "⚠️ 本文なし " in backlog_line(text, no_body)
     assert markup == {
-        "inline_keyboard": [plan_buttons(first), plan_buttons(second), now_buttons(waiting)]
+        "inline_keyboard": [
+            plan_buttons(first), plan_buttons(second), [dismiss_button(no_body)],
+            now_buttons(waiting),
+        ]
     }
     biggest = 2**63 - 1  # SQLite の id の最大でも callback_data は 64 バイト以内(設計 04 §3)
     assert len(f"b:{biggest}:p".encode()) <= 64
     assert len(f"b:{biggest}:n".encode()) <= 64
+    assert all(len(f"b:{biggest}:{code}".encode()) <= 64 for code in "ruxy")
 
 
 def test_no_skip_buttons_without_plan_or_when_daily_cap_zero(conn, tmp_path) -> None:
@@ -1644,7 +1679,7 @@ def test_no_skip_buttons_without_plan_or_when_daily_cap_zero(conn, tmp_path) -> 
     set_state(conn, STATE_SURVEY_SENT, "")  # 同じ日にもう一度送る
     [(_, text, no_plan)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
     assert planned_ids_in(text) == []
-    assert no_plan is None
+    assert no_plan == {"inline_keyboard": [[dismiss_button(item)]]}  # 👎 不要だけ(GH#409)
 
 
 def test_skip_buttons_follow_rows_when_list_is_split(conn, tmp_path) -> None:
@@ -1686,15 +1721,18 @@ def test_skip_buttons_per_message_are_capped(conn, tmp_path) -> None:
 
     messages = sent_backlog(conn, config_with_cap(tmp_path, count))
 
-    # 予定の行は ⚡ 今すぐと ⏭️ 外すの 2 つ(GH#388)なので、1 通に上限の半分の行まで
-    per_message = DIG_BACKLOG_MAX_BUTTONS // 2
-    assert [len(skip_ids(markup)) for _, _, markup in messages] == [per_message] * 4 + [3]
+    # 予定の行は ⚡ 今すぐ・⏭️ 外す・👎 不要の 3 つ(GH#388・GH#409)なので、1 通に上限の 3 分の 1 の
+    # 行まで
+    per_message = DIG_BACKLOG_MAX_BUTTONS // 3
+    assert [len(skip_ids(markup)) for _, _, markup in messages] == (
+        [per_message] * (count // per_message) + [count % per_message]
+    )
     assert all(button_count(markup) <= DIG_BACKLOG_MAX_BUTTONS for _, _, markup in messages)
     for _, text, markup in messages:
         assert skip_ids(markup) == planned_ids_in(text)
     assert sorted(i for _, _, markup in messages for i in skip_ids(markup)) == sorted(planned)
-    assert messages[0][1].startswith(f"🔖 未消化の深掘り候補({count}件)\n")
-    assert all(t.startswith("🔖 未消化の深掘り候補(続き)\n") for _, t, _ in messages[1:])
+    assert messages[0][1].startswith(f"🔖 まだ読んでいない記事({count}件)\n")
+    assert all(t.startswith("🔖 まだ読んでいない記事(続き)\n") for _, t, _ in messages[1:])
     assert "↩️ " in messages[-1][1]
 
 
@@ -1782,7 +1820,9 @@ def test_skip_button_keeps_checks_and_is_idempotent_and_undoable(conn, tmp_path)
     assert queue_row(conn, first)["status"] == "passed"
     assert queue_row(conn, second)["status"] == "passed"
     assert api.answered[2] == ("cb3", f"⏭️ {first} は外し済みです")
-    board = [BacklogButtons(item, now=True, skip=True) for item in (first, second)]
+    board = [
+        BacklogButtons(item, now=True, skip=True, dismiss=True) for item in (first, second)
+    ]
     both_checked = backlog_keyboard(board, passed={first, second})
     assert [markup for _, _, markup in api.edited] == [
         backlog_keyboard(board, passed={first}),
@@ -2284,7 +2324,7 @@ def test_read_confirm_lists_unread_items_with_notes_on_sunday(conn, tmp_path) ->
     assert len(api.sent) == 1
     assert api.sent[0][1] == (
         "📝 感想を書いた未消化(2件)\n"
-        "感想をリプライした記事です。読み終えたものは ✅ を押すと、未消化一覧から外れます\n"
+        "感想をリプライした記事です。読み終えたものは ✅ を押すと、夜の一覧から外れます\n"
         "\n"
         f'{newer}. <a href="https://c/newer">新しい方</a>\n'
         f'{older}. <a href="https://c/older">古い方</a>'
@@ -2366,7 +2406,7 @@ def test_read_confirm_row_button_marks_and_undoes(conn, tmp_path) -> None:
 
     assert latest_followups(conn) == {a: "yes"}
     assert [row["item_id"] for row in pending_dig_items(conn)] == [b]
-    assert api.answered == [("cb1", f"✅ {a} を読んだにしました(未消化一覧から外れます)")]
+    assert api.answered == [("cb1", f"✅ {a} を読んだにしました(夜の一覧から外れます)")]
     assert api.edited == [(CHAT_ID, 901, read_confirm_keyboard([a, b], {a}))]
     assert api.edited[0][2]["inline_keyboard"][0][0] == {
         "text": f"✅ {a} ✓", "callback_data": f"c:{a}:u"
@@ -2380,7 +2420,7 @@ def test_read_confirm_row_button_marks_and_undoes(conn, tmp_path) -> None:
     signals = conn.execute("SELECT count(*) FROM signals WHERE kind = 'followup_dig'")
     assert signals.fetchone()[0] == 2  # 二重押しで no を 2 回書かない
     assert api.answered == [
-        ("cb2", f"↩️ {a} の読んだを取り消しました(未消化一覧に戻ります)"),
+        ("cb2", f"↩️ {a} の読んだを取り消しました(夜の一覧に戻ります)"),
         ("cb3", f"↩️ {a} は読んだにしていません"),
     ]
     assert api.edited[-1][2] == read_confirm_keyboard([a, b], set())
@@ -2588,3 +2628,295 @@ def test_read_confirm_undo_on_a_dismissed_item_says_it_stays_off(conn, tmp_path)
         "cb2", f"↩️ {a} の読んだを取り消しました(不要にしてあるので、一覧には載りません)"
     )
     assert [row["item_id"] for row in pending_dig_items(conn)] == [b]
+
+
+# --- 夜の一覧の行の ✅ 読んだ・👎 不要(GH#409) ---
+
+
+def add_card(conn, item_id: int, *, message_id: int | None = 700) -> int:
+    """深掘りカード(dig_results)。message_id が None なら、まだ送っていない。"""
+    return conn.execute(
+        "INSERT INTO dig_results (item_id, note_name, card_text, message_id) "
+        "VALUES (?, 'note', 'カード', ?)",
+        (item_id, message_id),
+    ).lastrowid
+
+
+def backlog_press(
+    data: str, message_id: object, markup: dict | None, *, update_id: int = 1
+) -> dict:
+    """一覧の行のボタンの callback(skip_press と同じ形で、callback_data を選べる)。"""
+    update = skip_press(0, message_id, markup, update_id=update_id)
+    update["callback_query"]["data"] = data
+    return update
+
+
+def followups(conn, item_id: int) -> list[tuple[str, str]]:
+    return [
+        (row["value"], row["signal_date"])
+        for row in conn.execute(
+            "SELECT value, signal_date FROM signals WHERE kind = 'followup_dig' AND item_id = ? "
+            "ORDER BY id",
+            (item_id,),
+        )
+    ]
+
+
+def listed_ids(conn) -> list[int]:
+    return [row["item_id"] for row in pending_dig_items(conn)]
+
+
+def test_backlog_rows_get_read_button_only_when_a_card_was_sent(conn, tmp_path) -> None:
+    # カードを送ったことがある行だけに ✅ 読んだ。カードがまだ送れていない行と、カードの無い行は
+    # ⚡ 今すぐ(付けられるとき)と 👎 不要。掘った印は出さない(GH#409)
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    dug = add_item(conn, "https://a/dug", title="掘った記事")
+    unsent = add_item(conn, "https://a/unsent", title="カード未送信")
+    plain = add_item(conn, "https://a/plain", title="カードなし")
+    for item in (dug, unsent, plain):
+        add_dig_reaction(conn, item, day)
+        add_body(conn, item)
+    add_queue(conn, dug, "done")
+    add_card(conn, dug)
+    add_queue(conn, unsent, "done")
+    add_card(conn, unsent, message_id=None)
+
+    [(_, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
+
+    rows = {int(row[0]["callback_data"].split(":")[1]): row for row in markup["inline_keyboard"]}
+    assert rows[dug] == [read_button(dug), dismiss_button(dug)]
+    assert rows[unsent] == [dismiss_button(unsent)]
+    assert rows[plain] == now_buttons(plain)
+    assert "掘った" not in text.replace("掘った記事", "")
+    assert DIG_BACKLOG_READ_NOTE in text
+
+
+def test_backlog_read_button_records_like_the_card_and_can_be_undone(conn, tmp_path) -> None:
+    # 一覧の ✅ 読んだはカードの ✅ 読んだと同じ記録(followup_dig。signal_date は 🔖 の配信日)。
+    # 再配達は書かず、✓ の付いたボタンで取り消すと一覧に戻る
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    item = add_item(conn, "https://a/dug")
+    add_dig_reaction(conn, item, day)
+    add_body(conn, item)
+    add_queue(conn, item, "done")
+    add_card(conn, item)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+
+    api = FakeApi([
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=1)],
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=1)],  # 再配達
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=2)],  # 二重押し
+    ])
+    for _ in range(3):
+        poll_once(conn, config, api, logger)
+
+    assert followups(conn, item) == [("yes", day)]
+    assert listed_ids(conn) == []
+    assert api.answered == [
+        ("cb1", f"✅ {item} を読んだにしました(夜の一覧から外れます)"),
+        ("cb1", f"✅ {item} は読んだにしてあります"),
+        ("cb2", f"✅ {item} は読んだにしてあります"),
+    ]
+    checked = {"inline_keyboard": [[read_button(item, read=True), dismiss_button(item)]]}
+    assert [edited for _, _, edited in api.edited] == [checked] * 3
+
+    undo = FakeApi([[backlog_press(f"b:{item}:u", message_id, checked, update_id=3)]])
+    poll_once(conn, config, undo, logger)
+
+    assert followups(conn, item) == [("yes", day), ("no", day)]
+    assert listed_ids(conn) == [item]
+    assert undo.answered == [("cb3", f"↩️ {item} の読んだを取り消しました(夜の一覧に戻ります)")]
+    assert undo.edited[0][2] == {"inline_keyboard": [[read_button(item), dismiss_button(item)]]}
+
+
+def test_backlog_dismiss_button_hides_an_item_without_a_card(conn, tmp_path) -> None:
+    # カードの無い X のブックマークも、一覧の 👎 不要で消せる。台帳のカードの列は NULL で、反応・
+    # followup_dig は書かない。取り消すと戻る
+    silence_watchdog(conn)
+    kept = add_bookmarked(conn, "https://x/kept", "2026-10-24T00:00:00Z")
+    item = add_bookmarked(conn, "https://x/no-card", "2026-10-24T01:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    assert dismiss_button(item) in [b for row in markup["inline_keyboard"] for b in row]
+
+    api = FakeApi([[backlog_press(f"b:{item}:x", message_id, markup, update_id=1)]])
+    poll_once(conn, config, api, logger)
+
+    assert [tuple(row) for row in conn.execute(
+        "SELECT item_id, dig_result_id FROM dig_dismissals"
+    )] == [(item, None)]
+    assert conn.execute(
+        "SELECT count(*) FROM signals WHERE item_id = ?", (item,)
+    ).fetchone()[0] == 0
+    assert listed_ids(conn) == [kept]
+    assert api.answered == [("cb1", f"👎 {item} を不要にしました(夜の一覧から外れます)")]
+    edited = api.edited[0][2]
+    assert dismiss_button(item, dismissed=True) in edited["inline_keyboard"][0]
+    assert dismiss_button(kept) in edited["inline_keyboard"][1]
+
+    again = FakeApi([
+        [backlog_press(f"b:{item}:x", message_id, markup, update_id=2)],
+        [backlog_press(f"b:{item}:y", message_id, edited, update_id=3)],
+        [backlog_press(f"b:{item}:y", message_id, edited, update_id=4)],
+    ])
+    for _ in range(3):
+        poll_once(conn, config, again, logger)
+
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+    assert listed_ids(conn) == [item, kept]
+    assert [text for _, text in again.answered] == [
+        f"👎 {item} は不要にしてあります",
+        f"↩️ {item} の不要を取り消しました(夜の一覧に戻ります)",
+        f"↩️ {item} は不要にしていません",
+    ]
+
+
+def test_backlog_dismiss_on_a_plan_row_also_passes_it(conn, tmp_path) -> None:
+    # 明朝の予定の行を不要にすると、カードの 👎 不要と同じく深掘りの予定からも外す(passed)
+    silence_watchdog(conn)
+    item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-03T00:00:00Z")
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+    assert planned_ids_in(text) == [item]
+
+    api = FakeApi([[backlog_press(f"b:{item}:x", message_id, markup, update_id=1)]])
+    poll_once(conn, config, api, logger)
+
+    assert queue_row(conn, item)["status"] == "passed"
+    assert listed_ids(conn) == []
+    assert api.answered == [
+        ("cb1", f"👎 {item} を不要にしました(夜の一覧から外れます。深掘りの予定も外しました)")
+    ]
+    assert api.edited[0][2] == {
+        "inline_keyboard": [plan_buttons(item, passed=True, dismissed=True)]
+    }
+
+
+def test_backlog_undo_says_when_the_other_mark_keeps_it_off(conn, tmp_path) -> None:
+    # 読んだと不要の片方を取り消しても、もう片方があれば一覧には戻らない(そう知らせる)
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    item = add_item(conn, "https://a/dug")
+    add_dig_reaction(conn, item, day)
+    add_body(conn, item)
+    add_queue(conn, item, "done")
+    add_card(conn, item)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+
+    api = FakeApi([
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=1)],
+        [backlog_press(f"b:{item}:x", message_id, markup, update_id=2)],
+        [backlog_press(f"b:{item}:y", message_id, markup, update_id=3)],
+        [backlog_press(f"b:{item}:x", message_id, markup, update_id=4)],
+        [backlog_press(f"b:{item}:u", message_id, markup, update_id=5)],
+    ])
+    for _ in range(5):
+        poll_once(conn, config, api, logger)
+
+    assert [text for _, text in api.answered][1:] == [
+        f"👎 {item} を不要にしました",  # 読んだで、もう一覧に載っていない
+        f"↩️ {item} の不要を取り消しました(読んだにしてあるので、一覧には載りません)",
+        f"👎 {item} を不要にしました",
+        f"↩️ {item} の読んだを取り消しました(不要にしてあるので、一覧には載りません)",
+    ]
+    assert listed_ids(conn) == []
+    assert api.edited[-1][2] == {
+        "inline_keyboard": [[read_button(item), dismiss_button(item, dismissed=True)]]
+    }
+
+
+@pytest.mark.parametrize("code", ["r", "u", "x", "y"])
+def test_backlog_read_and_dismiss_need_the_row_on_the_pressed_list(conn, tmp_path, code) -> None:
+    # callback_data の番号だけを信じない。押した 1 通の盤面にその行のそのボタンが無い・一覧で
+    # ないメッセージ・owner の chat でないなら、何も書かない
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    shown = add_item(conn, "https://a/shown")
+    add_dig_reaction(conn, shown, day)
+    other = add_item(conn, "https://a/other")  # 一覧の 1 通に載っていない
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    kind_missing = "r" if code in "ru" else None  # shown にはカードが無く、読んだのボタンも無い
+
+    presses = [
+        backlog_press(f"b:{other}:{code}", message_id, markup, update_id=1),
+        backlog_press(f"b:{shown}:{code}", 12345, markup, update_id=2),  # 一覧でない
+    ]
+    other_chat = backlog_press(f"b:{shown}:{code}", message_id, markup, update_id=3)
+    other_chat["callback_query"]["message"]["chat"]["id"] = CHAT_ID + 1
+    presses.append(other_chat)
+    if kind_missing is not None:
+        presses.append(backlog_press(f"b:{shown}:{code}", message_id, markup, update_id=4))
+    api = FakeApi([[press] for press in presses])
+    for _ in presses:
+        poll_once(conn, config, api, logger)
+
+    assert {text for _, text in api.answered} == {"⚠️ この一覧には対応できません"}
+    assert len(api.answered) == len(presses)
+    assert api.edited == []
+    assert followups(conn, shown) == [] and followups(conn, other) == []
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+def test_backlog_plan_rows_show_current_read_and_dismiss_marks(conn, tmp_path) -> None:
+    # 不要・読んだの後に調べ直しでキューへ戻った item は、予定の行として載る。ボタンには今の記録の
+    # ✓ を付けて送る(✓ が無いと、不要を取り消すつもりで押して予定から外してしまう。Codex 指摘)
+    silence_watchdog(conn)
+    day = (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    dismissed = add_queued_bookmark(conn, "https://a/dismissed", enqueued_at="2026-07-03T00:00:00Z")
+    read = add_queued_bookmark(conn, "https://a/read", enqueued_at="2026-07-02T00:00:00Z")
+    card = add_card(conn, read)
+    # 前の日に掘った(今日もう掘った行には ⚡ 今すぐを付けないため)
+    conn.execute("UPDATE dig_results SET created_at = '2026-07-01T00:00:00Z' WHERE id = ?", (card,))
+    conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (?)", (dismissed,))
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', ?)",
+        (read, day),
+    )
+    config = config_with_cap(tmp_path, 2)
+
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+
+    assert planned_ids_in(text) == [dismissed, read]
+    assert markup == {"inline_keyboard": [
+        plan_buttons(dismissed, dismissed=True), plan_buttons(read, read=True),
+    ]}
+    undo = FakeApi([[backlog_press(f"b:{dismissed}:y", message_id, markup, update_id=1)]])
+    poll_once(conn, config, undo, logger)
+    assert queue_row(conn, dismissed)["status"] == "queued"  # 予定は外さない
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+def test_backlog_answers_do_not_claim_a_plan_only_row_leaves_or_returns(conn, tmp_path) -> None:
+    # 🔖 もブックマークも無く、予定の行だけで載った item(カードからの調べ直しなど)は、一覧から
+    # 外れる・戻るとは言わない。不要にすると予定から外れ、取り消しても予定には戻らない(Codex 指摘)
+    silence_watchdog(conn)
+    item = add_item(conn, "https://a/plan-only", title="予定だけ")
+    add_body(conn, item)
+    add_queue(conn, item, enqueued_at="2026-07-03T00:00:00Z")
+    add_card(conn, item)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+    assert planned_ids_in(text) == [item]
+
+    api = FakeApi([
+        [backlog_press(f"b:{item}:r", message_id, markup, update_id=1)],
+        [backlog_press(f"b:{item}:u", message_id, markup, update_id=2)],
+        [backlog_press(f"b:{item}:x", message_id, markup, update_id=3)],
+        [backlog_press(f"b:{item}:y", message_id, markup, update_id=4)],
+    ])
+    for _ in range(4):
+        poll_once(conn, config, api, logger)
+
+    assert [text for _, text in api.answered] == [
+        f"✅ {item} を読んだにしました",
+        f"↩️ {item} の読んだを取り消しました",
+        f"👎 {item} を不要にしました(深掘りの予定も外しました)",
+        f"↩️ {item} の不要を取り消しました",
+    ]
+    assert queue_row(conn, item)["status"] == "passed"
