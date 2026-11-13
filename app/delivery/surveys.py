@@ -63,6 +63,10 @@ DIG_BACKLOG_CONTINUED = f"{DIG_BACKLOG_TITLE}(続き)"
 # 設計 06 §2・04 §3)。1 通のボタンの数の上限は、Telegram の inline keyboard の上限(約 100)に
 # 余裕を残す。超えるなら行の単位で次の 1 通に分ける
 DIG_BACKLOG_MAX_BUTTONS = 50
+# 行のボタンを付ける行の数(明朝の予定の行は数えずに必ず付ける。GH#411)。15 行すべてに付けると
+# ボタンが縦に 15 段以上並び、多すぎる(ユーザーのフィードバック 2026-11-13)。付けるのは新しい順の
+# 上から。下の行は、上の行が一覧から外れると次の夜から上がってくる
+DIG_BACKLOG_BUTTON_ROWS = 5
 # 今すぐのボタンを付ける行の状態(本文があり、掘り終えておらず、パスもしていない。GH#388)。
 # 明朝の予定の行(planned)は skip のボタンと並べる
 DIG_NOW_STATES: frozenset[DigState | None] = frozenset({"planned", "waiting", None})
@@ -540,11 +544,13 @@ def _dig_backlog_text(
     (DIG_BACKLOG_TEXT_MAX_CHARS)を超えるときは行の単位で複数通に分ける。見出しは 1 通目、
     注記とリプライの案内は最後の 1 通に置き、2 通目以降には続きの見出しを付ける(GH#349)。
     with_buttons なら行のボタンを、その行を載せた 1 通に付ける(他の 1 通の行のボタンは付けない。
-    1 通のボタンは DIG_BACKLOG_MAX_BUTTONS 個まで)。予定の行は ⚡ 今すぐと ⏭️ 外す(GH#349)、
+    1 通のボタンは DIG_BACKLOG_MAX_BUTTONS 個まで)。ボタンを付けるのは予定の行と、残りの行の
+    上から DIG_BACKLOG_BUTTON_ROWS 件だけ(GH#411)。それより下の行は本文だけで、ボタンの無い行が
+    あるときは注記で、ボタンを付けた行の数を知らせる。予定の行は ⚡ 今すぐと ⏭️ 外す(GH#349)、
     残りの行は状態が DIG_NOW_STATES のときだけ ⚡ 今すぐ(GH#388)。dug_today(今日もう掘った)の
-    行には今すぐを付けない。carded(深掘りカードを送ったことがある)の行には ✅ 読んだを、どの行にも
-    👎 不要を付ける(GH#409)。read_marked・dismissed(読んだ・不要にしてある)の行のボタンには ✓ を
-    付ける(押すと取り消す)。ボタンの無い 1 通はボタンなし。
+    行には今すぐを付けない。carded(深掘りカードを送ったことがある)の行には ✅ 読んだを、ボタンを
+    付けるどの行にも 👎 不要を付ける(GH#409)。read_marked・dismissed(読んだ・不要にしてある)の
+    行のボタンには ✓ を付ける(押すと取り消す)。ボタンの無い 1 通はボタンなし。
     """
     states = states or {}
     lines = [f"{DIG_BACKLOG_TITLE}({len(plan_rows) + len(rows)}件)"]
@@ -569,6 +575,9 @@ def _dig_backlog_text(
         notes.append("🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります")
     if digest_fill > 0:
         notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
+    if with_buttons and len(rows[:DIG_BACKLOG_MAX_ITEMS]) > DIG_BACKLOG_BUTTON_ROWS:
+        # ボタンの無い行がある(GH#411)。予定の行は先頭に並ぶので、上から数えた行の数で言える
+        notes.append(f"ボタンは上の {len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます")
     if with_buttons:
         # 何をすると一覧から消えるか(GH#398・GH#409)。カードが届いただけでは消えない
         notes.append(DIG_BACKLOG_READ_NOTE)
@@ -592,7 +601,7 @@ def _dig_backlog_text(
             )
             for index, row in enumerate(plan_rows, start=1)
         }
-        for index, row in enumerate(rows[:DIG_BACKLOG_MAX_ITEMS], start=len(plan_rows) + 1):
+        for index, row in enumerate(rows[:DIG_BACKLOG_BUTTON_ROWS], start=len(plan_rows) + 1):
             item_id = row["item_id"]
             buttons_at[index] = BacklogButtons(
                 item_id,

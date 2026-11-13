@@ -14,6 +14,7 @@ from app.delivery import notify_run_failure, poll_once, run_due_timers, run_poll
 from app.delivery.poller import TIMER_RETRY_S
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
+    DIG_BACKLOG_BUTTON_ROWS,
     DIG_BACKLOG_READ_NOTE,
     STATE_READ_CONFIRM_SENT,
     STATE_RUN_FAILURE_NOTIFIED,
@@ -1973,9 +1974,9 @@ def test_skip_button_db_failure_answers_warning(conn, tmp_path, monkeypatch) -> 
 @pytest.mark.parametrize(
     "markup", [None, {"inline_keyboard": "x"}, {"inline_keyboard": [[{"callback_data": 1}]]}]
 )
-def test_skip_button_with_unreadable_markup_applies_without_board(
-    conn, tmp_path, markup
-) -> None:
+def test_skip_button_with_unreadable_markup_is_refused(conn, tmp_path, markup) -> None:
+    # 盤面を読めないと、その行のボタンを押したと確かめられないので受け付けない(GH#411。前は盤面を
+    # 差し替えずにパスだけ反映していた)。Telegram は押されたメッセージの盤面を付けて送る
     silence_watchdog(conn)
     item = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-01T00:00:00Z")
     config = config_with_cap(tmp_path, 2)
@@ -1984,7 +1985,8 @@ def test_skip_button_with_unreadable_markup_applies_without_board(
     api = FakeApi([[skip_press(item, message_id, markup)]])
     poll_once(conn, config, api, logger)
 
-    assert queue_row(conn, item)["status"] == "passed"
+    assert queue_row(conn, item)["status"] == "queued"
+    assert api.answered == [("cb1", "⚠️ この一覧には対応できません")]
     assert api.edited == []
 
 
@@ -2920,3 +2922,104 @@ def test_backlog_answers_do_not_claim_a_plan_only_row_leaves_or_returns(conn, tm
         f"↩️ {item} の不要を取り消しました",
     ]
     assert queue_row(conn, item)["status"] == "passed"
+
+
+def keyboard_ids(markup: dict | None) -> list[int]:
+    """1 通のボタンの段ごとの item id(段の順)。"""
+    if markup is None:
+        return []
+    return [int(row[0]["callback_data"].split(":")[1]) for row in markup["inline_keyboard"]]
+
+
+def test_backlog_buttons_only_on_plan_rows_and_the_newest_rows(conn, tmp_path) -> None:
+    # 行のボタンは明朝の予定の行と、残りの行の上から DIG_BACKLOG_BUTTON_ROWS 件だけ(GH#411)。
+    # 下の行は本文に載るがボタンは無く、注記でボタンを付けた行の数を知らせる。ボタンの無い行の
+    # callback を偽っても、押した 1 通の盤面に無いので受け付けない
+    silence_watchdog(conn)
+    planned = [
+        add_queued_bookmark(conn, f"https://a/plan-{i}", enqueued_at=f"2026-07-0{3 - i}T00:00:00Z")
+        for i in range(2)
+    ]
+    newest_first = [
+        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        for i in range(17)
+    ]
+    config = config_with_cap(tmp_path, 2)
+
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+
+    assert planned_ids_in(text) == planned
+    assert keyboard_ids(markup) == planned + newest_first[:DIG_BACKLOG_BUTTON_ROWS]
+    assert len(markup["inline_keyboard"]) == 2 + DIG_BACKLOG_BUTTON_ROWS
+    assert all(backlog_line(text, item) for item in newest_first[:15])  # 本文は今までどおり 15 件
+    assert "(他 2 件)" in text
+    assert f"ボタンは上の {2 + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます" in text
+    assert text.index("ボタンは上の") < text.index(DIG_BACKLOG_READ_NOTE)
+
+    below = newest_first[DIG_BACKLOG_BUTTON_ROWS]
+    api = FakeApi([[backlog_press(f"b:{below}:x", message_id, markup, update_id=1)]])
+    poll_once(conn, config, api, logger)
+    assert api.answered == [("cb1", "⚠️ この一覧には対応できません")]
+    assert api.edited == []
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("count", [DIG_BACKLOG_BUTTON_ROWS, DIG_BACKLOG_BUTTON_ROWS + 1])
+def test_backlog_button_note_only_when_some_rows_have_no_buttons(conn, tmp_path, count) -> None:
+    # 予定が無くても同じ。どの行にもボタンがあるときは注記を足さない(GH#411)
+    silence_watchdog(conn)
+    newest_first = [
+        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        for i in range(count)
+    ]
+
+    [(_, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
+
+    assert keyboard_ids(markup) == newest_first[:DIG_BACKLOG_BUTTON_ROWS]
+    note = f"ボタンは上の {DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
+    assert (note in text) is (count > DIG_BACKLOG_BUTTON_ROWS)
+    assert DIG_BACKLOG_READ_NOTE in text
+
+
+@pytest.mark.parametrize("code", ["n", "p", "x"])
+def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, code) -> None:
+    # ボタンの無い行(上の 5 件より下)の callback は、今すぐ・外す・不要のどれも、偽っても
+    # 受け付けない(GH#411。Codex 指摘)。前の夜の一覧(この変更の前に送った 1 通)のように、
+    # 押した 1 通の盤面にその行のボタンがあれば受け付ける
+    silence_watchdog(conn)
+    add_queued_bookmark(conn, "https://a/plan", enqueued_at="2026-07-03T00:00:00Z")
+    newest_first = [
+        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        for i in range(DIG_BACKLOG_BUTTON_ROWS + 1)
+    ]
+    below = newest_first[-1]
+    add_body(conn, below)
+    add_queue(conn, below, enqueued_at="2026-07-01T00:00:00Z")  # ⏳ 待ち(今すぐも外すも効く)
+    config = config_with_cap(tmp_path, 1)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+    assert "⏳ 待ち " in backlog_line(text, below)
+    assert below not in keyboard_ids(markup)
+    before = tuple(queue_row(conn, below))
+    worker = FakeWorker()
+
+    forged = FakeApi([[backlog_press(f"b:{below}:{code}", message_id, markup, update_id=1)]])
+    poll_once(conn, config, forged, logger, dig_now_worker=worker)
+
+    assert forged.answered == [("cb1", "⚠️ この一覧には対応できません")]
+    assert forged.edited == []
+    assert tuple(queue_row(conn, below)) == before
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+    assert worker.kicks == 0
+
+    old_board = {"inline_keyboard": [[{"text": "前の一覧", "callback_data": f"b:{below}:{code}"}]]}
+    old = FakeApi([[backlog_press(f"b:{below}:{code}", message_id, old_board, update_id=2)]])
+    poll_once(conn, config, old, logger, dig_now_worker=worker)
+
+    assert old.answered[0][1] != "⚠️ この一覧には対応できません"
+    after = queue_row(conn, below)
+    if code == "n":
+        assert after["now_requested_at"] is not None and worker.kicks == 1
+    elif code == "p":
+        assert after["status"] == "passed"
+    else:
+        assert [row[0] for row in conn.execute("SELECT item_id FROM dig_dismissals")] == [below]
