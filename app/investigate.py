@@ -3,6 +3,9 @@
 朝のダイジェストの「📰 今日の IT ニュース」の出来事 1 つを、報じた記事をまとめて材料にして調べる。
 何が起きたか・経緯と原因・影響・報じ方の違い・X の反応・まだ分からないこと をカードとノートにする。
 
+- 材料は手元の記事(出来事を報じた items)に、GDELT で探した報道を足す(GH#415 の 2 本目。ADR 0006)。
+  検索の語は LLM が作り、外へ出す前にコードが演算子と使えない文字を外す。検索と本文の取得はコードが
+  行い、どれが失敗しても手元の記事だけで続ける
 - 深掘り(記事 1 本が単位。dig_queue・dig_results)とは別の台帳(news_investigations)に持つ。同じ日に
   2 回掘らない規則やノートの名前が記事に結び付くので、代表の記事のふつうの深掘りを邪魔しないため
 - 作るのは `intel dig-now` の中(app.deepdive が、今すぐの深掘りの依頼の後に呼ぶ)。ノートの公開と
@@ -18,23 +21,29 @@ import json
 import re
 import secrets
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.analysis.llm import LLMEngine, complete_with_retry
+from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.config import Config
+from app.connectors.gdelt import GdeltArticle, GdeltError, search_articles
+from app.connectors.google_news import GoogleNewsError, NewsHeadline, search_headlines
 from app.delivery.telegram import escape_and_truncate, escape_attr
 from app.export.neutralize import neutralize_markdown
 from app.export.obsidian import FORBIDDEN_IN_SLUG, render_frontmatter
+from app.extraction.extractor import fetch_article_text
+from app.http import HttpClient
 from app.models import NewsEntry, link_host, parse_news_json
 from app.prompting import fill_template, load_writing_guide, sanitize, sanitize_body
 
 PROMPT_VERSION = "investigate-v001"
+QUERY_PROMPT_VERSION = "investigate-query-v001"  # 検索の語を作る(GH#415 の 2 本目)
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # 知らせ(固定の文言だけ。外部由来の見出しを入れない。今すぐの深掘りの知らせと同じ考え)
@@ -45,7 +54,26 @@ NO_MATERIAL_NOTICE = (
 
 # X の投稿の host(材料の種別を決める。trend のリンクの並べ方と同じ)
 _POST_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
-_KIND_LABELS = {"article": "記事", "post": "X の投稿"}
+_KIND_LABELS = {
+    "article": "記事",
+    "post": "X の投稿",
+    "news": "報道(検索)",
+    "headline": "報道の見出し(検索)",  # Google ニュースの予備。本文は無い
+}
+_ENGINE_LABELS = {"gdelt": "GDELT", "google_news": "Google ニュース"}
+
+# GDELT の検索の語(外へ出す前の検査)。英数字と一部の記号だけを残し、演算子と短い語を外す
+_NEWS_QUERY_MAX = 100
+_NEWS_QUERY_TOKENS_MAX = 6
+_NEWS_TOKEN = re.compile(r'"[^"]*"|\S+')
+_NEWS_DISALLOWED = re.compile(r"[^A-Za-z0-9 .&'+\-]")
+_NEWS_OPERATORS = frozenset({"AND", "OR", "NOT"})
+_NEWS_MIN_WORD = 3  # GDELT は 3 文字未満の語を受け付けない
+_NEWS_WINDOW_BEFORE = timedelta(days=2)  # 検索の範囲(digest の日の 2 日前から)
+# Google ニュース(予備)の検索の語。日本語の語を拾うので文字の種類は広く、演算子と記号を外す
+_JA_QUERY_MAX = 60
+_JA_QUERY_TOKENS_MAX = 4
+_JA_MIN_WORD = 2
 
 # カードの各欄の上限(UTF-16 の code unit。escape_and_truncate で切る)。どれも LLM の出力か外部由来で
 # 長さを検証していない。上限いっぱいでも 1 通が Telegram の 4096 字に収まる
@@ -72,6 +100,32 @@ _CITATION_SPLIT = re.compile(r"\s*[,、]\s*")
 
 class NoMaterialError(Exception):
     """本文のある材料が無い(見出しだけでは調べられない)。"""
+
+
+class SearchPlan(BaseModel):
+    """検索の語(prompts/investigate-query-v001.md)。
+
+    news_query は GDELT(英語)、news_query_ja は予備の Google ニュース(日本語)、x_query は X の反応
+    (3 本目)で使う。
+    """
+
+    news_query: str = Field(max_length=500)
+    news_query_ja: str = Field(default="", max_length=500)
+    x_query: str = Field(default="", max_length=500)
+
+
+SearchEngine = Literal["gdelt", "google_news"]
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    """報道の検索の結果(カードとノートに出す)。"""
+
+    status: Literal["ok", "none", "failed", "off"]  # 足した / 見つからない / 失敗 / 検索しない
+    query: str | None  # 最後に送った語(送っていなければ None)
+    local: int  # 手元の材料の数
+    found: int  # 検索で足した報道の数
+    engine: SearchEngine | None = None  # 足した報道の出どころ(足していなければ None)
 
 
 class InvestigationReaction(BaseModel):
@@ -107,11 +161,11 @@ class InvestigationRequest:
 @dataclass(frozen=True)
 class Material:
     number: int  # プロンプトとカードで使う番号(1 から)
-    item_id: int
-    kind: Literal["article", "post"]
+    item_id: int | None  # 手元の記事の items.id(検索で足した報道は None)
+    kind: Literal["article", "post", "news", "headline"]
     title: str
     host: str
-    url: str  # items.canonical_url
+    url: str  # 手元の記事は items.canonical_url、検索の報道は GDELT の URL を正規化したもの
     published_at: str | None
     body: str
 
@@ -319,6 +373,216 @@ def gather_materials(
     return materials
 
 
+# --- 報道の検索(GDELT。GH#415 の 2 本目) ---
+
+
+def search_news(
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    http: HttpClient,
+    request: InvestigationRequest,
+    materials: list[Material],
+    *,
+    now: datetime | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    search: Callable[..., list[GdeltArticle]] = search_articles,
+    headlines: Callable[..., list[NewsHeadline]] = search_headlines,
+    fetch: Callable[[HttpClient, str], str | None] = fetch_article_text,
+) -> tuple[list[Material], SearchOutcome]:
+    """同じ出来事の報道を探し、手元の材料の後ろに番号を続けて返す。
+
+    まず GDELT で探して本文を取る。GDELT が断ったか、使える報道が無ければ、予備として Google
+    ニュースの RSS の検索で見出しと媒体名を拾う(本文は無い。ADR 0006)。検索の語は LLM が作り、
+    外へ出す前に検査する。どれも使えなければ材料を足さない(調査は手元の記事だけで続ける)。
+    配信記事の重なりと、手元の材料・足した報道と同じ host は外し、`[investigate].news_articles`
+    本まで足す。GDELT の本文は `[investigate].news_fetch_budget_s` の間だけ取り、取れなかった
+    報道は題だけの材料にする。
+    """
+    local = len(materials)
+    limit = config.investigate.news_articles
+    if limit <= 0:
+        return [], SearchOutcome("off", None, local, 0)
+    try:
+        plan = complete_with_retry(
+            engine_factory("low"),
+            build_query_prompt(request, materials),
+            SearchPlan,
+            timeout_s=config.dig.timeout_s,
+        )
+    except LLMError:
+        return [], SearchOutcome("failed", None, local, 0)
+    now = now or datetime.now(UTC)
+    hosts = {m.host for m in materials}
+    titles: set[str] = set()
+    searched = False  # どれかの検索が(見つからなくても)答えた
+    sent: str | None = None
+
+    def fresh(host: str, title: str) -> bool:
+        key = _title_key(title)
+        if not host or host in hosts or not key or key in titles:  # 配信記事の重なりを 1 本に
+            return False
+        hosts.add(host)
+        titles.add(key)
+        return True
+
+    query = clean_news_query(plan.news_query)
+    if query:
+        sent = query
+        start, end = search_window(request.digest_date, now)
+        try:
+            articles = search(http, query, start=start, end=end)
+        except GdeltError:
+            articles = None
+        if articles is not None:
+            searched = True
+            deadline = clock() + config.investigate.news_fetch_budget_s
+            found: list[Material] = []
+            for article in articles:
+                if len(found) >= limit:
+                    break
+                host = link_host(article.url)
+                if not fresh(host, article.title):
+                    continue
+                body = fetch(http, article.url) if clock() < deadline else None
+                found.append(
+                    Material(
+                        number=local + len(found) + 1,
+                        item_id=None,
+                        kind="news",
+                        title=article.title,
+                        host=host,
+                        url=article.url,
+                        published_at=_seen_at(article.seen_at),
+                        body=body or "",
+                    )
+                )
+            if found:
+                return found, SearchOutcome("ok", query, local, len(found), "gdelt")
+
+    query_ja = clean_ja_query(plan.news_query_ja)
+    if query_ja:
+        sent = query_ja
+        start, end = search_window(request.digest_date, now)
+        try:
+            results = headlines(http, query_ja, after=start.date(), before=end.date())
+        except GoogleNewsError:
+            results = None
+        if results is not None:
+            searched = True
+            found = []
+            for headline in results:
+                if len(found) >= limit:
+                    break
+                host = headline.outlet_host or link_host(headline.url)
+                if not fresh(host, headline.title):
+                    continue
+                found.append(
+                    Material(
+                        number=local + len(found) + 1,
+                        item_id=None,
+                        kind="headline",
+                        title=headline.title,
+                        host=host,
+                        url=headline.url,
+                        published_at=headline.published_at,
+                        body="",
+                    )
+                )
+            if found:
+                return found, SearchOutcome("ok", query_ja, local, len(found), "google_news")
+    return [], SearchOutcome("none" if searched else "failed", sent, local, 0)
+
+
+def build_query_prompt(request: InvestigationRequest, materials: list[Material]) -> str:
+    nonce = secrets.token_hex(4)
+    template = (_PROMPTS_DIR / f"{QUERY_PROMPT_VERSION}.md").read_text(encoding="utf-8")
+    lines = [
+        f"見出し: {sanitize(request.label, 100, nonce)}",
+        f"要約: {sanitize(request.summary, 300, nonce)}",
+        *(f"記事の題: {sanitize(m.title, 200, nonce)}" for m in materials if m.title),
+    ]
+    return fill_template(
+        template,
+        {
+            "event": "\n".join(lines),
+            "schema": json.dumps(SearchPlan.model_json_schema(), ensure_ascii=False),
+            "nonce": nonce,
+        },
+    )
+
+
+def clean_news_query(text: str) -> str:
+    """GDELT に送る語を検査する。英数字と一部の記号だけを残し、演算子・3 文字未満の語を外す。
+
+    `"..."` の語句はそのまま 1 つの語にする(閉じていない引用符は外す)。演算子の形の語(コロンを
+    含む・`-` で始まる)は丸ごと捨てる(文字を外して別の語として送らない)。語の数と長さにも上限を
+    付ける。何も残らなければ空文字(検索しない)。
+    """
+    flat = " ".join(text.split())
+    if flat.count('"') % 2:
+        flat = flat.replace('"', "")
+    tokens: list[str] = []
+    for token in _NEWS_TOKEN.findall(flat):
+        if token.startswith('"'):
+            phrase = " ".join(_NEWS_DISALLOWED.sub(" ", token[1:-1]).split())
+            if len(phrase) >= _NEWS_MIN_WORD:
+                tokens.append(f'"{phrase}"')
+        elif ":" in token or token.startswith("-"):
+            continue  # 演算子の形の語(sourcelang:・domain:・除外の -)は丸ごと捨てる
+        else:
+            word = _NEWS_DISALLOWED.sub("", token).strip(".&'+-")
+            if len(word) >= _NEWS_MIN_WORD and word.upper() not in _NEWS_OPERATORS:
+                tokens.append(word)
+    query = ""
+    for token in tokens[:_NEWS_QUERY_TOKENS_MAX]:
+        candidate = f"{query} {token}".strip()
+        if len(candidate) > _NEWS_QUERY_MAX:
+            break
+        query = candidate
+    return query
+
+
+def clean_ja_query(text: str) -> str:
+    """Google ニュース(予備)に送る語を検査する。文字と数字(日本語を含む)と一部の記号だけを残す。
+
+    演算子(AND・OR・NOT)と演算子の形の語(コロンを含む・`-` で始まる)は丸ごと捨てる。期間の
+    after: / before: は送るときにコードが付ける。2 文字未満の語は捨て、4 語・60 字まで。
+    """
+    flat = " ".join(text.replace('"', " ").split())
+    query = ""
+    for token in flat.split(" ")[: _JA_QUERY_TOKENS_MAX * 2]:
+        if ":" in token or token.startswith("-") or token.upper() in _NEWS_OPERATORS:
+            continue
+        word = "".join(ch for ch in token if ch.isalnum() or ch in ".&+・ー")
+        if len(word) < _JA_MIN_WORD:
+            continue
+        candidate = f"{query} {word}".strip()
+        if len(candidate) > _JA_QUERY_MAX or candidate.count(" ") >= _JA_QUERY_TOKENS_MAX:
+            break
+        query = candidate
+    return query
+
+
+def search_window(digest_date: str, now: datetime) -> tuple[datetime, datetime]:
+    """検索の範囲(UTC)。digest の日の 2 日前の 0 時から、翌日の終わりか今のうち早い方まで。"""
+    day = datetime.strptime(digest_date, "%Y-%m-%d").replace(tzinfo=UTC)
+    end = min(day + timedelta(days=2) - timedelta(seconds=1), now)
+    return day - _NEWS_WINDOW_BEFORE, end
+
+
+def _title_key(title: str) -> str:
+    """配信記事の重なりを見分ける題の鍵(小文字の英数字だけの先頭 60 字)。"""
+    return "".join(ch for ch in title.lower() if ch.isalnum())[:60]
+
+
+def _seen_at(value: str) -> str | None:
+    """GDELT の seendate(YYYYMMDDTHHMMSSZ)を ISO 8601 の UTC にする。読めなければ None。"""
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
 # --- 生成 ---
 
 
@@ -328,9 +592,13 @@ def generate_investigation(
     request: InvestigationRequest,
     materials: list[Material],
     *,
+    search: SearchOutcome | None = None,
     now: datetime | None = None,
 ) -> GeneratedInvestigation:
-    """材料から調査のカードとノートを作る。本文のある材料が無ければ NoMaterialError。"""
+    """材料から調査のカードとノートを作る。本文のある材料が無ければ NoMaterialError。
+
+    search は報道の検索の結果(カードの末尾とノートの frontmatter に出す)。None は検索しない扱い。
+    """
     if sum(len(m.body.strip()) for m in materials) < config.dig.min_body_chars:
         raise NoMaterialError("本文のある材料が無い")
     engine = engine_factory(config.dig.reasoning_effort)
@@ -341,10 +609,11 @@ def generate_investigation(
     draft = clean_draft(draft, materials)
     created = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
     name = note_name(request)
+    search = search or SearchOutcome("off", None, len(materials), 0)
     return GeneratedInvestigation(
         note_name=name,
-        note_markdown=render_note(request, draft, materials, created),
-        card_text=render_card(request, draft, materials),
+        note_markdown=render_note(request, draft, materials, created, search),
+        card_text=render_card(request, draft, materials, search),
     )
 
 
@@ -464,7 +733,10 @@ def _card_materials(draft: InvestigationDraft, materials: list[Material]) -> lis
 
 
 def render_card(
-    request: InvestigationRequest, draft: InvestigationDraft, materials: list[Material]
+    request: InvestigationRequest,
+    draft: InvestigationDraft,
+    materials: list[Material],
+    search: SearchOutcome | None = None,
 ) -> str:
     """Telegram のカード(parse_mode=HTML)。LLM の出力と外部由来の値は escape して上限で切る。"""
     lines = [
@@ -502,7 +774,22 @@ def render_card(
             f"{escape_and_truncate(m.title or '(題なし)', CARD_MATERIAL_TITLE_MAX)}"
             for m in card_materials
         ]
+    if search is not None:
+        lines += ["", search_summary(search)]
     return "\n".join(lines)
+
+
+def search_summary(search: SearchOutcome) -> str:
+    """材料の内訳の 1 行(固定の文言と数だけ。外部由来の文字を入れない)。"""
+    if search.status == "failed":
+        return f"材料: 手元 {search.local} 件(報道の検索に失敗したので、手元の材料だけで調べた)"
+    if search.status == "off":
+        return f"材料: 手元 {search.local} 件"
+    if search.engine == "google_news":
+        return (
+            f"材料: 手元 {search.local} 件・検索した報道の見出し {search.found} 件(Google ニュース)"
+        )
+    return f"材料: 手元 {search.local} 件・検索した報道 {search.found} 件"
 
 
 def render_note(
@@ -510,6 +797,7 @@ def render_note(
     draft: InvestigationDraft,
     materials: list[Material],
     created: str,
+    search: SearchOutcome | None = None,
 ) -> str:
     """解説ノート(kind: investigation)。本文は公開の直前にも外部の埋め込みと生の HTML を直す。"""
     frontmatter = {
@@ -521,6 +809,11 @@ def render_note(
         "created": created,
         "materials": len(materials),
     }
+    if search is not None:
+        frontmatter["search"] = search.status
+        frontmatter["search_engine"] = _ENGINE_LABELS.get(search.engine or "", "")
+        frontmatter["search_query"] = search.query or ""
+        frontmatter["materials_search"] = search.found
     body = [
         f"# {draft.title_ja or request.label}",
         "",
@@ -541,6 +834,8 @@ def render_note(
     if draft.unknowns:
         body += ["", "## まだ分からないこと"]
         body += [f"- {u}" for u in draft.unknowns]
+    if search is not None:
+        body += ["", search_summary(search)]
     if materials:
         body += ["", "## 材料"]
         body += [

@@ -197,6 +197,27 @@ def test_429_respects_retry_after() -> None:
     assert sleeps == [7]  # Retry-After 優先。追加バックオフを重ねない
 
 
+@pytest.mark.parametrize("status", [429, 503])
+def test_no_retries_sends_once_and_fails_without_waiting(status) -> None:
+    # GH#415: 短い間隔の試し直しを断る先(GDELT)は retries=0 で 1 回だけ送る
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(status, headers={"retry-after": "1"})
+
+    sleeps: list[float] = []
+    with pytest.raises(app.http.RetryableError, match=r"リトライ上限\(0回\)"):
+        make_client(handler, sleeps=sleeps).get("https://example.com/", retries=0)
+    assert calls == [1] and sleeps == []
+
+
+@pytest.mark.parametrize("retries", [-1, app.http.MAX_RETRIES + 1])
+def test_retries_out_of_range_is_rejected(retries) -> None:
+    with pytest.raises(ValueError):
+        make_client(lambda r: httpx.Response(200)).get("https://example.com/", retries=retries)
+
+
 def test_429_retry_after_at_cap_is_waited() -> None:
     calls = []
 

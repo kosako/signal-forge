@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from app.analysis.llm import LLMError
 from app.config import Config, DigConfig, InvestigateConfig, ObsidianConfig, TelegramConfig
+from app.connectors.gdelt import GdeltArticle, GdeltError
+from app.connectors.google_news import GoogleNewsError, NewsHeadline
 from app.db import apply_migrations, connect
 from app.deepdive import DigError, run_dig_now
 from app.delivery.telegram import visible_length
@@ -17,9 +20,13 @@ from app.investigate import (
     InvestigationDraft,
     InvestigationReaction,
     NoMaterialError,
+    SearchOutcome,
+    SearchPlan,
     build_prompt,
     claim_investigation,
     clean_draft,
+    clean_ja_query,
+    clean_news_query,
     event_of_digest,
     gather_materials,
     generate_investigation,
@@ -27,6 +34,8 @@ from app.investigate import (
     render_card,
     render_note,
     request_investigation,
+    search_news,
+    search_window,
 )
 from app.jst import today_jst
 from app.models import NewsEntry
@@ -56,6 +65,8 @@ def config(tmp_path: Path) -> Config:
         obsidian=ObsidianConfig(vault_path=str(vault)),
         telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10),
         dig=DigConfig(daily_cap=2),
+        # 報道の検索は既定で切る(テストから外部へ通信しない)。検索のテストは HTTP の模型を渡す
+        investigate=InvestigateConfig(news_articles=0),
     )
 
 
@@ -96,16 +107,35 @@ DRAFT = InvestigationDraft(
 )
 
 
+PLAN = SearchPlan(
+    news_query='"Microsoft 365" outage',
+    news_query_ja="Microsoft 365 障害",
+    x_query="Microsoft 365 障害",
+)
+
+
 class DraftEngine:
     name = "fake"
 
-    def __init__(self, draft: InvestigationDraft = DRAFT, fail: bool = False):
+    def __init__(
+        self,
+        draft: InvestigationDraft = DRAFT,
+        fail: bool = False,
+        plan: SearchPlan | None = PLAN,
+    ):
         self.prompts: list[str] = []
+        self.plans: list[str] = []
         self.efforts: list[str] = []
         self._draft = draft
         self._fail = fail
+        self._plan = plan
 
     def complete_structured(self, prompt, schema, timeout_s=120):
+        if schema is SearchPlan:
+            self.plans.append(prompt)
+            if self._plan is None:
+                raise LLMError("語を作れない")
+            return self._plan
         assert schema is InvestigationDraft
         self.prompts.append(prompt)
         if self._fail:
@@ -447,3 +477,352 @@ def test_unsent_investigation_card_is_sent_by_next_run(conn, config) -> None:
     run_dig_now(conn, config, factory(engine), api, logger)
     assert engine.prompts == []  # 作り直さず、台帳のカードを送る
     assert len(api.sent) == 1 and status_of(conn)["message_id"] == 901
+
+
+# --- 報道の検索(GDELT。GH#415 の 2 本目) ---
+
+
+@pytest.mark.parametrize(
+    ("raw", "cleaned"),
+    [
+        ('"Microsoft 365" outage', '"Microsoft 365" outage'),
+        ("Microsoft OR Azure AND (outage) -AI sourcelang:japanese", "Microsoft Azure outage"),
+        ("Microsoft -outage domain:x.com", "Microsoft"),  # 除外と絞り込みを語として送らない
+        ('"Microsoft 365 outage', "Microsoft 365 outage"),  # 閉じていない引用符は外す
+        ('"AI" "Gemini 4" 障害 Hydrogen', '"Gemini 4" Hydrogen'),  # 3 文字未満・ASCII 以外
+        ("a b c", ""),
+        ("one two three four five six seven eight", "one two three four five six"),
+        ("x" * 120, ""),  # 1 語で上限を超える
+        ("  NVIDIA\n Huang\tresigns ", "NVIDIA Huang resigns"),
+    ],
+)
+def test_news_query_is_checked_before_sending(raw, cleaned) -> None:
+    assert clean_news_query(raw) == cleaned
+
+
+def test_search_window_is_utc_days_around_the_digest() -> None:
+    from datetime import UTC, datetime
+
+    late = datetime(2026, 11, 20, tzinfo=UTC)
+    assert search_window("2026-11-14", late) == (
+        datetime(2026, 11, 12, tzinfo=UTC),
+        datetime(2026, 11, 15, 23, 59, 59, tzinfo=UTC),
+    )
+    now = datetime(2026, 11, 14, 3, 0, tzinfo=UTC)
+    assert search_window("2026-11-14", now)[1] == now  # 今より先は探さない
+
+
+def gdelt(url: str, title: str) -> GdeltArticle:
+    return GdeltArticle(
+        url=url, title=title, domain="", language="English", seen_at="20261113T180000Z"
+    )
+
+
+def search_inputs(conn, config, **investigate):
+    seed_event(conn)
+    request(conn)
+    claimed = claim_investigation(conn)
+    on = Config(
+        config_dir=config.config_dir,
+        obsidian=config.obsidian,
+        telegram=config.telegram,
+        dig=config.dig,
+        investigate=InvestigateConfig(**({"news_articles": 3} | investigate)),
+    )
+    return on, claimed, gather_materials(conn, claimed)
+
+
+def test_search_adds_distinct_reports_after_local_materials(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    articles = [
+        gdelt("https://forest.example/other", "手元と同じ host"),  # 手元の記事と同じ host
+        gdelt("https://a.example/1", "Is Outlook down? Widespread outage"),
+        gdelt("https://b.example/1", "Is Outlook down?  Widespread outage!"),  # 同じ配信記事
+        gdelt("https://a.example/2", "同じ host の別の記事"),
+        gdelt("https://c.example/1", "Microsoft reports progress"),
+        gdelt("https://d.example/1", "Outage enters second day"),
+        gdelt("https://e.example/1", "上限を超える 4 本目"),
+    ]
+    queries: list[str] = []
+
+    def search(http, query, *, start, end):
+        queries.append(query)
+        return articles
+
+    fetched = {"https://a.example/1": "A の本文", "https://d.example/1": None}
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=search, fetch=lambda http, url: fetched.get(url, "本文"),
+    )
+    assert queries == ['"Microsoft 365" outage']
+    assert [(m.number, m.kind, m.host, m.item_id, m.body) for m in found] == [
+        (4, "news", "a.example", None, "A の本文"),
+        (5, "news", "c.example", None, "本文"),
+        (6, "news", "d.example", None, ""),  # 本文が取れなければ題だけの材料
+    ]
+    assert found[0].published_at == "2026-11-13T18:00:00Z"
+    assert outcome == SearchOutcome("ok", '"Microsoft 365" outage', 3, 3, "gdelt")
+
+
+def test_search_stops_fetching_after_the_time_budget(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config, news_fetch_budget_s=10)
+    ticks = iter([0, 5, 11, 12])  # 期限の計算・1 本目・2 本目(期限を過ぎた)…
+    fetched: list[str] = []
+
+    def fetch(http, url):
+        fetched.append(url)
+        return "本文"
+
+    found, _ = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=lambda *a, **k: [gdelt("https://a.example/", "A"), gdelt("https://b.example/", "B")],
+        headlines=lambda *a, **k: pytest.fail("GDELT で足りたら予備は使わない"),
+        fetch=fetch, clock=lambda: next(ticks),
+    )
+    assert fetched == ["https://a.example/"]
+    assert [m.body for m in found] == ["本文", ""]
+
+
+def headline(url: str, title: str, outlet_host: str) -> NewsHeadline:
+    return NewsHeadline(
+        url=url, title=title, outlet="媒体", outlet_host=outlet_host,
+        published_at="2026-11-13T20:43:24Z",
+    )
+
+
+def test_google_news_headlines_when_gdelt_fails(conn, config) -> None:
+    from datetime import date
+
+    on, claimed, materials = search_inputs(conn, config)
+    sent: list[tuple] = []
+
+    def search(http, query, *, start, end):
+        raise GdeltError("HTTP 429")
+
+    def headlines(http, query, *, after, before):
+        sent.append((query, after))
+        return [
+            headline("https://news.google.com/a/A", "手元と同じ媒体", "forest.example"),
+            headline("https://news.google.com/a/B", "マイクロソフト障害、復旧", "nikkei.example"),
+            headline("https://news.google.com/a/C", "マイクロソフト障害、復旧", "asahi.example"),
+            headline("https://news.google.com/a/D", "テクノロジー依存を痛感", "bbc.example"),
+            headline("https://news.google.com/a/E", "媒体の host が無い", ""),
+        ]
+
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=search, headlines=headlines, fetch=lambda *a: pytest.fail("見出しの本文は取らない"),
+    )
+    day = date.fromisoformat(today_jst())
+    assert sent == [("Microsoft 365 障害", day.fromordinal(day.toordinal() - 2))]
+    assert [(m.number, m.kind, m.host, m.url, m.body) for m in found] == [
+        (4, "headline", "nikkei.example", "https://news.google.com/a/B", ""),
+        (5, "headline", "bbc.example", "https://news.google.com/a/D", ""),
+        (6, "headline", "news.google.com", "https://news.google.com/a/E", ""),
+    ]
+    assert outcome == SearchOutcome("ok", "Microsoft 365 障害", 3, 3, "google_news")
+
+
+def test_google_news_when_gdelt_finds_nothing_usable(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=lambda *a, **k: [gdelt("https://forest.example/x", "手元と同じ host")],
+        headlines=lambda *a, **k: [headline("https://news.google.com/a", "見出し", "n.example")],
+        fetch=lambda *a: "本文",
+    )
+    assert [m.kind for m in found] == ["headline"] and outcome.engine == "google_news"
+
+
+@pytest.mark.parametrize(
+    ("plan", "gdelt_result", "google_result", "status", "query"),
+    [
+        (None, [], [], "failed", None),  # 語を作れない(LLM の失敗)
+        # 検査で語が残らない
+        (SearchPlan(news_query="AI :: OR", news_query_ja="x"), [], [], "failed", None),
+        (PLAN, GdeltError("429"), GoogleNewsError("503"), "failed", "Microsoft 365 障害"),
+        (PLAN, GdeltError("429"), [], "none", "Microsoft 365 障害"),  # 予備は答えたが見つからない
+        (PLAN, [], GoogleNewsError("503"), "none", "Microsoft 365 障害"),  # GDELT は答えた
+        # 日本語の語が無ければ予備は使わない
+        (SearchPlan(news_query='"Microsoft 365"'), [], [], "none", '"Microsoft 365"'),
+    ],
+)
+def test_search_failures_keep_local_materials_only(
+    conn, config, plan, gdelt_result, google_result, status, query
+):
+    on, claimed, materials = search_inputs(conn, config)
+
+    def answer(result):
+        def call(*args, **kwargs):
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return call
+
+    found, outcome = search_news(
+        on, factory(DraftEngine(plan=plan)), object(), claimed, materials,
+        search=answer(gdelt_result), headlines=answer(google_result),
+    )
+    assert found == [] and outcome == SearchOutcome(status, query, 3, 0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "cleaned"),
+    [
+        ("Microsoft 365 障害", "Microsoft 365 障害"),
+        ('"マイクロソフト" OR 障害 site:x.com -噂 (復旧)', "マイクロソフト 障害 復旧"),
+        ("a 障 365", "365"),  # 2 文字未満の語は捨てる
+        ("一 二三 四五 六七 八九 十一", "二三 四五 六七 八九"),  # 4 語まで
+        ("あ" * 70, ""),  # 1 語で上限を超える
+    ],
+)
+def test_ja_query_is_checked_before_sending(raw, cleaned) -> None:
+    assert clean_ja_query(raw) == cleaned
+
+
+def test_search_off_does_not_call_llm(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config, news_articles=0)
+    engine = DraftEngine()
+    found, outcome = search_news(
+        on, factory(engine), object(), claimed, materials,
+        search=lambda *a, **k: pytest.fail("検索しない"),
+    )
+    assert (found, outcome, engine.plans) == ([], SearchOutcome("off", None, 3, 0), [])
+
+
+def test_query_prompt_fences_event_and_titles(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    engine = DraftEngine()
+    search_news(
+        on, factory(engine), object(), claimed, materials,
+        search=lambda *a, **k: [], headlines=lambda *a, **k: [],
+    )
+    [prompt] = engine.plans
+    nonce = prompt.split("<<<DATA-")[1].split("\n")[0]
+    fenced = prompt.split(f"<<<DATA-{nonce}\n")[1].split(f"DATA-{nonce}>>>")[0]
+    assert "見出し: Microsoft 365 で障害" in fenced
+    assert "記事の題: Microsoft 365 の障害" in fenced
+    assert engine.efforts == ["low"]
+
+
+def test_card_and_note_show_material_breakdown(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    claimed = claim_investigation(conn)
+    materials = gather_materials(conn, claimed)
+    draft = clean_draft(DRAFT, materials)
+    ok = SearchOutcome("ok", '"Microsoft 365" outage', 3, 2, "gdelt")
+    assert render_card(claimed, draft, materials, ok).endswith(
+        "\n\n材料: 手元 3 件・検索した報道 2 件"
+    )
+    google = SearchOutcome("ok", "Microsoft 365 障害", 3, 4, "google_news")
+    assert render_card(claimed, draft, materials, google).endswith(
+        "\n\n材料: 手元 3 件・検索した報道の見出し 4 件(Google ニュース)"
+    )
+    failed = SearchOutcome("failed", None, 3, 0)
+    assert "報道の検索に失敗したので、手元の材料だけで調べた" in render_card(
+        claimed, draft, materials, failed
+    )
+    note = render_note(claimed, draft, materials, "2026-11-14T00:00:00Z", ok)
+    assert "search: ok\n" in note and "materials_search: 2\n" in note
+    assert "search_engine: GDELT\n" in note
+    google_note = render_note(claimed, draft, materials, "2026-11-14T00:00:00Z", google)
+    assert "search_engine: Google ニュース\n" in google_note
+    assert "search_query: '\"Microsoft 365\" outage'" in note
+
+
+GDELT_BODY = json.dumps(
+    {
+        "articles": [
+            {"url": "https://wire.example/m365", "title": "Microsoft outage drags on",
+             "seendate": "20261113T004500Z"},
+            {"url": "https://tech.example/m365", "title": "Microsoft 365 caught a bug",
+             "seendate": "20261113T180000Z"},
+        ]
+    }
+)
+ARTICLE_HTML = (
+    "<html><body><article><p>" + "Exchange Online was down. " * 20 + "</p></article></body></html>"
+)
+
+
+GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>t</title>
+<item><title>マイクロソフト365障害、20時間経て広範に復旧 - 日本経済新聞</title>
+<link>https://news.google.com/rss/articles/CBMiAAA?oc=5</link>
+<pubDate>Fri, 13 Nov 2026 20:43:24 GMT</pubDate>
+<source url="https://www.nikkei.com">日本経済新聞</source></item>
+</channel></rss>"""
+
+
+def gdelt_http(status: int = 200, google_status: int = 200):
+    from tests.test_extraction import make_http
+
+    def handler(request):
+        import httpx
+
+        host = request.headers["host"]
+        if host == "api.gdeltproject.org":
+            return httpx.Response(status, text=GDELT_BODY)
+        if host == "news.google.com":
+            return httpx.Response(
+                google_status, text=GOOGLE_RSS, headers={"content-type": "application/xml"}
+            )
+        return httpx.Response(200, text=ARTICLE_HTML, headers={"content-type": "text/html"})
+
+    return make_http(handler)
+
+
+def test_dig_now_investigation_uses_gdelt_reports(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    on = Config(
+        config_dir=config.config_dir, obsidian=config.obsidian, telegram=config.telegram,
+        dig=config.dig, investigate=InvestigateConfig(news_articles=5),
+    )
+    engine = DraftEngine()
+    api = FakeApi()
+    run_dig_now(conn, on, factory(engine), api, logger, http=gdelt_http())
+
+    [prompt] = engine.prompts
+    assert "[4] 種別: 報道(検索) | 媒体: wire.example | 題: Microsoft outage drags on" in prompt
+    assert "[5] 種別: 報道(検索) | 媒体: tech.example" in prompt
+    assert "Exchange Online was down." in prompt  # 検索した報道の本文を取って渡す
+    [(_, card)] = api.sent
+    assert card.endswith("材料: 手元 3 件・検索した報道 2 件")
+    note = (deepdive_dir(on) / f"{status_of(conn)['note_name']}.md").read_text()
+    assert "search: ok" in note and "(wire.example・報道(検索))" in note
+
+
+def test_dig_now_investigation_falls_back_to_google_news(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    on = Config(
+        config_dir=config.config_dir, obsidian=config.obsidian, telegram=config.telegram,
+        dig=config.dig, investigate=InvestigateConfig(news_articles=5),
+    )
+    engine = DraftEngine(
+        draft=DRAFT.model_copy(update={"coverage": "日経は復旧を伝えた[4]。"})
+    )
+    api = FakeApi()
+    run_dig_now(conn, on, factory(engine), api, logger, http=gdelt_http(status=429))
+    [prompt] = engine.prompts
+    assert "[4] 種別: 報道の見出し(検索) | 媒体: nikkei.com | 題: マイクロソフト365障害" in prompt
+    [(_, card)] = api.sent
+    assert card.endswith("材料: 手元 3 件・検索した報道の見出し 1 件(Google ニュース)")
+    assert '[4] <a href="https://news.google.com/rss/articles/CBMiAAA' in card
+
+
+def test_dig_now_investigation_survives_every_search_failure(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    on = Config(
+        config_dir=config.config_dir, obsidian=config.obsidian, telegram=config.telegram,
+        dig=config.dig, investigate=InvestigateConfig(news_articles=5),
+    )
+    api = FakeApi()
+    http = gdelt_http(status=400, google_status=404)
+    run_dig_now(conn, on, factory(DraftEngine()), api, logger, http=http)
+    assert status_of(conn)["status"] == "done"
+    assert "報道の検索に失敗した" in api.sent[0][1]

@@ -150,8 +150,13 @@ class InvestigateConfig:
     報じた記事をまとめて材料にして調べる。生成の effort と時間の上限は [dig] と同じものを使う。
     """
 
-    # 材料 1 件ごとに LLM に渡す本文の上限(超過は切り詰め注記)。材料は最大 8 件(NEWS_MAX_SOURCES)
+    # 材料 1 件ごとに LLM に渡す本文の上限(超過は切り詰め注記)。手元の材料は最大 8 件
+    # (NEWS_MAX_SOURCES)
     source_max_chars: int = 6000
+    # GDELT で探して足す報道の上限(GH#415 の 2 本目。ADR 0006)。0 = 報道を検索しない
+    news_articles: int = 5
+    # 検索した報道の本文を取る時間の上限(秒。超えた後の報道は題だけの材料にする)
+    news_fetch_budget_s: int = 90
 
 
 @dataclass(frozen=True)
@@ -503,6 +508,7 @@ def _validate(path: Path, config: Config) -> None:
         ("dig", "min_body_chars", config.dig.min_body_chars),
         ("dig", "answer_source_max_chars", config.dig.answer_source_max_chars),
         ("investigate", "source_max_chars", config.investigate.source_max_chars),
+        ("investigate", "news_fetch_budget_s", config.investigate.news_fetch_budget_s),
         ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),
         ("x_search", "daily_read_cap", config.x_search.daily_read_cap),
         ("digest", "max_items", config.digest.max_items),
@@ -523,6 +529,7 @@ def _validate(path: Path, config: Config) -> None:
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),
         ("dig", "daily_cap", config.dig.daily_cap),
         ("dig", "answer_daily_cap", config.dig.answer_daily_cap),
+        ("investigate", "news_articles", config.investigate.news_articles),
         ("ranking", "min_score", config.ranking.min_score),
         ("ranking", "negative_penalty", config.ranking.negative_penalty),
         ("ranking", "freshness_penalty_24_48", config.ranking.freshness_penalty_24_48),
