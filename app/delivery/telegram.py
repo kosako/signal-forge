@@ -38,9 +38,11 @@ from app.digest.builder import BOOKMARK_SECTION_MAX
 from app.models import (
     EXTRACTION_FAILED_NOTE,
     NEWS_HEADING,
+    NEWS_MAX_EVENTS,
+    NEWS_MAX_LINKS,
     NewsEvent,
     NewsLink,
-    link_label,
+    link_host,
     parse_news_json,
 )
 
@@ -62,6 +64,12 @@ TITLE_MAX_CHARS = 300
 # ソース名(sources.name)は運用者が手で入れる値で長さ未検証。タイトルと同じ理由で切る
 # (通常の名前はこの上限に届かない。GH#356)
 SOURCE_NAME_MAX_CHARS = 80
+# 今日の IT ニュース(GH#413)の各欄の上限。escape_and_truncate で UTF-16 の code unit で数えて切る
+# (見出し・要約は LLM の出力、リンクの文字は外部由来の host 名で、どれも長さを検証していない)。
+# 上限いっぱいの出来事 6 件と 🔖 保存節を合わせても、ヘッダ 1 通は 4096 字に収まる
+NEWS_LABEL_MAX_CHARS = 40
+NEWS_SUMMARY_MAX_CHARS = 160
+NEWS_LINK_LABEL_MAX_CHARS = 40
 
 # 🔖 保存節(GH#99)のタイトル上限。ヘッダ 1 通に同梱するため短めに取り、可視テキストを
 # 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
@@ -397,18 +405,23 @@ def _news_html(events: list[NewsEvent]) -> str:
     """出来事ごとに見出し(太字)・要約・報道元のリンクを並べる。出来事の間は 1 行あける。
 
     見出しと要約は LLM の出力なので escape する。リンクの URL は items の正規 URL(http/https を
-    挿入時に保証済み)で、属性として escape する。リンクの文字は host 名(40 字で切る)。
+    挿入時に保証済み)で、属性として escape する。リンクの文字は host 名。各欄は UTF-16 の単位の
+    上限で切り、出来事とリンクの数も上限で切る(trend_json は自前の値だが、ヘッダ 1 通の上限を
+    中身に頼らない)。
     """
     blocks = []
-    for event in events:
-        lines = [f"・<b>{escape_text(event.label)}</b>", escape_text(event.summary)]
-        if event.links:
-            lines.append(
-                " / ".join(
-                    f'<a href="{escape_attr(link.url)}">{escape_text(link_label(link.url))}</a>'
-                    for link in event.links
-                )
-            )
+    for event in events[:NEWS_MAX_EVENTS]:
+        lines = [
+            f"・<b>{escape_and_truncate(event.label, NEWS_LABEL_MAX_CHARS)}</b>",
+            escape_and_truncate(event.summary, NEWS_SUMMARY_MAX_CHARS),
+        ]
+        links = [
+            f'<a href="{escape_attr(link.url)}">'
+            f"{escape_and_truncate(link_host(link.url) or '記事', NEWS_LINK_LABEL_MAX_CHARS)}</a>"
+            for link in event.links[:NEWS_MAX_LINKS]
+        ]
+        if links:
+            lines.append(" / ".join(links))
         blocks.append("\n".join(lines))
     return NEWS_HEADING + "\n" + "\n\n".join(blocks)
 

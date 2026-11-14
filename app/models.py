@@ -24,6 +24,8 @@ EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで�
 # 冒頭の「今日の IT ニュース」節(GH#413)。trend の段が作り、digest 段が digests に残し、Telegram と
 # Daily ノートがリンク付きで出す。3 つの段で共通なので共通の層に置く(設計 00 §3)
 NEWS_HEADING = "📰 今日の IT ニュース"
+NEWS_MAX_EVENTS = 6  # 節に載せる出来事の上限
+NEWS_MAX_LINKS = 3  # 出来事 1 つに付けるリンクの上限
 
 
 @dataclass(frozen=True)

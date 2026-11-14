@@ -487,6 +487,31 @@ def test_header_news_drops_links_of_missing_items(conn, tmp_path) -> None:
     assert "・<b>消えた記事</b>\n要約。" in header and "<a " not in header
 
 
+def test_header_news_bounds_fields_and_counts_in_utf16(conn, tmp_path) -> None:
+    # trend_json は自前の値だが、ヘッダ 1 通の上限を中身に頼らない。出来事は 6 件、リンクは 3 本
+    # まで。見出し・要約・リンクの文字は UTF-16 の単位の上限で切る(絵文字は 1 字で 2)
+    from app.delivery.telegram import (
+        NEWS_LABEL_MAX_CHARS,
+        NEWS_LINK_LABEL_MAX_CHARS,
+        NEWS_SUMMARY_MAX_CHARS,
+    )
+
+    a = add_item(conn, "https://a/1")
+    links = [add_item(conn, f"https://{'h' * 50}{i}.example/") for i in range(5)]
+    events = [("😀" * 40, "😀" * 200, links) for _ in range(8)]
+    digest_id = add_digest(conn, [a], trend_json=news_json(*events))
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert header.count("・<b>") == 6
+    assert header.count("<a href=") == 6 * 3
+    label = "😀" * ((NEWS_LABEL_MAX_CHARS - 1) // 2) + "…"
+    summary = "😀" * ((NEWS_SUMMARY_MAX_CHARS - 1) // 2) + "…"
+    assert f"・<b>{label}</b>\n{summary}\n" in header
+    assert f">{'h' * (NEWS_LINK_LABEL_MAX_CHARS - 1)}…</a>" in header
+
+
 def test_header_falls_back_to_trend_text_when_news_json_unreadable(conn, tmp_path) -> None:
     a = add_item(conn, "https://a/1")
     digest_id = add_digest(
@@ -883,7 +908,8 @@ def test_recorder_rejects_text_over_telegram_limit() -> None:
 def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_path) -> None:
     # GH#343: ヘッダ 1 通に縮退の印・ニュース節・🔖 保存節を同梱する。どれも上限いっぱいでも
     # 4096 字に収まる(各欄の上限の組み合わせの境界。模型が上限を超える本文を 400 にする)。
-    # ニュース節のリンクの文字(host 名)は外部由来で長さを検証していない(GH#413)
+    # ニュース節の見出し・要約(LLM の出力)とリンクの文字(host 名)は長さを検証していない。字数は
+    # UTF-16 の単位で数えるので、絵文字(1 字で 2)で埋める(GH#413・GH#394)
     from app.analysis.trend import TrendSummary, TrendTheme, _section
 
     links = [
@@ -897,7 +923,7 @@ def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_pa
     news = _section(
         TrendSummary(
             themes=[
-                TrendTheme(label="ラ" * 40, summary="&<要" * 300, item_ids=links)
+                TrendTheme(label="😀" * 40, summary="😀" * 300, item_ids=links)
                 for _ in range(10)
             ]
         ),

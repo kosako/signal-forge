@@ -24,7 +24,14 @@ from pydantic import BaseModel, Field
 
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.jst import jst_day_bounds_utc, today_jst
-from app.models import NewsEvent, NewsLink, NewsSection, link_host
+from app.models import (
+    NEWS_MAX_EVENTS,
+    NEWS_MAX_LINKS,
+    NewsEvent,
+    NewsLink,
+    NewsSection,
+    link_host,
+)
 from app.prompting import fill_template, sanitize
 
 PROMPT_VERSION = "trend-v003"
@@ -34,12 +41,12 @@ MIN_ITEMS = 5  # これ未満は全体の出来事として意味が出ないの
 # LLM 入力の上限(コスト・文脈保護)。1 日の分析の件数(日次上限。既定 150)より大きくして、
 # 関心の低い大きいニュースを relevance の順で削らない(GH#413)
 MAX_INPUT_ITEMS = 200
-MAX_EVENTS = 6
+MAX_EVENTS = NEWS_MAX_EVENTS
 MAX_LABEL = 40
 # 出来事の要約の切り詰め上限。prompt(v003)が 120 字以内を指示するため、遵守時は発動しない
 # 安全網(指示を無視した超過だけ切る)。6 件満載でもヘッダ 1 通は Telegram 4096 字に収まる
 MAX_SUMMARY = 160
-MAX_LINKS = 3  # 出来事 1 つに付けるリンクの上限
+MAX_LINKS = NEWS_MAX_LINKS
 # 個人の投稿の host。報道の記事・公式の発表より後ろに回す(リンクの順だけで、外しはしない)
 _SOCIAL_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 
