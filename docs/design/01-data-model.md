@@ -397,6 +397,7 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `dig_discussions`(migration 032。GH#407)= 深掘りカードの議論。`dig_result_id`(議論しているカード)・`started_at`(「💬 話す」で開いた時刻)・`closed_at`(「まとめて」を受け付けて閉じた時刻。NULL = 議論中)。1 枚のカードで同時に開く議論は 1 つ(`closed_at IS NULL` の部分 UNIQUE。再配達・二重押しで 2 つ開かない)。まとめを作れなかったら `closed_at` を NULL に戻して開き直す(その間に次の議論を開いていれば戻さない)。1 つの議論で take にするまとめは 1 つだけ(作れなかったまとめのやり直しは、その議論のまとめが作っている・作れた状態なら受けない)
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
 - `news_investigations`(migration 035。GH#415)= 出来事の調査(設計 06 §9)の依頼と結果。`digest_id`・`event_index`(依頼したときの出来事の番号)・`label`・`summary`・`item_ids`(材料の記事の id の JSON 配列)は依頼したときの写し(`--force` で trend_json が変わっても、頼んだ出来事のまま)。`UNIQUE (digest_id, label)` で、同じ digest の同じ見出しの出来事は 1 回だけ調べる。`status` は requested → running → done / failed(`failure` に失敗の種類。外部由来の本文は残さない)。失敗した行は、もう一度頼めば requested に戻す。done の行は `note_markdown`(公開したら NULL)・`card_text` を先に記帳し、`published_at`・`message_id`・`sent_at` で公開と送信を進める(深掘りの dig_results と同じ流れ)。深掘りの台帳(dig_queue・dig_results)とは混ぜない(記事 1 本を単位にした規則を、出来事の調査に当てないため)
+- `investigation_x_reads`(migration 036。GH#415 の 3 本目)= 出来事の調査の X の反応の検索の費用の台帳。検索を送るたびに 1 行(失敗も)。`investigation_id`(news_investigations)・`searched_at`(UTC)・`query`(送った語。外部由来の題から LLM が作り、コードが検査したもの)・`status`(ok / failed)・`api_reads`(課金されうる読取の数。200 の応答の data の件数。数が分からない失敗は `[investigate].x_posts` で多めに数える)・`estimated_cost_usd`(`api_reads × [x].unit_price_usd`)。この機能の月の上限(`[investigate].x_monthly_cap_usd`。UTC の暦月)の判定と、doctor #9 の当月の費用に使う(§9)。依頼を頼み直しても行は消さない(読んだ費用は残る)。X の日次の読取上限(collect_runs の当日の合計。設計 02 §2)には数えない(別の上限で止める)
 
 ## 8. digests
 
@@ -412,7 +413,8 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - LLM: `analyses.engine / model / input_tokens / output_tokens / estimated_cost_usd`。サブスク枠(codex-cli / claude-cli)は 0 を記録し、トークン数だけ残す(API 切替時の試算材料。クォータ消費率の表示は未実装 = 拡張点)。
 - X API: `collect_runs.api_reads × 単価(config、Day 0 実測値)` を `estimated_cost_usd` に記録。失敗の行(`status='error'`)も、それまでに読んだぶんを記録する(部分取得のあとの失敗 = GH#183・GH#182、途中の 401/403 と保存の失敗 = GH#178。X の日次の読取上限の当日の使用量にも使う。設計 02 §2)。S1b の興味シグナル取込は `x_signal_runs` に同形で記録(GH#58)。興味シグナルの費用には、応答の `includes` の物(expansions で返るユーザー・ポストなど)の数 × 種類ごとの単価を足す(GH#386。X の従量課金が 2026-11-22 から数えるため。数は列に持たない。設計 02 §2)。
 - Claude API(GH#153・#156): 深掘りのレビューは `dig_results.review_cost_usd`、主のエンジンが失敗したときの予備は `llm_fallback_calls`(migration 018。1 呼び出し = 1 行。段・朝バッチの run_id・モデル・主の失敗の種類(`skipped` = 主を飛ばした)・予備が答えたか・トークン数・見積もり額。予備も失敗した呼び出しも残す)。予備の月の上限の判定にも使う(UTC の暦月)。トークン数が空で額がある行は、応答の usage を受け取れず費用が分からなかった呼び出しで、額は課金されうる最大の額の見積もり(GH#241。設計 00 §5)。
-- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(dig_results.review_cost_usd) + sum(llm_fallback_calls.cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd)` の日割り外挿(月は UTC の暦月)。
+- 出来事の調査の X の反応(GH#415 の 3 本目): `investigation_x_reads` に検索 1 回 = 1 行(§7 末尾)。
+- `intel doctor` の月次見込み = 当月 `sum(analyses.estimated_cost_usd) + sum(dig_results.review_cost_usd) + sum(llm_fallback_calls.cost_usd) + sum(collect_runs.estimated_cost_usd) + sum(x_signal_runs.estimated_cost_usd) + sum(investigation_x_reads.estimated_cost_usd)` の日割り外挿(月は UTC の暦月)。X の額には出来事の調査の分を添える(`X $… (うち出来事の調査 $… / 上限 $5)`)。
 
 ## 10. マイグレーション運用
 

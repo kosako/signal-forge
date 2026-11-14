@@ -77,6 +77,7 @@ class Connector(Protocol):
   ```
 - **doctor #5 の整合検査**: `[x_search].slots` ⟷ mode=search 行の相互欠落(検索が黙って収集されない / collect で失敗し続ける)、同一 mode の複数 enabled 行(二重取得・二重課金)、mode 不正行を WARN で可視化。
 - **月次上限**: 課金は credits 従量(Day 0 実測)のため検索専用の別枠上限は持たず、合算日次 cap × 30(165 × 30 × $0.004 ≈ $19.8/月)と doctor #9 の当月集計(collect_runs の estimated_cost_usd 合算。検索も自動で載る)で管理する。
+- **出来事の調査の X の反応(`search_posts`。GH#415 の 3 本目・ADR 0006)**: 同じ search/recent を、出来事の調査が別の口で読む。items には入れず、調査の材料にだけ使う。1 回の調査で 1 ページ(`[investigate].x_posts` 件。既定 20)、関連の順(`sort_order=relevancy`)。語は調査の側が検査し(演算子の形の語・OR・括弧・引用符を外し、`#`・`@` は外して語にする。3 語・60 字まで)、送るときに上と同じ除外句を付ける(`(語) -is:retweet -is:reply`)。expansions は送らない(GH#386)。範囲は digest の日の 2 日前の 0 時(UTC)から翌日の終わりまでを、直近 7 日と「要求の 30 秒前まで」に狭める(残らなければ読まない)。429 は待たず、4xx は試し直さない。上の日次の読取上限と `[x].combined_daily_read_cap` には数えず、この機能の月の上限(`[investigate].x_monthly_cap_usd`。既定 $5)で止める。費用は台帳 `investigation_x_reads`(設計 01 §7)に残し、doctor #9 の当月の集計にも載る。
 
 ### OAuth 2.0(PKCE)認証基盤(`connectors/x_oauth2.py`・S1 = GH#58)
 

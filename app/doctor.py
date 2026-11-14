@@ -734,6 +734,16 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
             "WHERE started_at LIKE ? || '%'",
             (month_prefix,),
         ).fetchone()[0]
+    investigate_x = 0.0
+    if _table_exists(conn, "investigation_x_reads"):  # migration 036(GH#415 の 3 本目)
+        # 出来事の調査の X の反応。この機能の月の上限([investigate].x_monthly_cap_usd)は調査の
+        # 側で止める。ここでは全体の当月の費用に数える(ADR 0006)
+        investigate_x = conn.execute(
+            "SELECT coalesce(sum(estimated_cost_usd), 0) FROM investigation_x_reads "
+            "WHERE searched_at LIKE ? || '%'",
+            (month_prefix,),
+        ).fetchone()[0]
+        x_cost += investigate_x
     now = datetime.now(UTC)
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     spent = llm_cost + x_cost
@@ -742,6 +752,7 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
         "llm_usd": llm_cost,
         "fallback_estimated_usd": fallback_estimated,  # llm_usd のうち予備の費用不明分の見積もり
         "x_usd": x_cost,
+        "investigate_x_usd": investigate_x,  # x_usd のうち出来事の調査の X の反応
         "spent_usd": spent,
         "projected_usd": projected,
         "cap_usd": config.budget.monthly_cap_usd,
@@ -759,6 +770,17 @@ def llm_cost_text(summary: dict[str, float]) -> str:
     return text
 
 
+def x_cost_text(summary: dict[str, float], config: Config) -> str:
+    """X の当月の額(doctor #9)。出来事の調査の分があれば、その額と機能の上限を添える(GH#415)。"""
+    text = f"X ${summary['x_usd']:.2f}"
+    if summary["investigate_x_usd"] > 0:
+        text += (
+            f"(うち出来事の調査 ${summary['investigate_x_usd']:.2f} / "
+            f"上限 ${config.investigate.x_monthly_cap_usd:g})"
+        )
+    return text
+
+
 def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> CheckResult:
     if (
         conn is None
@@ -770,7 +792,7 @@ def _check_cost(conn: sqlite3.Connection | None, config: Config | None) -> Check
     summary = month_cost_summary(conn, config)
     detail = (
         f"実績 ${summary['spent_usd']:.2f}({llm_cost_text(summary)} / "
-        f"X ${summary['x_usd']:.2f})→ 着地見込み ${summary['projected_usd']:.2f} / "
+        f"{x_cost_text(summary, config)})→ 着地見込み ${summary['projected_usd']:.2f} / "
         f"上限 ${summary['cap_usd']:.0f}"
     )
     if summary["projected_usd"] > summary["cap_usd"]:

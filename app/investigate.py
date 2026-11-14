@@ -3,9 +3,10 @@
 朝のダイジェストの「📰 今日の IT ニュース」の出来事 1 つを、報じた記事をまとめて材料にして調べる。
 何が起きたか・経緯と原因・影響・報じ方の違い・X の反応・まだ分からないこと をカードとノートにする。
 
-- 材料は手元の記事(出来事を報じた items)に、GDELT で探した報道を足す(GH#415 の 2 本目。ADR 0006)。
-  検索の語は LLM が作り、外へ出す前にコードが演算子と使えない文字を外す。検索と本文の取得はコードが
-  行い、どれが失敗しても手元の記事だけで続ける
+- 材料は手元の記事(出来事を報じた items)に、GDELT で探した報道(GH#415 の 2 本目)と X の投稿
+  (3 本目)を足す(ADR 0006)。検索の語は LLM が作り、外へ出す前にコードが演算子と使えない文字を
+  外す。検索と本文の取得はコードが行い、どれが失敗しても手元の記事だけで続ける。X の読み取りには
+  この機能の月の上限があり、台帳(investigation_x_reads)で数える
 - 深掘り(記事 1 本が単位。dig_queue・dig_results)とは別の台帳(news_investigations)に持つ。同じ日に
   2 回掘らない規則やノートの名前が記事に結び付くので、代表の記事のふつうの深掘りを邪魔しないため
 - 作るのは `intel dig-now` の中(app.deepdive が、今すぐの深掘りの依頼の後に呼ぶ)。ノートの公開と
@@ -35,6 +36,7 @@ from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.config import Config
 from app.connectors.gdelt import GdeltArticle, GdeltError, search_articles
 from app.connectors.google_news import GoogleNewsError, NewsHeadline, search_headlines
+from app.connectors.x_search import END_TIME_LAG, XPostsError, XPostsResult
 from app.delivery.telegram import escape_and_truncate, escape_attr
 from app.export.neutralize import neutralize_markdown
 from app.export.obsidian import FORBIDDEN_IN_SLUG, render_frontmatter
@@ -55,9 +57,11 @@ NO_MATERIAL_NOTICE = (
 
 # X の投稿の host(材料の種別を決める。trend のリンクの並べ方と同じ)
 _POST_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
+_POST_KINDS = frozenset({"post", "searched_post"})  # X の反応の根拠にできる材料
 _KIND_LABELS = {
     "article": "記事",
     "post": "X の投稿",
+    "searched_post": "X の投稿(検索)",  # X の反応の検索で読んだ投稿(GH#415 の 3 本目)
     "news": "報道(検索)",
     "headline": "報道の見出し(検索)",  # Google ニュースの予備。本文は無い
 }
@@ -75,6 +79,12 @@ _NEWS_WINDOW_BEFORE = timedelta(days=2)  # 検索の範囲(digest の日の 2 �
 _JA_QUERY_MAX = 60
 _JA_QUERY_TOKENS_MAX = 4
 _JA_MIN_WORD = 2
+# X の検索の語(3 本目)。語は AND で結ばれるので少なめにする。演算子はコードが付ける除外句だけ
+_X_QUERY_MAX = 60
+_X_QUERY_TOKENS_MAX = 3
+# search/recent が読めるのは直近 7 日。要求までの時間と時計のずれに余裕を取る
+_X_MAX_AGE = timedelta(days=7) - timedelta(minutes=10)
+_X_TITLE_MAX = 60  # 投稿の材料の題(本文の先頭。カードと材料の一覧で使う)
 
 # カードの各欄の上限(UTF-16 の code unit。escape_and_truncate で切る)。どれも LLM の出力か外部由来で
 # 長さを検証していない。上限いっぱいでも 1 通が Telegram の 4096 字に収まる
@@ -92,6 +102,9 @@ CARD_MATERIAL_TITLE_MAX = 40
 CARD_MATERIALS_MAX = 10
 REACTIONS_MAX = 3
 REACTION_SOURCES_MAX = 5  # 論調 1 つに付ける根拠の投稿の番号の上限(カードの長さの歯止め)
+# 検索で読んだ X の投稿は、カードでは番号のリンクを 1 行に並べる(題が本文の先頭で、行ごとに並べると
+# 長い)。主張に使った投稿だけで、X の反応の番号の上限と同じ数まで
+CARD_POSTS_MAX = 15
 UNKNOWNS_MAX = 3
 
 # 主張の番号。`[1]`・`[1, 3]`・`[1、3]` を読み、材料にある番号だけを `[1][3]` の形で残す
@@ -107,7 +120,7 @@ class SearchPlan(BaseModel):
     """検索の語(prompts/investigate-query-v001.md)。
 
     news_query は GDELT(英語)、news_query_ja は予備の Google ニュース(日本語)、x_query は X の反応
-    (3 本目)で使う。
+    (GH#415 の 3 本目)で使う。
     """
 
     news_query: str = Field(max_length=500)
@@ -127,6 +140,26 @@ class SearchOutcome:
     local: int  # 手元の材料の数
     found: int  # 検索で足した報道の数
     engine: SearchEngine | None = None  # 足した報道の出どころ(足していなければ None)
+
+
+XStatus = Literal["ok", "none", "failed", "capped", "expired", "off"]
+# X の検索(`app.connectors.x_search.search_posts` を session に結び付けたもの)。
+# 引数は (語, *, start, end, max_results)。合成点(app.run)が作って渡す
+XRead = Callable[..., XPostsResult]
+
+
+@dataclass(frozen=True)
+class XOutcome:
+    """X の反応の検索の結果(GH#415 の 3 本目。カードとノートに出す)。
+
+    status: 読んだ / 見つからない(語が残らないときも)/ 失敗 / 今月の上限で読まない /
+    digest の日が検索できる直近 7 日の外 / 読まない(設定・キーが無い)。
+    """
+
+    status: XStatus
+    query: str | None = None  # 送った語(送っていなければ None)
+    found: int = 0  # 材料に足した投稿の数
+    cap_usd: float = 0.0  # 上限の額(capped の表示に使う)
 
 
 class InvestigationReaction(BaseModel):
@@ -163,7 +196,7 @@ class InvestigationRequest:
 class Material:
     number: int  # プロンプトとカードで使う番号(1 から)
     item_id: int | None  # 手元の記事の items.id(検索で足した報道は None)
-    kind: Literal["article", "post", "news", "headline"]
+    kind: Literal["article", "post", "news", "headline", "searched_post"]
     title: str
     host: str
     url: str  # 手元の記事は items.canonical_url、検索の報道は GDELT の URL を正規化したもの
@@ -331,6 +364,40 @@ def record_generated(
     )
 
 
+def x_month_cost(conn: sqlite3.Connection, now: datetime) -> float:
+    """この機能の X の読み取りの、その月(UTC の暦月)の費用の見積もりの合計。"""
+    return conn.execute(
+        "SELECT coalesce(sum(estimated_cost_usd), 0) FROM investigation_x_reads "
+        "WHERE searched_at LIKE ? || '%'",
+        (now.astimezone(UTC).strftime("%Y-%m"),),
+    ).fetchone()[0]
+
+
+def record_x_read(
+    conn: sqlite3.Connection,
+    investigation_id: int,
+    *,
+    searched_at: datetime,
+    query: str,
+    status: Literal["ok", "failed"],
+    api_reads: int,
+    unit_price_usd: float,
+) -> None:
+    """X の検索を 1 回送ったことを費用の台帳に残す(失敗も。課金されうる読取の数で数える)。"""
+    conn.execute(
+        "INSERT INTO investigation_x_reads (investigation_id, searched_at, query, status, "
+        "api_reads, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            investigation_id,
+            searched_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            query,
+            status,
+            api_reads,
+            round(api_reads * unit_price_usd, 6),
+        ),
+    )
+
+
 # --- 材料 ---
 
 
@@ -378,15 +445,44 @@ def gather_materials(
     return materials
 
 
+# --- 検索の語(GH#415 の 2 本目) ---
+
+
+def plan_search(
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    request: InvestigationRequest,
+    materials: list[Material],
+    *,
+    x: bool,
+) -> SearchPlan | None:
+    """報道と X の検索の語を LLM(effort low)に作らせる。作れなければ None。
+
+    x = X を読める(設定とキーがある)か。報道も X も検索しないなら LLM を呼ばずに None を返す
+    (このとき search_news・search_x は off を返す)。
+    """
+    if config.investigate.news_articles <= 0 and not (x and _x_enabled(config)):
+        return None
+    try:
+        return complete_with_retry(
+            engine_factory("low"),
+            build_query_prompt(request, materials),
+            SearchPlan,
+            timeout_s=config.dig.timeout_s,
+        )
+    except LLMError:
+        return None
+
+
 # --- 報道の検索(GDELT。GH#415 の 2 本目) ---
 
 
 def search_news(
     config: Config,
-    engine_factory: Callable[[str], LLMEngine],
     http: HttpClient,
     request: InvestigationRequest,
     materials: list[Material],
+    plan: SearchPlan | None,
     *,
     now: datetime | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -398,8 +494,9 @@ def search_news(
     """同じ出来事の報道を探し、手元の材料の後ろに番号を続けて返す。
 
     まず GDELT で探して本文を取る。GDELT が断ったか、使える報道が無ければ、予備として Google
-    ニュースの RSS の検索で見出しと媒体名を拾う(本文は無い。ADR 0006)。検索の語は LLM が作り、
-    外へ出す前に検査する。どれも使えなければ材料を足さない(調査は手元の記事だけで続ける)。
+    ニュースの RSS の検索で見出しと媒体名を拾う(本文は無い。ADR 0006)。検索の語は plan_search が
+    LLM に作らせたもので(None = 作れなかった)、外へ出す前に検査する。どれも使えなければ材料を
+    足さない(調査は手元の記事だけで続ける)。
     配信記事の重なりと、手元の材料・足した報道と同じ host は外し、`[investigate].news_articles`
     本まで足す。GDELT の本文は `[investigate].news_fetch_budget_s` の間だけ取り、取れなかった
     報道は題だけの材料にする。
@@ -424,14 +521,7 @@ def search_news(
     limit = config.investigate.news_articles
     if limit <= 0:
         return [], SearchOutcome("off", None, local, 0)
-    try:
-        plan = complete_with_retry(
-            engine_factory("low"),
-            build_query_prompt(request, materials),
-            SearchPlan,
-            timeout_s=config.dig.timeout_s,
-        )
-    except LLMError:
+    if plan is None:
         return [], SearchOutcome("failed", None, local, 0)
     now = now or datetime.now(UTC)
     hosts = {m.host for m in materials}
@@ -533,6 +623,105 @@ def search_news(
     return [], SearchOutcome("none" if searched else "failed", sent, local, 0)
 
 
+# --- X の反応(GH#415 の 3 本目) ---
+
+
+def search_x(
+    conn: sqlite3.Connection,
+    config: Config,
+    read: XRead | None,
+    request: InvestigationRequest,
+    materials: list[Material],
+    plan: SearchPlan | None,
+    *,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[list[Material], XOutcome]:
+    """X の投稿を `[investigate].x_posts` 件まで読み、materials の後ろに番号を続けて返す。
+
+    read は X の検索(`app.connectors.x_search.search_posts` を session に結び付けたもの。None = X の
+    設定かキーが無い)。この機能の月の上限(`[investigate].x_monthly_cap_usd`)は、1 回分を足すと
+    超えるなら読まない。送った検索は失敗も費用の台帳に残す(課金されうる読取の数。分からなければ
+    多めに数える)。手元の材料と同じ投稿は外す。どの失敗でも手元の材料での調査を止めない。
+    """
+    log = logger or logging.getLogger(__name__)
+    if read is None or not _x_enabled(config):
+        return [], XOutcome("off")
+    if plan is None:
+        return [], XOutcome("failed")
+    query = clean_x_query(plan.x_query)
+    if not query:
+        return [], XOutcome("none")
+    now = now or datetime.now(UTC)
+    window = x_window(request.digest_date, now)
+    if window is None:
+        return [], XOutcome("expired")
+    posts_max = config.investigate.x_posts
+    unit = config.x.unit_price_usd
+    cap = config.investigate.x_monthly_cap_usd
+    if x_month_cost(conn, now) + posts_max * unit > cap + 1e-9:
+        return [], XOutcome("capped", cap_usd=cap)
+    start, end = window
+
+    def record(status: Literal["ok", "failed"], reads: int) -> None:
+        record_x_read(
+            conn, request.id, searched_at=now, query=query, status=status, api_reads=reads,
+            unit_price_usd=unit,
+        )
+
+    try:
+        result = read(query, start=start, end=end, max_results=posts_max)
+    except XPostsError as e:
+        record("failed", e.api_reads)
+        return [], XOutcome("failed", query)
+    except Exception as e:  # 外部の応答の壊れ方は数えきれない。調査は手元の材料で続ける
+        log.warning(f"出来事の調査の X の検索で想定外の失敗: {type(e).__name__}")
+        record("failed", posts_max)  # 課金されたかが分からないので、上限の件数を数える
+        return [], XOutcome("failed", query)
+    record("ok", result.api_reads)
+    seen = {m.url for m in materials if m.kind in _POST_KINDS}
+    texts = {_title_key(m.body) for m in materials if m.kind in _POST_KINDS} - {""}
+    found: list[Material] = []
+    for post in result.posts:
+        text_key = _title_key(post.text)
+        # 手元の材料と同じ投稿と、同じ文の投稿(写し・bot の繰り返し)は 1 つにする
+        if post.url in seen or (text_key and text_key in texts):
+            continue
+        seen.add(post.url)
+        texts.add(text_key)
+        found.append(
+            Material(
+                number=len(materials) + len(found) + 1,
+                item_id=None,
+                kind="searched_post",
+                title=_one_line(post.text)[:_X_TITLE_MAX],
+                host="x.com",
+                url=post.url,
+                published_at=post.created_at,
+                body=post.text,
+            )
+        )
+    return found, XOutcome("ok" if found else "none", query, len(found))
+
+
+def _x_enabled(config: Config) -> bool:
+    return config.investigate.x_posts > 0 and config.investigate.x_monthly_cap_usd > 0
+
+
+def x_window(digest_date: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """X の検索の範囲(UTC)。報道と同じ範囲を、search/recent が読める直近 7 日に狭める。
+
+    終わりは要求の時刻の 30 秒前まで(search/recent は 10 秒以上前を求める)。範囲が残らなければ
+    None(digest の日が古い)。
+    """
+    start, end = search_window(digest_date, now)
+    start = max(start, now - _X_MAX_AGE)
+    end = min(end, now - END_TIME_LAG)
+    if end - start < timedelta(minutes=1):
+        return None
+    return start, end
+
+
 def build_query_prompt(request: InvestigationRequest, materials: list[Material]) -> str:
     nonce = secrets.token_hex(4)
     template = (_PROMPTS_DIR / f"{QUERY_PROMPT_VERSION}.md").read_text(encoding="utf-8")
@@ -588,9 +777,22 @@ def clean_ja_query(text: str) -> str:
     演算子(AND・OR・NOT)と演算子の形の語(コロンを含む・`-` で始まる)は丸ごと捨てる。期間の
     after: / before: は送るときにコードが付ける。2 文字未満の語は捨て、4 語・60 字まで。
     """
+    return _clean_words(text, _JA_QUERY_TOKENS_MAX, _JA_QUERY_MAX)
+
+
+def clean_x_query(text: str) -> str:
+    """X に送る語を検査する(GH#415 の 3 本目)。規則は clean_ja_query と同じで、3 語・60 字まで。
+
+    X の演算子(`from:`・`lang:`・`-除外`・OR・括弧・引用符)は残さない。`#`・`@` は外して語にする。
+    除外句(RT・リプライを除く)は送るときにコードが付ける。
+    """
+    return _clean_words(text, _X_QUERY_TOKENS_MAX, _X_QUERY_MAX)
+
+
+def _clean_words(text: str, tokens_max: int, chars_max: int) -> str:
     flat = " ".join(text.replace('"', " ").split())
     query = ""
-    for token in flat.split(" ")[: _JA_QUERY_TOKENS_MAX * 2]:
+    for token in flat.split(" ")[: tokens_max * 2]:
         if ":" in token or token.startswith("-"):
             continue
         word = "".join(ch for ch in token if ch.isalnum() or ch in ".&+・ー")
@@ -598,7 +800,7 @@ def clean_ja_query(text: str) -> str:
         if len(word) < _JA_MIN_WORD or word.upper() in _NEWS_OPERATORS:
             continue
         candidate = f"{query} {word}".strip()
-        if len(candidate) > _JA_QUERY_MAX or candidate.count(" ") >= _JA_QUERY_TOKENS_MAX:
+        if len(candidate) > chars_max or candidate.count(" ") >= tokens_max:
             break
         query = candidate
     return query
@@ -634,11 +836,13 @@ def generate_investigation(
     materials: list[Material],
     *,
     search: SearchOutcome | None = None,
+    x: XOutcome | None = None,
     now: datetime | None = None,
 ) -> GeneratedInvestigation:
     """材料から調査のカードとノートを作る。本文のある材料が無ければ NoMaterialError。
 
-    search は報道の検索の結果(カードの末尾とノートの frontmatter に出す)。None は検索しない扱い。
+    search は報道の検索の結果、x は X の反応の検索の結果(カードの末尾とノートの frontmatter に
+    出す)。None は検索しない扱い。
     """
     if sum(len(m.body.strip()) for m in materials) < config.dig.min_body_chars:
         raise NoMaterialError("本文のある材料が無い")
@@ -651,10 +855,11 @@ def generate_investigation(
     created = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
     name = note_name(request)
     search = search or SearchOutcome("off", None, len(materials), 0)
+    x = x or XOutcome("off")
     return GeneratedInvestigation(
         note_name=name,
-        note_markdown=render_note(request, draft, materials, created, search),
-        card_text=render_card(request, draft, materials, search),
+        note_markdown=render_note(request, draft, materials, created, search, x),
+        card_text=render_card(request, draft, materials, search, x),
     )
 
 
@@ -699,7 +904,7 @@ def _material_block(material: Material, limit: int, nonce: str) -> str:
 def clean_draft(draft: InvestigationDraft, materials: list[Material]) -> InvestigationDraft:
     """材料に無い番号を外し、X の反応は X の投稿を根拠にしたものだけを残す。"""
     valid = {m.number for m in materials}
-    posts = {m.number for m in materials if m.kind == "post"}
+    posts = {m.number for m in materials if m.kind in _POST_KINDS}
     reactions = []
     for reaction in draft.reactions:
         sources = [n for n in dict.fromkeys(reaction.sources) if n in posts]
@@ -764,13 +969,20 @@ def note_name(request: InvestigationRequest) -> str:
     return f"{request.digest_date.replace('-', '')}-調査{request.id}-{slug}"
 
 
-def _card_materials(draft: InvestigationDraft, materials: list[Material]) -> list[Material]:
-    """カードに並べる材料。主張に使った材料だけ(1 つも無ければ記事の材料)、上限まで。"""
+def _card_materials(
+    draft: InvestigationDraft, materials: list[Material]
+) -> tuple[list[Material], list[Material]]:
+    """カードに並べる材料。主張に使った材料だけ(1 つも無ければ記事の材料)、上限まで。
+
+    (行ごとに並べる材料, 番号のリンクを 1 行に並べる検索の投稿)を返す。
+    """
     cited = cited_numbers(draft)
-    chosen = [m for m in materials if m.number in cited] or [
-        m for m in materials if m.kind == "article"
-    ]
-    return chosen[:CARD_MATERIALS_MAX]
+    chosen = [m for m in materials if m.number in cited]
+    rows = [m for m in chosen if m.kind != "searched_post"]
+    posts = [m for m in chosen if m.kind == "searched_post"]
+    if not chosen:
+        rows = [m for m in materials if m.kind == "article"]
+    return rows[:CARD_MATERIALS_MAX], posts[:CARD_POSTS_MAX]
 
 
 def render_card(
@@ -778,6 +990,7 @@ def render_card(
     draft: InvestigationDraft,
     materials: list[Material],
     search: SearchOutcome | None = None,
+    x: XOutcome | None = None,
 ) -> str:
     """Telegram のカード(parse_mode=HTML)。LLM の出力と外部由来の値は escape して上限で切る。"""
     lines = [
@@ -806,31 +1019,55 @@ def render_card(
         lines += [
             f"・{escape_and_truncate(u, CARD_UNKNOWN_MAX)}" for u in draft.unknowns[:UNKNOWNS_MAX]
         ]
-    card_materials = _card_materials(draft, materials)
-    if card_materials:
+    rows, posts = _card_materials(draft, materials)
+    if rows or posts:
         lines += ["", "<b>材料</b>"]
         lines += [
             f'[{m.number}] <a href="{escape_attr(m.url)}">'
             f"{escape_and_truncate(m.host or '記事', CARD_MATERIAL_HOST_MAX)}</a> "
             f"{escape_and_truncate(m.title or '(題なし)', CARD_MATERIAL_TITLE_MAX)}"
-            for m in card_materials
+            for m in rows
         ]
+    if posts:
+        lines.append(
+            "X の投稿 "
+            + " ".join(f'<a href="{escape_attr(m.url)}">[{m.number}]</a>' for m in posts)
+        )
     if search is not None:
-        lines += ["", search_summary(search)]
+        lines += ["", search_summary(search, x)]
     return "\n".join(lines)
 
 
-def search_summary(search: SearchOutcome) -> str:
-    """材料の内訳の 1 行(固定の文言と数だけ。外部由来の文字を入れない)。"""
-    if search.status == "failed":
-        return f"材料: 手元 {search.local} 件(報道の検索に失敗したので、手元の材料だけで調べた)"
-    if search.status == "off":
-        return f"材料: 手元 {search.local} 件"
-    if search.engine == "google_news":
-        return (
-            f"材料: 手元 {search.local} 件・検索した報道の見出し {search.found} 件(Google ニュース)"
-        )
-    return f"材料: 手元 {search.local} 件・検索した報道 {search.found} 件"
+def search_summary(search: SearchOutcome, x: XOutcome | None = None) -> str:
+    """材料の内訳の 1 行(固定の文言と数だけ。外部由来の文字を入れない)。
+
+    足した材料を「・」で並べ、検索の失敗と、X を読まなかった理由を括弧に添える。検索で 1 件も
+    足せず理由があるときは、手元の材料だけで調べたことも書く。
+    """
+    x = x or XOutcome("off")
+    parts = [f"手元 {search.local} 件"]
+    notes: list[str] = []
+    if search.status in ("ok", "none"):
+        if search.engine == "google_news":
+            parts.append(f"検索した報道の見出し {search.found} 件(Google ニュース)")
+        else:
+            parts.append(f"検索した報道 {search.found} 件")
+    elif search.status == "failed":
+        notes.append("報道の検索に失敗した")
+    if x.status in ("ok", "none"):
+        parts.append(f"X の投稿 {x.found} 件")
+    elif x.status == "failed":
+        notes.append("X の検索に失敗した")
+    elif x.status == "capped":
+        notes.append(f"X はこの機能の今月の上限(${x.cap_usd:g})に達したので読まなかった")
+    elif x.status == "expired":
+        notes.append("X は検索できる直近 7 日の外なので読まなかった")
+    line = "材料: " + "・".join(parts)
+    if notes:
+        if search.found == 0 and x.found == 0:
+            notes.append("手元の材料だけで調べた")
+        line += f"({'。'.join(notes)})"
+    return line
 
 
 def render_note(
@@ -839,6 +1076,7 @@ def render_note(
     materials: list[Material],
     created: str,
     search: SearchOutcome | None = None,
+    x: XOutcome | None = None,
 ) -> str:
     """解説ノート(kind: investigation)。本文は公開の直前にも外部の埋め込みと生の HTML を直す。"""
     frontmatter = {
@@ -855,6 +1093,10 @@ def render_note(
         frontmatter["search_engine"] = _ENGINE_LABELS.get(search.engine or "", "")
         frontmatter["search_query"] = search.query or ""
         frontmatter["materials_search"] = search.found
+    if x is not None:
+        frontmatter["x_search"] = x.status
+        frontmatter["x_query"] = x.query or ""
+        frontmatter["materials_x"] = x.found
     body = [
         f"# {draft.title_ja or request.label}",
         "",
@@ -876,7 +1118,7 @@ def render_note(
         body += ["", "## まだ分からないこと"]
         body += [f"- {u}" for u in draft.unknowns]
     if search is not None:
-        body += ["", search_summary(search)]
+        body += ["", search_summary(search, x)]
     if materials:
         body += ["", "## 材料"]
         body += [

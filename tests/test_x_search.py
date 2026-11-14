@@ -7,8 +7,16 @@ import pytest
 
 from app.config import X_SEARCH_QUERY_SUFFIX
 from app.connectors.base import FatalError, RetryableError
-from app.connectors.x import XCredentials
-from app.connectors.x_search import XSearchConnector, _snowflake_time, _split_budget
+from app.connectors.x import XApiSession, XCredentials
+from app.connectors.x_search import (
+    XPost,
+    XPostsError,
+    XPostsResult,
+    XSearchConnector,
+    _snowflake_time,
+    _split_budget,
+    search_posts,
+)
 from app.models import Source
 
 CREDS = XCredentials(
@@ -759,3 +767,106 @@ def test_search_note_tweet_full_text_preferred() -> None:
     assert item.raw_content == "検索の全文。" * 100
     fields = parse_qs(urlsplit(str(seen[0].url)).query)["tweet.fields"][0]
     assert "note_tweet" in fields
+
+
+# --- 出来事の調査の X の反応(GH#415 の 3 本目) ---
+
+
+def posts_session(handler) -> XApiSession:
+    return XApiSession(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=CREDS,
+        sleep=lambda _s: None,
+    )
+
+
+POSTS_START = datetime(2026, 11, 12, tzinfo=UTC)
+POSTS_END = datetime(2026, 11, 14, 11, 0, tzinfo=UTC)
+
+
+def test_search_posts_reads_one_page_by_relevancy_without_expansions() -> None:
+    long = tweet("902", "切り詰め…", created="2026-11-13T09:00:00.000Z")
+    long["note_tweet"] = {"text": "長文の全文"}
+    body = page(
+        [
+            tweet("901", "仕事にならない", created="2026-11-13T08:00:00.000Z"),
+            long,
+            {"id": "x1", "text": "id が数字でない"},
+            {"id": "903", "text": "   "},
+            {"id": "904"},
+            "形が違う",
+        ]
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=body)
+
+    result = search_posts(
+        posts_session(handler), "Microsoft 365 障害", start=POSTS_START, end=POSTS_END,
+        max_results=20,
+    )
+    assert result == XPostsResult(
+        posts=[
+            XPost("https://x.com/i/web/status/901", "仕事にならない", "2026-11-13T08:00:00Z"),
+            XPost("https://x.com/i/web/status/902", "長文の全文", "2026-11-13T09:00:00Z"),
+        ],
+        api_reads=6,  # 課金は応答の data の件数(形の悪い投稿も数える)
+    )
+    [request] = seen
+    query = {k: v[0] for k, v in parse_qs(urlsplit(str(request.url)).query).items()}
+    assert query == {
+        "query": f"(Microsoft 365 障害) {X_SEARCH_QUERY_SUFFIX}",
+        "max_results": "20",
+        "start_time": "2026-11-12T00:00:00Z",
+        "end_time": "2026-11-14T11:00:00Z",
+        "sort_order": "relevancy",
+        "tweet.fields": "created_at,note_tweet",
+    }
+    assert "authorization" in {k.lower() for k in request.headers}  # OAuth 1.0a の署名つき
+
+
+def test_search_posts_without_results_is_empty() -> None:
+    result = search_posts(
+        posts_session(lambda request: httpx.Response(200, json={"meta": {"result_count": 0}})),
+        "abc", start=POSTS_START, end=POSTS_END, max_results=20,
+    )
+    assert result == XPostsResult(posts=[], api_reads=0)
+
+
+@pytest.mark.parametrize(
+    ("response", "reads"),
+    [
+        (httpx.Response(429, json={}), 0),  # rate limit は待たない
+        (httpx.Response(402, json={}), 0),  # クレジット切れ
+        (httpx.Response(401, json={}), 0),
+        (httpx.Response(200, text="not json"), 20),  # 課金された数が分からない = 上限で数える
+        (httpx.Response(200, json={"data": {}}), 20),
+        (httpx.Response(200, json=[1]), 20),
+    ],
+)
+def test_search_posts_failure_raises_with_billable_reads(response, reads) -> None:
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return response
+
+    with pytest.raises(XPostsError) as raised:
+        search_posts(
+            posts_session(handler), "abc", start=POSTS_START, end=POSTS_END, max_results=20
+        )
+    assert raised.value.api_reads == reads
+    assert len(sent) == 1  # 4xx は試し直さない
+
+
+def test_search_posts_transport_failure_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(XPostsError) as raised:
+        search_posts(
+            posts_session(handler), "abc", start=POSTS_START, end=POSTS_END, max_results=20
+        )
+    assert raised.value.api_reads == 0

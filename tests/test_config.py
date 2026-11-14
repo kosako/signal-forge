@@ -538,3 +538,21 @@ def test_llm_fallback_rejects_bad_values(tmp_path: Path, body: str, match: str) 
     write_config(tmp_path, f"[llm_fallback]\n{body}\n")
     with pytest.raises(ConfigError, match=match):
         load_config(tmp_path)
+
+
+def test_investigate_x_defaults_and_bounds(tmp_path: Path) -> None:
+    # 出来事の調査の X の反応(GH#415 の 3 本目): 1 回 20 件・月 $5(ユーザーの判断)
+    config = load_config(empty_config(tmp_path))
+    assert (config.investigate.x_posts, config.investigate.x_monthly_cap_usd) == (20, 5.0)
+    for body in ("x_posts = 0\nx_monthly_cap_usd = 0\n", "x_posts = 10\n", "x_posts = 100\n"):
+        write_config(tmp_path, f"[investigate]\n{body}")
+        load_config(tmp_path)
+    for body, message in (
+        ("x_posts = 9\n", "x_posts は 0 か 10〜100"),  # search/recent の max_results の範囲
+        ("x_posts = 101\n", "x_posts は 0 か 10〜100"),
+        ("x_monthly_cap_usd = -1\n", "x_monthly_cap_usd は 0 以上の有限値"),
+        ("x_monthly_cap_usd = inf\n", "x_monthly_cap_usd は有限値"),
+    ):
+        write_config(tmp_path, f"[investigate]\n{body}")
+        with pytest.raises(ConfigError, match=message):
+            load_config(tmp_path)

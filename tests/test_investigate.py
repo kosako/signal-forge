@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,25 +18,32 @@ from app.deepdive import DigError, run_dig_now
 from app.delivery.telegram import visible_length
 from app.investigate import (
     CARD_MATERIALS_MAX,
+    CARD_POSTS_MAX,
     InvestigationDraft,
     InvestigationReaction,
     NoMaterialError,
     SearchOutcome,
     SearchPlan,
+    XOutcome,
     build_prompt,
     claim_investigation,
     clean_draft,
     clean_ja_query,
     clean_news_query,
+    clean_x_query,
     event_of_digest,
     gather_materials,
     generate_investigation,
     has_unsent_investigations,
+    plan_search,
     render_card,
     render_note,
     request_investigation,
     search_news,
     search_window,
+    search_x,
+    x_month_cost,
+    x_window,
 )
 from app.jst import today_jst
 from app.models import NewsEntry
@@ -354,6 +362,40 @@ def test_card_with_every_field_full_stays_within_telegram_limit(conn) -> None:
     assert visible_length(card) <= TELEGRAM_TEXT_MAX
     assert card.count("<a href=") == min(len(materials), CARD_MATERIALS_MAX)
 
+    # X の反応(GH#415 の 3 本目)も上限いっぱいにする。検索した投稿を足して材料の一覧を上限まで
+    # 埋め、材料の内訳の行も長い形にする
+    news = [
+        replace(materials[0], number=9 + i, item_id=None, kind="news", host="n.example")
+        for i in range(4)
+    ]
+    posts = [
+        replace(materials[0], number=13 + i, item_id=None, kind="searched_post", host="x.com",
+                url=f"https://x.com/i/web/status/{i + 1}", title="😀" * 60)
+        for i in range(20)
+    ]
+    reacted = draft.model_copy(
+        update={
+            "reactions": [
+                InvestigationReaction(
+                    stance="😀" * 200,
+                    summary="😀" * 2000,
+                    sources=list(range(13 + 5 * i, 18 + 5 * i)),
+                )
+                for i in range(3)
+            ]
+        }
+    )
+    # 反応の根拠(15 件)に加えて、本文の欄も検索した投稿を挙げる(1 行に並べるのは 15 件まで)
+    reacted = reacted.model_copy(update={"coverage": full + "[9][10][11][12][30][31]"})
+    every = materials + news + posts
+    breakdown = SearchOutcome("ok", "q", 8, 100, "google_news")
+    x = XOutcome("capped", cap_usd=12345.67)
+    card = render_card(claimed, clean_draft(reacted, every), every, breakdown, x)
+    assert card.count("・【") == 3
+    assert visible_length(card) <= TELEGRAM_TEXT_MAX
+    # 行ごとの材料は上限まで、検索した投稿は根拠の番号の上限まで 1 行に並べる
+    assert card.count("<a href=") == CARD_MATERIALS_MAX + CARD_POSTS_MAX
+
 
 def test_note_has_sections_materials_and_safe_markdown(conn) -> None:
     report, tv, post = seed_event(conn)
@@ -501,8 +543,6 @@ def test_news_query_is_checked_before_sending(raw, cleaned) -> None:
 
 
 def test_search_window_is_utc_days_around_the_digest() -> None:
-    from datetime import UTC, datetime
-
     late = datetime(2026, 11, 20, tzinfo=UTC)
     assert search_window("2026-11-14", late) == (
         datetime(2026, 11, 12, tzinfo=UTC),
@@ -551,7 +591,7 @@ def test_search_adds_distinct_reports_after_local_materials(conn, config) -> Non
 
     fetched = {"https://a.example/1": "A の本文", "https://d.example/1": None}
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=search, fetch=lambda http, url: fetched.get(url, "本文"),
     )
     assert queries == ['"Microsoft 365" outage']
@@ -568,7 +608,7 @@ def test_search_skips_reprints_of_local_materials(conn, config) -> None:
     # 手元の記事の転載(別の host・同じ題)は検索の枠を使わない
     on, claimed, materials = search_inputs(conn, config, news_articles=1)
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: [
             gdelt("https://reprint.example/1", "Microsoft 365 の障害"),  # 手元の [1] と同じ題
             gdelt("https://other.example/1", "別の報道"),
@@ -600,7 +640,7 @@ def test_search_skips_reprints_by_original_title_of_translated_local_article(con
         investigate=InvestigateConfig(news_articles=1),
     )
     found, _ = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: [
             gdelt("https://reprint.example/1", "Microsoft outage drags on"),
             gdelt("https://other.example/1", "Outage enters second day"),
@@ -620,7 +660,7 @@ def test_search_stops_fetching_after_the_time_budget(conn, config) -> None:
         return "本文"
 
     found, _ = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: [gdelt("https://a.example/", "A"), gdelt("https://b.example/", "B")],
         headlines=lambda *a, **k: pytest.fail("GDELT で足りたら予備は使わない"),
         fetch=fetch, clock=lambda: next(ticks),
@@ -656,7 +696,7 @@ def test_google_news_headlines_when_gdelt_fails(conn, config) -> None:
         ]
 
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=search, headlines=headlines, fetch=lambda *a: pytest.fail("見出しの本文は取らない"),
     )
     # Google ニュースの before はその日を含まないので、digest の日の 2 日後まで
@@ -680,7 +720,7 @@ def test_google_news_headlines_when_gdelt_fails(conn, config) -> None:
 def test_google_news_when_gdelt_finds_nothing_usable(conn, config) -> None:
     on, claimed, materials = search_inputs(conn, config)
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: [gdelt("https://forest.example/x", "手元と同じ host")],
         headlines=lambda *a, **k: [headline("https://news.google.com/a", "見出し", "n.example")],
         fetch=lambda *a: "本文",
@@ -715,7 +755,7 @@ def test_search_failures_keep_local_materials_only(
         return call
 
     found, outcome = search_news(
-        on, factory(DraftEngine(plan=plan)), object(), claimed, materials,
+        on, object(), claimed, materials, plan,
         search=answer(gdelt_result), headlines=answer(google_result),
     )
     assert found == [] and outcome == SearchOutcome(status, query, 3, 0)
@@ -745,7 +785,7 @@ def test_unexpected_errors_in_search_and_fetch_do_not_stop_investigation(conn, c
         raise ValueError("Invalid IPv6 URL")
 
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: [gdelt("https://a.example/1", "A")], fetch=fetch,
     )
     assert [(m.host, m.body) for m in found] == [("a.example", "")]  # 題だけの材料で続ける
@@ -755,7 +795,7 @@ def test_unexpected_errors_in_search_and_fetch_do_not_stop_investigation(conn, c
         raise ValueError("壊れた応答")
 
     found, outcome = search_news(
-        on, factory(DraftEngine()), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=broken, headlines=broken,
     )
     assert found == [] and outcome.status == "failed"
@@ -764,20 +804,28 @@ def test_unexpected_errors_in_search_and_fetch_do_not_stop_investigation(conn, c
 def test_search_off_does_not_call_llm(conn, config) -> None:
     on, claimed, materials = search_inputs(conn, config, news_articles=0)
     engine = DraftEngine()
+    # 報道も X も検索しないなら、語を作らない
+    assert plan_search(on, factory(engine), claimed, materials, x=False) is None
+    off_x = replace(on, investigate=replace(on.investigate, x_posts=0))
+    assert plan_search(off_x, factory(engine), claimed, materials, x=True) is None
     found, outcome = search_news(
-        on, factory(engine), object(), claimed, materials,
+        on, object(), claimed, materials, PLAN,
         search=lambda *a, **k: pytest.fail("検索しない"),
     )
     assert (found, outcome, engine.plans) == ([], SearchOutcome("off", None, 3, 0), [])
+    # X だけを読むときも語を作る
+    assert plan_search(on, factory(engine), claimed, materials, x=True) == PLAN
+
+
+def test_plan_failure_is_none(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    assert plan_search(on, factory(DraftEngine(plan=None)), claimed, materials, x=True) is None
 
 
 def test_query_prompt_fences_event_and_titles(conn, config) -> None:
     on, claimed, materials = search_inputs(conn, config)
     engine = DraftEngine()
-    search_news(
-        on, factory(engine), object(), claimed, materials,
-        search=lambda *a, **k: [], headlines=lambda *a, **k: [],
-    )
+    plan_search(on, factory(engine), claimed, materials, x=False)
     [prompt] = engine.plans
     nonce = prompt.split("<<<DATA-")[1].split("\n")[0]
     fenced = prompt.split(f"<<<DATA-{nonce}\n")[1].split(f"DATA-{nonce}>>>")[0]
@@ -801,8 +849,8 @@ def test_card_and_note_show_material_breakdown(conn, config) -> None:
         "\n\n材料: 手元 3 件・検索した報道の見出し 4 件(Google ニュース)"
     )
     failed = SearchOutcome("failed", None, 3, 0)
-    assert "報道の検索に失敗したので、手元の材料だけで調べた" in render_card(
-        claimed, draft, materials, failed
+    assert render_card(claimed, draft, materials, failed).endswith(
+        "\n\n材料: 手元 3 件(報道の検索に失敗した。手元の材料だけで調べた)"
     )
     note = render_note(claimed, draft, materials, "2026-11-14T00:00:00Z", ok)
     assert "search: ok\n" in note and "materials_search: 2\n" in note
@@ -937,3 +985,275 @@ def test_dig_now_investigation_survives_every_search_failure(conn, config) -> No
     run_dig_now(conn, on, factory(DraftEngine()), api, logger, http=http)
     assert status_of(conn)["status"] == "done"
     assert "報道の検索に失敗した" in api.sent[0][1]
+
+
+# --- X の反応(GH#415 の 3 本目) ---
+
+
+def x_post(number: int, text: str = "反応", created: str | None = "2026-11-13T08:00:00Z"):
+    from app.connectors.x_search import XPost
+
+    return XPost(f"https://x.com/i/web/status/{number}", text, created)
+
+
+def x_reader(posts=(), *, reads: int | None = None, error: Exception | None = None, sent=None):
+    from app.connectors.x_search import XPostsResult
+
+    def read(query, *, start, end, max_results):
+        if sent is not None:
+            sent.append((query, start, end, max_results))
+        if error is not None:
+            raise error
+        return XPostsResult(list(posts), len(posts) if reads is None else reads)
+
+    return read
+
+
+def x_ledger(conn) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT investigation_id, query, status, api_reads, estimated_cost_usd "
+            "FROM investigation_x_reads ORDER BY id"
+        )
+    ]
+
+
+def test_x_posts_are_added_after_materials_and_recorded(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    sent: list[tuple] = []
+    posts = [
+        x_post(1, "手元と同じ投稿"),  # 手元の材料 [3] と同じ
+        x_post(7, "仕事にならない\n朝から"),
+        x_post(8, "長い" * 50, created=None),
+        x_post(7, "同じ投稿が 2 回"),
+        x_post(9, "仕事にならない 朝から!"),  # 同じ文の投稿(写し・bot の繰り返し)
+        x_post(10, "仕事にならない"),  # 手元の投稿 [3] と同じ文
+    ]
+    found, outcome = search_x(
+        conn, on, x_reader(posts, reads=8, sent=sent), claimed, materials, PLAN, logger=logger
+    )
+    [(query, start, end, max_results)] = sent
+    assert (query, max_results) == ("Microsoft 365 障害", 20)
+    assert start < end
+    assert [(m.number, m.kind, m.host, m.item_id, m.url, m.body) for m in found] == [
+        (4, "searched_post", "x.com", None, "https://x.com/i/web/status/7",
+         "仕事にならない\n朝から"),
+        (5, "searched_post", "x.com", None, "https://x.com/i/web/status/8", "長い" * 50),
+    ]
+    assert found[0].title == "仕事にならない 朝から"  # 本文の先頭を 1 行に
+    assert len(found[1].title) == 60 and found[1].published_at is None
+    assert outcome == XOutcome("ok", "Microsoft 365 障害", 2)
+    # 課金は応答の件数で数える(手元と同じ投稿や、形の悪くて外した投稿も読んでいる)
+    assert x_ledger(conn) == [(claimed.id, "Microsoft 365 障害", "ok", 8, 0.032)]
+
+
+def test_x_posts_feed_reactions_from_searched_posts(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    found, _ = search_x(conn, on, x_reader([x_post(7)]), claimed, materials, PLAN)
+    draft = DRAFT.model_copy(
+        update={
+            "reactions": [
+                InvestigationReaction(stance="不満", summary="声。", sources=[4]),
+                InvestigationReaction(stance="記事", summary="記事の中身。", sources=[1]),
+            ]
+        }
+    )
+    cleaned = clean_draft(draft, materials + found)
+    # 検索した投稿も X の反応の根拠になる(記事の中身は論調にしない)
+    assert [(r.stance, r.sources) for r in cleaned.reactions] == [("不満", [4])]
+
+
+@pytest.mark.parametrize(
+    ("raw", "cleaned"),
+    [
+        ("Microsoft 365 障害", "Microsoft 365 障害"),
+        ("from:someone lang:ja #障害 @MSFT365Status", "障害 MSFT365Status"),
+        ("Microsoft OR (Outlook) -噂 復旧", "Microsoft Outlook 復旧"),
+        ("一二 三四 五六 七八", "一二 三四 五六"),  # 3 語まで(AND で結ばれるので少なめ)
+        ('"Microsoft 365" 障害', "Microsoft 365 障害"),  # 引用符は外す
+        ("あ" * 70, ""),
+    ],
+)
+def test_x_query_is_checked_before_sending(raw, cleaned) -> None:
+    assert clean_x_query(raw) == cleaned
+
+
+def test_x_window_is_the_news_window_within_the_last_seven_days() -> None:
+    now = datetime(2026, 11, 14, 3, 0, tzinfo=UTC)
+    assert x_window("2026-11-14", now) == (
+        datetime(2026, 11, 12, tzinfo=UTC),
+        now - timedelta(seconds=30),  # search/recent は要求の 10 秒以上前までしか読めない
+    )
+    later = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    start, end = x_window("2026-11-14", later)
+    assert start == later - timedelta(days=7) + timedelta(minutes=10)  # 直近 7 日に狭める
+    assert end == datetime(2026, 11, 15, 23, 59, 59, tzinfo=UTC)
+    assert x_window("2026-11-14", datetime(2026, 11, 23, tzinfo=UTC)) is None  # 古い日
+
+
+def test_x_is_skipped_when_the_monthly_cap_would_be_exceeded(conn, config) -> None:
+    from app.investigate import record_x_read
+
+    on, claimed, materials = search_inputs(conn, config, x_monthly_cap_usd=0.2)
+    now = datetime.now(UTC)
+    last_month = now.replace(day=1) - timedelta(days=1)
+    record_x_read(  # 先月の分は数えない
+        conn, claimed.id, searched_at=last_month, query="q", status="ok", api_reads=100,
+        unit_price_usd=0.004,
+    )
+    record_x_read(  # 今月 $0.12。1 回分($0.08)を足すと $0.20 ちょうどで、まだ読める
+        conn, claimed.id, searched_at=now, query="q", status="ok", api_reads=30,
+        unit_price_usd=0.004,
+    )
+    assert x_month_cost(conn, now) == pytest.approx(0.12)
+    found, outcome = search_x(conn, on, x_reader([x_post(7)]), claimed, materials, PLAN)
+    assert outcome.status == "ok" and x_month_cost(conn, now) == pytest.approx(0.124)
+    # 次の 1 回分を足すと上限を超えるので、読まない(台帳にも残さない)
+    found, outcome = search_x(
+        conn, on, x_reader(error=AssertionError("読まない")), claimed, materials, PLAN
+    )
+    assert (found, outcome) == ([], XOutcome("capped", cap_usd=0.2))
+    assert len(x_ledger(conn)) == 3
+
+
+def test_x_failures_are_recorded_and_keep_local_materials(conn, config, caplog) -> None:
+    from app.connectors.x_search import XPostsError
+
+    on, claimed, materials = search_inputs(conn, config)
+    found, outcome = search_x(
+        conn, on, x_reader(error=XPostsError("HTTP 429")), claimed, materials, PLAN
+    )
+    assert (found, outcome) == ([], XOutcome("failed", "Microsoft 365 障害"))
+    found, outcome = search_x(
+        conn, on, x_reader(error=XPostsError("応答が JSON でない", api_reads=20)), claimed,
+        materials, PLAN,
+    )
+    assert outcome.status == "failed"
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        found, outcome = search_x(
+            conn, on, x_reader(error=ValueError("壊れた https://secret.example")), claimed,
+            materials, PLAN, logger=logger,
+        )
+    assert outcome.status == "failed"
+    # 想定外の失敗は型だけをログに残し、課金されたか分からないので上限の件数を数える
+    assert "出来事の調査の X の検索で想定外の失敗: ValueError" in caplog.text
+    assert "secret.example" not in caplog.text
+    assert [(status, reads) for _, _, status, reads, _ in x_ledger(conn)] == [
+        ("failed", 0), ("failed", 20), ("failed", 20)
+    ]
+
+
+def test_x_is_off_or_skipped_without_reader_plan_or_words(conn, config) -> None:
+    on, claimed, materials = search_inputs(conn, config)
+    never = x_reader(error=AssertionError("読まない"))
+    assert search_x(conn, on, None, claimed, materials, PLAN) == ([], XOutcome("off"))
+    off = replace(on, investigate=replace(on.investigate, x_posts=0))
+    assert search_x(conn, off, never, claimed, materials, PLAN) == ([], XOutcome("off"))
+    no_cap = replace(on, investigate=replace(on.investigate, x_monthly_cap_usd=0))
+    assert search_x(conn, no_cap, never, claimed, materials, PLAN) == ([], XOutcome("off"))
+    # 語を作れなかった
+    assert search_x(conn, on, never, claimed, materials, None) == ([], XOutcome("failed"))
+    # 検査で語が残らない
+    plan = SearchPlan(news_query="x", x_query="from:a OR -b")
+    assert search_x(conn, on, never, claimed, materials, plan) == ([], XOutcome("none"))
+    assert x_ledger(conn) == []
+
+
+def test_x_is_not_read_for_an_old_digest(conn, config) -> None:
+    seed_event(conn)
+    conn.execute("UPDATE digests SET digest_date = '2026-01-01'")
+    request(conn, day="2026-01-01")
+    claimed = claim_investigation(conn)
+    on = replace(config, investigate=InvestigateConfig(news_articles=0))
+    found, outcome = search_x(
+        conn, on, x_reader(error=AssertionError("読まない")), claimed,
+        gather_materials(conn, claimed), PLAN, now=datetime(2026, 11, 14, tzinfo=UTC),
+    )
+    assert (found, outcome) == ([], XOutcome("expired"))
+
+
+def test_card_and_note_show_x_breakdown(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    claimed = claim_investigation(conn)
+    materials = gather_materials(conn, claimed)
+    draft = clean_draft(DRAFT, materials)
+    google = SearchOutcome("ok", "Microsoft 365 障害", 3, 4, "google_news")
+    failed = SearchOutcome("failed", None, 3, 0)
+    off = SearchOutcome("off", None, 3, 0)
+
+    def tail(search, x):
+        return render_card(claimed, draft, materials, search, x).rsplit("\n", 1)[1]
+
+    assert tail(google, XOutcome("ok", "q", 18)) == (
+        "材料: 手元 3 件・検索した報道の見出し 4 件(Google ニュース)・X の投稿 18 件"
+    )
+    assert tail(off, XOutcome("none", "q", 0)) == "材料: 手元 3 件・X の投稿 0 件"
+    assert tail(failed, XOutcome("ok", "q", 5)) == (
+        "材料: 手元 3 件・X の投稿 5 件(報道の検索に失敗した)"
+    )
+    assert tail(google, XOutcome("capped", cap_usd=5.0)) == (
+        "材料: 手元 3 件・検索した報道の見出し 4 件(Google ニュース)"
+        "(X はこの機能の今月の上限($5)に達したので読まなかった)"
+    )
+    assert tail(failed, XOutcome("failed", "q")) == (
+        "材料: 手元 3 件(報道の検索に失敗した。X の検索に失敗した。手元の材料だけで調べた)"
+    )
+    assert tail(off, XOutcome("expired")) == (
+        "材料: 手元 3 件(X は検索できる直近 7 日の外なので読まなかった。手元の材料だけで調べた)"
+    )
+    assert tail(off, XOutcome("off")) == "材料: 手元 3 件"
+    note = render_note(
+        claimed, draft, materials, "2026-11-14T00:00:00Z", google, XOutcome("ok", "障害", 18)
+    )
+    assert "x_search: ok\n" in note and "materials_x: 18\n" in note
+    assert "x_query: 障害\n" in note
+    assert "・X の投稿 18 件" in note
+
+
+X_PLAN_ONLY = InvestigateConfig(news_articles=0)
+
+
+def test_dig_now_investigation_reads_x_reactions(conn, config) -> None:
+    seed_event(conn)
+    request(conn)
+    on = replace(config, investigate=X_PLAN_ONLY)
+    engine = DraftEngine(
+        draft=DRAFT.model_copy(
+            update={
+                "reactions": [
+                    InvestigationReaction(stance="不満", summary="仕事が止まった。", sources=[4])
+                ]
+            }
+        )
+    )
+    api = FakeApi()
+    sent: list[tuple] = []
+    run_dig_now(
+        conn, on, factory(engine), api, logger,
+        x_read=x_reader([x_post(7, "朝から Outlook が開かない")], sent=sent),
+    )
+    assert status_of(conn)["status"] == "done"
+    assert engine.efforts[0] == "low" and len(engine.plans) == 1  # 語は X のためにも作る
+    [prompt] = engine.prompts
+    assert "[4] 種別: X の投稿(検索) | 媒体: x.com | 題: 朝から Outlook が開かない" in prompt
+    [(_, card)] = api.sent
+    assert "・【不満】仕事が止まった。[4]" in card
+    # 検索した投稿は、番号のリンクを 1 行に並べる
+    assert '\nX の投稿 <a href="https://x.com/i/web/status/7">[4]</a>\n' in card
+    assert '[4] <a href="https://x.com/i/web/status/7">' not in card  # 行ごとには並べない
+    assert card.endswith("材料: 手元 3 件・X の投稿 1 件")
+    assert [row[2:4] for row in x_ledger(conn)] == [("ok", 1)]
+    note = (deepdive_dir(on) / f"{status_of(conn)['note_name']}.md").read_text()
+    assert "x_search: ok" in note and "materials_x: 1" in note
+
+
+def test_dig_now_investigation_without_x_reader_does_not_plan(conn, config) -> None:
+    # 報道の検索が切れていて X も読めないなら、語を作らない(今までと同じ)
+    seed_event(conn)
+    request(conn)
+    engine = DraftEngine()
+    api = FakeApi()
+    run_dig_now(conn, config, factory(engine), api, logger)
+    assert engine.plans == [] and api.sent[0][1].endswith("材料: 手元 3 件")

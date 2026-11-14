@@ -39,6 +39,8 @@
 - expansions は要求せず、items.author は NULL にする(GH#386。ホームTL と同じ理由)。
 - 同一ツイートが複数スロットに一致した場合は重複して返すが、collect の UNIQUE
   (source_id, external_id)で無害に吸収される(設計 02 §1 の冪等性契約)。
+- `search_posts` は出来事の調査(GH#415 の 3 本目)の X の反応を読む別の口。同じ endpoint を関連の
+  順で 1 ページだけ読み、items には入れない。費用は調査の台帳と月の上限で数える(ADR 0006)。
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -277,6 +280,103 @@ def _split_budget(total: int, n: int) -> list[int]:
     """均等割・端数は先頭から(35, 3 → [12, 12, 11]。ADR 0001「3スロット × 約12件」)。"""
     base, remainder = divmod(total, n)
     return [base + (1 if i < remainder else 0) for i in range(n)]
+
+
+@dataclass(frozen=True)
+class XPost:
+    """出来事の調査で読む投稿(GH#415 の 3 本目)。本文は note_tweet を先にする。"""
+
+    url: str  # https://x.com/i/web/status/{id}(normalize_url の X の投稿の形と同じ)
+    text: str
+    created_at: str | None  # ISO 8601 の UTC
+
+
+@dataclass(frozen=True)
+class XPostsResult:
+    posts: list[XPost]
+    api_reads: int  # 課金される読取の数(応答の data の件数。形の悪い投稿も数える)
+
+
+class XPostsError(Exception):
+    """出来事の調査の X の検索の失敗。api_reads は課金されうる読取の数(費用の台帳に残す)。"""
+
+    def __init__(self, message: str, *, api_reads: int = 0) -> None:
+        super().__init__(message)
+        self.api_reads = api_reads
+
+
+def search_posts(
+    session: XApiSession,
+    query: str,
+    *,
+    start: datetime,
+    end: datetime,
+    max_results: int,
+) -> XPostsResult:
+    """出来事の調査の X の反応(GH#415 の 3 本目。ADR 0006)。関連の順で 1 ページだけ読む。
+
+    朝の収集の検索スロットとは別の口で、日次の読取上限ではなく調査の月の上限で止める(呼び出し側)。
+    語は呼び出し側が検査済み。演算子はコードが付ける除外句(RT・リプライを除く)だけにする。
+    expansions は要求しない(GH#386)。start・end は UTC(search/recent の直近 7 日の中で、end は
+    要求の時刻の 10 秒以上前であること)。
+    """
+    params: dict[str, str | int] = {
+        "query": x_search_query(query),  # (語) + 除外句(GH#230 と同じ組み方)
+        "max_results": max_results,
+        "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sort_order": "relevancy",  # 反応を見るので、新しい順より関連の順
+        "tweet.fields": "created_at,note_tweet",
+    }
+    try:
+        response = session.get(SEARCH_URL, params)
+    except RetryableError as e:
+        raise XPostsError(type(e).__name__) from e
+    if response.status_code != 200:
+        raise XPostsError(f"HTTP {response.status_code}")
+    try:
+        body = response.json()
+    except ValueError:
+        # 200 で読めない応答は、課金された件数が分からない。上限の件数を数える(多めに)
+        raise XPostsError("応答が JSON でない", api_reads=max_results) from None
+    data = body.get("data", []) if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise XPostsError("応答の形が違う", api_reads=max_results)
+    posts: list[XPost] = []
+    for tweet in data:
+        if not isinstance(tweet, dict):
+            continue
+        tweet_id, text = tweet.get("id"), tweet_full_text(tweet)
+        if not isinstance(tweet_id, str) or not tweet_id.isdigit():
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        posts.append(
+            XPost(
+                url=f"https://x.com/i/web/status/{tweet_id}",
+                text=text,
+                created_at=_iso_utc(tweet.get("created_at")),
+            )
+        )
+    return XPostsResult(posts=posts, api_reads=len(data))
+
+
+def build_x_session(env: dict[str, str]) -> XApiSession:
+    """出来事の調査の X の検索の session(前提: has_x_credentials(env) が真)。"""
+    return XApiSession(client=build_x_client(), credentials=credentials_from_env(env))
+
+
+def _iso_utc(value: object) -> str | None:
+    """X の created_at を ISO 8601 の UTC(秒まで)にする。読めなければ None。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = parse_created_at(value)
+    except ValueError:
+        return None
+    if parsed is None or parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _to_raw_item(tweet: dict, query: str) -> RawItem:
