@@ -284,8 +284,8 @@ def test_json_round_trip_keeps_events_and_link_ids(conn) -> None:
     )
     section = synthesize_trend(conn, FakeEngine(result), logger)
     assert parse_news_json(section.to_json()) == [
-        ("A<&>", "要約 \"1\"。", ids[:3]),
-        ("B", "要約 2。", [ids[3]]),
+        ("A<&>", "要約 \"1\"。", ids[:3], ids[:3]),
+        ("B", "要約 2。", [ids[3]], [ids[3]]),
     ]
     assert "http" not in section.to_json()  # URL は持たず、配信のときに items から引く
 
@@ -318,3 +318,20 @@ def test_link_label_is_short_host() -> None:
     long_host = "h" * 60 + ".example"
     assert link_label(f"https://{long_host}/") == "h" * 39 + "…"
     assert link_label("not a url") == "記事"
+
+
+def test_events_keep_every_grounded_report_as_sources(conn) -> None:
+    # GH#415: リンクは 3 本までだが、出来事を報じた記事は材料として全部残す(上限 8。出来事の調査)
+    from app.models import NEWS_MAX_SOURCES
+
+    ids = [
+        add_analyzed(conn, f"https://r{i}.example/", topic="t", title_ja=f"報道{i}")
+        for i in range(10)
+    ]
+    order = [ids[0], 999999, ids[1], ids[0], *ids[2:]]
+    result = TrendSummary(themes=[TrendTheme(label="出来事", summary="要約。", item_ids=order)])
+    event = synthesize_trend(conn, FakeEngine(result), logger).events[0]
+    assert len(event.links) == MAX_LINKS
+    assert event.sources == tuple(ids[:NEWS_MAX_SOURCES])  # 幻の id と重複を外し、順を保つ
+    entry = parse_news_json(synthesize_trend(conn, FakeEngine(result), logger).to_json())[0]
+    assert entry.source_ids == ids[:NEWS_MAX_SOURCES]

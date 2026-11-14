@@ -242,6 +242,70 @@ def dig_now(
 
 
 @app.command()
+def investigate(
+    event: int = typer.Option(
+        ..., "--event", min=1, help="今日の IT ニュースの出来事の番号(上から 1, 2, …)"
+    ),
+    digest_date: str | None = typer.Option(
+        None, "--date", help="digest の日付(YYYY-MM-DD・JST。既定 = 当日)"
+    ),
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+) -> None:
+    """今日の IT ニュースの出来事を、報じた記事をまとめて調べ、ノートとカードを作る(GH#415)。
+
+    依頼を台帳に積んでから、`intel dig-now` と同じ実行で作る(今すぐの深掘りの依頼も一緒に進む)。
+    """
+    from datetime import datetime
+
+    from ulid import ULID
+
+    from app.config import load_config, load_env
+    from app.db import apply_migrations, connect
+    from app.deepdive import DigError
+    from app.investigate import event_of_digest, request_investigation
+    from app.jst import today_jst
+    from app.logs import DEFAULT_LOG_DIR, setup_logging
+    from app.run import dig_now_stage
+
+    if digest_date is not None:
+        try:
+            digest_date = datetime.strptime(digest_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            typer.echo(f"--date が不正: {digest_date}(YYYY-MM-DD で指定)", err=True)
+            raise typer.Exit(code=1) from None
+    config = load_config(config_dir)
+    env = load_env(config_dir)
+    conn = connect(config.db_path)
+    apply_migrations(conn, config.db_path)
+    logger = setup_logging(DEFAULT_LOG_DIR, "dig-now.log")
+    if config.dig.daily_cap <= 0:
+        typer.echo("[dig].daily_cap = 0(調査段は無効)")
+        raise typer.Exit(code=0)
+    day = digest_date or today_jst()
+    found = event_of_digest(conn, day, event)
+    if found is None:
+        typer.echo(f"{day} の digest に {event} 件目の出来事が無い", err=True)
+        raise typer.Exit(code=1)
+    digest_id, entry = found
+    outcome = request_investigation(conn, digest_id, event, entry)
+    if outcome == "no_sources":
+        typer.echo("出来事に材料の記事が無いため、調べられない", err=True)
+        raise typer.Exit(code=1)
+    if outcome == "done":
+        typer.echo("この出来事は調査済み(カードは送ってある)")
+        return
+    try:
+        ran = dig_now_stage(conn, config, env, logger, run_id=str(ULID()))
+    except DigError as e:  # 作れなかった依頼は知らせ済み
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from None
+    if not ran:
+        typer.echo("別の実行が深掘りを進めているため、調査はその実行か次の実行で送る")
+        return
+    typer.echo("investigate 完了(生成・送信の内訳はログ参照)")
+
+
+@app.command()
 def answer(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:

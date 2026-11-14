@@ -101,6 +101,18 @@ from app.dig import (
 from app.dig_take import is_dismissed, is_read
 from app.export.neutralize import neutralize_markdown, neutralize_note
 from app.export.obsidian import FORBIDDEN_IN_SLUG, atomic_write, render_frontmatter
+from app.investigate import FAILED_NOTICE as _INVESTIGATE_FAILED
+from app.investigate import NO_MATERIAL_NOTICE as _INVESTIGATE_NO_MATERIAL
+from app.investigate import (
+    NoMaterialError,
+    claim_investigation,
+    gather_materials,
+    generate_investigation,
+    has_unsent_investigations,
+    interrupted_investigations,
+    record_generated,
+)
+from app.investigate import close_failed as close_investigation_failed
 from app.jst import today_jst
 from app.prompting import fill_template, load_writing_guide, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
@@ -541,8 +553,8 @@ def _run_dig_now_locked(
             # 指定し直しても朝の選定がこの行を選ばない
             close_now_request(conn, item_id, started_at, to_morning=False)
     # 前の実行が公開・送信できなかった分(送信の失敗など)を先に進める。依頼はもう閉じているので、
-    # 下のループだけでは進まない
-    if has_unsent_cards(conn):
+    # 下のループだけでは進まない。出来事の調査(GH#415)の分も同じ流れで進める
+    if has_unsent_cards(conn) or has_unsent_investigations(conn):
         failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
 
     completed = True
@@ -607,7 +619,12 @@ def _run_dig_now_locked(
             continue
         failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
 
-    if api is None and has_unsent_cards(conn):
+    # 出来事の調査(GH#415)。生成の間は dig.lock を持たない(朝の選定と関わらない)
+    failures.extend(
+        _run_investigations(conn, config, engine_factory, api, logger, run_id, vault)
+    )
+
+    if api is None and (has_unsent_cards(conn) or has_unsent_investigations(conn)):
         logger.warning(
             "Telegram 未設定のため、概要カードは未送信のまま",
             extra={"run_id": run_id, "stage": "dig-now"},
@@ -615,6 +632,75 @@ def _run_dig_now_locked(
     if failures:
         raise DigError(f"今すぐの深掘りで {len(failures)} 件失敗: " + " / ".join(failures))
     return completed
+
+
+def _run_investigations(
+    conn: sqlite3.Connection,
+    config: Config,
+    engine_factory: Callable[[str], LLMEngine],
+    api: TelegramApi | None,
+    logger: logging.Logger,
+    run_id: str | None,
+    vault: VaultGuard,
+) -> list[str]:
+    """出来事の調査(GH#415。設計 06 §9)の依頼を受け付けた順に作り、1 件ごとに公開と送信まで進める。
+
+    `<DB>.dig-now.lock` の中で呼ぶ。作り始めた印の残った依頼は前の実行が途中で止まったもので、
+    作り直さずに失敗として閉じて知らせる(LLM を繰り返し呼ばない。押し直せば受け付け直す)。
+    本文のある材料が無い依頼は、作らずに閉じて知らせる。作れなかった依頼(LLM の失敗など)も
+    閉じて知らせ、段の失敗にする。ほかの依頼と深掘りは止めない。
+    """
+    failures: list[str] = []
+    for request in interrupted_investigations(conn):
+        close_investigation_failed(conn, request.id, "interrupted")
+        logger.warning(
+            "前の実行が途中で止まった出来事の調査を、作り直さずに閉じた",
+            extra={"run_id": run_id, "stage": "dig-now", "extra": {"investigation": request.id}},
+        )
+        _notify_now(
+            config, api, logger, run_id,
+            _INVESTIGATE_FAILED.format(date=request.digest_date, index=request.event_index),
+        )
+        failures.append(f"investigation {request.id}: 前の実行が途中で止まった")
+    while True:
+        request = claim_investigation(conn)
+        if request is None:
+            break
+        log_extra = {"run_id": run_id, "stage": "dig-now", "extra": {"investigation": request.id}}
+        try:
+            materials = gather_materials(conn, request)
+            generated = generate_investigation(config, engine_factory, request, materials)
+        except NoMaterialError:
+            close_investigation_failed(conn, request.id, "no_material")
+            logger.warning(
+                "本文のある材料が無いため、出来事の調査を作らずに閉じた", extra=log_extra
+            )
+            _notify_now(
+                config, api, logger, run_id,
+                _INVESTIGATE_NO_MATERIAL.format(
+                    date=request.digest_date, index=request.event_index
+                ),
+            )
+            continue
+        except Exception as e:
+            logger.error(
+                f"出来事の調査の生成失敗 investigation={request.id}: {type(e).__name__}: {e}",
+                extra=log_extra,
+                exc_info=True,
+            )
+            failures.append(f"investigation {request.id}: {type(e).__name__}")
+            close_investigation_failed(conn, request.id, type(e).__name__)
+            _notify_now(
+                config, api, logger, run_id,
+                _INVESTIGATE_FAILED.format(date=request.digest_date, index=request.event_index),
+            )
+            continue
+        record_generated(conn, request.id, generated)
+        logger.info(
+            f"出来事の調査を作った(材料 {len(materials)} 件)", extra=log_extra
+        )
+        failures.extend(_publish_and_send(conn, config, api, logger, run_id, vault))
+    return failures
 
 
 def _publish_and_send(
@@ -1072,60 +1158,130 @@ def _publish_pending_notes(
         "SELECT id, item_id, note_name, source_note_name, note_markdown,"
         " source_note_markdown FROM dig_results WHERE published_at IS NULL ORDER BY id"
     ).fetchall()
-    if not rows:
+    # 出来事の調査(GH#415)の未公開のノートも、同じロック・同じ時間の上限で書き出す
+    investigations = conn.execute(
+        "SELECT id, note_name, note_markdown FROM news_investigations"
+        " WHERE status = 'done' AND published_at IS NULL ORDER BY id"
+    ).fetchall()
+    units = [_dig_note_unit(conn, config, row, logger, run_id) for row in rows] + [
+        _investigation_note_unit(conn, config, row, logger, run_id) for row in investigations
+    ]
+    if not units:
         return failures
     lock = _PublishLock.acquire(conn)
     if lock is None:
         logger.error(
             "別の実行のノートの公開が終わっていない(vault が応答しないまま止まっている可能性)"
-            f"ので、この実行では公開しない(未公開の {len(rows)} 件は次の実行へ。runbook §11)",
+            f"ので、この実行では公開しない(未公開の {len(units)} 件は次の実行へ。runbook §11)",
             extra={"run_id": run_id, "stage": "dig"},
         )
-        failures.append(f"ノート公開: 別の実行の公開が終わっていない(未公開 {len(rows)} 件)")
+        failures.append(f"ノート公開: 別の実行の公開が終わっていない(未公開 {len(units)} 件)")
         return failures
 
-    def publish(row: sqlite3.Row) -> None:
+    def publish(unit: _PendingNote) -> None:
         if not lock.begin_write():  # 見切られた後に動き出した。ロックは放されたので書かない
             return
         try:
-            _publish_row_notes(config, row, logger, run_id)
+            unit.write()
         finally:
             lock.end_write()  # 見切られた後に終わったなら、ここで放す
 
     try:
-        for index, row in enumerate(rows):
+        for index, unit in enumerate(units):
             try:
-                vault.call(lambda row=row: publish(row))
+                vault.call(lambda unit=unit: publish(unit))
             except VaultStalled as e:
-                unpublished = len(rows) - index
+                unpublished = len(units) - index
                 logger.error(
                     "vault が応答しないので、ノートの公開をこの実行では止める"
                     f"(未公開の {unpublished} 件は本文を台帳に残し、次の実行で公開する。"
                     f"runbook §11): {e}",
-                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                    extra=unit.log_extra,
                 )
                 failures.append(
-                    f"item {row['item_id']}: ノート公開 VaultStalled"
+                    f"{unit.name}: ノート公開 VaultStalled"
                     f"(未公開 {unpublished} 件は次の実行へ)"
                 )
                 break
             except Exception as e:
                 logger.error(
-                    f"DeepDive ノート公開失敗 item={row['item_id']}: {type(e).__name__}",
-                    extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+                    f"DeepDive ノート公開失敗 {unit.log_name}: {type(e).__name__}",
+                    extra=unit.log_extra,
                     exc_info=True,
                 )
-                failures.append(f"item {row['item_id']}: ノート公開 {type(e).__name__}")
+                failures.append(f"{unit.name}: ノート公開 {type(e).__name__}")
                 continue
-            conn.execute(
-                "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
-                " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
-                (row["id"],),
-            )
+            unit.mark_published()
     finally:
         # 見切ったスレッドがまだ書いているなら、それが終わるまで(またはプロセスの終了まで)握る
         lock.leave()
     return failures
+
+
+@dataclass(frozen=True)
+class _PendingNote:
+    """公開を待つノートの 1 行ぶん(深掘りの dig_results か、出来事の調査の news_investigations)。"""
+
+    name: str  # 失敗の記録の名前(item 5 / investigation 3)
+    log_name: str  # ログの名前(item=5 / investigation=3)
+    log_extra: dict
+    write: Callable[[], None]  # vault-io のスレッドで動く。DB に触れない
+    mark_published: Callable[[], None]  # 書けた後に台帳に記帳する(本文の列を NULL にする)
+
+
+def _dig_note_unit(
+    conn: sqlite3.Connection,
+    config: Config,
+    row: sqlite3.Row,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> _PendingNote:
+    def mark() -> None:
+        conn.execute(
+            "UPDATE dig_results SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+            " note_markdown = NULL, source_note_markdown = NULL WHERE id = ?",
+            (row["id"],),
+        )
+
+    return _PendingNote(
+        name=f"item {row['item_id']}",
+        log_name=f"item={row['item_id']}",
+        log_extra={"run_id": run_id, "stage": "dig", "item_id": row["item_id"]},
+        write=partial(_publish_row_notes, config, row, logger, run_id),
+        mark_published=mark,
+    )
+
+
+def _investigation_note_unit(
+    conn: sqlite3.Connection,
+    config: Config,
+    row: sqlite3.Row,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> _PendingNote:
+    def write() -> None:
+        _publish_note(
+            _deepdive_dir(config),
+            f"{row['note_name']}.md",
+            neutralize_note(row["note_markdown"]),
+            logger,
+            run_id,
+        )
+
+    def mark() -> None:
+        conn.execute(
+            "UPDATE news_investigations SET published_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),"
+            " note_markdown = NULL WHERE id = ?",
+            (row["id"],),
+        )
+
+    return _PendingNote(
+        name=f"investigation {row['id']}",
+        log_name=f"investigation={row['id']}",
+        log_extra={"run_id": run_id, "stage": "dig", "extra": {"investigation": row["id"]}},
+        write=write,
+        mark_published=mark,
+    )
 
 
 def _publish_row_notes(
@@ -1398,6 +1554,41 @@ def _send_pending_cards(
         # 接続は autocommit(送信 1 件ごとに即永続化 = 中断しても再送は未送信分のみ)
         conn.execute(
             "UPDATE dig_results SET message_id = ?, "
+            "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+            (message_id, row["id"]),
+        )
+    failures.extend(_send_pending_investigation_cards(conn, config, api, logger, run_id))
+    return failures
+
+
+def _send_pending_investigation_cards(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    run_id: str | None,
+) -> list[str]:
+    """出来事の調査(GH#415)の未送信カードを送る(公開済みの行だけ。深掘りのカードと同じ扱い)。
+
+    ボタンは付けない(返事・読んだ・不要はこの Issue の外。材料のリンクはカードの本文にある)。
+    """
+    failures: list[str] = []
+    rows = conn.execute(
+        "SELECT id, card_text FROM news_investigations WHERE status = 'done'"
+        " AND message_id IS NULL AND published_at IS NOT NULL ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        try:
+            message_id = api.send_message(config.telegram.owner_chat_id, row["card_text"])
+        except Exception as e:
+            logger.error(
+                f"出来事の調査のカード送信失敗 investigation={row['id']}: {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "dig", "extra": {"investigation": row["id"]}},
+            )
+            failures.append(f"investigation {row['id']}: カード送信 {type(e).__name__}")
+            continue
+        conn.execute(
+            "UPDATE news_investigations SET message_id = ?, "
             "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
             (message_id, row["id"]),
         )

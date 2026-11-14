@@ -140,7 +140,7 @@ analyses への写像(01 §3 の列に対応): `relevance` → relevance_score /
 - **リンクの選び方(コード)**: item_ids のうち入力に有る id から、最大 3 本をリンクにする。LLM の並べた順を保ったまま X の投稿(host が `x.com`・`twitter.com`)を後ろに回し、同じ host は 1 本にする。URL は items の正規 URL だけで、LLM の出力の URL は使わない。リンクの文字は host 名(先頭の `www.` を外し、40 字で切る。host は外部由来で長さを検証していない)。
 - **接地の確認**: 入力に有る id を 1 つも持たない出来事は捨てる(幻の出来事を排除)。要約は 160 字で切る安全網を持ち(prompt を守れば発動しない)、出来事は最大 6 件。
 - **失敗時**: 対象が少ない・LLM の失敗・接地のある出来事が 0 件のときは節を省く。digest を当日生成済みで作り直さない(`--force` でない)ときは呼ばない。
-- **載せる先**: `digests.trend_json`(migration 034。出来事とリンクにする記事の id)と `digests.trend_markdown`(migration 003。リンクを含まないプレーンテキストの写し)に保存する。Telegram のヘッダメッセージは trend_json から、配信のときに items の正規 URL を引いてリンク付きで組む(設計 04 §2)。Obsidian の Daily ノートには digest の Markdown として、リンク付きで出す。degraded 配信では付けない。trend_json の無い前の digest は、今までどおり trend_markdown の文を出す。
+- **載せる先**: `digests.trend_json`(migration 034。出来事とリンクにする記事の id と、出来事を報じた記事の id(`source_ids`。リンクにしない分も含めて最大 8 件。出来事の調査の材料。GH#415・設計 06 §9))と `digests.trend_markdown`(migration 003。リンクを含まないプレーンテキストの写し)に保存する。Telegram のヘッダメッセージは trend_json から、配信のときに items の正規 URL を引いてリンク付きで組む(設計 04 §2)。Obsidian の Daily ノートには digest の Markdown として、リンク付きで出す。degraded 配信では付けない。trend_json の無い前の digest は、今までどおり trend_markdown の文を出す。
 
 ## 4. interest-profile.md の形式
 

@@ -242,7 +242,7 @@ repo 固有の決まり:
 | `app/digest/` | ダイジェストの生成 |
 | `app/delivery/` | Telegram の配信、受信デーモン、夜アンケートと watchdog と失敗通知、`intel answer`・`intel dig-now` の起動 |
 | `app/export/` | Obsidian への書き出し |
-| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py` | 深掘りのキュー(夜の入口と今すぐの依頼)、朝の調査段と今すぐの深掘り、カードへの質問への返事、take の記録 |
+| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py`・`app/investigate.py` | 深掘りのキュー(夜の入口と今すぐの依頼)、朝の調査段と今すぐの深掘り、カードへの質問への返事、take の記録、今日の IT ニュースの出来事の調査(`intel investigate --event N`) |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
 | `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-intent・dig-review・dig-revise)と、深掘りの文章の書き方の手引き(writing-guide-ja。dig-answer と dig が入れる)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |

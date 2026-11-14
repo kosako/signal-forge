@@ -49,7 +49,7 @@ PROPOSAL.md と project/plan.md が参照先として挙げる `.agent-context.l
 | [design/03-analysis-ranking.md](design/03-analysis-ranking.md) | 分析とランキング。事前選別、LLM のプロンプトと出力スキーマ、関心プロファイルの形式、スコア式、コスト上限、プロンプトインジェクション対策 | 仕様 |
 | [design/04-delivery-telegram-obsidian.md](design/04-delivery-telegram-obsidian.md) | 出口層。Telegram の配信と受信(メッセージ形式、ボタン、リプライの振り分け、認可)と Obsidian へのノート出力の規則 | 仕様 |
 | [design/05-ops-runtime.md](design/05-ops-runtime.md) | 運用設計。launchd の構成、`intel doctor` の検査項目、ログ、失敗通知、バックアップ、secrets、月次コスト、リトライとタイムアウトの規約(§8 が単一正本)、開発フロー | 仕様 |
-| [design/06-deepdive-experience.md](design/06-deepdive-experience.md) | フェーズ 2 の深掘り体験。夜のリプライで指定 → 朝の調査段 → 概要カード → カードへの質問への返事と take。ADR 0002〜0005 を具体化する | 仕様 |
+| [design/06-deepdive-experience.md](design/06-deepdive-experience.md) | フェーズ 2 の深掘り体験。夜のリプライで指定 → 朝の調査段 → 概要カード → カードへの質問への返事と take。今日の IT ニュースの出来事の調査(§9)。ADR 0002〜0006 を具体化する | 仕様 |
 
 ### 判断(adr/)
 
@@ -116,6 +116,7 @@ ADR(Architecture Decision Record)は、覆しにくい判断とその理由・�
 | [0003](adr/0003-knowledge-item-as-deepdive-byproduct.md) | 知見の単位は「深掘りの副産物」 | Accepted | 2026-07-12 | 知見 = ソース + 出典群 + ユーザーの結論(take)。AI がドラフトし、take が付いたものだけを確定とする | 0002 を前提とする。take の記録は GH#106 で実装(解説ノートへの追記と followup_dig) |
 | [0004](adr/0004-deepdive-in-agent-obsidian-substrate.md) | 深掘りは既存エージェント内 / 知見の substrate は Obsidian | Accepted | 2026-07-12 | 深掘りは既存のエージェントの中で行い、知見はダイジェストと同じ Obsidian vault の別フォルダに貯める | 0002・0003 を前提とする。「専用 UI は延期」の部分は 0005 で置き換え |
 | [0005](adr/0005-operation-surface-separate-app.md) | 機能は signal-forge が口として持ち、操作するアプリは別プロジェクトで作る | Accepted | 2026-10-18 | 操作面を差し替えられる形に寄せる。当面の操作面は Telegram で、カードへの質問への返事を先に作る | 0004 の一部を置き換える。中央アプリへ出す口(0002 の MCP の方向)は口を出すときに改めて決める |
+| [0006](adr/0006-investigation-external-search.md) | 出来事の調査では、コードが外部の検索で材料を集めて LLM に渡す | Accepted | 2026-11-14 | 今日の IT ニュースの出来事を調べるとき、報道を GDELT で、X の反応を X の検索で集める。検索と取得はコードが行い、LLM に道具を持たせない。月 $5 の上限 | 深掘り(記事 1 本)の「外部リサーチは持たない」は変えない。出来事の調査に限る |
 
 ADR の扱い:
 

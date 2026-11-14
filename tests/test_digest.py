@@ -606,8 +606,9 @@ def test_news_section_stored_with_links_and_rendered_in_markdown(conn, tmp_path)
     assert json.loads(row["trend_json"]) == {
         "events": [
             {"label": "Microsoft 365 で長時間の障害", "summary": "メールに影響した。",
-             "item_ids": [41, 42]},
-            {"label": "NVIDIA の人事", "summary": "辞任が報じられた。", "item_ids": [43]},
+             "item_ids": [41, 42], "source_ids": [41, 42]},
+            {"label": "NVIDIA の人事", "summary": "辞任が報じられた。", "item_ids": [43],
+             "source_ids": [43]},
         ]
     }
     assert row["trend_markdown"] == (

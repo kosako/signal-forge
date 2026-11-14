@@ -91,12 +91,14 @@ app/
                   #   answer_worker.py(poller から intel answer を起動する。GH#126)
   dig.py          # 深掘りキュー(夜の入口。GH#104。poller から import — 軽量に保つ)
   deepdive.py     # 朝の調査段(GH#105。DeepDive ノート生成 + 概要カード。設計 06 §4〜5)
+  investigate.py  # 出来事の調査(GH#415。今日の IT ニュースの出来事を、報じた記事をまとめて調べる。
+                  #   設計 06 §9)。生成は deepdive.py の dig-now の実行から呼ばれる
   dig_answer.py   # カードへの質問への返事(GH#126。操作面に依存しない。ADR 0005)
   dig_take.py     # カードへのリプライのうち take を解説ノートと followup_dig に記録する(GH#106)
   export/obsidian.py    # Items/ + Daily/ への Markdown 書き出し(DeepDive/ への書き出しも
                   #   同じ atomic_write を使う。DeepDive ノートの中身は deepdive.py が作る)
 migrations/       # 001_init.sql 形式、db.py の自前ランナーで適用
-prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer・dig-intent・
+prompts/          # バージョン付き .md(analyze・trend・dig・dig-translate・dig-answer・dig-intent・investigate・
                   #   dig-review・dig-revise・writing-guide-ja。analyses は prompt_version 列で追跡し、
                   #   ほかは各モジュールの版の定数。PROMPT_VERSION と、deepdive.py の TRANSLATE_・REVIEW_・
                   #   REVISE_PROMPT_VERSION、dig_answer.py の INTENT_PROMPT_VERSION、prompting.py の
@@ -112,7 +114,7 @@ tests/
 - 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
   - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う。`analysis/fallback.py`(予備への切り替え。§5)は LLMEngine を作る側(cli・run)が使う
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を見て行う)
-  - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
+  - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。出来事の調査(`investigate.py`)は深掘りの段の一部で、`deepdive.py` が dig-now の実行の中で生成を呼び、ノートの公開とカードの送信は深掘りと同じ流れで行う(GH#415)。`investigate.py` もカードとノートの組み立てに `delivery/telegram.py` のエスケープと `export/` の部品を使う。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
   - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
   - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)。カードへの返事(`dig_answer.py`)も、調べ直しの依頼を同じ規則でキューに積む(`dig.py`。GH#137)
   - ソースの健康(`source_health.py` の連続の失敗の知らせと週 1 回の健康診断)を、doctor と poller の内蔵タイマー(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む
