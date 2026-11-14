@@ -578,6 +578,38 @@ def test_search_skips_reprints_of_local_materials(conn, config) -> None:
     assert [m.host for m in found] == ["other.example"]
 
 
+def test_search_skips_reprints_by_original_title_of_translated_local_article(conn, config):
+    # 手元の記事に日本語の見出し(analyses.title_ja)が付いていても、英語の原題の転載を外す
+    report = add_item(conn, "https://wire.example/m365", title="Microsoft outage drags on")
+    conn.execute(
+        "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
+        "recommendation_reason, implication, degraded, engine, model, prompt_version, input_hash) "
+        "VALUES (?, 'マイクロソフトの障害が長引く', 's', 'その他', 50, 'new', 'r', 'i', 0, "
+        "'codex-cli', 'm', 'p', 'h')",
+        (report,),
+    )
+    add_digest(conn, ("障害", "長引く。", [report]))
+    request(conn)
+    claimed = claim_investigation(conn)
+    materials = gather_materials(conn, claimed)
+    assert (materials[0].title, materials[0].original_title) == (
+        "マイクロソフトの障害が長引く", "Microsoft outage drags on"
+    )
+    on = Config(
+        config_dir=config.config_dir, dig=config.dig,
+        investigate=InvestigateConfig(news_articles=1),
+    )
+    found, _ = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=lambda *a, **k: [
+            gdelt("https://reprint.example/1", "Microsoft outage drags on"),
+            gdelt("https://other.example/1", "Outage enters second day"),
+        ],
+        fetch=lambda *a: "本文",
+    )
+    assert [m.host for m in found] == ["other.example"]
+
+
 def test_search_stops_fetching_after_the_time_budget(conn, config) -> None:
     on, claimed, materials = search_inputs(conn, config, news_fetch_budget_s=10)
     ticks = iter([0, 5, 11, 12])  # 期限の計算・1 本目・2 本目(期限を過ぎた)…

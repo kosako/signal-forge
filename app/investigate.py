@@ -169,6 +169,9 @@ class Material:
     url: str  # 手元の記事は items.canonical_url、検索の報道は GDELT の URL を正規化したもの
     published_at: str | None
     body: str
+    # 手元の記事の原題(items.title)。title は分析の日本語の見出しを先にするので、検索した報道との
+    # 題の重なり(転載)を見るときに両方を使う
+    original_title: str = ""
 
 
 @dataclass(frozen=True)
@@ -365,6 +368,7 @@ def gather_materials(
                 item_id=item_id,
                 kind="post" if host in _POST_HOSTS else "article",
                 title=(row["title_ja"] or row["title"] or "").strip(),
+                original_title=(row["title"] or "").strip(),
                 host=host,
                 url=row["canonical_url"],
                 published_at=row["published_at"],
@@ -432,7 +436,12 @@ def search_news(
     now = now or datetime.now(UTC)
     hosts = {m.host for m in materials}
     # 手元の材料の題も入れる(手元の記事の転載が別の host から来ても、検索の枠を使わない)
-    titles = {key for key in (_title_key(m.title) for m in materials) if key}
+    titles = {
+        key
+        for m in materials
+        for key in (_title_key(m.title), _title_key(m.original_title))
+        if key
+    }
     searched = False  # どれかの検索が(見つからなくても)答えた
     sent: str | None = None
 
