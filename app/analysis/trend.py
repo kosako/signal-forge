@@ -1,12 +1,15 @@
-"""今日の全体トレンドまとめ(GH#75)。
+"""今日の IT ニュース(GH#75 の「今日のトレンド」を GH#413 で出来事の単位にした)。
 
-その日(JST)の非 degraded 分析を topic をヒントに 3〜5 テーマへ束ね、日本語で俯瞰要約する。
-ダイジェスト冒頭(Telegram ヘッダメッセージ + Obsidian markdown)に載せ、
-「全体感を掴む → 個別アイテム → 深掘り」の入口にする。
+その日(JST)の非 degraded 分析を読み、IT 業界の全体にとって大きい出来事を 3〜6 個選んで
+日本語でまとめる。出来事ごとに、報じた記事のリンクを最大 MAX_LINKS 本付ける。ダイジェスト冒頭
+(Telegram ヘッダメッセージ + Obsidian markdown)に載せ、「全体感を掴む → 個別アイテム → 深掘り」の
+入口にする。下の 10 件(関心で選ぶ)とは別に、関心の低い大きいニュースもここで拾う。
 
 - 付加機能: 失敗・対象少数は None を返して節を省く(digest 本体は止めない)
 - 入力の各フィールドは未検証データ。nonce フェンス + sanitize で data として扱う
-- item_ids は幻の id を allowlist で排除(接地確認。接地の無いテーマは捨てる)
+- item_ids は幻の id を allowlist で排除(接地確認。接地の無い出来事は捨てる)
+- リンクの URL は items の正規 URL だけ(LLM の出力の URL は使わない)。どの記事をリンクにするかは
+  コードが決める(X の投稿を後ろにし、同じ host は 1 本)
 """
 
 from __future__ import annotations
@@ -21,18 +24,31 @@ from pydantic import BaseModel, Field
 
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.jst import jst_day_bounds_utc, today_jst
+from app.models import (
+    NEWS_MAX_EVENTS,
+    NEWS_MAX_LINKS,
+    NewsEvent,
+    NewsLink,
+    NewsSection,
+    link_host,
+)
 from app.prompting import fill_template, sanitize
 
-PROMPT_VERSION = "trend-v002"
+PROMPT_VERSION = "trend-v003"
 PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
-MIN_ITEMS = 5  # これ未満は全体トレンドとして意味が出ないので節を省く
-MAX_INPUT_ITEMS = 120  # LLM 入力の上限(コスト・文脈保護。relevance 上位を優先)
-MAX_THEMES = 5
+MIN_ITEMS = 5  # これ未満は全体の出来事として意味が出ないので節を省く
+# LLM 入力の上限(コスト・文脈保護)。1 日の分析の件数(日次上限。既定 150)より大きくして、
+# 関心の低い大きいニュースを relevance の順で削らない(GH#413)
+MAX_INPUT_ITEMS = 200
+MAX_EVENTS = NEWS_MAX_EVENTS
 MAX_LABEL = 40
-# テーマ要約の切り詰め上限。prompt(v002)が 160 字以内を指示するため、遵守時は発動しない
-# 安全網(指示を無視した超過だけ切る)。5 テーマ満載でもヘッダ 1 通は Telegram 4096 字に収まる
-MAX_SUMMARY = 200
+# 出来事の要約の切り詰め上限。prompt(v003)が 120 字以内を指示するため、遵守時は発動しない
+# 安全網(指示を無視した超過だけ切る)。6 件満載でもヘッダ 1 通は Telegram 4096 字に収まる
+MAX_SUMMARY = 160
+MAX_LINKS = NEWS_MAX_LINKS
+# 個人の投稿の host。報道の記事・公式の発表より後ろに回す(リンクの順だけで、外しはしない)
+_SOCIAL_HOSTS = frozenset({"x.com", "twitter.com", "mobile.twitter.com"})
 
 
 class TrendTheme(BaseModel):
@@ -51,11 +67,10 @@ def synthesize_trend(
     logger: logging.Logger,
     *,
     run_id: str | None = None,
-) -> str | None:
-    """当日の分析を俯瞰したトレンドのプレーンテキストを返す。対象少数・失敗時は None。
+) -> NewsSection | None:
+    """当日の分析から今日の IT ニュースの節を作る。対象少数・失敗・接地なしは None。
 
-    戻り値は markup を含まないプレーンテキスト(consumer 側で escape/整形する)。
-    Telegram(parse_mode=HTML)は _header_text で escape_text してから載せる。
+    出来事の文字列は markup を含まない(consumer 側で escape/整形する)。
     """
     rows = _fetch_today_items(conn)
     if len(rows) < MIN_ITEMS:
@@ -65,7 +80,6 @@ def synthesize_trend(
         )
         return None
     rows = rows[:MAX_INPUT_ITEMS]
-    valid_ids = {row["item_id"] for row in rows}
     nonce = secrets.token_hex(4)
     prompt = _build_prompt(rows, nonce)
     try:
@@ -77,7 +91,7 @@ def synthesize_trend(
             extra={"run_id": run_id, "stage": "digest"},
         )
         return None
-    return _render(result, valid_ids) or None
+    return _section(result, {row["item_id"]: row for row in rows})
 
 
 def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -89,9 +103,9 @@ def _fetch_today_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     start, end = jst_day_bounds_utc(today_jst())
     return conn.execute(
         """
-        SELECT items.id AS item_id,
+        SELECT items.id AS item_id, items.canonical_url,
                sources.type || ':' || sources.name AS source_label,
-               a.title_ja, a.topic, a.category
+               a.title_ja, a.topic, a.category, a.relevance_score
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses a ON a.id = (
@@ -121,6 +135,8 @@ def _build_prompt(rows: list[sqlite3.Row], nonce: str) -> str:
                 f"topic: {sanitize(row['topic'], 60, nonce)}",
                 f"category: {sanitize(row['category'], 40, nonce)}",
                 f"source: {sanitize(row['source_label'], 60, nonce)}",
+                # 自前の数値(外部由来でない)。出来事の大きさが同じくらいのときだけ使わせる
+                f"relevance: {round(row['relevance_score'])}",
             ]
         )
         for row in rows
@@ -133,24 +149,46 @@ def _build_prompt(rows: list[sqlite3.Row], nonce: str) -> str:
     return fill_template(template, mapping)
 
 
-def _render(result: TrendSummary, valid_ids: set[int]) -> str:
-    """接地のあるテーマ(実在 id を1つ以上含む)だけをプレーンテキスト節にする。
+def _section(result: TrendSummary, rows_by_id: dict[int, sqlite3.Row]) -> NewsSection | None:
+    """接地のある出来事(一覧にある id を 1 つ以上含む)だけを節にする。
 
-    markup は入れない(consumer 側で escape/整形)。要約は MAX_SUMMARY で切り詰めて
-    ヘッダ 1 通が Telegram 上限を超えないようにする。
+    要約は MAX_SUMMARY で切り詰めて、ヘッダ 1 通が Telegram の上限を超えないようにする。
     """
-    themes: list[str] = []
+    events: list[NewsEvent] = []
     for theme in result.themes:
         label = theme.label.strip()
         summary = theme.summary.strip()
-        grounded = any(i in valid_ids for i in theme.item_ids)  # 幻テーマを排除
-        if not label or not summary or not grounded:
+        links = _pick_links(theme.item_ids, rows_by_id)
+        if not label or not summary or not links:  # 幻の id だけの出来事を排除
             continue
         if len(summary) > MAX_SUMMARY:
             summary = summary[: MAX_SUMMARY - 1].rstrip() + "…"
-        themes.append(f"・{label} — {summary}")
-        if len(themes) >= MAX_THEMES:
+        events.append(NewsEvent(label=label, summary=summary, links=links))
+        if len(events) >= MAX_EVENTS:
             break
-    if not themes:
-        return ""
-    return "\n".join(["今日のトレンド", *themes])
+    return NewsSection(events=tuple(events)) if events else None
+
+
+def _pick_links(item_ids: list[int], rows_by_id: dict[int, sqlite3.Row]) -> tuple[NewsLink, ...]:
+    """出来事のリンクにする記事を、一覧にある id から最大 MAX_LINKS 本選ぶ。
+
+    LLM の並べた順(報道・公式を先に)を保ったまま、X の投稿を後ろに回す。同じ host は 1 本にする
+    (同じサイトの記事を並べても報道元が増えないため)。
+    """
+    rows: list[sqlite3.Row] = []
+    for item_id in dict.fromkeys(item_ids):  # 重複を除き、順を保つ
+        row = rows_by_id.get(item_id)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: link_host(row["canonical_url"]) in _SOCIAL_HOSTS)  # 安定ソート
+    links: list[NewsLink] = []
+    hosts: set[str] = set()
+    for row in rows:
+        host = link_host(row["canonical_url"])
+        if not host or host in hosts:
+            continue
+        hosts.add(host)
+        links.append(NewsLink(item_id=row["item_id"], url=row["canonical_url"]))
+        if len(links) >= MAX_LINKS:
+            break
+    return tuple(links)

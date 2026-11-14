@@ -172,7 +172,7 @@ def digest_stage(
     force: bool = False,
     hold_if_empty: bool = False,
 ) -> int | None:
-    """digest 段: 先に「今日のトレンド」を synthesis(付加機能・失敗は節省略)し digest に渡す。
+    """digest 段: 先に「今日の IT ニュース」を synthesis(付加機能・失敗は節省略)し digest に渡す。
 
     朝バッチと `intel digest` が呼ぶ(GH#206)。作った digest の id を返す(生成済みで skip なら
     None)。primary は主のエンジンの作り方(None = config の `[llm].engine`)。
@@ -196,7 +196,7 @@ def digest_stage(
                 extra={"run_id": run_id, "stage": "digest"},
             )
     return generate_digest(
-        conn, config, logger, run_id=run_id, force=force, trend_markdown=trend,
+        conn, config, logger, run_id=run_id, force=force, news=trend,
         hold_if_empty=hold_if_empty,
     )
 

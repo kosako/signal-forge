@@ -65,6 +65,7 @@ def test_apply_migrations_records_ledger_and_seeds_manual(conn: sqlite3.Connecti
         (31, "031_dig_dismissals.sql"),
         (32, "032_dig_discussions.sql"),
         (33, "033_dig_dismissals_from_backlog.sql"),
+        (34, "034_digests_trend_json.sql"),
     ]
     manual = conn.execute("SELECT type, name, enabled FROM sources").fetchone()
     assert (manual["type"], manual["name"], manual["enabled"]) == ("manual", "manual", 1)
@@ -581,7 +582,7 @@ def test_dig_dismissals_from_backlog_migration_keeps_rows_and_allows_no_card(
     with pytest.raises(sqlite3.IntegrityError):  # 032 まではカードが要る(前提)
         conn.execute("INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (2, NULL)")
 
-    assert apply_migrations(conn, db) == ["033_dig_dismissals_from_backlog.sql"]
+    assert "033_dig_dismissals_from_backlog.sql" in apply_migrations(conn, db)
 
     kept = conn.execute("SELECT item_id, dig_result_id, dismissed_at FROM dig_dismissals")
     assert [tuple(row) for row in kept] == [(1, 7, "2026-11-11T00:00:00Z")]
@@ -605,3 +606,28 @@ def test_dig_dismissals_from_backlog_migration_keeps_rows_and_allows_no_card(
     with pytest.raises(sqlite3.IntegrityError):  # 無いカードは指せない
         conn.execute("INSERT INTO dig_dismissals (item_id, dig_result_id) VALUES (3, 99)")
     conn.close()
+
+
+def test_digests_trend_json_migration_keeps_rows_and_checks_json(tmp_path: Path) -> None:
+    # GH#413(migration 034): 前の digest は trend_json が空(trend_markdown の文で出す)。新しい列は
+    # JSON だけを受け付ける
+    before = tmp_path / "before"
+    before.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:3]) <= 33:
+            (before / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db, before)
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, trend_markdown) "
+        "VALUES ('2026-11-13', '# md', '[]', 0, '今日のトレンド')"
+    )
+
+    assert "034_digests_trend_json.sql" in apply_migrations(conn, db)
+
+    row = conn.execute("SELECT trend_markdown, trend_json FROM digests").fetchone()
+    assert (row["trend_markdown"], row["trend_json"]) == ("今日のトレンド", None)
+    conn.execute("UPDATE digests SET trend_json = '{\"events\": []}'")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE digests SET trend_json = 'not json'")

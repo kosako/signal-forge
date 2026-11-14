@@ -35,7 +35,16 @@ from app.config import Config
 from app.deliver_lock import delivery_lock
 from app.dig import items_with_material
 from app.digest.builder import BOOKMARK_SECTION_MAX
-from app.models import EXTRACTION_FAILED_NOTE
+from app.models import (
+    EXTRACTION_FAILED_NOTE,
+    NEWS_HEADING,
+    NEWS_MAX_EVENTS,
+    NEWS_MAX_LINKS,
+    NewsEvent,
+    NewsLink,
+    link_host,
+    parse_news_json,
+)
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 ENV_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
@@ -55,6 +64,12 @@ TITLE_MAX_CHARS = 300
 # ソース名(sources.name)は運用者が手で入れる値で長さ未検証。タイトルと同じ理由で切る
 # (通常の名前はこの上限に届かない。GH#356)
 SOURCE_NAME_MAX_CHARS = 80
+# 今日の IT ニュース(GH#413)の各欄の上限。escape_and_truncate で UTF-16 の code unit で数えて切る
+# (見出し・要約は LLM の出力、リンクの文字は外部由来の host 名で、どれも長さを検証していない)。
+# 上限いっぱいの出来事 6 件と 🔖 保存節を合わせても、ヘッダ 1 通は 4096 字に収まる
+NEWS_LABEL_MAX_CHARS = 40
+NEWS_SUMMARY_MAX_CHARS = 160
+NEWS_LINK_LABEL_MAX_CHARS = 40
 
 # 🔖 保存節(GH#99)のタイトル上限。ヘッダ 1 通に同梱するため短めに取り、可視テキストを
 # 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
@@ -290,7 +305,10 @@ def _deliver_locked(
     try:
         if not header_sent:
             message_id = api.send_message(
-                chat_id, _header_text(digest, _load_bookmark_rows(conn, digest))
+                chat_id,
+                _header_text(
+                    digest, _load_bookmark_rows(conn, digest), _load_news_events(conn, digest)
+                ),
             )
             _record_message(conn, digest_id, None, message_id, logger, run_id, sleep)
             sent += 1
@@ -350,7 +368,11 @@ def escape_attr(value: str) -> str:
     return escape_text(value).replace('"', "&quot;").replace("'", "&#x27;")
 
 
-def _header_text(digest: sqlite3.Row, bookmark_rows: list[sqlite3.Row] = ()) -> str:
+def _header_text(
+    digest: sqlite3.Row,
+    bookmark_rows: list[sqlite3.Row] = (),
+    news_events: list[NewsEvent] | None = None,
+) -> str:
     date = datetime.strptime(digest["digest_date"], "%Y-%m-%d")
     weekday = _WEEKDAYS_JA[date.weekday()]
     header = (
@@ -359,7 +381,9 @@ def _header_text(digest: sqlite3.Row, bookmark_rows: list[sqlite3.Row] = ()) -> 
     if digest["status"] == "degraded":
         # LLM の全滅によるタイトルのみの配信。本文の抽出の失敗は記事ごとに出す(GH#240)
         header += "\n⚠️ 分析縮退あり(LLM の失敗でタイトルのみ)"
-    if digest["trend_markdown"]:  # 「今日のトレンド」節を冒頭メッセージに同梱(GH#75)
+    if news_events:  # 「今日の IT ニュース」節を冒頭メッセージに同梱(GH#75・GH#413)
+        header += "\n\n" + _news_html(news_events)
+    elif digest["trend_markdown"]:  # trend_json の無い前の digest は、今までどおり文だけで出す
         # trend はプレーンテキスト。HTML(parse_mode=HTML)へ載せる前に必ず escape する
         # (LLM 生成の <>& で配信全体が 400 で落ちるのを防ぐ)
         header += "\n\n" + escape_text(digest["trend_markdown"])
@@ -375,6 +399,60 @@ def _header_text(digest: sqlite3.Row, bookmark_rows: list[sqlite3.Row] = ()) -> 
             lines.append(f"(他 {len(bookmark_rows) - BOOKMARK_SECTION_MAX} 件は Items ノートへ)")
         header += "\n\n" + "\n".join(lines)
     return header
+
+
+def _news_html(events: list[NewsEvent]) -> str:
+    """出来事ごとに見出し(太字)・要約・報道元のリンクを並べる。出来事の間は 1 行あける。
+
+    見出しと要約は LLM の出力なので escape する。リンクの URL は items の正規 URL(http/https を
+    挿入時に保証済み)で、属性として escape する。リンクの文字は host 名。各欄は UTF-16 の単位の
+    上限で切り、出来事とリンクの数も上限で切る(trend_json は自前の値だが、ヘッダ 1 通の上限を
+    中身に頼らない)。
+    """
+    blocks = []
+    for event in events[:NEWS_MAX_EVENTS]:
+        lines = [
+            f"・<b>{escape_and_truncate(event.label, NEWS_LABEL_MAX_CHARS)}</b>",
+            escape_and_truncate(event.summary, NEWS_SUMMARY_MAX_CHARS),
+        ]
+        links = [
+            f'<a href="{escape_attr(link.url)}">'
+            f"{escape_and_truncate(link_host(link.url) or '記事', NEWS_LINK_LABEL_MAX_CHARS)}</a>"
+            for link in event.links[:NEWS_MAX_LINKS]
+        ]
+        if links:
+            lines.append(" / ".join(links))
+        blocks.append("\n".join(lines))
+    return NEWS_HEADING + "\n" + "\n\n".join(blocks)
+
+
+def _load_news_events(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[NewsEvent] | None:
+    """digests.trend_json の出来事に、リンクの記事の正規 URL を items から引いて付ける(GH#413)。
+
+    trend_json が無い・読めない digest は None(呼び出し側は trend_markdown の文に戻す)。記事が
+    消えていて引けない id はリンクを外す(出来事の見出しと要約は残す)。
+    """
+    parsed = parse_news_json(digest["trend_json"])
+    if parsed is None:
+        return None
+    ids = sorted({item_id for _, _, item_ids in parsed for item_id in item_ids})
+    urls: dict[int, str] = {}
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        urls = {
+            row["id"]: row["canonical_url"]
+            for row in conn.execute(
+                f"SELECT id, canonical_url FROM items WHERE id IN ({placeholders})", ids
+            )
+        }
+    return [
+        NewsEvent(
+            label=label,
+            summary=summary,
+            links=tuple(NewsLink(item_id=i, url=urls[i]) for i in item_ids if i in urls),
+        )
+        for label, summary, item_ids in parsed
+    ]
 
 
 def _load_bookmark_rows(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[sqlite3.Row]:
