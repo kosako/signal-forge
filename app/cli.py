@@ -294,6 +294,8 @@ def investigate(
     if outcome == "done":
         typer.echo("この出来事は調査済み(カードは送ってある)")
         return
+    # accepted・requested は作る。running は前の実行が止まったものなら閉じて知らせる。unsent は
+    # 作り直さず、台帳のノートとカードの公開・送信を進める(どれも dig-now の実行が行う)
     try:
         ran = dig_now_stage(conn, config, env, logger, run_id=str(ULID()))
     except DigError as e:  # 作れなかった依頼は知らせ済み

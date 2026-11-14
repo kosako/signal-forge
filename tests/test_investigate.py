@@ -140,6 +140,8 @@ def test_request_once_per_event_and_reports_state(conn) -> None:
     assert claimed is not None and claimed.started_at is not None
     assert request(conn) == "running"
     conn.execute("UPDATE news_investigations SET status = 'done'")
+    assert request(conn) == "unsent"  # 作り終えたが送っていない(作り直さず送る)
+    conn.execute("UPDATE news_investigations SET message_id = 900")
     assert request(conn) == "done"
     assert conn.execute("SELECT count(*) FROM news_investigations").fetchone()[0] == 1
 
@@ -256,8 +258,9 @@ def test_clean_draft_keeps_known_citations_and_post_reactions(conn) -> None:
         coverage="違い[1][1]",
         reactions=[
             InvestigationReaction(stance="記事の論調", summary="記事だけ[1]。", sources=[1, 2]),
-            InvestigationReaction(stance="不満", summary="声[3][8]。", sources=[3, 3, 9]),
+            InvestigationReaction(stance="不満[99]", summary="声[3][8]。", sources=[3, 3, 9]),
             InvestigationReaction(stance=" ", summary="空", sources=[3]),
+            InvestigationReaction(stance="[3]", summary="論調が番号だけ", sources=[3]),
         ],
         unknowns=["a", " ", "b", "c", "d"],
     )

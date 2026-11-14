@@ -123,7 +123,7 @@ class GeneratedInvestigation:
     card_text: str
 
 
-RequestOutcome = Literal["accepted", "requested", "running", "done", "no_sources"]
+RequestOutcome = Literal["accepted", "requested", "running", "unsent", "done", "no_sources"]
 
 
 # --- 依頼の台帳 ---
@@ -150,7 +150,8 @@ def request_investigation(
     """出来事の調査を依頼する。同じ digest の同じ見出しの出来事は 1 回だけ作る。
 
     戻り値は accepted(受け付けた)・requested / running(受け付け済みで、待っている / 作っている)・
-    done(作り終えた)・no_sources(材料の記事が無い)。失敗した依頼は、もう一度押せば受け付け直す。
+    unsent(作り終えたが、公開か送信がまだ)・done(カードを送った)・no_sources(材料の記事が無い)。
+    失敗した依頼は、もう一度押せば受け付け直す。unsent は作り直さず、台帳から公開・送信を進める。
     1 つずつの文で書くので、呼び出し側のトランザクションの中でも外でも使える。
     """
     if not entry.source_ids:
@@ -163,7 +164,8 @@ def request_investigation(
     if inserted:
         return "accepted"
     row = conn.execute(
-        "SELECT id, status FROM news_investigations WHERE digest_id = ? AND label = ?",
+        "SELECT id, status, message_id FROM news_investigations"
+        " WHERE digest_id = ? AND label = ?",
         (digest_id, entry.label),
     ).fetchone()
     if row["status"] == "failed":
@@ -174,6 +176,8 @@ def request_investigation(
             (row["id"],),
         ).rowcount
         return "accepted" if retried else "requested"
+    if row["status"] == "done" and row["message_id"] is None:
+        return "unsent"
     return row["status"]
 
 
@@ -389,8 +393,9 @@ def clean_draft(draft: InvestigationDraft, materials: list[Material]) -> Investi
     reactions = []
     for reaction in draft.reactions:
         sources = [n for n in dict.fromkeys(reaction.sources) if n in posts]
-        stance = _one_line(reaction.stance)
-        # 根拠の番号は sources が正(カードとノートはそこから付ける。要約の中の番号は外して重ねない)
+        # 根拠の番号は sources が正(カードとノートはそこから付ける)。論調と要約の中の番号は外し、
+        # 材料に無い番号を出さず、重ねもしない
+        stance = _CITATION.sub("", _one_line(reaction.stance)).strip()
         summary = _CITATION.sub("", _one_line(reaction.summary)).strip()
         if sources and stance and summary:
             reactions.append(
