@@ -83,7 +83,7 @@ app/
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
   analysis/       # llm.py(LLMEngine 抽象層)、fallback.py(主のエンジンが失敗した呼び出しを予備で
                   #   やり直す。GH#156)、stage1.py(事前選別)、analyzer.py(本分析)、
-                  #   trend.py(今日の全体トレンド)、profile.py(関心プロファイルの読込)— analyses を produce
+                  #   trend.py(今日の IT ニュース)、profile.py(関心プロファイルの読込)— analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
   digest/         # digests(日本語 Markdown)を produce
   delivery/       # telegram.py(Bot API 直叩き・配信)、poller.py(受信デーモン)、

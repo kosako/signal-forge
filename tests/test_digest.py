@@ -571,3 +571,87 @@ def test_bookmark_markdown_link_escapes_structure(conn, tmp_path) -> None:
         "SELECT markdown FROM digests WHERE id = ?", (digest_id,)
     ).fetchone()[0]
     assert "- [題 \\[注記\\] あり](https://b/a_%281%29)" in md
+
+
+def news_section(*events):
+    from app.models import NewsEvent, NewsLink, NewsSection
+
+    return NewsSection(
+        events=tuple(
+            NewsEvent(
+                label=label,
+                summary=summary,
+                links=tuple(NewsLink(item_id=i, url=url) for i, url in links),
+            )
+            for label, summary, links in events
+        )
+    )
+
+
+def test_news_section_stored_with_links_and_rendered_in_markdown(conn, tmp_path) -> None:
+    # GH#413: 冒頭の「今日の IT ニュース」は、出来事と記事の id を trend_json に、リンクの無い文を
+    # trend_markdown に残す。Daily ノートの Markdown にはリンク(host 名。items の正規 URL)を出す
+    add_analyzed(conn, "https://a/1", relevance=90)
+    news = news_section(
+        (
+            "Microsoft 365 で長時間の障害",
+            "メールに影響した。",
+            [(41, "https://www.news.example/m365(1)"), (42, "https://x.com/i/web/status/1")],
+        ),
+        ("NVIDIA の人事", "辞任が報じられた。", [(43, "https://pc.example/n")]),
+    )
+    digest_id = generate_digest(conn, make_config(tmp_path), logger, news=news)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+
+    assert json.loads(row["trend_json"]) == {
+        "events": [
+            {"label": "Microsoft 365 で長時間の障害", "summary": "メールに影響した。",
+             "item_ids": [41, 42]},
+            {"label": "NVIDIA の人事", "summary": "辞任が報じられた。", "item_ids": [43]},
+        ]
+    }
+    assert row["trend_markdown"] == (
+        "📰 今日の IT ニュース\n"
+        "・Microsoft 365 で長時間の障害 — メールに影響した。\n"
+        "・NVIDIA の人事 — 辞任が報じられた。"
+    )
+    assert (
+        "## 📰 今日の IT ニュース\n"
+        "- Microsoft 365 で長時間の障害\n"
+        "  メールに影響した。\n"
+        "  [news.example](https://www.news.example/m365%281%29) / "
+        "[x.com](https://x.com/i/web/status/1)\n"
+        "- NVIDIA の人事\n"
+        "  辞任が報じられた。\n"
+        "  [pc.example](https://pc.example/n)\n"
+    ) in row["markdown"]
+    assert row["markdown"].index("今日の IT ニュース") < row["markdown"].index("## 1. ")
+
+
+def test_news_section_omitted_on_degraded_digest(conn, tmp_path, fixed_today) -> None:
+    item = add_analyzed(conn, "https://a/1", degraded=1)
+    set_analyzed_at(conn, TODAY_AT, item)
+    news = news_section(("出来事", "要約。", [(item, "https://a/1")]))
+    digest_id = generate_digest(conn, make_config(tmp_path), logger, news=news)
+    row = conn.execute("SELECT * FROM digests WHERE id = ?", (digest_id,)).fetchone()
+
+    assert row["status"] == "degraded"
+    assert row["trend_json"] is None and row["trend_markdown"] is None
+    assert "今日の IT ニュース" not in row["markdown"]
+
+
+def test_force_replace_rewrites_news_section(conn, tmp_path) -> None:
+    add_analyzed(conn, "https://a/1", relevance=90)
+    config = make_config(tmp_path)
+    first = news_section(("前の出来事", "前。", [(1, "https://a/1")]))
+    generate_digest(conn, config, logger, news=first)
+
+    generate_digest(conn, config, logger, force=True, news=None)  # 置換で節が無くなった
+    row = conn.execute("SELECT trend_json, trend_markdown, markdown FROM digests").fetchone()
+    assert row["trend_json"] is None and row["trend_markdown"] is None
+    assert "前の出来事" not in row["markdown"]
+
+    second = news_section(("新しい出来事", "新。", [(1, "https://a/1")]))
+    generate_digest(conn, config, logger, force=True, news=second)
+    row = conn.execute("SELECT trend_json FROM digests").fetchone()
+    assert json.loads(row["trend_json"])["events"][0]["label"] == "新しい出来事"

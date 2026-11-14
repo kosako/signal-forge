@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import MISSING, dataclass, fields
 from typing import Self
+from urllib.parse import urlsplit
 
 RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
 
@@ -18,6 +20,105 @@ RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計
 # digest・Telegram・Items ノートの 3 つの段で共通なので共通の層に置く(設計 00 §3)。degraded(LLM の
 # 失敗でタイトルのみ)とは別で、分析がある記事にだけ付ける
 EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで分析)"
+
+# 冒頭の「今日の IT ニュース」節(GH#413)。trend の段が作り、digest 段が digests に残し、Telegram と
+# Daily ノートがリンク付きで出す。3 つの段で共通なので共通の層に置く(設計 00 §3)
+NEWS_HEADING = "📰 今日の IT ニュース"
+
+
+@dataclass(frozen=True)
+class NewsLink:
+    item_id: int
+    url: str  # items.canonical_url(DB の正規 URL。LLM の出力ではない)
+
+
+@dataclass(frozen=True)
+class NewsEvent:
+    label: str
+    summary: str
+    links: tuple[NewsLink, ...]
+
+
+@dataclass(frozen=True)
+class NewsSection:
+    """今日の IT ニュースの節。
+
+    digests の trend_markdown(plain_text)と trend_json(to_json)に残す。
+    """
+
+    events: tuple[NewsEvent, ...]
+
+    def plain_text(self) -> str:
+        """リンクを含まないプレーンテキスト(markup なし)。"""
+        lines = [NEWS_HEADING]
+        lines.extend(f"・{event.label} — {event.summary}" for event in self.events)
+        return "\n".join(lines)
+
+    def to_json(self) -> str:
+        """出来事と、リンクにする記事の id。URL は持たず、配信のときに items から引く。"""
+        return json.dumps(
+            {
+                "events": [
+                    {
+                        "label": event.label,
+                        "summary": event.summary,
+                        "item_ids": [link.item_id for link in event.links],
+                    }
+                    for event in self.events
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
+def parse_news_json(text: str | None) -> list[tuple[str, str, list[int]]] | None:
+    """digests.trend_json を (見出し, 要約, リンクの記事の id) の並びにする。
+
+    空・形が違えば None(呼び出し側は trend_markdown の文に戻す)。
+    """
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    events = data.get("events") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        return None
+    parsed: list[tuple[str, str, list[int]]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        label, summary, item_ids = event.get("label"), event.get("summary"), event.get("item_ids")
+        if not (
+            isinstance(label, str)
+            and isinstance(summary, str)
+            and isinstance(item_ids, list)
+            and all(type(i) is int for i in item_ids)  # bool を id と取り違えない
+        ):
+            return None
+        parsed.append((label, summary, item_ids))
+    return parsed or None
+
+
+NEWS_LINK_LABEL_MAX = 40  # リンクの文字(host 名)の上限。host は外部由来で長さを検証していない
+
+
+def link_label(url: str) -> str:
+    """リンクに出す文字。host 名を NEWS_LINK_LABEL_MAX 字で切る(取れなければ「記事」)。"""
+    host = link_host(url) or "記事"
+    if len(host) > NEWS_LINK_LABEL_MAX:
+        host = host[: NEWS_LINK_LABEL_MAX - 1] + "…"
+    return host
+
+
+def link_host(url: str) -> str:
+    """リンクの文字にする host 名(小文字・先頭の www. を外す)。取れなければ空文字。"""
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:  # 壊れた URL(正規 URL は検証済みだが、表示の段で落とさない)
+        return ""
+    return host.lower().removeprefix("www.")
 
 
 @dataclass(frozen=True)

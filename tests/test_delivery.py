@@ -66,13 +66,13 @@ def add_item(
 
 
 def add_digest(
-    conn, item_ids, *, status="ok", trend_markdown=None, bookmark_item_ids=None
+    conn, item_ids, *, status="ok", trend_markdown=None, bookmark_item_ids=None, trend_json=None
 ) -> int:
     return conn.execute(
         "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status, "
-        "trend_markdown, bookmark_item_ids) VALUES (?, '# md', ?, ?, ?, ?, ?)",
+        "trend_markdown, bookmark_item_ids, trend_json) VALUES (?, '# md', ?, ?, ?, ?, ?, ?)",
         (today_jst(), json.dumps(item_ids), len(item_ids), status, trend_markdown,
-         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None),
+         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None, trend_json),
     ).lastrowid
 
 
@@ -424,8 +424,8 @@ def test_degraded_digest_header_has_warning(conn, tmp_path) -> None:
 
 
 def test_header_includes_trend_summary_html_escaped(conn, tmp_path) -> None:
-    # 「今日のトレンド」節はヘッダ(冒頭)メッセージに同梱され、parse_mode=HTML 用に
-    # escape される(LLM 生成の <>& で配信全体が 400 で落ちないこと。GH#75)
+    # trend_json の無い前の digest は「今日のトレンド」の文をヘッダ(冒頭)メッセージに同梱し、
+    # parse_mode=HTML 用に escape する(LLM 生成の <>& で配信全体が 400 で落ちないこと。GH#75)
     a = add_item(conn, "https://a/1")
     trend = "今日のトレンド\n・A<B>&C — 権限と秘匿が話題。"
     digest_id = add_digest(conn, [a], trend_markdown=trend)
@@ -437,6 +437,65 @@ def test_header_includes_trend_summary_html_escaped(conn, tmp_path) -> None:
     assert "今日のトレンド" in header  # トレンド節が冒頭メッセージに載る
     assert "A&lt;B&gt;&amp;C" in header  # <>& が escape されている
     assert "A<B>&C" not in header  # 生の HTML 特殊文字は残さない
+
+
+def news_json(*events) -> str:
+    return json.dumps(
+        {"events": [{"label": a, "summary": b, "item_ids": ids} for a, b, ids in events]},
+        ensure_ascii=False,
+    )
+
+
+def test_header_news_section_links_reports_by_host(conn, tmp_path) -> None:
+    # GH#413: 今日の IT ニュースは出来事ごとに見出し・要約・報道元のリンク(items の正規 URL、
+    # 文字は host 名)を出す。見出しと要約は escape し、URL は属性として escape する
+    a = add_item(conn, "https://a/1")
+    report = add_item(conn, "https://www.news.example/m365?a=1&b=\"2\"")
+    post = add_item(conn, "https://x.com/i/web/status/1")
+    digest_id = add_digest(
+        conn,
+        [a],
+        trend_markdown="📰 今日の IT ニュース\n・文だけの写し — 使わない。",
+        trend_json=news_json(
+            ("Microsoft 365 で<障害>&", "メールに影響した。", [report, post]),
+            ("NVIDIA の人事", "辞任が報じられた。", [post]),
+        ),
+    )
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert (
+        "📰 今日の IT ニュース\n・<b>Microsoft 365 で&lt;障害&gt;&amp;</b>\nメールに影響した。\n"
+    ) in header
+    assert (
+        '<a href="https://www.news.example/m365?a=1&amp;b=&quot;2&quot;">news.example</a>'
+        ' / <a href="https://x.com/i/web/status/1">x.com</a>'
+    ) in header
+    assert "\n\n・<b>NVIDIA の人事</b>\n辞任が報じられた。\n" in header  # 出来事の間は 1 行あける
+    assert "文だけの写し" not in header  # trend_json があれば文の写しは使わない
+
+
+def test_header_news_drops_links_of_missing_items(conn, tmp_path) -> None:
+    # 記事が消えて引けない id はリンクを外す。出来事の見出しと要約は残す
+    a = add_item(conn, "https://a/1")
+    digest_id = add_digest(conn, [a], trend_json=news_json(("消えた記事", "要約。", [999999])))
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    header = recorder.texts()[0]
+    assert "・<b>消えた記事</b>\n要約。" in header and "<a " not in header
+
+
+def test_header_falls_back_to_trend_text_when_news_json_unreadable(conn, tmp_path) -> None:
+    a = add_item(conn, "https://a/1")
+    digest_id = add_digest(
+        conn, [a], trend_markdown="今日のトレンド\n・文 — 写し。", trend_json='{"events": [1]}'
+    )
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert "今日のトレンド\n・文 — 写し。" in recorder.texts()[0]
 
 
 def test_empty_digest_sends_header_only(conn, tmp_path) -> None:
@@ -822,31 +881,47 @@ def test_recorder_rejects_text_over_telegram_limit() -> None:
 
 
 def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_path) -> None:
-    # GH#343: ヘッダ 1 通に縮退の印・トレンド節・🔖 保存節を同梱する。どれも上限いっぱいでも
-    # 4096 字に収まる(各欄の上限の組み合わせの境界。模型が上限を超える本文を 400 にする)
-    from app.analysis.trend import TrendSummary, TrendTheme, _render
+    # GH#343: ヘッダ 1 通に縮退の印・ニュース節・🔖 保存節を同梱する。どれも上限いっぱいでも
+    # 4096 字に収まる(各欄の上限の組み合わせの境界。模型が上限を超える本文を 400 にする)。
+    # ニュース節のリンクの文字(host 名)は外部由来で長さを検証していない(GH#413)
+    from app.analysis.trend import TrendSummary, TrendTheme, _section
 
-    trend = _render(
+    links = [
+        add_item(conn, f"https://{'h' * 60}.{'d' * 60}.{i}.example/" + "p" * 2000)
+        for i in range(5)
+    ]
+    rows = {
+        row["id"]: {"item_id": row["id"], "canonical_url": row["canonical_url"]}
+        for row in conn.execute("SELECT id, canonical_url FROM items")
+    }
+    news = _section(
         TrendSummary(
             themes=[
-                TrendTheme(label="ラ" * 40, summary="&<要" * 300, item_ids=[1])
+                TrendTheme(label="ラ" * 40, summary="&<要" * 300, item_ids=links)
                 for _ in range(10)
             ]
         ),
-        {1},
+        rows,
     )
+    trend = news.plain_text()
     # 保存節のタイトルはエスケープ後の長さで切るので、エスケープの無い字が可視の字数の最大
     bookmarks = [
         add_item(conn, f"https://b/{i}?q=" + "x" * 2000, title="保" * 500) for i in range(12)
     ]
     digest_id = add_digest(
-        conn, [], status="degraded", trend_markdown=trend, bookmark_item_ids=bookmarks
+        conn,
+        [],
+        status="degraded",
+        trend_markdown=trend,
+        bookmark_item_ids=bookmarks,
+        trend_json=news.to_json(),
     )
     recorder = ApiRecorder()
 
     assert deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger) == 1
     header = recorder.texts()[0]
-    assert "今日のトレンド" in header and "🔖 保存(12件)" in header
+    assert "📰 今日の IT ニュース" in header and "🔖 保存(12件)" in header
+    assert header.count("<a href=") == 6 * 3 + 10  # 出来事 6 × リンク 3 + 保存節 10
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
 
 

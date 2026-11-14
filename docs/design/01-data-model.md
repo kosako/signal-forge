@@ -401,7 +401,8 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 
 - 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。朝バッチで analyze 段か extract 段が失敗し、載せる記事が無い日は行を作らない(障害の空を「該当なし」として確定すると、同じ日の再実行が skip するため。設計 00 §6・GH#191)。
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
-- `trend_markdown`(migration 003。GH#75)= その日の「今日のトレンド」節のプレーンテキスト。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
+- `trend_markdown`(migration 003。GH#75)= その日の冒頭の節(GH#413 から「📰 今日の IT ニュース」)のプレーンテキスト。リンクを含まない。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
+- `trend_json`(migration 034。GH#413)= 冒頭の節の出来事と、リンクにする記事の id。`{"events": [{"label", "summary", "item_ids"}]}`(出来事の大きい順)。URL は持たず、Telegram の配信のときに items の正規 URL を引く。NULL = 構造なし(節なし、またはこの列より前の digest。前の digest の配信は trend_markdown の文で出す)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。
 - `delivery_status` で watchdog(digest 未生成・未送検知)が判定する。`status='degraded'` は LLM 全滅時(当日に分析された候補の最新の分析がすべて degraded。GH#175)のタイトルのみ配信。
 
