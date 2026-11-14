@@ -21,6 +21,7 @@ from app.doctor import (
     has_failure,
     month_cost_summary,
     run_doctor,
+    x_cost_text,
 )
 from app.vault_guard import VaultGuard
 
@@ -1012,6 +1013,38 @@ def test_month_cost_summary_breakdown(config_dir, tmp_path) -> None:
     assert summary["spent_usd"] == 1.5
     assert summary["projected_usd"] >= 1.5
     assert summary["cap_usd"] == 30.0
+
+
+def test_month_cost_summary_includes_investigation_x_reads(config_dir, tmp_path) -> None:
+    # 出来事の調査の X の反応(GH#415 の 3 本目)は X に入れ、内訳を添える。前の月の分は入れない
+    from app.config import load_config
+
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db)
+    digest = conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count) "
+        "VALUES ('2026-11-14', '# md', '[]', 0)"
+    ).lastrowid
+    investigation = conn.execute(
+        "INSERT INTO news_investigations (digest_id, event_index, label, summary, item_ids) "
+        "VALUES (?, 1, 'l', 's', '[1]')",
+        (digest,),
+    ).lastrowid
+    this_month = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for searched_at, cost in ((this_month, 0.08), ("2000-01-15T00:00:00Z", 9.0)):
+        conn.execute(
+            "INSERT INTO investigation_x_reads (investigation_id, searched_at, query, status, "
+            "api_reads, estimated_cost_usd) VALUES (?, ?, 'q', 'ok', 20, ?)",
+            (investigation, searched_at, cost),
+        )
+    config = load_config(config_dir)
+    summary = month_cost_summary(conn, config)
+    conn.close()
+    assert summary["x_usd"] == pytest.approx(0.08)
+    assert summary["investigate_x_usd"] == pytest.approx(0.08)
+    assert x_cost_text(summary, config) == "X $0.08(うち出来事の調査 $0.08 / 上限 $5)"
+    assert x_cost_text({**summary, "investigate_x_usd": 0.0}, config) == "X $0.08"
 
 
 def test_month_cost_summary_includes_review_cost(config_dir, tmp_path) -> None:

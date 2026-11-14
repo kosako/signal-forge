@@ -106,13 +106,16 @@ from app.investigate import FAILED_NOTICE as _INVESTIGATE_FAILED
 from app.investigate import NO_MATERIAL_NOTICE as _INVESTIGATE_NO_MATERIAL
 from app.investigate import (
     NoMaterialError,
+    XRead,
     claim_investigation,
     gather_materials,
     generate_investigation,
     has_unsent_investigations,
     interrupted_investigations,
+    plan_search,
     record_generated,
     search_news,
+    search_x,
 )
 from app.investigate import close_failed as close_investigation_failed
 from app.jst import today_jst
@@ -493,10 +496,14 @@ def run_dig_now(
     review_engine_factory: Callable[[], LLMEngine] | None = None,
     vault: VaultGuard | None = None,
     http: HttpClient | None = None,
+    x_read: XRead | None = None,
 ) -> bool:
     """今すぐの依頼(GH#388。設計 06 §3)を受け付けた順に 1 件ずつ作り、ノートの公開とカードの
     送信まで進める。poller が起動する `intel dig-now` が呼ぶ。依頼を作り切ったら True、別の実行に
     阻まれて依頼を残したら False(poller の見回りが後で起動し直す)。
+
+    http は出来事の調査の報道の検索(None なら作る)、x_read は X の反応の検索(None = X を読まない。
+    合成点が X の設定とキーを見て渡す。GH#415)。
 
     朝の調査段と同じ台帳を使い、作った分は朝の 1 日の上限に数えない(dig_results.on_demand)。
     - 実行どうし: `intel dig-now` は自分のロック(`<DB>.dig-now.lock`)で 1 つにする。調査段の
@@ -521,7 +528,7 @@ def run_dig_now(
             return False
         return _run_dig_now_locked(
             conn, config, engine_factory, api, logger, run_id, review_engine_factory,
-            vault or VaultGuard(), http,
+            vault or VaultGuard(), http, x_read,
         )
 
 
@@ -540,6 +547,7 @@ def _run_dig_now_locked(
     review_engine_factory: Callable[[], LLMEngine] | None,
     vault: VaultGuard,
     http: HttpClient | None = None,
+    x_read: XRead | None = None,
 ) -> bool:
     """run_dig_now の本体(`<DB>.dig-now.lock` の中で呼ぶ)。"""
     failures: list[str] = []
@@ -625,7 +633,9 @@ def _run_dig_now_locked(
 
     # 出来事の調査(GH#415)。生成の間は dig.lock を持たない(朝の選定と関わらない)
     failures.extend(
-        _run_investigations(conn, config, engine_factory, api, logger, run_id, vault, http)
+        _run_investigations(
+            conn, config, engine_factory, api, logger, run_id, vault, http, x_read
+        )
     )
 
     if api is None and (has_unsent_cards(conn) or has_unsent_investigations(conn)):
@@ -647,14 +657,15 @@ def _run_investigations(
     run_id: str | None,
     vault: VaultGuard,
     http: HttpClient | None = None,
+    x_read: XRead | None = None,
 ) -> list[str]:
     """出来事の調査(GH#415。設計 06 §9)の依頼を受け付けた順に作り、1 件ごとに公開と送信まで進める。
 
     `<DB>.dig-now.lock` の中で呼ぶ。作り始めた印の残った依頼は前の実行が途中で止まったもので、
     作り直さずに失敗として閉じて知らせる(LLM を繰り返し呼ばない。押し直せば受け付け直す)。
     本文のある材料が無い依頼は、作らずに閉じて知らせる。作れなかった依頼(LLM の失敗など)も
-    閉じて知らせ、段の失敗にする。ほかの依頼と深掘りは止めない。報道の検索(GDELT)に失敗しても、
-    手元の材料だけで作る(カードとノートにその旨が出る)。
+    閉じて知らせ、段の失敗にする。ほかの依頼と深掘りは止めない。報道の検索(GDELT と予備の Google
+    ニュース)と X の反応の検索に失敗しても、手元の材料だけで作る(カードとノートにその旨が出る)。
     """
     failures: list[str] = []
     for request in interrupted_investigations(conn):
@@ -677,16 +688,20 @@ def _run_investigations(
             materials = gather_materials(conn, request)
             if http is None:
                 http = HttpClient()
-            found, search = search_news(
-                config, engine_factory, http, request, materials, logger=logger
+            plan = plan_search(
+                config, engine_factory, request, materials, x=x_read is not None
             )
+            found, search = search_news(config, http, request, materials, plan, logger=logger)
+            materials = materials + found
+            posts, x = search_x(conn, config, x_read, request, materials, plan, logger=logger)
+            materials = materials + posts
             logger.info(
-                f"出来事の調査の報道の検索: {search.status}(足した報道 {search.found} 件)",
+                f"出来事の調査の検索: 報道 {search.status}(足した報道 {search.found} 件)・"
+                f"X {x.status}(足した投稿 {x.found} 件)",
                 extra=log_extra,
             )
-            materials = materials + found
             generated = generate_investigation(
-                config, engine_factory, request, materials, search=search
+                config, engine_factory, request, materials, search=search, x=x
             )
         except NoMaterialError:
             close_investigation_failed(conn, request.id, "no_material")

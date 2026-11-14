@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from app.analysis.fallback import run_fallback_notice
@@ -39,7 +40,9 @@ from app.purge import purge_expired
 from app.vault_guard import VaultGuard
 
 if TYPE_CHECKING:
+    from app.connectors.x_search import XPostsResult
     from app.deepdive import DigCandidate
+    from app.investigate import XRead
 
 
 class RunFailures(list[str]):
@@ -323,7 +326,28 @@ def dig_now_stage(
         logger,
         run_id=run_id,
         review_engine_factory=review_engine_factory,
+        x_read=_investigation_x_read(config, env),
     )
+
+
+def _investigation_x_read(config: Config, env: dict[str, str]) -> XRead | None:
+    """出来事の調査の X の反応の検索(GH#415 の 3 本目)。X が無効かキーが無ければ None(読まない)。
+
+    session は最初の検索のときに作る(調査の依頼が無い実行では X の client を作らない)。
+    """
+    from app.connectors.x import has_x_credentials
+    from app.connectors.x_search import build_x_session, search_posts
+
+    if not config.x.enabled or not has_x_credentials(env):
+        return None
+    sessions = []
+
+    def read(query: str, *, start: datetime, end: datetime, max_results: int) -> XPostsResult:
+        if not sessions:
+            sessions.append(build_x_session(env))
+        return search_posts(sessions[0], query, start=start, end=end, max_results=max_results)
+
+    return read
 
 
 def _dig_engines(

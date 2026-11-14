@@ -22,6 +22,7 @@ _LLM_ENGINES = ("codex-cli", "claude-cli", "anthropic-api")
 # (コネクタ側に置くと config が httpx 依存を吸ってしまうため、軽い側=ここに置く)
 X_SEARCH_MAX_SLOTS = 3  # 3スロット固定・入れ替え式(ADR 0001。増やさない設計の担保)
 X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
+X_SEARCH_MAX_PAGE = 100  # 同じく上限(出来事の調査の [investigate].x_posts の検査に使う)
 X_SEARCH_QUERY_MAX = 512  # クエリ長上限(Basic tier)
 X_SEARCH_QUERY_SUFFIX = "-is:retweet -is:reply"  # 各スロットに自動付加(設計 02 §2)
 
@@ -157,6 +158,12 @@ class InvestigateConfig:
     news_articles: int = 5
     # 検索した報道の本文を取る時間の上限(秒。超えた後の報道は題だけの材料にする)
     news_fetch_budget_s: int = 90
+    # X の反応として読む投稿の数(GH#415 の 3 本目。1 回の調査で 1 ページ。search/recent の
+    # max_results なので 10〜100)。0 = X を読まない。[x].enabled と X のキーも要る
+    x_posts: int = 20
+    # この機能の X の読み取りの月の上限(UTC の暦月。[x].unit_price_usd の見積もりで数える)。
+    # 1 回分を足すと超えるなら X を読まずに調べる(カードにその旨)。0 = X を読まない
+    x_monthly_cap_usd: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -545,6 +552,15 @@ def _validate(path: Path, config: Config) -> None:
     for section, key, value in positives:
         if value <= 0:
             raise ConfigError(f"{path}: [{section}].{key} は正の整数であること: {value}")
+    x_posts = config.investigate.x_posts
+    if x_posts != 0 and not X_SEARCH_MIN_PAGE <= x_posts <= X_SEARCH_MAX_PAGE:
+        raise ConfigError(
+            f"{path}: [investigate].x_posts は 0 か {X_SEARCH_MIN_PAGE}〜{X_SEARCH_MAX_PAGE}: "
+            f"{x_posts}"
+        )
+    x_cap = config.investigate.x_monthly_cap_usd
+    if not (math.isfinite(x_cap) and x_cap >= 0):
+        raise ConfigError(f"{path}: [investigate].x_monthly_cap_usd は 0 以上の有限値: {x_cap}")
     if config.x.unit_price_usd < 0 or config.budget.monthly_cap_usd <= 0:
         raise ConfigError(f"{path}: 単価・予算上限は正の値であること")
     # includes の物の単価(GH#386)。0 は「数えない」の明示として受ける

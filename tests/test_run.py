@@ -1118,3 +1118,44 @@ def test_overlapping_analyze_waits_and_keeps_daily_limit(tmp_path, caplog) -> No
     finally:
         os.close(fd)
     setup.close()
+
+
+def test_investigation_x_read_needs_x_enabled_and_keys(monkeypatch) -> None:
+    # 出来事の調査の X の反応(GH#415 の 3 本目)。X が無効かキーが無ければ読まない
+    from dataclasses import replace
+
+    from app.config import XConfig
+    from app.connectors import x_search
+    from app.connectors.x import XApiSession, XCredentials
+    from app.run import _investigation_x_read
+
+    keys = {
+        "X_API_KEY": "k", "X_API_SECRET": "s", "X_ACCESS_TOKEN": "t", "X_ACCESS_TOKEN_SECRET": "ts"
+    }
+    off = Config(config_dir=Path("/nonexistent"))
+    on = replace(off, x=XConfig(enabled=True))
+    assert _investigation_x_read(off, keys) is None  # [x].enabled = false
+    assert _investigation_x_read(on, {**keys, "X_ACCESS_TOKEN": ""}) is None
+
+    sent: list[httpx.Request] = []
+    built: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"data": [{"id": "1", "text": "反応"}]})
+
+    def build(env):
+        built.append(env)
+        return XApiSession(
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            credentials=XCredentials("k", "s", "t", "ts"),
+        )
+
+    monkeypatch.setattr(x_search, "build_x_session", build)
+    read = _investigation_x_read(on, keys)
+    assert built == []  # 依頼の無い実行では X の client を作らない
+    start = datetime(2026, 11, 13, tzinfo=UTC)
+    end = datetime(2026, 11, 14, tzinfo=UTC)
+    for _ in range(2):
+        result = read("障害", start=start, end=end, max_results=20)
+    assert result.api_reads == 1 and len(sent) == 2 and len(built) == 1

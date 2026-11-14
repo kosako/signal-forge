@@ -95,25 +95,35 @@ class XApiSession:
         )
         self._sleep = sleep
 
-    def get(self, url: str, params: dict[str, str | int]) -> httpx.Response:
+    def get(
+        self, url: str, params: dict[str, str | int], *, retries: int = MAX_RETRIES
+    ) -> httpx.Response:
+        """retries = 通信の失敗と 5xx の試し直しの回数(0〜MAX_RETRIES)。
+
+        出来事の調査の X の反応(GH#415)は 0 で 1 回だけ送る(試し直しの読み取りを月の上限と台帳の
+        外にしない)。通信の失敗は RetryableError で、元の httpx の例外を __cause__ に持つ。
+        """
+        if not 0 <= retries <= MAX_RETRIES:
+            raise ValueError(f"retries は 0〜{MAX_RETRIES}: {retries}")
         full_url = f"{url}?{urlencode(params)}" if params else url
         last_error: Exception | None = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(retries + 1):
             signed_url, headers, _ = self._oauth.sign(full_url, http_method="GET")
             try:
                 response = self._client.get(signed_url, headers=headers)
             except httpx.HTTPError as e:
                 last_error = RetryableError(f"X 接続失敗: {type(e).__name__}")
-                self._backoff(attempt)
+                last_error.__cause__ = e
+                self._backoff(attempt, retries)
                 continue
-            if response.status_code >= 500 and attempt < MAX_RETRIES:
-                self._backoff(attempt)
+            if response.status_code >= 500 and attempt < retries:
+                self._backoff(attempt, retries)
                 continue
             return response
         raise last_error  # transport error のリトライ尽き(直前 continue で必ず設定済み)
 
-    def _backoff(self, attempt: int) -> None:
-        if attempt < MAX_RETRIES:
+    def _backoff(self, attempt: int, retries: int) -> None:
+        if attempt < retries:
             self._sleep(BACKOFF_S[attempt] + random.random())
 
 
