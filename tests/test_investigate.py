@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1093,18 +1094,16 @@ def test_x_window_is_the_news_window_within_the_last_seven_days() -> None:
 
 
 def test_x_is_skipped_when_the_monthly_cap_would_be_exceeded(conn, config) -> None:
-    from app.investigate import record_x_read
+    from app.investigate import reserve_x_read
 
     on, claimed, materials = search_inputs(conn, config, x_monthly_cap_usd=0.2)
     now = datetime.now(UTC)
     last_month = now.replace(day=1) - timedelta(days=1)
-    record_x_read(  # 先月の分は数えない
-        conn, claimed.id, searched_at=last_month, query="q", status="ok", api_reads=100,
-        unit_price_usd=0.004,
+    reserve_x_read(  # 先月の分は数えない
+        conn, claimed.id, searched_at=last_month, query="q", api_reads=100, unit_price_usd=0.004
     )
-    record_x_read(  # 今月 $0.12。1 回分($0.08)を足すと $0.20 ちょうどで、まだ読める
-        conn, claimed.id, searched_at=now, query="q", status="ok", api_reads=30,
-        unit_price_usd=0.004,
+    reserve_x_read(  # 今月 $0.12。1 回分($0.08)を足すと $0.20 ちょうどで、まだ読める
+        conn, claimed.id, searched_at=now, query="q", api_reads=30, unit_price_usd=0.004
     )
     assert x_month_cost(conn, now) == pytest.approx(0.12)
     found, outcome = search_x(conn, on, x_reader([x_post(7)]), claimed, materials, PLAN)
@@ -1115,6 +1114,23 @@ def test_x_is_skipped_when_the_monthly_cap_would_be_exceeded(conn, config) -> No
     )
     assert (found, outcome) == ([], XOutcome("capped", cap_usd=0.2))
     assert len(x_ledger(conn)) == 3
+
+
+def test_x_read_is_reserved_before_sending_and_kept_when_interrupted(conn, config) -> None:
+    # 送る前に上限の件数で予約の行を書く。送った後に実行が止まっても、上限の件数のまま月の合計に
+    # 数えられる(上限を超えない)
+    on, claimed, materials = search_inputs(conn, config)
+    during: list[list[tuple]] = []
+
+    def read(query, *, start, end, max_results):
+        during.append(x_ledger(conn))
+        raise KeyboardInterrupt  # 応答の前に実行が止まった
+
+    with pytest.raises(KeyboardInterrupt):
+        search_x(conn, on, read, claimed, materials, PLAN)
+    assert during == [[(claimed.id, "Microsoft 365 障害", "pending", 20, 0.08)]]
+    assert x_ledger(conn) == [(claimed.id, "Microsoft 365 障害", "pending", 20, 0.08)]
+    assert x_month_cost(conn, datetime.now(UTC)) == pytest.approx(0.08)
 
 
 def test_x_failures_are_recorded_and_keep_local_materials(conn, config, caplog) -> None:
@@ -1171,6 +1187,34 @@ def test_x_is_not_read_for_an_old_digest(conn, config) -> None:
         gather_materials(conn, claimed), PLAN, now=datetime(2026, 11, 14, tzinfo=UTC),
     )
     assert (found, outcome) == ([], XOutcome("expired"))
+
+
+def test_card_links_every_shown_reaction_number_first(conn, config) -> None:
+    # 本文が引いた投稿より、X の反応に出す番号のリンクを先に取る(Codex 指摘)。反応の根拠は
+    # 出す 5 件で切る
+    on, claimed, materials = search_inputs(conn, config)
+    found, _ = search_x(
+        conn, on, x_reader([x_post(100 + i, f"投稿 {i}") for i in range(20)]), claimed,
+        materials, PLAN,
+    )
+    assert [m.number for m in found] == list(range(4, 24))
+    draft = DRAFT.model_copy(
+        update={
+            "what_happened": "障害が起きた[1][4]。",
+            "reactions": [
+                InvestigationReaction(stance="a", summary="s", sources=list(range(5, 10)) + [20]),
+                InvestigationReaction(stance="b", summary="s", sources=list(range(10, 15))),
+                InvestigationReaction(stance="c", summary="s", sources=list(range(15, 20))),
+            ],
+        }
+    )
+    cleaned = clean_draft(draft, materials + found)
+    assert cleaned.reactions[0].sources == [5, 6, 7, 8, 9]  # 出す 5 件で切る
+    card = render_card(claimed, cleaned, materials + found)
+    line = next(text for text in card.split("\n") if text.startswith("X の投稿 "))
+    linked = [int(n) for n in re.findall(r">\[(\d+)\]</a>", line)]
+    assert linked == list(range(5, 20))  # 反応の 15 件で枠が埋まり、本文の [4] は入らない
+    assert "[20]" not in card
 
 
 def test_card_and_note_show_x_breakdown(conn, config) -> None:

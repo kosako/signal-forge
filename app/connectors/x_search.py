@@ -319,6 +319,10 @@ def search_posts(
     語は呼び出し側が検査済み。演算子はコードが付ける除外句(RT・リプライを除く)だけにする。
     expansions は要求しない(GH#386)。start・end は UTC(search/recent の直近 7 日の中で、end は
     要求の時刻の 10 秒以上前であること)。
+
+    試し直さずに 1 回だけ送る(試し直しの読み取りが、呼び出し側の月の上限の判定と台帳から漏れない
+    ように)。送った後の通信の失敗(応答の受信中の時間切れなど)は、X が処理して課金したかが
+    分からないので、上限の件数を課金されうる数にする。接続できなかった失敗は送っていないので 0。
     """
     params: dict[str, str | int] = {
         "query": x_search_query(query),  # (語) + 除外句(GH#230 と同じ組み方)
@@ -329,9 +333,10 @@ def search_posts(
         "tweet.fields": "created_at,note_tweet",
     }
     try:
-        response = session.get(SEARCH_URL, params)
+        response = session.get(SEARCH_URL, params, retries=0)
     except RetryableError as e:
-        raise XPostsError(type(e).__name__) from e
+        unsent = isinstance(e.__cause__, _UNSENT_ERRORS)
+        raise XPostsError(type(e).__name__, api_reads=0 if unsent else max_results) from e
     if response.status_code != 200:
         raise XPostsError(f"HTTP {response.status_code}")
     try:
@@ -359,6 +364,11 @@ def search_posts(
             )
         )
     return XPostsResult(posts=posts, api_reads=len(data))
+
+
+# 要求が X に届いていない通信の失敗(接続できない・接続の順番待ちの時間切れ)。ほかの失敗は、送った
+# 後かもしれないので課金されうるものとして数える
+_UNSENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 def build_x_session(env: dict[str, str]) -> XApiSession:

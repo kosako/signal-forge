@@ -373,28 +373,46 @@ def x_month_cost(conn: sqlite3.Connection, now: datetime) -> float:
     ).fetchone()[0]
 
 
-def record_x_read(
+def reserve_x_read(
     conn: sqlite3.Connection,
     investigation_id: int,
     *,
     searched_at: datetime,
     query: str,
-    status: Literal["ok", "failed"],
     api_reads: int,
     unit_price_usd: float,
-) -> None:
-    """X の検索を 1 回送ったことを費用の台帳に残す(失敗も。課金されうる読取の数で数える)。"""
-    conn.execute(
+) -> int:
+    """X の検索を送る前に、費用の台帳へ上限の件数で予約の行(pending)を書く。行の id を返す。
+
+    送った後に実行が止まっても、予約の行が上限の件数のまま月の合計に数えられる(上限を超えない)。
+    応答の後に settle_x_read で実際の数に直す。
+    """
+    return conn.execute(
         "INSERT INTO investigation_x_reads (investigation_id, searched_at, query, status, "
-        "api_reads, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?)",
+        "api_reads, estimated_cost_usd) VALUES (?, ?, ?, 'pending', ?, ?)",
         (
             investigation_id,
             searched_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             query,
-            status,
             api_reads,
             round(api_reads * unit_price_usd, 6),
         ),
+    ).lastrowid
+
+
+def settle_x_read(
+    conn: sqlite3.Connection,
+    read_id: int,
+    *,
+    status: Literal["ok", "failed"],
+    api_reads: int,
+    unit_price_usd: float,
+) -> None:
+    """予約の行を、応答の結果と課金されうる読取の数に直す(失敗も行を残す)。"""
+    conn.execute(
+        "UPDATE investigation_x_reads SET status = ?, api_reads = ?, estimated_cost_usd = ? "
+        "WHERE id = ? AND status = 'pending'",
+        (status, api_reads, round(api_reads * unit_price_usd, 6), read_id),
     )
 
 
@@ -641,8 +659,9 @@ def search_x(
 
     read は X の検索(`app.connectors.x_search.search_posts` を session に結び付けたもの。None = X の
     設定かキーが無い)。この機能の月の上限(`[investigate].x_monthly_cap_usd`)は、1 回分を足すと
-    超えるなら読まない。送った検索は失敗も費用の台帳に残す(課金されうる読取の数。分からなければ
-    多めに数える)。手元の材料と同じ投稿は外す。どの失敗でも手元の材料での調査を止めない。
+    超えるなら読まない。送る前に上限の件数で台帳に予約の行を書き、応答の後に課金されうる読取の数に
+    直す(失敗も残す。数が分からなければ上限の件数のまま)。手元の材料と同じ投稿と同じ文の投稿は
+    外す。どの失敗でも手元の材料での調査を止めない。
     """
     log = logger or logging.getLogger(__name__)
     if read is None or not _x_enabled(config):
@@ -662,12 +681,12 @@ def search_x(
     if x_month_cost(conn, now) + posts_max * unit > cap + 1e-9:
         return [], XOutcome("capped", cap_usd=cap)
     start, end = window
+    read_id = reserve_x_read(
+        conn, request.id, searched_at=now, query=query, api_reads=posts_max, unit_price_usd=unit
+    )
 
     def record(status: Literal["ok", "failed"], reads: int) -> None:
-        record_x_read(
-            conn, request.id, searched_at=now, query=query, status=status, api_reads=reads,
-            unit_price_usd=unit,
-        )
+        settle_x_read(conn, read_id, status=status, api_reads=reads, unit_price_usd=unit)
 
     try:
         result = read(query, start=start, end=end, max_results=posts_max)
@@ -907,7 +926,9 @@ def clean_draft(draft: InvestigationDraft, materials: list[Material]) -> Investi
     posts = {m.number for m in materials if m.kind in _POST_KINDS}
     reactions = []
     for reaction in draft.reactions:
-        sources = [n for n in dict.fromkeys(reaction.sources) if n in posts]
+        # カードとノートに出すのは先頭の REACTION_SOURCES_MAX 件だけなので、そこで切る
+        # (カードの材料のリンクを、出さない番号に使わない)
+        sources = [n for n in dict.fromkeys(reaction.sources) if n in posts][:REACTION_SOURCES_MAX]
         # 根拠の番号は sources が正(カードとノートはそこから付ける)。論調と要約の中の番号は外し、
         # 材料に無い番号を出さず、重ねもしない
         stance = _without_citations(reaction.stance)
@@ -974,15 +995,24 @@ def _card_materials(
 ) -> tuple[list[Material], list[Material]]:
     """カードに並べる材料。主張に使った材料だけ(1 つも無ければ記事の材料)、上限まで。
 
-    (行ごとに並べる材料, 番号のリンクを 1 行に並べる検索の投稿)を返す。
+    (行ごとに並べる材料, 番号のリンクを 1 行に並べる検索の投稿)を返す。上限で切るときは、X の反応の
+    番号(カードに必ず出る。3 個 × 5 件 = 投稿の行の上限)を先に取り、残りの枠に本文の番号を入れる。
+    並びは番号の順。
     """
     cited = cited_numbers(draft)
+    reacted = {n for r in draft.reactions[:REACTIONS_MAX] for n in r.sources[:REACTION_SOURCES_MAX]}
     chosen = [m for m in materials if m.number in cited]
-    rows = [m for m in chosen if m.kind != "searched_post"]
-    posts = [m for m in chosen if m.kind == "searched_post"]
     if not chosen:
-        rows = [m for m in materials if m.kind == "article"]
-    return rows[:CARD_MATERIALS_MAX], posts[:CARD_POSTS_MAX]
+        return [m for m in materials if m.kind == "article"][:CARD_MATERIALS_MAX], []
+
+    def pick(group: list[Material], limit: int) -> list[Material]:
+        first = sorted(group, key=lambda m: (m.number not in reacted, m.number))[:limit]
+        return sorted(first, key=lambda m: m.number)
+
+    return (
+        pick([m for m in chosen if m.kind != "searched_post"], CARD_MATERIALS_MAX),
+        pick([m for m in chosen if m.kind == "searched_post"], CARD_POSTS_MAX),
+    )
 
 
 def render_card(

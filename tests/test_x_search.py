@@ -861,12 +861,55 @@ def test_search_posts_failure_raises_with_billable_reads(response, reads) -> Non
     assert len(sent) == 1  # 4xx は試し直さない
 
 
-def test_search_posts_transport_failure_raises() -> None:
+@pytest.mark.parametrize(
+    ("error", "reads"),
+    [
+        (httpx.ConnectError("down"), 0),  # 送っていない
+        (httpx.ConnectTimeout("slow"), 0),
+        # 送った後の失敗は、X が処理して課金したかが分からない = 上限の件数
+        (httpx.ReadTimeout("no response"), 20),
+        (httpx.RemoteProtocolError("closed"), 20),
+    ],
+)
+def test_search_posts_transport_failure_is_sent_once(error, reads) -> None:
+    # 試し直しの読み取りを、調査の月の上限の判定と台帳から漏らさない(Codex 指摘)
+    sent: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("down")
+        sent.append(request)
+        raise error
 
     with pytest.raises(XPostsError) as raised:
         search_posts(
             posts_session(handler), "abc", start=POSTS_START, end=POSTS_END, max_results=20
         )
-    assert raised.value.api_reads == 0
+    assert raised.value.api_reads == reads
+    assert len(sent) == 1
+
+
+def test_search_posts_does_not_retry_on_5xx() -> None:
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(503, json={})
+
+    with pytest.raises(XPostsError) as raised:
+        search_posts(
+            posts_session(handler), "abc", start=POSTS_START, end=POSTS_END, max_results=20
+        )
+    assert raised.value.api_reads == 0 and len(sent) == 1
+
+
+def test_session_retries_are_bounded_and_default_unchanged() -> None:
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(503, json={})
+
+    session = posts_session(handler)
+    assert session.get("https://api.twitter.com/2/x", {}).status_code == 503
+    assert len(sent) == 3  # 既定は今までどおり 2 回まで試し直す
+    with pytest.raises(ValueError, match="retries"):
+        session.get("https://api.twitter.com/2/x", {}, retries=3)
