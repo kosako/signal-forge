@@ -466,13 +466,14 @@ def test_header_news_section_links_reports_by_host(conn, tmp_path) -> None:
 
     header = recorder.texts()[0]
     assert (
-        "📰 今日の IT ニュース\n・<b>Microsoft 365 で&lt;障害&gt;&amp;</b>\nメールに影響した。\n"
+        "📰 今日の IT ニュース\n1. <b>Microsoft 365 で&lt;障害&gt;&amp;</b>\nメールに影響した。\n"
     ) in header
     assert (
         '<a href="https://www.news.example/m365?a=1&amp;b=&quot;2&quot;">news.example</a>'
         ' / <a href="https://x.com/i/web/status/1">x.com</a>'
     ) in header
-    assert "\n\n・<b>NVIDIA の人事</b>\n辞任が報じられた。\n" in header  # 出来事の間は 1 行あける
+    # 出来事の間は 1 行あける。番号はヘッダの「🔎 N」のボタンと同じ(GH#415)
+    assert "\n\n2. <b>NVIDIA の人事</b>\n辞任が報じられた。\n" in header
     assert "文だけの写し" not in header  # trend_json があれば文の写しは使わない
 
 
@@ -484,7 +485,7 @@ def test_header_news_drops_links_of_missing_items(conn, tmp_path) -> None:
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
 
     header = recorder.texts()[0]
-    assert "・<b>消えた記事</b>\n要約。" in header and "<a " not in header
+    assert "1. <b>消えた記事</b>\n要約。" in header and "<a " not in header
 
 
 def test_header_news_bounds_fields_and_counts_in_utf16(conn, tmp_path) -> None:
@@ -504,11 +505,11 @@ def test_header_news_bounds_fields_and_counts_in_utf16(conn, tmp_path) -> None:
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
 
     header = recorder.texts()[0]
-    assert header.count("・<b>") == 6
+    assert [n for n in range(1, 9) if f"\n{n}. <b>" in header] == [1, 2, 3, 4, 5, 6]
     assert header.count("<a href=") == 6 * 3
     label = "😀" * ((NEWS_LABEL_MAX_CHARS - 1) // 2) + "…"
     summary = "😀" * ((NEWS_SUMMARY_MAX_CHARS - 1) // 2) + "…"
-    assert f"・<b>{label}</b>\n{summary}\n" in header
+    assert f"6. <b>{label}</b>\n{summary}\n" in header
     assert f">{'h' * (NEWS_LINK_LABEL_MAX_CHARS - 1)}…</a>" in header
 
 
@@ -1039,3 +1040,90 @@ def test_digest_delivery_disables_link_preview_on_every_message(conn, tmp_path) 
     assert len(recorder.requests) == 3
     for payload in recorder.requests:
         assert json.loads(payload["link_preview_options"]) == {"is_disabled": True}
+
+
+# --- ヘッダの出来事の調査のボタン(GH#415 の 4 本目) ---
+
+
+def header_row(conn, digest_id: int) -> sqlite3.Row:
+    return conn.execute(
+        "SELECT message_id, news_json FROM digest_messages WHERE digest_id = ? AND item_id IS NULL",
+        (digest_id,),
+    ).fetchone()
+
+
+def test_header_has_investigate_buttons_and_keeps_the_news_snapshot(conn, tmp_path) -> None:
+    a = add_item(conn, "https://a/1")
+    report = add_item(conn, "https://news.example/1")
+    trend = json.dumps(
+        {
+            "events": [
+                {"label": f"出来事 {n}", "summary": "s", "item_ids": [report],
+                 "source_ids": [report]}
+                for n in range(1, 6)
+            ]
+            + [{"label": "材料なし", "summary": "s", "item_ids": [], "source_ids": []}]
+        },
+        ensure_ascii=False,
+    )
+    digest_id = add_digest(conn, [a], trend_json=trend)
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    keyboard = json.loads(recorder.requests[0]["reply_markup"])
+    assert keyboard == {
+        "inline_keyboard": [
+            [{"text": f"🔎 {n}", "callback_data": f"e:{digest_id}:{n}"} for n in (1, 2, 3)],
+            [{"text": f"🔎 {n}", "callback_data": f"e:{digest_id}:{n}"} for n in (4, 5)],
+        ]
+    }  # 材料の記事の無い 6 件目には付けない。1 行に 3 つまで
+    assert "\n6. <b>材料なし</b>" in recorder.texts()[0]  # 番号はボタンの N と同じ
+    # 押したときに読む出来事の写し(--force で trend_json が変わっても、押したメッセージの出来事)
+    assert header_row(conn, digest_id)["news_json"] == trend
+    items = conn.execute(
+        "SELECT news_json FROM digest_messages WHERE item_id IS NOT NULL"
+    ).fetchall()
+    assert [row["news_json"] for row in items] == [None]
+
+
+@pytest.mark.parametrize("case", ["dig_off", "no_news", "trend_text_only"])
+def test_header_without_investigate_buttons(conn, tmp_path, case) -> None:
+    from dataclasses import replace
+
+    from app.config import DigConfig
+
+    a = add_item(conn, "https://a/1")
+    config = make_config(tmp_path)
+    trend = news_json(("出来事", "s", [a]))
+    if case == "dig_off":  # 深掘りの段が止まっている(⚡ と同じ)
+        config = replace(config, dig=DigConfig(daily_cap=0))
+        digest_id = add_digest(conn, [a], trend_json=trend)
+    elif case == "no_news":
+        digest_id = add_digest(conn, [a])
+    else:  # trend_json の無い前の digest
+        digest_id = add_digest(conn, [a], trend_markdown="トレンドの文")
+    recorder = ApiRecorder()
+    deliver_digest(conn, config, recorder.api(), digest_id, logger)
+    assert "reply_markup" not in recorder.requests[0]
+    assert header_row(conn, digest_id)["news_json"] is None
+
+
+def test_investigate_keyboard_marks_requested_events() -> None:
+    from app.delivery.telegram import investigate_keyboard
+    from app.models import NewsEntry
+
+    entries = [
+        NewsEntry("A", "s", (1,), (1,)),
+        NewsEntry("B", "s", (2,), (2,)),
+        NewsEntry("C", "s", (), ()),
+    ]
+    keyboard = investigate_keyboard(7, entries, marked={"B", "C"})
+    assert keyboard == {
+        "inline_keyboard": [
+            [
+                {"text": "🔎 1", "callback_data": "e:7:1"},
+                {"text": "🔎 2 ✓", "callback_data": "e:7:2"},
+            ]
+        ]
+    }
+    assert investigate_keyboard(7, [entries[2]]) is None

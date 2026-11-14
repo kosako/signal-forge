@@ -27,6 +27,7 @@ from pathlib import Path
 from app.dig import has_now_requests, has_unsent_cards
 from app.dig_answer import has_pending, has_unsent
 from app.dig_take import has_unrecorded_take
+from app.investigate_ledger import has_investigation_requests, has_unsent_investigations
 
 RETRY_UNSENT_S = 600
 
@@ -122,16 +123,17 @@ class AnswerWorker(_ChildWorker):
 
 
 class DigNowWorker(_ChildWorker):
-    """今すぐの深掘り(GH#388)。作っていない依頼と、送れていないカードを見る。
+    """今すぐの深掘り(GH#388)と出来事の調査(GH#415)。作っていない依頼と、送れていないカードを見る。
 
     送れていないカードは作った経路を問わない(朝の段が今すぐの依頼を引き受けて作った分も、
     朝を待たずに送り直す。dig-now は台帳の未公開・未送信を公開・送信してから依頼を見る)。
+    出来事の調査も dig-now の中で作るので、同じ子が受け持つ。
     """
 
     subcommand = "dig-now"
 
     def _has_pending(self, conn: sqlite3.Connection) -> bool:
-        return has_now_requests(conn)
+        return has_now_requests(conn) or has_investigation_requests(conn)
 
     def _has_unsent(self, conn: sqlite3.Connection) -> bool:
-        return has_unsent_cards(conn)
+        return has_unsent_cards(conn) or has_unsent_investigations(conn)

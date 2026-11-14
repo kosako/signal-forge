@@ -262,7 +262,8 @@ def investigate(
     from app.config import load_config, load_env
     from app.db import apply_migrations, connect
     from app.deepdive import DigError
-    from app.investigate import event_of_digest, request_investigation
+    from app.investigate import event_of_digest
+    from app.investigate_ledger import request_investigation
     from app.jst import today_jst
     from app.logs import DEFAULT_LOG_DIR, setup_logging
     from app.run import dig_now_stage

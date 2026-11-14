@@ -44,6 +44,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   - analyze 段が失敗して載せる記事が無い日は、空のダイジェストを作らず送らない。失敗の知らせにそう出るので、直してから同じ日のうちに再実行すれば届く。
 - **受信デーモン `intel poll`**: Telegram から次のものを受けて DB に記録する。
   - 反応ボタン(👍 価値あり / 🔖 深掘り / ✅ 既知 / 👎 不要)と、本文のある記事の ⚡ 今すぐ深掘り。
+  - ヘッダの「📰 今日の IT ニュース」の出来事の「🔎 N」(出来事の調査)。poller が `intel dig-now` を別プロセスで起動し、報じた記事・検索した報道・X の反応をまとめた調査のカードとノートが数分で届く([設計 06 §9](docs/design/06-deepdive-experience.md))。
   - URL のメッセージ。手動投入として items に入り、翌朝のダイジェストで分析される。
   - ダイジェストの記事・ヘッダへのリプライ(感想)。翌朝の export で Obsidian の Items / Daily ノートに反映する。
   - 夜アンケートの回答と、未消化一覧へのリプライ(深掘りの指定)と、一覧のボタン(⏭️ 外す・⚡ 今すぐ・✅ 読んだ・👎 不要)。
@@ -242,7 +243,7 @@ repo 固有の決まり:
 | `app/digest/` | ダイジェストの生成 |
 | `app/delivery/` | Telegram の配信、受信デーモン、夜アンケートと watchdog と失敗通知、`intel answer`・`intel dig-now` の起動 |
 | `app/export/` | Obsidian への書き出し |
-| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py`・`app/investigate.py` | 深掘りのキュー(夜の入口と今すぐの依頼)、朝の調査段と今すぐの深掘り、カードへの質問への返事、take の記録、今日の IT ニュースの出来事の調査(`intel investigate --event N`) |
+| `app/dig.py`・`app/deepdive.py`・`app/dig_answer.py`・`app/dig_take.py`・`app/investigate.py`・`app/investigate_ledger.py` | 深掘りのキュー(夜の入口と今すぐの依頼)、朝の調査段と今すぐの深掘り、カードへの質問への返事、take の記録、今日の IT ニュースの出来事の調査(ヘッダの「🔎 N」のボタンか `intel investigate --event N`) |
 | `migrations/` | 番号付きの SQL。`app/db.py` が順に当てる |
 | `prompts/` | 版付きのプロンプト(analyze・trend・dig・dig-translate・dig-answer・dig-intent・dig-review・dig-revise)と、深掘りの文章の書き方の手引き(writing-guide-ja。dig-answer と dig が入れる)。使う版は各モジュールの版の定数で決まる(上の「開発」の決まり) |
 | `ops/` | launchd の plist の雛形 2 本と runbook |

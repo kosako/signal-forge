@@ -2316,3 +2316,208 @@ def test_digest_now_board_uses_latest_reaction_by_created_at(conn, tmp_path) -> 
     assert api.edited == [
         (CHAT_ID, 55, reaction_keyboard(item, selected="up", with_now=True, now_marked=True))
     ]
+
+
+# --- ヘッダの出来事の調査のボタン(GH#415 の 4 本目) ---
+
+
+HEADER_MESSAGE_ID = 54
+
+
+def add_header_with_buttons(conn, labels=("障害", "人事", "決算"), *, sources=True) -> int:
+    """今日の digest のヘッダを、調査のボタンと出来事の写しを付けて送ったことにする。"""
+    a = add_item(conn, "https://a/header")
+    trend = json.dumps(
+        {
+            "events": [
+                {"label": label, "summary": f"{label}の要約", "item_ids": [a],
+                 "source_ids": [a] if sources else []}
+                for label in labels
+            ]
+        },
+        ensure_ascii=False,
+    )
+    digest_id = add_digest(conn, [a], trend_json=trend)
+    conn.execute(
+        "INSERT INTO digest_messages (digest_id, item_id, message_id, news_json) "
+        "VALUES (?, NULL, ?, ?)",
+        (digest_id, HEADER_MESSAGE_ID, trend),
+    )
+    return digest_id
+
+
+def investigate_press(
+    digest_id: int, number: int, *, update_id: int = 1, message_id: object = HEADER_MESSAGE_ID,
+    chat_id: object = CHAT_ID, data: str | None = None,
+) -> dict:
+    update = make_callback_update(
+        0, update_id=update_id, data=data or f"e:{digest_id}:{number}"
+    )
+    message = update["callback_query"]["message"]
+    message.update({"message_id": message_id, "chat": {"id": chat_id}})
+    return update
+
+
+def investigations(conn) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT event_index, label, status, request_callback_id FROM news_investigations "
+            "ORDER BY id"
+        )
+    ]
+
+
+def entries_of(conn, digest_id):
+    from app.models import parse_news_json
+
+    row = conn.execute("SELECT trend_json FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    return parse_news_json(row[0])
+
+
+def test_investigate_button_requests_the_event_and_starts_dig_now(conn, tmp_path) -> None:
+    from app.delivery.telegram import investigate_keyboard
+
+    digest_id = add_header_with_buttons(conn)
+    worker = FakeWorker()
+    api = FakeApi([[investigate_press(digest_id, 2)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=worker)
+
+    assert investigations(conn) == [(2, "人事", "requested", "cb1")]
+    assert api.answered == [("cb1", "🔎 2 件目を調べます。数分でカードが届きます")]
+    assert worker.kicks == 1
+    # 押した出来事のボタンに ✓ を付ける
+    assert api.edited == [
+        (CHAT_ID, HEADER_MESSAGE_ID,
+         investigate_keyboard(digest_id, entries_of(conn, digest_id), marked={"人事"}))
+    ]
+    assert api.edited[0][2]["inline_keyboard"][0][1]["text"] == "🔎 2 ✓"
+
+
+def test_investigate_button_pressed_again_is_answered_without_a_second_request(
+    conn, tmp_path
+) -> None:
+    digest_id = add_header_with_buttons(conn)
+    worker = FakeWorker()
+    config = make_config(tmp_path)
+    api = FakeApi([[investigate_press(digest_id, 1, update_id=1)],
+                   [investigate_press(digest_id, 1, update_id=2)]])
+    for _ in range(2):
+        poll_once(conn, config, api, logger, dig_now_worker=worker)
+
+    assert investigations(conn) == [(1, "障害", "requested", "cb2")]
+    assert api.answered[1] == ("cb2", "🔎 1 件目は受け付け済みです。順番に調べます")
+    assert worker.kicks == 1
+
+
+def test_investigate_button_redelivery_does_not_reopen_a_failed_request(conn, tmp_path) -> None:
+    # 答えた後、offset を保存する前に止まって同じ callback が再配達されても、失敗して閉じた依頼を
+    # 受け付け直さない。押し直した callback は受け付け直す
+    digest_id = add_header_with_buttons(conn)
+    worker = FakeWorker()
+    config = make_config(tmp_path)
+    poll_once(conn, config, FakeApi([[investigate_press(digest_id, 1)]]), logger,
+              dig_now_worker=worker)
+    conn.execute("UPDATE news_investigations SET status = 'failed'")
+
+    redelivered = FakeApi([[investigate_press(digest_id, 1, update_id=1)]])
+    poll_once(conn, config, redelivered, logger, dig_now_worker=worker)
+    assert investigations(conn)[0][2] == "failed"
+    assert redelivered.answered == [
+        ("cb1", "⚠️ 1 件目は調べられませんでした。もう一度押してください")
+    ]
+    # 失敗して閉じた出来事のボタンには ✓ を付けない
+    [(_, _, board)] = redelivered.edited
+    assert [b["text"] for b in board["inline_keyboard"][0]] == ["🔎 1", "🔎 2", "🔎 3"]
+
+    again = FakeApi([[investigate_press(digest_id, 1, update_id=2)]])
+    poll_once(conn, config, again, logger, dig_now_worker=worker)
+    assert investigations(conn) == [(1, "障害", "requested", "cb2")]
+    assert worker.kicks == 2
+
+
+def test_investigate_button_reads_the_snapshot_of_the_pressed_header(conn, tmp_path) -> None:
+    # --force の置換で trend_json の出来事が入れ替わっても、押したメッセージに載っていた
+    # 出来事を調べる(置換の前の世代のヘッダも)
+    digest_id = add_header_with_buttons(conn)
+    conn.execute(
+        "UPDATE digests SET trend_json = ? WHERE id = ?",
+        (json.dumps({"events": [{"label": "別の出来事", "summary": "s", "item_ids": [1]}]}),
+         digest_id),
+    )
+    conn.execute("UPDATE digest_messages SET superseded_at = '2026-11-14T00:00:00Z'")
+    api = FakeApi([[investigate_press(digest_id, 3)]])
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+    assert investigations(conn) == [(3, "決算", "requested", "cb1")]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["other_chat", "item_message", "no_snapshot", "other_digest", "zero", "beyond", "no_message"],
+)
+def test_investigate_button_not_tied_to_a_header_is_rejected(conn, tmp_path, case) -> None:
+    digest_id = add_header_with_buttons(conn)
+    press = {
+        "other_chat": lambda: investigate_press(digest_id, 1, chat_id=CHAT_ID + 1),
+        "item_message": lambda: investigate_press(digest_id, 1, message_id=55),
+        "no_snapshot": lambda: investigate_press(digest_id, 1),
+        "other_digest": lambda: investigate_press(digest_id + 1, 1),
+        "zero": lambda: investigate_press(digest_id, 0),
+        "beyond": lambda: investigate_press(digest_id, 4),  # 写しは 3 件
+        "no_message": lambda: investigate_press(digest_id, 1, message_id="54"),
+    }[case]()
+    if case == "item_message":  # 記事の行(写しは無い)
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, 1, 55)",
+            (digest_id,),
+        )
+    if case == "no_snapshot":  # ボタンを付けずに送ったヘッダ(この PR より前の配信など)
+        conn.execute("UPDATE digest_messages SET news_json = NULL")
+    worker = FakeWorker()
+    api = FakeApi([[press]])
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=worker)
+    assert investigations(conn) == []
+    assert api.answered == [("cb1", "⚠️ この出来事には対応できません")]
+    assert (worker.kicks, api.edited) == (0, [])
+
+
+def test_investigate_button_when_dig_is_off(conn, tmp_path) -> None:
+    digest_id = add_header_with_buttons(conn)
+    off = replace(make_config(tmp_path), dig=DigConfig(daily_cap=0))
+    api = FakeApi([[investigate_press(digest_id, 1)]])
+    poll_once(conn, off, api, logger, dig_now_worker=FakeWorker())
+    assert api.answered == [("cb1", "深掘りをしない設定です")] and investigations(conn) == []
+
+
+def test_investigate_button_for_an_event_without_sources(conn, tmp_path) -> None:
+    # 材料の記事の無い出来事にはボタンを付けないが、届いても依頼にしない
+    digest_id = add_header_with_buttons(conn, sources=False)
+    api = FakeApi([[investigate_press(digest_id, 1)]])
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+    assert api.answered == [("cb1", "⚠️ 1 件目には材料の記事がありません")]
+    assert investigations(conn) == [] and api.edited == []
+
+
+def test_investigate_button_resends_a_made_but_unsent_card(conn, tmp_path) -> None:
+    digest_id = add_header_with_buttons(conn)
+    config = make_config(tmp_path)
+    poll_once(conn, config, FakeApi([[investigate_press(digest_id, 1)]]), logger,
+              dig_now_worker=FakeWorker())
+    conn.execute(
+        "UPDATE news_investigations SET status = 'done', note_name = 'n', card_text = 'c'"
+    )
+    worker = FakeWorker()
+    api = FakeApi([[investigate_press(digest_id, 1, update_id=2)]])
+    poll_once(conn, config, api, logger, dig_now_worker=worker)
+    assert api.answered == [("cb2", "🔎 1 件目は調べ終えています。カードを送り直します")]
+    assert worker.kicks == 1  # 送れていないカードを送り直す
+
+
+@pytest.mark.parametrize("data", ["e:1:²", "e:1:12", "e:x:1", "e:1:1:1"])
+def test_malformed_investigate_callback_is_discarded(conn, tmp_path, data) -> None:
+    digest_id = add_header_with_buttons(conn)
+    assert digest_id == 1
+    api = FakeApi([[investigate_press(digest_id, 1, data=data)]])
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+    assert api.answered == [("cb1", None)] and investigations(conn) == []

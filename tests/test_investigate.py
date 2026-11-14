@@ -35,17 +35,16 @@ from app.investigate import (
     event_of_digest,
     gather_materials,
     generate_investigation,
-    has_unsent_investigations,
     plan_search,
     render_card,
     render_note,
-    request_investigation,
     search_news,
     search_window,
     search_x,
     x_month_cost,
     x_window,
 )
+from app.investigate_ledger import has_unsent_investigations, request_investigation
 from app.jst import today_jst
 from app.models import NewsEntry
 from tests.test_deepdive import BODY, FakeApi, add_item, deepdive_dir

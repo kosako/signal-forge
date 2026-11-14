@@ -214,9 +214,6 @@ class GeneratedInvestigation:
     card_text: str
 
 
-RequestOutcome = Literal["accepted", "requested", "running", "unsent", "done", "no_sources"]
-
-
 # --- 依頼の台帳 ---
 
 
@@ -233,63 +230,6 @@ def event_of_digest(
     if not 1 <= event_index <= len(entries):
         return None
     return row["id"], entries[event_index - 1]
-
-
-def request_investigation(
-    conn: sqlite3.Connection, digest_id: int, event_index: int, entry: NewsEntry
-) -> RequestOutcome:
-    """出来事の調査を依頼する。同じ digest の同じ見出しの出来事は 1 回だけ作る。
-
-    戻り値は accepted(受け付けた)・requested / running(受け付け済みで、待っている / 作っている)・
-    unsent(作り終えたが、公開か送信がまだ)・done(カードを送った)・no_sources(材料の記事が無い)。
-    失敗した依頼は、もう一度押せば受け付け直す。unsent は作り直さず、台帳から公開・送信を進める。
-    1 つずつの文で書くので、呼び出し側のトランザクションの中でも外でも使える。
-    """
-    if not entry.source_ids:
-        return "no_sources"
-    inserted = conn.execute(
-        "INSERT INTO news_investigations (digest_id, event_index, label, summary, item_ids) "
-        "VALUES (?, ?, ?, ?, ?) ON CONFLICT (digest_id, label) DO NOTHING",
-        (digest_id, event_index, entry.label, entry.summary, json.dumps(entry.source_ids)),
-    ).rowcount
-    if inserted:
-        return "accepted"
-    row = conn.execute(
-        "SELECT id, status, message_id FROM news_investigations"
-        " WHERE digest_id = ? AND label = ?",
-        (digest_id, entry.label),
-    ).fetchone()
-    if row["status"] == "failed":
-        retried = conn.execute(
-            "UPDATE news_investigations SET status = 'requested', "
-            "requested_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'), started_at = NULL, "
-            "finished_at = NULL, failure = NULL WHERE id = ? AND status = 'failed'",
-            (row["id"],),
-        ).rowcount
-        return "accepted" if retried else "requested"
-    if row["status"] == "done" and row["message_id"] is None:
-        return "unsent"
-    return row["status"]
-
-
-def has_investigation_requests(conn: sqlite3.Connection) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM news_investigations WHERE status = 'requested' LIMIT 1"
-        ).fetchone()
-        is not None
-    )
-
-
-def has_unsent_investigations(conn: sqlite3.Connection) -> bool:
-    """作り終えて、公開か送信がまだの調査があるか(中断した分の再開の合図)。"""
-    return (
-        conn.execute(
-            "SELECT 1 FROM news_investigations WHERE status = 'done' AND message_id IS NULL "
-            "LIMIT 1"
-        ).fetchone()
-        is not None
-    )
 
 
 _REQUEST_SELECT = (
