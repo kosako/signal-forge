@@ -564,6 +564,20 @@ def test_search_adds_distinct_reports_after_local_materials(conn, config) -> Non
     assert outcome == SearchOutcome("ok", '"Microsoft 365" outage', 3, 3, "gdelt")
 
 
+def test_search_skips_reprints_of_local_materials(conn, config) -> None:
+    # 手元の記事の転載(別の host・同じ題)は検索の枠を使わない
+    on, claimed, materials = search_inputs(conn, config, news_articles=1)
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=lambda *a, **k: [
+            gdelt("https://reprint.example/1", "Microsoft 365 の障害"),  # 手元の [1] と同じ題
+            gdelt("https://other.example/1", "別の報道"),
+        ],
+        fetch=lambda *a: "本文",
+    )
+    assert [m.host for m in found] == ["other.example"]
+
+
 def test_search_stops_fetching_after_the_time_budget(conn, config) -> None:
     on, claimed, materials = search_inputs(conn, config, news_fetch_budget_s=10)
     ticks = iter([0, 5, 11, 12])  # 期限の計算・1 本目・2 本目(期限を過ぎた)…
@@ -848,7 +862,7 @@ def test_dig_now_investigation_falls_back_to_google_news(conn, config) -> None:
     assert '[4] <a href="https://news.google.com/rss/articles/CBMiAAA' in card
 
 
-def test_dig_now_investigation_survives_broken_redirect_of_a_report(conn, config) -> None:
+def test_dig_now_investigation_survives_broken_redirect_of_a_report(conn, config, caplog) -> None:
     # 記事が壊れた Location を返しても(urljoin の ValueError)、その記事を題だけにして作る
     from tests.test_extraction import make_http
 
@@ -868,8 +882,12 @@ def test_dig_now_investigation_survives_broken_redirect_of_a_report(conn, config
     )
     engine = DraftEngine()
     api = FakeApi()
-    run_dig_now(conn, on, factory(engine), api, logger, http=make_http(handler))
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        run_dig_now(conn, on, factory(engine), api, logger, http=make_http(handler))
     assert status_of(conn)["status"] == "done"
+    # 想定外の失敗は型だけをログに残す(URL や本文は書かない)
+    assert "出来事の調査の報道の本文の取得で想定外の失敗: ValueError" in caplog.text
+    assert "https://[" not in caplog.text
     [prompt] = engine.prompts
     assert "[4] 種別: 報道(検索) | 媒体: wire.example" in prompt
     assert api.sent[0][1].endswith("材料: 手元 3 件・検索した報道 2 件")

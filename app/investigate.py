@@ -405,7 +405,9 @@ def search_news(
     """
     log = logger or logging.getLogger(__name__)
 
-    def attempt(what: str, call: Callable[[], object], expected: type[Exception]) -> object | None:
+    def attempt(
+        what: str, call: Callable[[], object], expected: tuple[type[Exception], ...]
+    ) -> object | None:
         try:
             return call()
         except expected:
@@ -429,7 +431,8 @@ def search_news(
         return [], SearchOutcome("failed", None, local, 0)
     now = now or datetime.now(UTC)
     hosts = {m.host for m in materials}
-    titles: set[str] = set()
+    # 手元の材料の題も入れる(手元の記事の転載が別の host から来ても、検索の枠を使わない)
+    titles = {key for key in (_title_key(m.title) for m in materials) if key}
     searched = False  # どれかの検索が(見つからなくても)答えた
     sent: str | None = None
 
@@ -446,7 +449,7 @@ def search_news(
         sent = query
         start, end = search_window(request.digest_date, now)
         articles = attempt(
-            "報道の検索", lambda: search(http, query, start=start, end=end), GdeltError
+            "報道の検索", lambda: search(http, query, start=start, end=end), (GdeltError,)
         )
         if articles is not None:
             searched = True
@@ -460,7 +463,9 @@ def search_news(
                     continue
                 body = (
                     attempt(
-                        "報道の本文の取得", lambda url=article.url: fetch(http, url), ValueError
+                        # 取得の想定内の失敗は fetch が None で返す。それ以外(壊れたリダイレクトの
+                        # ValueError など)は型をログに残して題だけの材料にする
+                        "報道の本文の取得", lambda url=article.url: fetch(http, url), ()
                     )
                     if clock() < deadline
                     else None
@@ -491,7 +496,7 @@ def search_news(
             lambda: headlines(
                 http, query_ja, after=day - _NEWS_WINDOW_BEFORE, before=day + _NEWS_WINDOW_BEFORE
             ),
-            GoogleNewsError,
+            (GoogleNewsError,),
         )
         if results is not None:
             searched = True
