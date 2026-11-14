@@ -396,13 +396,14 @@ Telegram 反応(**活用** = 提示済みへの評価)とは出所が違う**探
 - `discussion_wrap`(migration 032)= 1 なら「まとめて」(議論を閉じるまとめ)。まとめは、議論の中に本人の発言があれば `kind = take` にし、返事を送った後に、議論の中の発言(`discussion_wrap = 0` の行の `question`)の原文を古い順に並べて 1 つの take として記録する(記録番号はまとめの行の id)
 - `dig_discussions`(migration 032。GH#407)= 深掘りカードの議論。`dig_result_id`(議論しているカード)・`started_at`(「💬 話す」で開いた時刻)・`closed_at`(「まとめて」を受け付けて閉じた時刻。NULL = 議論中)。1 枚のカードで同時に開く議論は 1 つ(`closed_at IS NULL` の部分 UNIQUE。再配達・二重押しで 2 つ開かない)。まとめを作れなかったら `closed_at` を NULL に戻して開き直す(その間に次の議論を開いていれば戻さない)。1 つの議論で take にするまとめは 1 つだけ(作れなかったまとめのやり直しは、その議論のまとめが作っている・作れた状態なら受けない)
 - 返事の材料のノート本文は vault から読む(dig_results の本文列は公開時に NULL 化されるため)。カードのボタンからの依頼は、元記事の本文を `documents` から読む(保持期限を過ぎていれば原文/対訳ノート)
+- `news_investigations`(migration 035。GH#415)= 出来事の調査(設計 06 §9)の依頼と結果。`digest_id`・`event_index`(依頼したときの出来事の番号)・`label`・`summary`・`item_ids`(材料の記事の id の JSON 配列)は依頼したときの写し(`--force` で trend_json が変わっても、頼んだ出来事のまま)。`UNIQUE (digest_id, label)` で、同じ digest の同じ見出しの出来事は 1 回だけ調べる。`status` は requested → running → done / failed(`failure` に失敗の種類。外部由来の本文は残さない)。失敗した行は、もう一度頼めば requested に戻す。done の行は `note_markdown`(公開したら NULL)・`card_text` を先に記帳し、`published_at`・`message_id`・`sent_at` で公開と送信を進める(深掘りの dig_results と同じ流れ)。深掘りの台帳(dig_queue・dig_results)とは混ぜない(記事 1 本を単位にした規則を、出来事の調査に当てないため)
 
 ## 8. digests
 
 - 1 暦日(JST)1 行、`digest_date` UNIQUE。再生成は同日行を置換(`INSERT OR REPLACE`)ではなく、生成済みなら skip を既定とし `--force` で置換。理由: 朝バッチの多重起動(launchd のまとめ実行)で二重配信しないための冪等キー。朝バッチで analyze 段か extract 段が失敗し、載せる記事が無い日は行を作らない(障害の空を「該当なし」として確定すると、同じ日の再実行が skip するため。設計 00 §6・GH#191)。
 - `item_ids` は配信順の JSON 配列。KPI の分母・ソース別ピボットは `json_each(item_ids)` で items に結合する。
 - `trend_markdown`(migration 003。GH#75)= その日の冒頭の節(GH#413 から「📰 今日の IT ニュース」)のプレーンテキスト。リンクを含まない。NULL = 節なし(対象が少ない・synthesis の失敗・degraded 配信。設計 03 §3.5)。
-- `trend_json`(migration 034。GH#413)= 冒頭の節の出来事と、リンクにする記事の id。`{"events": [{"label", "summary", "item_ids"}]}`(出来事の大きい順)。URL は持たず、Telegram の配信のときに items の正規 URL を引く。NULL = 構造なし(節なし、またはこの列より前の digest。前の digest の配信は trend_markdown の文で出す)。
+- `trend_json`(migration 034。GH#413)= 冒頭の節の出来事と、リンクにする記事の id。`{"events": [{"label", "summary", "item_ids", "source_ids"}]}`(出来事の大きい順)。`source_ids` は出来事を報じた記事の id(リンクにしない分も含めて最大 8 件。出来事の調査の材料。GH#415)で、無い前の digest は `item_ids` を材料とみなす。URL は持たず、Telegram の配信のときに items の正規 URL を引く。NULL = 構造なし(節なし、またはこの列より前の digest。前の digest の配信は trend_markdown の文で出す)。
 - `bookmark_item_ids`(migration 008。GH#99)は「🔖 保存」節に載せたブックマーク item の JSON 配列(保存順)。ランキング外の must-include 別枠で、`item_ids` とは重ならない。KPI の分母(item_count / json_each(item_ids))には含めない。
 - `delivery_status` で watchdog(digest 未生成・未送検知)が判定する。`status='degraded'` は LLM 全滅時(当日に分析された候補の最新の分析がすべて degraded。GH#175)のタイトルのみ配信。
 

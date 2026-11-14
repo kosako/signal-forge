@@ -483,6 +483,86 @@ def test_dig_now_runs_dig_now_stage(tmp_path, monkeypatch, outcome, exit_code, o
     assert (tmp_path / "logs" / "dig-now.log").exists()
 
 
+def _investigate_db(tmp_path):
+    import json
+
+    from app.db import apply_migrations, connect
+    from app.jst import today_jst
+
+    db = tmp_path / "intel.db"
+    conn = connect(db)
+    apply_migrations(conn, db)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('rss', 'feed')")  # id=2
+    item = conn.execute(
+        "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
+        "VALUES (2, 'https://a.example/1', 'https://a.example/1', 't', 'sha256:x')"
+    ).lastrowid
+    trend = {"events": [{"label": "A", "summary": "a。", "item_ids": [item], "source_ids": [item]}]}
+    conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, trend_json) "
+        "VALUES (?, '# md', '[]', 0, ?)",
+        (today_jst(), json.dumps(trend)),
+    )
+    return conn
+
+
+@pytest.mark.parametrize(
+    ("state", "runs", "output"),
+    [
+        (None, 1, "investigate 完了"),  # 新しい依頼を積んで作る
+        ("unsent", 1, "investigate 完了"),  # 作り終えたが送っていない: 作り直さず送りに行く
+        ("sent", 0, "この出来事は調査済み"),  # 送ってある: 何もしない
+    ],
+)
+def test_investigate_requests_and_runs_dig_now(tmp_path, monkeypatch, state, runs, output) -> None:
+    # GH#415: 依頼を台帳に積み、intel dig-now と同じ実行で作る。公開・送信が残っていれば進める
+    from app import logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")  # 本物のログに書かない
+    _answer_config(tmp_path, telegram=True)
+    conn = _investigate_db(tmp_path)
+    if state is not None:
+        conn.execute(
+            "INSERT INTO news_investigations "
+            "(digest_id, event_index, label, summary, item_ids, status, message_id) "
+            "VALUES (1, 1, 'A', 'a。', '[1]', 'done', ?)",
+            (900 if state == "sent" else None,),
+        )
+    calls: list[dict] = []
+
+    def spy(conn, config, env, logger, **kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(run, "dig_now_stage", spy)
+    result = runner.invoke(app, ["investigate", "--event", "1", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == runs and output in result.output
+    if state is None:
+        status = conn.execute("SELECT status FROM news_investigations").fetchone()[0]
+        assert status == "requested"
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--event", "2"], "2 件目の出来事が無い"),
+        (["--event", "1", "--date", "2026-13-01"], "--date が不正"),
+    ],
+)
+def test_investigate_rejects_missing_event_and_bad_date(tmp_path, monkeypatch, args, message):
+    from app import logs, run
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    _investigate_db(tmp_path).close()
+    monkeypatch.setattr(run, "dig_now_stage", lambda *a, **k: pytest.fail("作らない"))
+    result = runner.invoke(app, ["investigate", *args, "--config-dir", str(tmp_path)])
+    assert result.exit_code == 1
+    assert message in result.output
+
+
 def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     # 朝バッチは、段が成功していても予備の利用(GH#156)を知らせる経路を通る
     from app import logs, run
@@ -632,6 +712,7 @@ def test_run_releases_material_request_only_after_failure_notice_is_sent(
 # 既定の DB を読む(GH#338)
 _CONFIG_REQUIRED = [
     ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["dig-now"],
+    ["investigate", "--event", "1"],
     ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"],
     ["doctor", "--purge"], ["doctor", "--cost"],
 ]

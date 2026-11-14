@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import MISSING, dataclass, fields
-from typing import Self
+from typing import NamedTuple, Self
 from urllib.parse import urlsplit
 
 RAW_CONTENT_MAX_CHARS = 50_000  # items.raw_payload の切り詰め上限(設計 01 §6)
@@ -26,6 +26,7 @@ EXTRACTION_FAILED_NOTE = "⚠️ 本文を読めていない(見出しだけで�
 NEWS_HEADING = "📰 今日の IT ニュース"
 NEWS_MAX_EVENTS = 6  # 節に載せる出来事の上限
 NEWS_MAX_LINKS = 3  # 出来事 1 つに付けるリンクの上限
+NEWS_MAX_SOURCES = 8  # 出来事 1 つの材料(報じた記事)として残す id の上限(出来事の調査。GH#415)
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,17 @@ class NewsEvent:
     label: str
     summary: str
     links: tuple[NewsLink, ...]
+    # 出来事を報じた記事の id(リンクにしない分も含む。出来事の調査の材料。GH#415)
+    sources: tuple[int, ...] = ()
+
+
+class NewsEntry(NamedTuple):
+    """digests.trend_json の出来事 1 つ(parse_news_json が返す)。"""
+
+    label: str
+    summary: str
+    item_ids: list[int]  # リンクにする記事
+    source_ids: list[int]  # 出来事を報じた記事(無い前の digest はリンクの記事と同じ)
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,9 @@ class NewsSection:
                         "label": event.label,
                         "summary": event.summary,
                         "item_ids": [link.item_id for link in event.links],
+                        # 材料の記事。無ければリンクの記事を材料とみなす(読む側と同じ規則)
+                        "source_ids": list(event.sources)
+                        or [link.item_id for link in event.links],
                     }
                     for event in self.events
                 ]
@@ -73,10 +88,11 @@ class NewsSection:
         )
 
 
-def parse_news_json(text: str | None) -> list[tuple[str, str, list[int]]] | None:
-    """digests.trend_json を (見出し, 要約, リンクの記事の id) の並びにする。
+def parse_news_json(text: str | None) -> list[NewsEntry] | None:
+    """digests.trend_json を出来事の並びにする。
 
-    空・形が違えば None(呼び出し側は trend_markdown の文に戻す)。
+    空・形が違えば None(呼び出し側は trend_markdown の文に戻す)。source_ids の無い前の
+    digest(GH#415 より前)は、リンクの記事を材料の記事とみなす。
     """
     if not text:
         return None
@@ -87,20 +103,26 @@ def parse_news_json(text: str | None) -> list[tuple[str, str, list[int]]] | None
     events = data.get("events") if isinstance(data, dict) else None
     if not isinstance(events, list):
         return None
-    parsed: list[tuple[str, str, list[int]]] = []
+    parsed: list[NewsEntry] = []
     for event in events:
         if not isinstance(event, dict):
             return None
         label, summary, item_ids = event.get("label"), event.get("summary"), event.get("item_ids")
+        source_ids = event.get("source_ids", item_ids)
         if not (
             isinstance(label, str)
             and isinstance(summary, str)
-            and isinstance(item_ids, list)
-            and all(type(i) is int for i in item_ids)  # bool を id と取り違えない
+            and _is_id_list(item_ids)
+            and _is_id_list(source_ids)
         ):
             return None
-        parsed.append((label, summary, item_ids))
+        parsed.append(NewsEntry(label, summary, item_ids, source_ids))
     return parsed or None
+
+
+def _is_id_list(value: object) -> bool:
+    # bool を id と取り違えない(bool は int の派生)
+    return isinstance(value, list) and all(type(i) is int for i in value)
 
 
 NEWS_LINK_LABEL_MAX = 40  # リンクの文字(host 名)の上限。host は外部由来で長さを検証していない

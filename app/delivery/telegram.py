@@ -435,7 +435,7 @@ def _load_news_events(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[New
     parsed = parse_news_json(digest["trend_json"])
     if parsed is None:
         return None
-    ids = sorted({item_id for _, _, item_ids in parsed for item_id in item_ids})
+    ids = sorted({item_id for entry in parsed for item_id in entry.item_ids})
     urls: dict[int, str] = {}
     if ids:
         placeholders = ",".join("?" * len(ids))
@@ -447,11 +447,11 @@ def _load_news_events(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[New
         }
     return [
         NewsEvent(
-            label=label,
-            summary=summary,
-            links=tuple(NewsLink(item_id=i, url=urls[i]) for i in item_ids if i in urls),
+            label=entry.label,
+            summary=entry.summary,
+            links=tuple(NewsLink(item_id=i, url=urls[i]) for i in entry.item_ids if i in urls),
         )
-        for label, summary, item_ids in parsed
+        for entry in parsed
     ]
 
 

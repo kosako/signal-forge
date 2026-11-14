@@ -145,6 +145,16 @@ class DigConfig:
 
 
 @dataclass(frozen=True)
+class InvestigateConfig:
+    """出来事の調査(GH#415 / 設計 06 §9)。朝のダイジェストの「今日の IT ニュース」の出来事を、
+    報じた記事をまとめて材料にして調べる。生成の effort と時間の上限は [dig] と同じものを使う。
+    """
+
+    # 材料 1 件ごとに LLM に渡す本文の上限(超過は切り詰め注記)。材料は最大 8 件(NEWS_MAX_SOURCES)
+    source_max_chars: int = 6000
+
+
+@dataclass(frozen=True)
 class LLMConfig:
     engine: str = "codex-cli"  # 仮決定(Issue #3)。値は _LLM_ENGINES のいずれか
 
@@ -276,6 +286,7 @@ class Config:
     x_signals: XSignalsConfig = field(default_factory=XSignalsConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     dig: DigConfig = field(default_factory=DigConfig)
+    investigate: InvestigateConfig = field(default_factory=InvestigateConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     anthropic_api: AnthropicApiConfig = field(default_factory=AnthropicApiConfig)
     llm_fallback: LLMFallbackConfig = field(default_factory=LLMFallbackConfig)
@@ -315,6 +326,7 @@ _SECTIONS = {
     "x_signals": XSignalsConfig,
     "digest": DigestConfig,
     "dig": DigConfig,
+    "investigate": InvestigateConfig,
     "llm": LLMConfig,
     "anthropic_api": AnthropicApiConfig,
     "llm_fallback": LLMFallbackConfig,
@@ -490,6 +502,7 @@ def _validate(path: Path, config: Config) -> None:
         ("dig", "translation_max_chars", config.dig.translation_max_chars),
         ("dig", "min_body_chars", config.dig.min_body_chars),
         ("dig", "answer_source_max_chars", config.dig.answer_source_max_chars),
+        ("investigate", "source_max_chars", config.investigate.source_max_chars),
         ("x", "combined_daily_read_cap", config.x.combined_daily_read_cap),
         ("x_search", "daily_read_cap", config.x_search.daily_read_cap),
         ("digest", "max_items", config.digest.max_items),

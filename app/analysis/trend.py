@@ -27,6 +27,7 @@ from app.jst import jst_day_bounds_utc, today_jst
 from app.models import (
     NEWS_MAX_EVENTS,
     NEWS_MAX_LINKS,
+    NEWS_MAX_SOURCES,
     NewsEvent,
     NewsLink,
     NewsSection,
@@ -163,7 +164,13 @@ def _section(result: TrendSummary, rows_by_id: dict[int, sqlite3.Row]) -> NewsSe
             continue
         if len(summary) > MAX_SUMMARY:
             summary = summary[: MAX_SUMMARY - 1].rstrip() + "…"
-        events.append(NewsEvent(label=label, summary=summary, links=links))
+        # 出来事を報じた記事は、リンクにしない分も材料として残す(出来事の調査。GH#415)
+        sources = tuple(i for i in dict.fromkeys(theme.item_ids) if i in rows_by_id)
+        events.append(
+            NewsEvent(
+                label=label, summary=summary, links=links, sources=sources[:NEWS_MAX_SOURCES]
+            )
+        )
         if len(events) >= MAX_EVENTS:
             break
     return NewsSection(events=tuple(events)) if events else None
