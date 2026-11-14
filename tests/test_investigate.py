@@ -600,7 +600,7 @@ def test_google_news_headlines_when_gdelt_fails(conn, config) -> None:
         raise GdeltError("HTTP 429")
 
     def headlines(http, query, *, after, before):
-        sent.append((query, after))
+        sent.append((query, after, before))
         return [
             headline("https://news.google.com/a/A", "手元と同じ媒体", "forest.example"),
             headline("https://news.google.com/a/B", "マイクロソフト障害、復旧", "nikkei.example"),
@@ -613,8 +613,16 @@ def test_google_news_headlines_when_gdelt_fails(conn, config) -> None:
         on, factory(DraftEngine()), object(), claimed, materials,
         search=search, headlines=headlines, fetch=lambda *a: pytest.fail("見出しの本文は取らない"),
     )
+    # Google ニュースの before はその日を含まないので、digest の日の 2 日後まで
+    # (当日の報道を外さない)
     day = date.fromisoformat(today_jst())
-    assert sent == [("Microsoft 365 障害", day.fromordinal(day.toordinal() - 2))]
+    assert sent == [
+        (
+            "Microsoft 365 障害",
+            day.fromordinal(day.toordinal() - 2),
+            day.fromordinal(day.toordinal() + 2),
+        )
+    ]
     assert [(m.number, m.kind, m.host, m.url, m.body) for m in found] == [
         (4, "headline", "nikkei.example", "https://news.google.com/a/B", ""),
         (5, "headline", "bbc.example", "https://news.google.com/a/D", ""),
@@ -673,12 +681,38 @@ def test_search_failures_keep_local_materials_only(
         ("Microsoft 365 障害", "Microsoft 365 障害"),
         ('"マイクロソフト" OR 障害 site:x.com -噂 (復旧)', "マイクロソフト 障害 復旧"),
         ("a 障 365", "365"),  # 2 文字未満の語は捨てる
+        # 記号を外した後も演算子を捨てる
+        ("Microsoft (OR) 障害 [NOT] 「and」", "Microsoft 障害"),
         ("一 二三 四五 六七 八九 十一", "二三 四五 六七 八九"),  # 4 語まで
         ("あ" * 70, ""),  # 1 語で上限を超える
     ],
 )
 def test_ja_query_is_checked_before_sending(raw, cleaned) -> None:
     assert clean_ja_query(raw) == cleaned
+
+
+def test_unexpected_errors_in_search_and_fetch_do_not_stop_investigation(conn, config) -> None:
+    # 外部の応答の壊れ方(壊れたリダイレクトの URL の ValueError など)で調査全体を止めない
+    on, claimed, materials = search_inputs(conn, config)
+
+    def fetch(http, url):
+        raise ValueError("Invalid IPv6 URL")
+
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=lambda *a, **k: [gdelt("https://a.example/1", "A")], fetch=fetch,
+    )
+    assert [(m.host, m.body) for m in found] == [("a.example", "")]  # 題だけの材料で続ける
+    assert outcome.status == "ok"
+
+    def broken(*args, **kwargs):
+        raise ValueError("壊れた応答")
+
+    found, outcome = search_news(
+        on, factory(DraftEngine()), object(), claimed, materials,
+        search=broken, headlines=broken,
+    )
+    assert found == [] and outcome.status == "failed"
 
 
 def test_search_off_does_not_call_llm(conn, config) -> None:
@@ -812,6 +846,33 @@ def test_dig_now_investigation_falls_back_to_google_news(conn, config) -> None:
     [(_, card)] = api.sent
     assert card.endswith("材料: 手元 3 件・検索した報道の見出し 1 件(Google ニュース)")
     assert '[4] <a href="https://news.google.com/rss/articles/CBMiAAA' in card
+
+
+def test_dig_now_investigation_survives_broken_redirect_of_a_report(conn, config) -> None:
+    # 記事が壊れた Location を返しても(urljoin の ValueError)、その記事を題だけにして作る
+    from tests.test_extraction import make_http
+
+    def handler(request):
+        import httpx
+
+        host = request.headers["host"]
+        if host == "api.gdeltproject.org":
+            return httpx.Response(200, text=GDELT_BODY)
+        return httpx.Response(302, headers={"location": "https://["})
+
+    seed_event(conn)
+    request(conn)
+    on = Config(
+        config_dir=config.config_dir, obsidian=config.obsidian, telegram=config.telegram,
+        dig=config.dig, investigate=InvestigateConfig(news_articles=5),
+    )
+    engine = DraftEngine()
+    api = FakeApi()
+    run_dig_now(conn, on, factory(engine), api, logger, http=make_http(handler))
+    assert status_of(conn)["status"] == "done"
+    [prompt] = engine.prompts
+    assert "[4] 種別: 報道(検索) | 媒体: wire.example" in prompt
+    assert api.sent[0][1].endswith("材料: 手元 3 件・検索した報道 2 件")
 
 
 def test_dig_now_investigation_survives_every_search_failure(conn, config) -> None:

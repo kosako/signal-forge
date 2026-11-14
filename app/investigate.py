@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -388,6 +389,7 @@ def search_news(
     search: Callable[..., list[GdeltArticle]] = search_articles,
     headlines: Callable[..., list[NewsHeadline]] = search_headlines,
     fetch: Callable[[HttpClient, str], str | None] = fetch_article_text,
+    logger: logging.Logger | None = None,
 ) -> tuple[list[Material], SearchOutcome]:
     """同じ出来事の報道を探し、手元の材料の後ろに番号を続けて返す。
 
@@ -397,7 +399,21 @@ def search_news(
     配信記事の重なりと、手元の材料・足した報道と同じ host は外し、`[investigate].news_articles`
     本まで足す。GDELT の本文は `[investigate].news_fetch_budget_s` の間だけ取り、取れなかった
     報道は題だけの材料にする。
+
+    検索と本文の取得は付け足しの材料なので、想定外の例外(壊れたリダイレクトの URL など)も、その
+    検索・その記事の失敗として扱い、手元の材料での調査を止めない(例外の型だけをログに残す)。
     """
+    log = logger or logging.getLogger(__name__)
+
+    def attempt(what: str, call: Callable[[], object], expected: type[Exception]) -> object | None:
+        try:
+            return call()
+        except expected:
+            return None
+        except Exception as e:  # 外部の応答の壊れ方は数えきれない。調査は手元の材料で続ける
+            log.warning(f"出来事の調査の{what}で想定外の失敗: {type(e).__name__}")
+            return None
+
     local = len(materials)
     limit = config.investigate.news_articles
     if limit <= 0:
@@ -429,10 +445,9 @@ def search_news(
     if query:
         sent = query
         start, end = search_window(request.digest_date, now)
-        try:
-            articles = search(http, query, start=start, end=end)
-        except GdeltError:
-            articles = None
+        articles = attempt(
+            "報道の検索", lambda: search(http, query, start=start, end=end), GdeltError
+        )
         if articles is not None:
             searched = True
             deadline = clock() + config.investigate.news_fetch_budget_s
@@ -443,7 +458,13 @@ def search_news(
                 host = link_host(article.url)
                 if not fresh(host, article.title):
                     continue
-                body = fetch(http, article.url) if clock() < deadline else None
+                body = (
+                    attempt(
+                        "報道の本文の取得", lambda url=article.url: fetch(http, url), ValueError
+                    )
+                    if clock() < deadline
+                    else None
+                )
                 found.append(
                     Material(
                         number=local + len(found) + 1,
@@ -462,11 +483,16 @@ def search_news(
     query_ja = clean_ja_query(plan.news_query_ja)
     if query_ja:
         sent = query_ja
-        start, end = search_window(request.digest_date, now)
-        try:
-            results = headlines(http, query_ja, after=start.date(), before=end.date())
-        except GoogleNewsError:
-            results = None
+        # Google ニュースの期間は日付だけで、before はその日を含まない。digest の日の前後 2 日にする
+        # (今の時刻に寄せると、当日の報道が外れる。UTC と JST の日付のずれも吸収する)
+        day = datetime.strptime(request.digest_date, "%Y-%m-%d").date()
+        results = attempt(
+            "見出しの検索",
+            lambda: headlines(
+                http, query_ja, after=day - _NEWS_WINDOW_BEFORE, before=day + _NEWS_WINDOW_BEFORE
+            ),
+            GoogleNewsError,
+        )
         if results is not None:
             searched = True
             found = []
@@ -551,10 +577,11 @@ def clean_ja_query(text: str) -> str:
     flat = " ".join(text.replace('"', " ").split())
     query = ""
     for token in flat.split(" ")[: _JA_QUERY_TOKENS_MAX * 2]:
-        if ":" in token or token.startswith("-") or token.upper() in _NEWS_OPERATORS:
+        if ":" in token or token.startswith("-"):
             continue
         word = "".join(ch for ch in token if ch.isalnum() or ch in ".&+・ー")
-        if len(word) < _JA_MIN_WORD:
+        # 記号を外した後の語でも演算子を検査する(`(OR)` が `OR` として残らない)
+        if len(word) < _JA_MIN_WORD or word.upper() in _NEWS_OPERATORS:
             continue
         candidate = f"{query} {word}".strip()
         if len(candidate) > _JA_QUERY_MAX or candidate.count(" ") >= _JA_QUERY_TOKENS_MAX:

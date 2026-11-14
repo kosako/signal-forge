@@ -677,7 +677,9 @@ def _run_investigations(
             materials = gather_materials(conn, request)
             if http is None:
                 http = HttpClient()
-            found, search = search_news(config, engine_factory, http, request, materials)
+            found, search = search_news(
+                config, engine_factory, http, request, materials, logger=logger
+            )
             logger.info(
                 f"出来事の調査の報道の検索: {search.status}(足した報道 {search.found} 件)",
                 extra=log_extra,
