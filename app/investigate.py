@@ -395,21 +395,27 @@ def clean_draft(draft: InvestigationDraft, materials: list[Material]) -> Investi
         sources = [n for n in dict.fromkeys(reaction.sources) if n in posts]
         # 根拠の番号は sources が正(カードとノートはそこから付ける)。論調と要約の中の番号は外し、
         # 材料に無い番号を出さず、重ねもしない
-        stance = _CITATION.sub("", _one_line(reaction.stance)).strip()
-        summary = _CITATION.sub("", _one_line(reaction.summary)).strip()
+        stance = _without_citations(reaction.stance)
+        summary = _without_citations(reaction.summary)
         if sources and stance and summary:
             reactions.append(
                 InvestigationReaction(stance=stance, summary=summary, sources=sources)
             )
     return InvestigationDraft(
-        title_ja=_one_line(draft.title_ja),
+        title_ja=_without_citations(draft.title_ja),
         what_happened=_clean_citations(draft.what_happened, valid),
         background=_clean_citations(draft.background, valid),
         impact=_clean_citations(draft.impact, valid),
         coverage=_clean_citations(draft.coverage, valid),
         reactions=reactions[:REACTIONS_MAX],
-        unknowns=[_one_line(u) for u in draft.unknowns if u.strip()][:UNKNOWNS_MAX],
+        unknowns=[u for u in map(_without_citations, draft.unknowns) if u][:UNKNOWNS_MAX],
     )
+
+
+def _without_citations(text: str) -> str:
+    """番号を求めていない欄(題・論調・要約・まだ分からないこと)。1 行にし、LLM が書いた番号を外す
+    (材料に無い番号を出さない。X の反応の番号は sources から付ける)。"""
+    return _CITATION.sub("", _one_line(text)).strip()
 
 
 def _one_line(text: str) -> str:

@@ -251,7 +251,7 @@ def test_clean_draft_keeps_known_citations_and_post_reactions(conn) -> None:
     request(conn)
     materials = gather_materials(conn, claim_investigation(conn))
     draft = InvestigationDraft(
-        title_ja="題\n2 行目",
+        title_ja="題\n2 行目[1]",
         what_happened="起きた[1, 9]。続き[2、3]。",
         background="原因[7]。",
         impact="影響[2]",
@@ -262,7 +262,7 @@ def test_clean_draft_keeps_known_citations_and_post_reactions(conn) -> None:
             InvestigationReaction(stance=" ", summary="空", sources=[3]),
             InvestigationReaction(stance="[3]", summary="論調が番号だけ", sources=[3]),
         ],
-        unknowns=["a", " ", "b", "c", "d"],
+        unknowns=["a[99]", " ", "[2]", "b", "c[1]", "d"],
     )
     cleaned = clean_draft(draft, materials)
     assert cleaned.title_ja == "題 2 行目"
