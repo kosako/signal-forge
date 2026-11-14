@@ -4,7 +4,8 @@
 - timeout: connect 10s / read 30s。加えて get 1 回の全体(名前解決・接続・受信・リダイレクト・
   リトライ・待機を含む)に期限 60s を付ける(GH#203)
 - リトライ: 2回・指数バックオフ(1s→4s)+ jitter。429 は Retry-After 尊重(30s まで。より長い
-  待ちを求められたら待たずに失敗)。恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)
+  待ちを求められたら待たずに失敗)。恒久 4xx はリトライしない(ステータスの業務分類は呼び出し側)。
+  試し直しを断る先(GDELT。GH#415)は get(retries=0) で 1 回だけ送る
 - 本文はストリーミングで受け、受信量(展開前)か展開後が 10 MiB を超えたら読むのをやめて失敗に
   する。展開は少しずつ行い、上限の検査の前に巨大に展開しない(GH#203)。短縮 URL の展開は
   転送を各ホップのヘッダで判定し、本文は読まない(GH#328)
@@ -200,15 +201,25 @@ class HttpClient:
             headers={"User-Agent": USER_AGENT, "Accept-Encoding": _ACCEPT_ENCODING},
         )
 
-    def get(self, url: str, *, headers: dict[str, str] | None = None) -> FetchedResponse:
+    def get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        retries: int = MAX_RETRIES,
+    ) -> FetchedResponse:
         """リトライ+リダイレクト追跡付き GET。
 
         2xx/3xx 以外もレスポンスとして返す(304 は正常系、4xx の業務分類は呼び出し側。
         リトライ対象は transport エラー・DNS 解決失敗・5xx・429 のみ)。
         本文の上限(ResponseTooLargeError)と全体の期限(FetchDeadlineError)の超過は
-        リトライせずに送出する(GH#203)。
+        リトライせずに送出する(GH#203)。retries はリトライの回数(0〜MAX_RETRIES。既定は最大)。
+        短い間隔の試し直しを断る先(GDELT は 429 の後の試し直しも数えて止める。GH#415)は 0 にする。
+        0 なら 1 回だけ送り、transport エラー・429・5xx は待たずに RetryableError で送出する。
         """
-        return self._fetch(url, headers, read_body=True)
+        if not 0 <= retries <= MAX_RETRIES:
+            raise ValueError(f"retries は 0〜{MAX_RETRIES}: {retries}")
+        return self._fetch(url, headers, read_body=True, retries=retries)
 
     def resolve_short_url(self, url: str) -> str:
         """既知短縮 URL の最終 URL 解決(u1 手順1 の resolver。設計 01 §4)。
@@ -220,26 +231,31 @@ class HttpClient:
         return self._fetch(url, None, read_body=False).final_url
 
     def _fetch(
-        self, url: str, headers: dict[str, str] | None, *, read_body: bool
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        *,
+        read_body: bool,
+        retries: int = MAX_RETRIES,
     ) -> FetchedResponse:
         """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。"""
         deadline = self._clock() + FETCH_DEADLINE_S
         last_error: Exception | None = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(retries + 1):
             try:
                 fetched = self._follow_redirects(url, headers, deadline, read_body=read_body)
             except (httpx.TransportError, httpx.TimeoutException, DnsResolutionError) as e:
                 # スリープ復帰直後などの一時的な名前解決の失敗も、transport エラーと
                 # 同じ回数・バックオフで再試行する(GH#188)
                 last_error = e
-                self._backoff(attempt, url, deadline, last_error)
+                self._backoff(attempt, retries, url, deadline, last_error)
                 continue
             status = fetched.response.status_code
             if status == 429:
                 last_error = RetryableError(f"HTTP 429: {url}")
                 # Retry-After 優先(追加バックオフは重ねない)。最終試行後は待たない
                 retry_after = fetched.response.headers.get("retry-after")
-                if attempt < MAX_RETRIES:
+                if attempt < retries:
                     if retry_after is not None and retry_after.isdigit():
                         if int(retry_after) > MAX_RETRY_AFTER_S:
                             # 求められた間隔より早く試し直しても断られるだけなので、待たずに
@@ -250,19 +266,21 @@ class HttpClient:
                             )
                         self._wait(int(retry_after), url, deadline, last_error)
                     else:
-                        self._backoff(attempt, url, deadline, last_error)
+                        self._backoff(attempt, retries, url, deadline, last_error)
                 continue
             if 500 <= status <= 599:
                 last_error = RetryableError(f"HTTP {status}: {url}")
-                self._backoff(attempt, url, deadline, last_error)
+                self._backoff(attempt, retries, url, deadline, last_error)
                 continue
             return fetched
         raise RetryableError(
-            f"リトライ上限({MAX_RETRIES}回)到達: {url}{_failure_detail(last_error)}"
+            f"リトライ上限({retries}回)到達: {url}{_failure_detail(last_error)}"
         ) from last_error
 
-    def _backoff(self, attempt: int, url: str, deadline: float, last_error: Exception) -> None:
-        if attempt < MAX_RETRIES:
+    def _backoff(
+        self, attempt: int, retries: int, url: str, deadline: float, last_error: Exception
+    ) -> None:
+        if attempt < retries:
             self._wait(BACKOFF_S[attempt] + random.random(), url, deadline, last_error)
 
     def _wait(self, seconds: float, url: str, deadline: float, last_error: Exception) -> None:
