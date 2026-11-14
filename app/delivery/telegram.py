@@ -25,7 +25,7 @@ import random
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -40,6 +40,7 @@ from app.models import (
     NEWS_HEADING,
     NEWS_MAX_EVENTS,
     NEWS_MAX_LINKS,
+    NewsEntry,
     NewsEvent,
     NewsLink,
     link_host,
@@ -94,6 +95,10 @@ _REACTION_BUTTONS = (
 )
 # digest の記事の今すぐのボタン(GH#388。callback_data `g:{item_id}:n` の正本は設計 04 §3)
 _DIG_NOW_LABEL = "⚡ 今すぐ深掘り"
+# ヘッダの出来事の調査のボタン(GH#415 の 4 本目。callback_data `e:{digest_id}:{N}` の正本は設計
+# 04 §3)。N はヘッダの今日の IT ニュースの番号。1 行に 3 つまで並べる
+INVESTIGATE_LABEL = "🔎 {n}"
+_INVESTIGATE_PER_ROW = 3
 
 
 class DeliveryError(Exception):
@@ -304,13 +309,23 @@ def _deliver_locked(
     sent = 0
     try:
         if not header_sent:
+            news_events = _load_news_events(conn, digest)
+            # 出来事の調査のボタン(GH#415)は、深掘りの段が動いていて、材料の記事のある出来事にだけ
+            # 付ける。付けたときは、押したときに読む出来事の写しを台帳の行に残す
+            keyboard = (
+                investigate_keyboard(digest_id, parse_news_json(digest["trend_json"]) or [])
+                if news_events and config.dig.daily_cap > 0
+                else None
+            )
             message_id = api.send_message(
                 chat_id,
-                _header_text(
-                    digest, _load_bookmark_rows(conn, digest), _load_news_events(conn, digest)
-                ),
+                _header_text(digest, _load_bookmark_rows(conn, digest), news_events),
+                reply_markup=keyboard,
             )
-            _record_message(conn, digest_id, None, message_id, logger, run_id, sleep)
+            _record_message(
+                conn, digest_id, None, message_id, logger, run_id, sleep,
+                news_json=digest["trend_json"] if keyboard else None,
+            )
             sent += 1
         for position, row in enumerate(items, start=1):
             if row["item_id"] in sent_item_ids:
@@ -402,7 +417,9 @@ def _header_text(
 
 
 def _news_html(events: list[NewsEvent]) -> str:
-    """出来事ごとに見出し(太字)・要約・報道元のリンクを並べる。出来事の間は 1 行あける。
+    """出来事ごとに番号と見出し(太字)・要約・報道元のリンクを並べる。出来事の間は 1 行あける。
+
+    番号はヘッダの「🔎 N」のボタン(GH#415)の N と同じ。
 
     見出しと要約は LLM の出力なので escape する。リンクの URL は items の正規 URL(http/https を
     挿入時に保証済み)で、属性として escape する。リンクの文字は host 名。各欄は UTF-16 の単位の
@@ -410,9 +427,9 @@ def _news_html(events: list[NewsEvent]) -> str:
     中身に頼らない)。
     """
     blocks = []
-    for event in events[:NEWS_MAX_EVENTS]:
+    for number, event in enumerate(events[:NEWS_MAX_EVENTS], start=1):
         lines = [
-            f"・<b>{escape_and_truncate(event.label, NEWS_LABEL_MAX_CHARS)}</b>",
+            f"{number}. <b>{escape_and_truncate(event.label, NEWS_LABEL_MAX_CHARS)}</b>",
             escape_and_truncate(event.summary, NEWS_SUMMARY_MAX_CHARS),
         ]
         links = [
@@ -424,6 +441,30 @@ def _news_html(events: list[NewsEvent]) -> str:
             lines.append(" / ".join(links))
         blocks.append("\n".join(lines))
     return NEWS_HEADING + "\n" + "\n\n".join(blocks)
+
+
+def investigate_keyboard(
+    digest_id: int, entries: list[NewsEntry], *, marked: Collection[str] = ()
+) -> dict | None:
+    """ヘッダの「🔎 N」のボタン(GH#415 の 4 本目)。材料の記事のある出来事にだけ付ける。
+
+    marked(調査を受け付けた・作った出来事の見出し)のボタンには ✓ を付ける。付けるボタンが無ければ
+    None。N はヘッダの番号(_news_html)と同じで、ヘッダに出す件数(NEWS_MAX_EVENTS)まで。
+    """
+    buttons = [
+        {
+            "text": INVESTIGATE_LABEL.format(n=number) + (" ✓" if entry.label in marked else ""),
+            "callback_data": f"e:{digest_id}:{number}",
+        }
+        for number, entry in enumerate(entries[:NEWS_MAX_EVENTS], start=1)
+        if entry.source_ids
+    ]
+    if not buttons:
+        return None
+    rows = [
+        buttons[i : i + _INVESTIGATE_PER_ROW] for i in range(0, len(buttons), _INVESTIGATE_PER_ROW)
+    ]
+    return {"inline_keyboard": rows}
 
 
 def _load_news_events(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[NewsEvent] | None:
@@ -745,7 +786,10 @@ def _record_message(
     logger: logging.Logger,
     run_id: str | None,
     sleep: Callable[[float], None],
+    *,
+    news_json: str | None = None,
 ) -> None:
+    """news_json は、出来事の調査のボタンを付けたヘッダの今日の IT ニュースの写し(GH#415)。"""
     # 接続は autocommit(app/db.py)。1通ごとに即確定し、途中クラッシュでも
     # 台帳と送信実績がずれない。
     # 送信は済んでいるので、記帳に失敗しても送り直さず記帳だけをやり直す(GH#225。ディスクの
@@ -757,8 +801,9 @@ def _record_message(
             sleep(BACKOFF_S[attempt - 1])
         try:
             conn.execute(
-                "INSERT INTO digest_messages (digest_id, item_id, message_id) VALUES (?, ?, ?)",
-                (digest_id, item_id, message_id),
+                "INSERT INTO digest_messages (digest_id, item_id, message_id, news_json) "
+                "VALUES (?, ?, ?, ?)",
+                (digest_id, item_id, message_id, news_json),
             )
             return
         except sqlite3.OperationalError as e:  # ディスク満杯・I/O エラーなど。やり直す

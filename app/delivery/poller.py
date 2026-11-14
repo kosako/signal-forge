@@ -55,6 +55,7 @@ from app.delivery.telegram import (
     TelegramApi,
     dig_card_keyboard,
     escape_and_truncate,
+    investigate_keyboard,
     pack_lines,
     reaction_keyboard,
 )
@@ -86,7 +87,9 @@ from app.dig_take import (
     read_items,
 )
 from app.export.obsidian import note_projection_date
+from app.investigate_ledger import RequestOutcome, investigated_labels, request_investigation
 from app.jst import JST
+from app.models import NEWS_MAX_EVENTS, parse_news_json
 from app.normalize import (
     content_hash,
     is_dedup_eligible,
@@ -444,6 +447,13 @@ def _handle_callback(
         if prefix == "g" and arg.isdigit() and code == "n":
             _record_digest_now(
                 conn, config, api, callback, callback_id, int(arg), logger, now_fn(),
+                dig_now_worker,
+            )
+            return
+        # ASCII の数字だけ(isdigit は int にできない数字の文字も通す)。N はヘッダの件数まで
+        if prefix == "e" and re.fullmatch(r"[0-9]{1,9}", arg) and re.fullmatch(r"[0-9]", code):
+            _record_investigation(
+                conn, config, api, callback, callback_id, int(arg), int(code), logger,
                 dig_now_worker,
             )
             return
@@ -1331,6 +1341,91 @@ def _record_digest_now(
             ),
             logger,
         )
+
+
+# 出来事の調査のボタンの答え(GH#415 の 4 本目)。固定の文言と番号だけ(外部由来の見出しを入れない)
+_INVESTIGATE_ANSWERS: dict[RequestOutcome, str] = {
+    "accepted": "🔎 {n} 件目を調べます。数分でカードが届きます",
+    "requested": "🔎 {n} 件目は受け付け済みです。順番に調べます",
+    "running": "🔎 {n} 件目はいま調べています",
+    "unsent": "🔎 {n} 件目は調べ終えています。カードを送り直します",
+    "done": "🔎 {n} 件目は調べ終えています(カードを送りました)",
+    "no_sources": "⚠️ {n} 件目には材料の記事がありません",
+    "failed": "⚠️ {n} 件目は調べられませんでした。もう一度押してください",
+}
+_INVESTIGATE_KICK = frozenset({"accepted", "unsent"})  # dig-now を起動する答え
+
+
+def _record_investigation(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    digest_id: int,
+    number: int,
+    logger: logging.Logger,
+    dig_now_worker: DigNowWorker | None,
+) -> None:
+    """ヘッダの「🔎 N」(GH#415 の 4 本目。設計 06 §9)。出来事の調査の依頼を台帳に積む。
+
+    押されたメッセージが、その digest のヘッダとしてボタンを付けて送ったメッセージ(digest_messages。
+    置換の前の世代も含む)で owner の chat にあることを確かめ、そのメッセージを送ったときの写し
+    (news_json)の N 件目を調べる(callback_data だけを信じない。--force で trend_json が変わっても、
+    押したメッセージに載っていた出来事を調べる)。状態の確認と反映は 1 つのトランザクションで行い、
+    受け付けたとき(と、作り終えて送れていないとき)だけ `intel dig-now` を起動する。同じ callback の
+    再配達は受け付け直さない。押した後は、調べた・受け付けた出来事のボタンに ✓ を付ける。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    row = (
+        conn.execute(
+            "SELECT news_json FROM digest_messages WHERE message_id = ? AND digest_id = ? "
+            "AND item_id IS NULL AND news_json IS NOT NULL",
+            (message_id, digest_id),
+        ).fetchone()
+        if type(message_id) is int
+        else None
+    )
+    entries = (parse_news_json(row["news_json"]) or []) if row is not None else []
+    if (
+        chat_id != config.telegram.owner_chat_id
+        or not 1 <= number <= min(len(entries), NEWS_MAX_EVENTS)
+    ):
+        logger.warning("ヘッダの出来事と結び付かない調査のボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この出来事には対応できません")
+        return
+    if config.dig.daily_cap <= 0:
+        api.answer_callback_query(callback_id, text="深掘りをしない設定です")
+        return
+    log_extra = {"stage": "poll", "extra": {"digest_id": digest_id, "event": number}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcome = request_investigation(
+                conn, digest_id, number, entries[number - 1], callback_id=callback_id
+            )
+            marked = investigated_labels(conn, digest_id)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"調査のボタンを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 受け付けに失敗、もう一度押してください")
+        return
+    logger.info(f"調査のボタン: {outcome}", extra=log_extra)
+    api.answer_callback_query(callback_id, text=_INVESTIGATE_ANSWERS[outcome].format(n=number))
+    if outcome in _INVESTIGATE_KICK and dig_now_worker is not None:
+        dig_now_worker.kick(logger)
+    keyboard = investigate_keyboard(digest_id, entries, marked=marked)
+    if keyboard is not None:
+        _edit_markup_best_effort(api, callback, keyboard, logger)
 
 
 def _accept_dig_now(

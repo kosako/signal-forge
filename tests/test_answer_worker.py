@@ -302,3 +302,45 @@ def test_dig_now_worker_logs_abnormal_exit(conn, tmp_path, caplog) -> None:
         worker.sweep(conn, logger)
 
     assert "intel dig-now が異常終了(exit=1)" in caplog.text
+
+
+# --- 出来事の調査(GH#415 の 4 本目) ---
+
+
+def add_investigation(conn, *, status: str = "requested", message_id: int | None = None) -> None:
+    digest = conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count) "
+        "VALUES ('2026-11-14', '# md', '[]', 0)"
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO news_investigations (digest_id, event_index, label, summary, item_ids, "
+        "status, note_name, card_text, message_id) VALUES (?, 1, 'l', 's', '[1]', ?, ?, ?, ?)",
+        (
+            digest,
+            status,
+            "n" if status == "done" else None,
+            "c" if status == "done" else None,
+            message_id,
+        ),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("status", "message_id", "starts"),
+    [
+        ("requested", None, True),  # 作っていない依頼
+        ("running", None, True),  # 作っている途中か、前の実行が途中で止まった(子が閉じて知らせる)
+        ("done", None, True),  # 作り終えて送れていない(送り直す)
+        ("done", 42, False),  # 送った
+        ("failed", None, False),
+    ],
+)
+def test_dig_now_worker_sweeps_investigations(conn, tmp_path, status, message_id, starts) -> None:
+    popen = FakePopen()
+    worker = DigNowWorker(tmp_path, popen=popen)
+    add_investigation(conn, status=status, message_id=message_id)
+
+    worker.sweep(conn, logger)
+
+    assert len(popen.calls) == int(starts)

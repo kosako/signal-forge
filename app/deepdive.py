@@ -110,7 +110,6 @@ from app.investigate import (
     claim_investigation,
     gather_materials,
     generate_investigation,
-    has_unsent_investigations,
     interrupted_investigations,
     plan_search,
     record_generated,
@@ -118,6 +117,7 @@ from app.investigate import (
     search_x,
 )
 from app.investigate import close_failed as close_investigation_failed
+from app.investigate_ledger import has_unsent_investigations
 from app.jst import today_jst
 from app.prompting import fill_template, load_writing_guide, sanitize, sanitize_body
 from app.vault_dir import VaultDir, VaultPathError, folder_dir
