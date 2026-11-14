@@ -365,11 +365,18 @@ def record_generated(
 
 
 def x_month_cost(conn: sqlite3.Connection, now: datetime) -> float:
-    """この機能の X の読み取りの、その月(UTC の暦月)の費用の見積もりの合計。"""
+    """この機能の X の読み取りの、その月(UTC の暦月)の費用の見積もりの合計(上限の判定に使う)。
+
+    前の月の予約の行(pending)もこの月に数える。予約の後に実行が止まった行は、送ったのが月をまたいだ
+    後かもしれないため(上限を超えない側に数える。doctor #9 は予約した月だけに数える)。
+    """
+    month_start = now.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month = month_start.strftime("%Y-%m")
+    previous = (month_start - timedelta(days=1)).strftime("%Y-%m")
     return conn.execute(
         "SELECT coalesce(sum(estimated_cost_usd), 0) FROM investigation_x_reads "
-        "WHERE searched_at LIKE ? || '%'",
-        (now.astimezone(UTC).strftime("%Y-%m"),),
+        "WHERE searched_at LIKE ? || '%' OR (status = 'pending' AND searched_at LIKE ? || '%')",
+        (month, previous),
     ).fetchone()[0]
 
 
@@ -407,12 +414,22 @@ def settle_x_read(
     status: Literal["ok", "failed"],
     api_reads: int,
     unit_price_usd: float,
+    settled_at: datetime,
 ) -> None:
-    """予約の行を、応答の結果と課金されうる読取の数に直す(失敗も行を残す)。"""
+    """予約の行を、応答の結果と課金されうる読取の数に直す(失敗も行を残す)。
+
+    時刻は応答を受けた時刻に直す(予約と送信の間に月が変わったら、送った後の月に数える)。
+    """
     conn.execute(
-        "UPDATE investigation_x_reads SET status = ?, api_reads = ?, estimated_cost_usd = ? "
-        "WHERE id = ? AND status = 'pending'",
-        (status, api_reads, round(api_reads * unit_price_usd, 6), read_id),
+        "UPDATE investigation_x_reads SET status = ?, api_reads = ?, estimated_cost_usd = ?, "
+        "searched_at = ? WHERE id = ? AND status = 'pending'",
+        (
+            status,
+            api_reads,
+            round(api_reads * unit_price_usd, 6),
+            settled_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            read_id,
+        ),
     )
 
 
@@ -653,6 +670,7 @@ def search_x(
     plan: SearchPlan | None,
     *,
     now: datetime | None = None,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     logger: logging.Logger | None = None,
 ) -> tuple[list[Material], XOutcome]:
     """X の投稿を `[investigate].x_posts` 件まで読み、materials の後ろに番号を続けて返す。
@@ -671,7 +689,7 @@ def search_x(
     query = clean_x_query(plan.x_query)
     if not query:
         return [], XOutcome("none")
-    now = now or datetime.now(UTC)
+    now = now or clock()
     window = x_window(request.digest_date, now)
     if window is None:
         return [], XOutcome("expired")
@@ -686,7 +704,10 @@ def search_x(
     )
 
     def record(status: Literal["ok", "failed"], reads: int) -> None:
-        settle_x_read(conn, read_id, status=status, api_reads=reads, unit_price_usd=unit)
+        settle_x_read(
+            conn, read_id, status=status, api_reads=reads, unit_price_usd=unit,
+            settled_at=clock(),
+        )
 
     try:
         result = read(query, start=start, end=end, max_results=posts_max)

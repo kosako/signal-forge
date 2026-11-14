@@ -3,11 +3,13 @@
 -- 検索を送るたびに 1 行(失敗も)。読取の数は課金されうる数で、分からないときは多めに数える。
 -- 送る前に上限の件数で pending の行を書き(予約)、応答の後に ok / failed と実際の数に直す。送った後に
 -- 実行が止まっても、pending の行が上限の件数のまま残って月の合計に数えられる(上限を超えない)。
+-- searched_at は予約の時刻で、応答の後に応答を受けた時刻に直す(予約と送信の間に月が変わったら、
+-- 送った後の月に数える)。上限の判定では、前の月の pending の行も今の月に数える。
 -- 検索の語は外部由来の題から LLM が作ったもの(検査済み)。どの語で読んだかを見返すために残す。
 CREATE TABLE investigation_x_reads (
   id                  INTEGER PRIMARY KEY,
   investigation_id    INTEGER NOT NULL REFERENCES news_investigations(id),
-  searched_at         TEXT    NOT NULL,                         -- UTC の ISO 8601
+  searched_at         TEXT    NOT NULL,                         -- UTC の ISO 8601(上の説明)
   query               TEXT    NOT NULL,
   status              TEXT    NOT NULL CHECK (status IN ('pending', 'ok', 'failed')),
   api_reads           INTEGER NOT NULL CHECK (api_reads >= 0),

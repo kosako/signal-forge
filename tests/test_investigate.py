@@ -1094,17 +1094,22 @@ def test_x_window_is_the_news_window_within_the_last_seven_days() -> None:
 
 
 def test_x_is_skipped_when_the_monthly_cap_would_be_exceeded(conn, config) -> None:
-    from app.investigate import reserve_x_read
+    from app.investigate import reserve_x_read, settle_x_read
 
     on, claimed, materials = search_inputs(conn, config, x_monthly_cap_usd=0.2)
     now = datetime.now(UTC)
     last_month = now.replace(day=1) - timedelta(days=1)
-    reserve_x_read(  # 先月の分は数えない
-        conn, claimed.id, searched_at=last_month, query="q", api_reads=100, unit_price_usd=0.004
-    )
-    reserve_x_read(  # 今月 $0.12。1 回分($0.08)を足すと $0.20 ちょうどで、まだ読める
-        conn, claimed.id, searched_at=now, query="q", api_reads=30, unit_price_usd=0.004
-    )
+
+    def read_on(when: datetime, reads: int) -> None:
+        read_id = reserve_x_read(
+            conn, claimed.id, searched_at=when, query="q", api_reads=reads, unit_price_usd=0.004
+        )
+        settle_x_read(
+            conn, read_id, status="ok", api_reads=reads, unit_price_usd=0.004, settled_at=when
+        )
+
+    read_on(last_month, 100)  # 先月の分は数えない
+    read_on(now, 30)  # 今月 $0.12。1 回分($0.08)を足すと $0.20 ちょうどで、まだ読める
     assert x_month_cost(conn, now) == pytest.approx(0.12)
     found, outcome = search_x(conn, on, x_reader([x_post(7)]), claimed, materials, PLAN)
     assert outcome.status == "ok" and x_month_cost(conn, now) == pytest.approx(0.124)
@@ -1131,6 +1136,35 @@ def test_x_read_is_reserved_before_sending_and_kept_when_interrupted(conn, confi
     assert during == [[(claimed.id, "Microsoft 365 障害", "pending", 20, 0.08)]]
     assert x_ledger(conn) == [(claimed.id, "Microsoft 365 障害", "pending", 20, 0.08)]
     assert x_month_cost(conn, datetime.now(UTC)) == pytest.approx(0.08)
+
+
+def test_x_read_across_the_month_boundary_counts_in_the_month_it_was_sent(conn, config) -> None:
+    # 予約の後に月が変わったら、応答を受けた月に数える。予約のまま止まった行は次の月にも数える
+    # (Codex 指摘。送った月の上限から費用を漏らさない)
+    on, claimed, materials = search_inputs(conn, config)
+    end_of_nov = datetime(2026, 11, 30, 23, 59, 59, tzinfo=UTC)
+    dec = datetime(2026, 12, 1, 0, 0, 5, tzinfo=UTC)
+    times = iter([end_of_nov, dec])
+    on_day = replace(claimed, digest_date="2026-11-30")
+    found, outcome = search_x(
+        conn, on, x_reader([x_post(7)]), on_day, materials, PLAN, clock=lambda: next(times)
+    )
+    assert outcome.status == "ok"
+    assert conn.execute("SELECT searched_at FROM investigation_x_reads").fetchone()[0] == (
+        "2026-12-01T00:00:05Z"
+    )
+    assert x_month_cost(conn, end_of_nov) == 0
+    assert x_month_cost(conn, dec) == pytest.approx(0.004)
+
+    def interrupted(query, *, start, end, max_results):
+        raise KeyboardInterrupt
+
+    conn.execute("DELETE FROM investigation_x_reads")
+    with pytest.raises(KeyboardInterrupt):
+        search_x(conn, on, interrupted, on_day, materials, PLAN, now=end_of_nov)
+    assert x_month_cost(conn, end_of_nov) == pytest.approx(0.08)  # 予約した月
+    assert x_month_cost(conn, dec) == pytest.approx(0.08)  # 次の月にも数える
+    assert x_month_cost(conn, datetime(2027, 1, 1, tzinfo=UTC)) == 0  # 2 か月後には数えない
 
 
 def test_x_failures_are_recorded_and_keep_local_materials(conn, config, caplog) -> None:
