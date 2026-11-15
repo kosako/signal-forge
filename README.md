@@ -63,7 +63,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 ## 必要なもの
 
 - macOS と launchd。システムのタイムゾーンが JST であること。
-- Python 3.12 と uv。uv は repo の `.python-version` を読み、.venv を Python 3.12 で作る。
+- Python 3.12 と uv。uv は repo の `.python-version` を読み、.venv をその版で作る。`.python-version` は patch の版まで決めていて(今は 3.12.13)、CI も同じ版でテストする。版を上げるときは PR で `.python-version` を変える。
 - Telegram の bot(BotFather で作る)。
 - codex CLI。`codex login` を済ませておく。呼び出しごとの追加の支払いは無い(codex のサブスク枠を使う)が、LLM の呼び出しはその枠(クレジット)を消費する。動作と隔離(doctor #6)を確かめた版は `codex-cli 0.162.1`(npm の `@openai/codex`。npm 版は Node.js も要る)。配布の形と更新の手順は [ops/runbook.md](ops/runbook.md) の §1 の末尾にある。
 - Obsidian の vault(書き出し先のローカルフォルダ)。
