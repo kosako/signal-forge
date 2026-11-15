@@ -212,6 +212,25 @@ class LLMFallbackConfig:
 
 
 @dataclass(frozen=True)
+class AnalysisReviewConfig:
+    """Codex の分析を Claude API が確かめる段(GH#423 / 設計 03 §3.6)。既定は off。
+
+    キーは .env の INTEL_ANTHROPIC_API_KEY([dig].review・[llm_fallback] と同じ)。単価は費用の
+    見積もりに使う(モデルを替えたら単価も合わせる)。
+    """
+
+    enabled: bool = False
+    model: str = "claude-sonnet-5-5"
+    effort: str = "low"  # 思考の量(費用と時間の主なつまみ)。ANTHROPIC_EFFORTS のいずれか
+    max_tokens: int = 16_000  # 出力の上限(思考 + 本文の合計。超えると打ち切り = その束は確かめない)
+    timeout_s: int = 300  # 1 回の呼び出しの上限(秒)
+    input_usd_per_mtok: float = 2.0  # Sonnet 5.5 の単価(2026-10 時点)
+    output_usd_per_mtok: float = 10.0
+    # この段の費用の月(UTC の暦月 = doctor #9 の当月)の上限。達したらその月は確かめない
+    monthly_cap_usd: float = 30.0
+
+
+@dataclass(frozen=True)
 class CollectConfig:
     """collect の段の上限(GH#340 / 設計 02 §3・05 §8)。使い切った残りは次の実行へ回す。"""
 
@@ -310,6 +329,7 @@ class Config:
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    analysis_review: AnalysisReviewConfig = field(default_factory=AnalysisReviewConfig)
     ranking: RankingConfig = field(default_factory=RankingConfig)
 
     @property
@@ -350,6 +370,7 @@ _SECTIONS = {
     "obsidian": ObsidianConfig,
     "storage": StorageConfig,
     "analysis": AnalysisConfig,
+    "analysis_review": AnalysisReviewConfig,
     "ranking": RankingConfig,
 }
 
@@ -478,11 +499,15 @@ def _validate(path: Path, config: Config) -> None:
     cap = config.dig.review_monthly_cap_usd
     if not (math.isfinite(cap) and cap > 0):
         raise ConfigError(f"{path}: [dig].review_monthly_cap_usd は正の有限値: {cap}")
-    if config.anthropic_api.effort not in ANTHROPIC_EFFORTS:
-        raise ConfigError(
-            f"{path}: [anthropic_api].effort は {'/'.join(ANTHROPIC_EFFORTS)} のいずれか: "
-            f"{config.anthropic_api.effort!r}"
-        )
+    for section, effort in (
+        ("anthropic_api", config.anthropic_api.effort),
+        ("analysis_review", config.analysis_review.effort),
+    ):
+        if effort not in ANTHROPIC_EFFORTS:
+            raise ConfigError(
+                f"{path}: [{section}].effort は {'/'.join(ANTHROPIC_EFFORTS)} のいずれか: "
+                f"{effort!r}"
+            )
     if config.llm_fallback.engine not in LLM_FALLBACK_ENGINES:
         raise ConfigError(
             f"{path}: [llm_fallback].engine は \"\"(切り替えない)か anthropic-api: "
@@ -491,6 +516,7 @@ def _validate(path: Path, config: Config) -> None:
     for section, settings in (
         ("anthropic_api", config.anthropic_api),
         ("llm_fallback", config.llm_fallback),
+        ("analysis_review", config.analysis_review),
     ):
         if not settings.model.strip():
             raise ConfigError(f"{path}: [{section}].model が空文字")
@@ -498,9 +524,12 @@ def _validate(path: Path, config: Config) -> None:
             price = getattr(settings, key)
             if not (math.isfinite(price) and price >= 0):
                 raise ConfigError(f"{path}: [{section}].{key} は 0 以上の有限値: {price}")
-    fallback_cap = config.llm_fallback.monthly_cap_usd
-    if not (math.isfinite(fallback_cap) and fallback_cap > 0):
-        raise ConfigError(f"{path}: [llm_fallback].monthly_cap_usd は正の有限値: {fallback_cap}")
+    for section, cap_value in (
+        ("llm_fallback", config.llm_fallback.monthly_cap_usd),
+        ("analysis_review", config.analysis_review.monthly_cap_usd),
+    ):
+        if not (math.isfinite(cap_value) and cap_value > 0):
+            raise ConfigError(f"{path}: [{section}].monthly_cap_usd は正の有限値: {cap_value}")
     for key in ("reasoning_effort", "answer_reasoning_effort"):
         if getattr(config.dig, key) not in DIG_EFFORTS:
             raise ConfigError(
@@ -528,6 +557,8 @@ def _validate(path: Path, config: Config) -> None:
         ("ranking", "max_per_source", config.ranking.max_per_source),
         ("anthropic_api", "max_tokens", config.anthropic_api.max_tokens),
         ("llm_fallback", "max_tokens", config.llm_fallback.max_tokens),
+        ("analysis_review", "max_tokens", config.analysis_review.max_tokens),
+        ("analysis_review", "timeout_s", config.analysis_review.timeout_s),
         ("collect", "rss_max_items", config.collect.rss_max_items),
         ("collect", "time_budget_s", config.collect.time_budget_s),
         ("extract", "time_budget_s", config.extract.time_budget_s),

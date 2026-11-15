@@ -58,7 +58,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
   3. 概要カードを Telegram に送る。原文の中に気になりそうな文があれば、カードとノートに最大 3 個を引用し、なぜ気になるかを一言添える(英語の記事は和訳だけを載せる。本文に無い文は載せない)。カードのボタンで、元記事を開く・もう少し詳しい説明を頼める。「💬 話す」を押すと、その記事について議論できる(リプライで打ち返し、「まとめて」で終えると、議論の中の自分の発言が take としてノートに残る)。読み終えたらカードか夜の一覧の「✅ 読んだ」、要らなければ「👎 不要」を押すと、未消化一覧から外れる(読んだは take のリプライでも付く。カードが届いただけでは外れない)。
   4. カードへのリプライ: poller が台帳に積み、`intel answer` を別プロセスで起動して返事をリプライで送る(1 日の上限は既定 20 件)。LLM が結論・感想(take)と分けたリプライは、原文を解説ノートの末尾に足す(ノートは書き直さず追記だけ)。
 - **データ**: SQLite が正本で、Obsidian は書き出し先。Daily / Items ノートの生成部分は SQLite のデータから export が書く(ノートに足した手書きメモは vault にしか無い)。DeepDive ノートだけは書き出した後に本文を DB に残さず、vault 側が恒久の置き場になる([設計 01 §7](docs/design/01-data-model.md)、[ADR 0004](docs/adr/0004-deepdive-in-agent-obsidian-substrate.md))。vault は intel のバックアップの対象外(runbook §7)なので、守るなら別に手当てする。
-- **LLM**: 主のエンジンは `codex-cli` で、使い捨ての `codex exec` を、ツールなし・ネットワーク遮断などで隔離して呼ぶ。`[llm].engine` に書けるほかの値(`claude-cli` / `anthropic-api`)は主のエンジンとしては未実装で、エンジンを作る時点で失敗する。Claude API(`anthropic-api`。tools を付けない素の Messages API)は、深掘りノートのレビュー(`[dig].review`)と、Codex が失敗した呼び出しの予備(`[llm_fallback]`)に使う(どちらも既定 off)([設計 00 §5](docs/design/00-architecture.md))。
+- **LLM**: 主のエンジンは `codex-cli` で、使い捨ての `codex exec` を、ツールなし・ネットワーク遮断などで隔離して呼ぶ。`[llm].engine` に書けるほかの値(`claude-cli` / `anthropic-api`)は主のエンジンとしては未実装で、エンジンを作る時点で失敗する。Claude API(`anthropic-api`。tools を付けない素の Messages API)は、深掘りノートのレビュー(`[dig].review`)と、Codex が失敗した呼び出しの予備(`[llm_fallback]`)と、Codex の分析を確かめる段(`[analysis_review]`。[設計 03 §3.6](docs/design/03-analysis-ranking.md))に使う(どれも既定 off)([設計 00 §5](docs/design/00-architecture.md))。
 
 ## 必要なもの
 
@@ -98,7 +98,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 
    - `TELEGRAM_BOT_TOKEN`(必須)
    - X を使うときだけ: `X_API_KEY` / `X_API_SECRET` / `X_ACCESS_TOKEN` / `X_ACCESS_TOKEN_SECRET`。ブックマーク等の取り込み(OAuth 2.0)を Web App 型で使うなら `X_OAUTH2_CLIENT_SECRET`。
-   - Claude API を使うときだけ: `INTEL_ANTHROPIC_API_KEY`。深掘りノートのレビュー(`[dig].review = true`。[ops/runbook.md](ops/runbook.md) の §13)と、Codex が失敗したときの予備(`[llm_fallback].engine = "anthropic-api"`。同 §14)で使う。名前を `ANTHROPIC_API_KEY` にしない。
+   - Claude API を使うときだけ: `INTEL_ANTHROPIC_API_KEY`。深掘りノートのレビュー(`[dig].review = true`。[ops/runbook.md](ops/runbook.md) の §13)と、Codex が失敗したときの予備(`[llm_fallback].engine = "anthropic-api"`。同 §14)と、Codex の分析を確かめる段(`[analysis_review].enabled = true`。[設計 03 §3.6](docs/design/03-analysis-ranking.md))で使う。名前を `ANTHROPIC_API_KEY` にしない。
 
 4. 関心プロファイルを置く。分析・深掘り・質問への返事はこれを基準にし、無いと analyze・dig・answer が失敗する。
 

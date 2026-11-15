@@ -165,8 +165,9 @@ def run_doctor(
 def _missing_anthropic_key(config: Config | None, env: dict[str, str]) -> str | None:
     """Claude API を使う設定なのにキーが無ければ、その説明。
 
-    使うのは深掘りのレビュー(GH#153)と、主のエンジンが失敗したときの予備(GH#156)。どちらも
-    キーが無くても本体は動く(レビュー・予備だけが失敗する)ので、ここで FAIL にして気づかせる。
+    使うのは深掘りのレビュー(GH#153)と、主のエンジンが失敗したときの予備(GH#156)と、分析の
+    確かめ(GH#423)。どれもキーが無くても本体は動く(レビュー・予備・確かめだけが動かない)ので、
+    ここで FAIL にして気づかせる。
     """
     from app.analysis.llm import ANTHROPIC_API_KEY_ENV
 
@@ -177,6 +178,8 @@ def _missing_anthropic_key(config: Config | None, env: dict[str, str]) -> str | 
         uses.append("[dig].review = true。深掘りのレビューが毎回失敗する")
     if config.llm_fallback.engine == "anthropic-api":
         uses.append("[llm_fallback].engine = anthropic-api。主のエンジンが失敗しても予備が動かない")
+    if config.analysis_review.enabled:
+        uses.append("[analysis_review].enabled = true。分析を確かめずに配信する")
     if not uses:
         return None
     return f"{ANTHROPIC_API_KEY_ENV} がない({' / '.join(uses)})"
@@ -728,6 +731,16 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
             (month_prefix,),
         ).fetchone()
         llm_cost += fallback_cost
+    review_cost = 0.0
+    if _table_exists(conn, "analysis_review_calls"):  # migration 038(GH#423)
+        # 分析の確かめ。この段の月の上限([analysis_review].monthly_cap_usd)は確かめの側で止める。
+        # 費用が分からなかった呼び出しは、課金されうる最大の額で積んである(予備と同じ。GH#241)
+        review_cost = conn.execute(
+            "SELECT coalesce(sum(cost_usd), 0) FROM analysis_review_calls "
+            "WHERE created_at LIKE ? || '%'",
+            (month_prefix,),
+        ).fetchone()[0]
+        llm_cost += review_cost
     if _table_exists(conn, "x_signal_runs"):  # migration 004 未適用の DB を落とさない
         x_cost += conn.execute(
             "SELECT coalesce(sum(estimated_cost_usd), 0) FROM x_signal_runs "
@@ -751,6 +764,8 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
     return {
         "llm_usd": llm_cost,
         "fallback_estimated_usd": fallback_estimated,  # llm_usd のうち予備の費用不明分の見積もり
+        "analysis_review_usd": review_cost,  # llm_usd のうち分析の確かめ(GH#423)
+        "analysis_review_cap_usd": config.analysis_review.monthly_cap_usd,
         "x_usd": x_cost,
         "investigate_x_usd": investigate_x,  # x_usd のうち出来事の調査の X の反応
         "spent_usd": spent,
@@ -762,11 +777,20 @@ def month_cost_summary(conn: sqlite3.Connection, config: Config) -> dict[str, fl
 def llm_cost_text(summary: dict[str, float]) -> str:
     """LLM の当月の額(doctor #9 / --cost で共用)。
 
-    予備の費用不明分の見積もり(最大の額)を含むなら、その額を添える(GH#241)。
+    予備の費用不明分の見積もり(最大の額)を含むなら、その額を添える(GH#241)。分析の確かめの分が
+    あれば、その額と段の上限を添える(GH#423)。
     """
     text = f"LLM ${summary['llm_usd']:.2f}"
+    notes = []
     if summary["fallback_estimated_usd"] > 0:
-        text += f"(うち予備の費用不明分の見積もり ${summary['fallback_estimated_usd']:.2f})"
+        notes.append(f"うち予備の費用不明分の見積もり ${summary['fallback_estimated_usd']:.2f}")
+    if summary.get("analysis_review_usd", 0) > 0:
+        notes.append(
+            f"うち分析の確かめ ${summary['analysis_review_usd']:.2f} / "
+            f"上限 ${summary['analysis_review_cap_usd']:g}"
+        )
+    if notes:
+        text += "(" + "・".join(notes) + ")"
     return text
 
 

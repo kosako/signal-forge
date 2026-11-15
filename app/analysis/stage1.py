@@ -106,13 +106,15 @@ def analyzed_on(conn: sqlite3.Connection, day: str) -> int:
 
     台帳は analyses(analyzed_at は UTC。暦日の境界はトレンド・digest と同じ)。degraded の
     行も数える(LLM には渡している)。ブックマークに紐付く item は日次上限の外なので数えない
-    (判定は事前選別と同じ x_signals の紐付け)。
+    (判定は事前選別と同じ x_signals の紐付け)。分析の確かめ(GH#423)で直して足した行も数えない
+    (Codex の分析の件数の上限で、確かめの費用は別の月の上限で止める)。
     """
     start, end = jst_day_bounds_utc(day)
     return conn.execute(
         """
         SELECT count(*) AS n FROM analyses
         WHERE analyzed_at >= ? AND analyzed_at < ?
+          AND prompt_version NOT LIKE 'analyze-review-%'
           AND NOT EXISTS (
             SELECT 1 FROM x_signals
             WHERE x_signals.kind = 'bookmark' AND x_signals.item_id = analyses.item_id
