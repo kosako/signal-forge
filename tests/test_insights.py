@@ -62,9 +62,9 @@ def test_topic_insights_join_analyzed_items_only(conn, tmp_path) -> None:
     for tweet_id, topic, degraded in (("t1", "MCP", 0), ("t2", "agents", 1)):
         item_id = conn.execute(
             "INSERT INTO items (source_id, url, canonical_url, external_id, content_hash) "
-            "VALUES (2, 'https://x.com/i/status/' || ?1, 'https://x.com/i/status/' || ?1, "
-            "?1, 'sha256:' || ?1)",
-            (tweet_id,),
+            "VALUES (2, 'https://x.com/i/status/' || :tweet_id, "
+            "'https://x.com/i/status/' || :tweet_id, :tweet_id, 'sha256:' || :tweet_id)",
+            {"tweet_id": tweet_id},
         ).lastrowid
         conn.execute(
             "INSERT INTO analyses (item_id, summary, category, topic, relevance_score, "
