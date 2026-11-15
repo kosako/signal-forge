@@ -272,9 +272,23 @@ def analyze_stage(
     )("low")
     with analysis_lock(conn, logger, run_id):
         result = preselect(conn, config, logger, run_id=run_id)
-        counts = analyze_selected(
-            conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
-        )
+        try:
+            counts = analyze_selected(
+                conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
+            )
+        except Exception:
+            # 本分析が途中で止まっても(環境障害・全滅)、保存できた分は確かめてから失敗を伝える。
+            # 確かめないまま digest に載ると、digested になって確かめの対象から外れるため。
+            # 確かめの側の想定外の失敗で、本分析の失敗を隠さない
+            if config.analysis_review.enabled:
+                try:
+                    _review_stage(conn, config, env, profile.body, logger, run_id, review_engine)
+                except Exception as review_error:  # 種類だけを書く(例外の文に外部の文が混ざりうる)
+                    logger.warning(
+                        f"本分析の失敗の後の分析の確かめも失敗した({type(review_error).__name__})",
+                        extra={"run_id": run_id, "stage": "analyze"},
+                    )
+            raise
         if config.analysis_review.enabled:
             _review_stage(conn, config, env, profile.body, logger, run_id, review_engine)
         return counts

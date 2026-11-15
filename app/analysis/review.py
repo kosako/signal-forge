@@ -217,8 +217,9 @@ def _review_batch(
         for analysis_row in batch:
             item_id = analysis_row["item_id"]
             reviewed = by_item.get(item_id)
-            if reviewed is None:
-                # 結果が無い = 確かめた記録を残さない(同じ日の次の実行で確かめ直す)
+            if reviewed is None or (reviewed.verdict == "fixed" and reviewed.analysis is None):
+                # 結果が無い・直すと答えたのに直した分析が無い = 確かめた記録を残さない(直すべきと
+                # いう判断を ok として失わない。同じ日の次の実行で確かめ直す)
                 counts.missing += 1
                 continue
             if not _still_latest(conn, analysis_row):
@@ -226,7 +227,7 @@ def _review_batch(
                 continue
             changed: list[str] = []
             fixed: ItemAnalysis | None = None
-            if reviewed.verdict == "fixed" and reviewed.analysis is not None:
+            if reviewed.verdict == "fixed" and reviewed.analysis is not None:  # 上で None は除いた
                 fixed = reviewed.analysis  # 行は確かめた分析の item に足す(中の item_id は使わない)
                 changed = changed_fields(analysis_row, fixed)
             if fixed is not None and changed:

@@ -231,6 +231,20 @@ def test_missing_result_and_unknown_ids_leave_codex_values(conn, tmp_path) -> No
     assert conn.execute("SELECT count(*) FROM analyses").fetchone()[0] == 2
 
 
+def test_fixed_without_analysis_is_left_for_next_run(conn, tmp_path) -> None:
+    # 直すと答えたのに直した分析が無い結果は、ok として記録しない(直すべきという判断を失わない)
+    a, b = add_item(conn, 1), add_item(conn, 2)
+    add_analysis(conn, a)
+    add_analysis(conn, b)
+    broken = {"item_id": a, "verdict": "fixed", "analysis": None, "note": "直す"}
+    engine = FakeClaude([{"results": [broken, ok(b)]}])
+
+    counts = review_analyses(conn, make_config(tmp_path), engine, "# 関心", logger)
+
+    assert (counts.reviewed, counts.fixed, counts.missing) == (1, 0, 1)
+    assert [r["item_id"] for r in pending_reviews(conn, today_jst())] == [a]
+
+
 def test_fixed_analysis_is_written_to_the_item_it_answered_for(conn, tmp_path) -> None:
     # analysis の中の item_id が違っても、結果の item_id(束の中の id)の分析として写す
     a = add_item(conn, 1)
@@ -410,6 +424,57 @@ def test_analyze_stage_reviews_after_analysis(conn, tmp_path) -> None:
 
     assert counts["analyzed"] == 1
     assert digest_candidates(conn)[0]["relevance_score"] == 88
+
+
+def test_analyze_stage_reviews_saved_items_before_raising(conn, tmp_path) -> None:
+    # 本分析が一部を保存した後に環境障害で止まっても、保存できた分は確かめてから失敗を伝える
+    from app.run import analyze_stage
+
+    a = add_item(conn, 1, status="new")
+    add_item(conn, 2, status="new")
+
+    class PartialThenUnavailable:
+        name = "codex-cli"
+        model = "fake"
+        calls = 0
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            self.calls += 1
+            if self.calls == 1:  # 束の呼び出し: 1 件目だけ答える(2 件目は単発の再分析へ)
+                return AnalysisBatch(results=[ItemAnalysis(**first(a))])
+            raise LLMUnavailableError("codex 不在")
+
+    engine = FakeClaude([{"results": [fixed(a, relevance=77)]}])
+    with pytest.raises(LLMUnavailableError):
+        analyze_stage(
+            conn, make_config(tmp_path), {}, logger,
+            primary=lambda _effort: PartialThenUnavailable(), review_engine=lambda: engine,
+        )
+
+    assert len(engine.prompts) == 1
+    assert digest_candidates(conn)[0]["relevance_score"] == 77
+
+
+def test_review_failure_after_analysis_failure_keeps_the_analysis_error(conn, tmp_path) -> None:
+    from app.run import analyze_stage
+
+    add_item(conn, 1, status="new")
+
+    class Unavailable:
+        name = "codex-cli"
+        model = "fake"
+
+        def complete_structured(self, prompt, schema, timeout_s=120):
+            raise LLMUnavailableError("codex 不在")
+
+    def broken_review_engine():
+        raise RuntimeError("確かめの側の想定外の失敗")
+
+    with pytest.raises(LLMUnavailableError):
+        analyze_stage(
+            conn, make_config(tmp_path), {}, logger,
+            primary=lambda _effort: Unavailable(), review_engine=broken_review_engine,
+        )
 
 
 def test_analyze_stage_skips_review_when_disabled(conn, tmp_path) -> None:
