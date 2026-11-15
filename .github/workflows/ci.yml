@@ -31,7 +31,9 @@ jobs:
           # 後続の step は git の認証を使わない。依存の install やテストから token を読めないようにする。
           persist-credentials: false
 
-      # Python は .python-version(3.12)を uv が入れる。uv の版は固定し、新しい版を CI で先に使わない。
+      # Python は .python-version の版(patch まで。本番の .venv と同じ)を uv が入れて使う(GH#421)。
+      # minor の版だけだと、uv は runner の system の Python(ubuntu-24.04 は 3.12.3)を使い、本番とずれる。
+      # uv の版は固定し、新しい版を CI で先に使わない。
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.12.21"
