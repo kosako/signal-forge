@@ -61,6 +61,12 @@ _CLIENT_HEADERS = (
     ("User-Agent", USER_AGENT),
 )
 _EXPANDING_CODINGS = frozenset({"gzip", "deflate", "br", "zstd"})  # httpx が展開しうる符号化
+# 名乗らない取得を時計の 1 分に 1 回までしか受けない domain と、続けて送るときに空ける秒数
+# (GH#424)。Reddit は 1 回で x-ratelimit-remaining が 0 になり、毎分 0 秒に戻る。同じ HttpClient
+# (朝バッチの 1 回)で送るときは、前に送った取得の終わりからこの秒数を空ける。転送先のホップと
+# リトライも 1 回に数え、subdomain も同じ枠に数える。待った分は取得の全体の期限
+# (FETCH_DEADLINE_S)を後ろへずらす
+_SLOW_DOMAINS = {"reddit.com": 61.0}
 # 期限で見捨てた名前解決のスレッドは止められないので、同時に走る数に上限を付ける。収集と本文
 # 抽出は直列に取得するので、ふだん走るのは 1 本。埋まっていれば新しく作らずに失敗にする(GH#203)
 _MAX_RESOLVER_THREADS = 4
@@ -91,6 +97,39 @@ class FetchedResponse:
     response: httpx.Response
     final_url: str  # リダイレクト追跡後の URL
     permanently_moved: bool  # 301/308 を経由した(RSS の警告表示用。設計 02 §3)
+
+
+class _Deadline:
+    """取得 1 回の全体の期限(GH#203)。
+
+    1 分に 1 回の host の間隔を待った分だけ後ろへずらす(GH#424)。
+    """
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+
+    def extend(self, seconds: float) -> None:
+        self.at += seconds
+
+
+def _slow_domain(url: str) -> str | None:
+    """URL の host が _SLOW_DOMAINS のどれか(subdomain を含む)なら、その domain。"""
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".")
+    except ValueError:  # 分解できない URL は、取得の側が接続先の検査で失敗にする
+        return None
+    for domain in _SLOW_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return domain
+    return None
+
+
+def is_slow_host(url: str) -> bool:
+    """名乗らない取得を 1 分に 1 回しか受けない host か(GH#424)。
+
+    本文抽出は、この host のページを記事ごとに取りに行かない(フィードの中身だけを使う)。
+    """
+    return _slow_domain(url) is not None
 
 
 def _default_resolve_host(host: str) -> list[str]:
@@ -193,6 +232,7 @@ class HttpClient:
         self._resolve_host = resolve_host
         self._sleep = sleep
         self._clock = clock  # 取得の全体の期限の計測用(GH#203)
+        self._slow_last_done: dict[str, float] = {}  # _SLOW_DOMAINS の domain → 前の取得の終わり
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,  # 各ホップで SSRF 再検査するため手動追跡
@@ -248,7 +288,7 @@ class HttpClient:
         retries: int = MAX_RETRIES,
     ) -> FetchedResponse:
         """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。"""
-        deadline = self._clock() + FETCH_DEADLINE_S
+        deadline = _Deadline(self._clock() + FETCH_DEADLINE_S)
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
@@ -287,35 +327,59 @@ class HttpClient:
         ) from last_error
 
     def _backoff(
-        self, attempt: int, retries: int, url: str, deadline: float, last_error: Exception
+        self, attempt: int, retries: int, url: str, deadline: _Deadline, last_error: Exception
     ) -> None:
         if attempt < retries:
             self._wait(BACKOFF_S[attempt] + random.random(), url, deadline, last_error)
 
-    def _wait(self, seconds: float, url: str, deadline: float, last_error: Exception) -> None:
+    def _wait(self, seconds: float, url: str, deadline: _Deadline, last_error: Exception) -> None:
         """リトライ前に待つ。待つと期限までに試す時間が残らないなら待たずに打ち切る(GH#203)。"""
-        if seconds >= deadline - self._clock():
+        if seconds >= deadline.at - self._clock():
             raise FetchDeadlineError(
                 f"取得の期限({FETCH_DEADLINE_S}s)内にリトライできない: "
                 f"{url}{_failure_detail(last_error)}"
             ) from last_error
         self._sleep(seconds)
 
-    def _remaining(self, deadline: float, url: str) -> float:
+    def _remaining(self, deadline: _Deadline, url: str) -> float:
         """取得の期限までの残り秒数。過ぎていれば FetchDeadlineError(GH#203)。"""
-        remaining = deadline - self._clock()
+        remaining = deadline.at - self._clock()
         if remaining <= 0:
             raise FetchDeadlineError(f"取得の期限({FETCH_DEADLINE_S}s)を超過: {url}")
         return remaining
 
+    def _pace(self, domain: str, deadline: _Deadline) -> None:
+        """1 分に 1 回の domain への前の取得の終わりから、間が空くまで待つ(GH#424)。
+
+        待った分は取得の期限を後ろへずらす(期限は相手の応答の遅さを止めるためのもので、
+        こちらが間を空ける待ちには当てない)。
+        """
+        last_done = self._slow_last_done.get(domain)
+        if last_done is None:
+            return
+        remaining = last_done + _SLOW_DOMAINS[domain] - self._clock()
+        if remaining > 0:
+            self._sleep(remaining)
+            deadline.extend(remaining)
+
     def _follow_redirects(
-        self, url: str, headers: dict[str, str] | None, deadline: float, *, read_body: bool
+        self, url: str, headers: dict[str, str] | None, deadline: _Deadline, *, read_body: bool
     ) -> FetchedResponse:
         current = url
         permanently_moved = False
         for _ in range(MAX_REDIRECTS + 1):
+            # 1 分に 1 回の host は、転送先のホップもリトライも、送るたびに間を空ける(GH#424)
+            domain = _slow_domain(current)
+            if domain is not None:
+                self._pace(domain, deadline)
             pinned_ip = self._check_target(current, deadline)  # 期限を過ぎていれば先へ進まない
-            response = self._get_pinned(current, pinned_ip, headers, deadline, read_body=read_body)
+            try:
+                response = self._get_pinned(
+                    current, pinned_ip, headers, deadline, read_body=read_body
+                )
+            finally:
+                if domain is not None:  # 失敗した取得も 1 回に数えて、次を空ける
+                    self._slow_last_done[domain] = self._clock()
             if response.status_code not in _REDIRECT_STATUSES:
                 return FetchedResponse(
                     response=response, final_url=current, permanently_moved=permanently_moved
@@ -334,7 +398,7 @@ class HttpClient:
         url: str,
         ip: str,
         headers: dict[str, str] | None,
-        deadline: float,
+        deadline: _Deadline,
         *,
         read_body: bool,
     ) -> httpx.Response:
@@ -400,7 +464,7 @@ class HttpClient:
             raise FetchDeadlineError(f"取得の期限({FETCH_DEADLINE_S}s)を超過: {url}")
         return response
 
-    def _read_body(self, response: httpx.Response, url: str, deadline: float) -> None:
+    def _read_body(self, response: httpx.Response, url: str, deadline: _Deadline) -> None:
         """本文を上限と期限を検査しながら読み、response.content で読めるようにする(GH#203)。
 
         上限は content-encoding(gzip 等)を展開した後のバイト数で数える(小さく圧縮した
@@ -433,7 +497,7 @@ class HttpClient:
         # 通常の取得と同じに content / text で読めるようにする(httpx の版は uv.lock で固定)
         response._content = b"".join(chunks)
 
-    def _check_target(self, url: str, deadline: float) -> str:
+    def _check_target(self, url: str, deadline: _Deadline) -> str:
         """接続先を検証し、接続に使う検証済み IP を返す。"""
         host = urlsplit(url).hostname
         if not host:
@@ -454,7 +518,7 @@ class HttpClient:
                 )
         return addresses[0]
 
-    def _resolve_within(self, host: str, deadline: float, url: str) -> list[str]:
+    def _resolve_within(self, host: str, deadline: _Deadline, url: str) -> list[str]:
         """名前解決を期限の残りまでしか待たない(GH#203)。
 
         getaddrinfo は途中で止められないため別のスレッドで引き、期限が来たら待つのをやめる。

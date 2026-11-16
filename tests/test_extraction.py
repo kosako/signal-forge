@@ -82,6 +82,33 @@ def test_short_raw_content_falls_back_to_http(conn, tmp_path) -> None:
     assert calls == ["https://example.com/1"]
 
 
+def test_slow_host_uses_only_feed_content(conn, tmp_path) -> None:
+    # Reddit のスレッドのページは 1 分に 1 回しか受けないので取りに行かない(GH#424)。
+    # 十分な本文のある投稿も、短い投稿も、フィードの中身だけを使う
+    add_item(conn, url="https://www.reddit.com/r/a/comments/1/long/", raw_content=ARTICLE_HTML)
+    short_url = "https://www.reddit.com/r/a/comments/2/short/"
+    add_item(conn, url=short_url, raw_content="<p>短い投稿</p>")
+    add_item(conn, url="https://old.reddit.com/r/a/comments/3/none/")
+    calls: list[str] = []
+    http = make_http(lambda request: httpx.Response(200, text=ARTICLE_HTML), calls)
+
+    counts = extract_pending(conn, config(tmp_path), http, logger)
+
+    assert calls == []
+    assert counts == {"ok": 1, "partial": 1, "failed": 1}
+    docs = {
+        row["url"]: row
+        for row in conn.execute(
+            "SELECT items.url, d.* FROM documents AS d JOIN items ON items.id = d.item_id"
+        )
+    }
+    assert docs["https://www.reddit.com/r/a/comments/1/long/"]["extraction_error"] is None
+    short = docs[short_url]
+    assert short["extracted_text"] == "短い投稿"
+    assert short["extraction_error"] == "取得しない host(フィードの中身だけを使う)"
+    assert docs["https://old.reddit.com/r/a/comments/3/none/"]["extraction_status"] == "failed"
+
+
 def test_no_raw_content_fetches_http(conn, tmp_path) -> None:
     add_item(conn)
     calls: list[str] = []

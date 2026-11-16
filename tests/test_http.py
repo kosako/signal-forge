@@ -21,6 +21,7 @@ from app.http import (
     HttpClient,
     ResponseTooLargeError,
     SsrfBlockedError,
+    is_slow_host,
 )
 
 PUBLIC = {"example.com": ["93.184.216.34"], "cdn.example": ["93.184.216.35"]}
@@ -454,6 +455,95 @@ def test_accept_encoding_is_limited_to_gzip_and_deflate(monkeypatch) -> None:
 
     make_client(handler).get("https://example.com/")
     assert seen[0].headers["accept-encoding"] == "gzip, deflate"
+
+
+def test_slow_domain_waits_between_requests() -> None:
+    # Reddit は名乗らない取得を時計の 1 分に 1 回しか受けない(GH#424)。前の取得の終わりから
+    # 61 秒を空ける。subdomain も同じ枠に数え、ほかの host は待たない
+    clock = FakeClock()
+    seen: list[tuple[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.headers["host"], clock.now))
+        if request.url.path == "/fail":
+            raise httpx.ConnectError("接続できない")
+        return httpx.Response(200)
+
+    reddit = {"www.reddit.com": ["151.101.1.140"], "old.reddit.com": ["151.101.1.140"]}
+    client = make_client(handler, hosts=reddit, clock=clock)
+    client.get("https://www.reddit.com/r/a/top/.rss")
+    clock.now += 10
+    client.get("https://example.com/")
+    client.get("https://old.reddit.com/r/b/top/.rss")
+    with pytest.raises(RetryableError):
+        client.get("https://www.reddit.com/fail", retries=0)
+    client.get("https://www.reddit.com/r/c/top/.rss")  # 失敗した取得の後も空ける
+    clock.now += 100
+    client.get("https://www.reddit.com/r/d/top/.rss")  # 間が空いていれば待たない
+
+    assert seen == [
+        ("www.reddit.com", 0.0),
+        ("example.com", 10.0),
+        ("old.reddit.com", 61.0),
+        ("www.reddit.com", 122.0),
+        ("www.reddit.com", 183.0),
+        ("www.reddit.com", 283.0),
+    ]
+    assert clock.sleeps == [51.0, 61.0, 61.0]
+
+
+def test_slow_domain_paces_retries_outside_the_deadline(monkeypatch) -> None:
+    # リトライも 1 回に数えて 61 秒空ける。待った分は取得の期限(60 秒)を後ろへずらすので、
+    # 期限の切れにならない(GH#424)
+    monkeypatch.setattr(app.http.random, "random", lambda: 0.0)
+    clock = FakeClock()
+    seen: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(clock.now)
+        return httpx.Response(200 if request.url.path == "/ok" else 500)
+
+    client = make_client(handler, hosts={"www.reddit.com": ["151.101.1.140"]}, clock=clock)
+    client.get("https://www.reddit.com/ok")
+    with pytest.raises(RetryableError, match="リトライ上限"):
+        client.get("https://www.reddit.com/r/a/top/.rss")  # 既定の retries=2
+
+    assert seen == [0.0, 61.0, 122.0, 183.0]
+    # 1 回目の前に 61 秒、リトライの前は通常のバックオフ(1 秒・4 秒)の残りを待つ
+    assert clock.sleeps == [61.0, 1.0, 60.0, 4.0, 57.0]
+
+
+def test_slow_domain_paces_redirect_hops() -> None:
+    # 短縮 URL などの転送先が Reddit でも、そのホップを 1 回に数えて間を空ける(GH#424)
+    clock = FakeClock()
+    seen: list[tuple[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.headers["host"], clock.now))
+        if request.headers["host"] == "cdn.example":
+            return httpx.Response(301, headers={"location": "https://www.reddit.com/r/a/comments/1/"})
+        return httpx.Response(200)
+
+    client = make_client(handler, hosts={"www.reddit.com": ["151.101.1.140"]}, clock=clock)
+    client.get("https://www.reddit.com/r/b/top/.rss")
+    resolved = client.resolve_short_url("https://cdn.example/s")
+    client.get("https://www.reddit.com/r/c/top/.rss")
+
+    assert resolved == "https://www.reddit.com/r/a/comments/1/"
+    assert seen == [
+        ("www.reddit.com", 0.0),
+        ("cdn.example", 0.0),
+        ("www.reddit.com", 61.0),  # 期限(60 秒)より長く待っても、期限の切れにならない
+        ("www.reddit.com", 122.0),
+    ]
+
+
+def test_is_slow_host_matches_the_domain_and_subdomains() -> None:
+    assert is_slow_host("https://www.reddit.com/r/a/")
+    assert is_slow_host("https://reddit.com/r/a/")
+    assert not is_slow_host("https://notreddit.com/r/a/")
+    assert not is_slow_host("https://i.redd.it/x.png")
+    assert not is_slow_host("http://[::1")  # 分解できない URL は取得の側で失敗にする
 
 
 def test_client_headers_keep_the_usual_order() -> None:
