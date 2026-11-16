@@ -51,6 +51,15 @@ _RAW_SLICE_BYTES = 1024
 # 展開比を抑えられる符号化だけを求める。httpx の既定は br / zstd の展開器を入れると求める
 # 符号化に加えるため、明示して固定する(GH#203)
 _ACCEPT_ENCODING = "gzip, deflate"
+# client の header。Accept と Connection の値は httpx の既定のまま、順も既定と同じにする。httpx は
+# client に渡した名前を既定の位置から外して後ろに足し直すので、4 つとも既定の順で渡す。
+# Accept-Encoding が User-Agent の後ろに来ると、Reddit は bot と見て 403 を返す(GH#424)
+_CLIENT_HEADERS = (
+    ("Accept", "*/*"),
+    ("Accept-Encoding", _ACCEPT_ENCODING),
+    ("Connection", "keep-alive"),
+    ("User-Agent", USER_AGENT),
+)
 _EXPANDING_CODINGS = frozenset({"gzip", "deflate", "br", "zstd"})  # httpx が展開しうる符号化
 # 期限で見捨てた名前解決のスレッドは止められないので、同時に走る数に上限を付ける。収集と本文
 # 抽出は直列に取得するので、ふだん走るのは 1 本。埋まっていれば新しく作らずに失敗にする(GH#203)
@@ -198,7 +207,7 @@ class HttpClient:
                 write=READ_TIMEOUT_S,
                 pool=CONNECT_TIMEOUT_S,
             ),
-            headers={"User-Agent": USER_AGENT, "Accept-Encoding": _ACCEPT_ENCODING},
+            headers=_CLIENT_HEADERS,
         )
 
     def get(

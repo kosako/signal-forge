@@ -16,6 +16,7 @@ from app.http import (
     MAX_RESPONSE_BYTES,
     MAX_RETRY_AFTER_S,
     READ_TIMEOUT_S,
+    USER_AGENT,
     FetchDeadlineError,
     HttpClient,
     ResponseTooLargeError,
@@ -453,6 +454,25 @@ def test_accept_encoding_is_limited_to_gzip_and_deflate(monkeypatch) -> None:
 
     make_client(handler).get("https://example.com/")
     assert seen[0].headers["accept-encoding"] == "gzip, deflate"
+
+
+def test_client_headers_keep_the_usual_order() -> None:
+    # Accept-Encoding を User-Agent の後ろに送ると、Reddit は bot と見て 403 を返す(GH#424)。
+    # Host は IP の pin で最後に付く(Host の位置は結果に関係しなかった)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200)
+
+    make_client(handler).get("https://example.com/feed")
+    assert [(k.decode().lower(), v.decode()) for k, v in seen[0].headers.raw] == [
+        ("accept", "*/*"),
+        ("accept-encoding", "gzip, deflate"),
+        ("connection", "keep-alive"),
+        ("user-agent", USER_AGENT),
+        ("host", "example.com"),
+    ]
 
 
 def test_compressed_body_within_limit_is_decoded() -> None:
