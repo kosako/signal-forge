@@ -490,6 +490,47 @@ def notify_llm_fallback(
     notice = run_fallback_notice(conn, run_id, config.llm_fallback.monthly_cap_usd)
     if notice is None:
         return
+    _send_owner_notice(config, env, notice, run_id, logger, what="予備の利用の知らせ")
+
+
+def notify_analysis_review(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    run_id: str,
+    logger: logging.Logger,
+) -> None:
+    """朝バッチの後、その日の分析に確かめていないものが残ったら 1 通知らせる(GH#423)。
+
+    知らせを作る・送る失敗はログだけにする(朝バッチの終了コードを汚さない)。
+    """
+    if not config.analysis_review.enabled:
+        return
+    try:
+        from app.analysis.review import run_review_notice
+
+        notice = run_review_notice(conn, config, env, run_id, today_jst())
+    except Exception as e:  # 種類だけを書く
+        logger.error(
+            f"分析の確かめの知らせを作れない({type(e).__name__})",
+            extra={"run_id": run_id, "stage": "run"},
+        )
+        return
+    if notice is None:
+        return
+    _send_owner_notice(config, env, notice, run_id, logger, what="分析の確かめの知らせ")
+
+
+def _send_owner_notice(
+    config: Config,
+    env: dict[str, str],
+    notice: str,
+    run_id: str,
+    logger: logging.Logger,
+    *,
+    what: str,
+) -> None:
+    """朝バッチの後の知らせをログに残し、Telegram の持ち主に送る。送れなくてもログだけにする。"""
     logger.warning(notice.replace("\n", " / "), extra={"run_id": run_id, "stage": "run"})
     if not is_telegram_configured(config, env) or config.telegram.owner_chat_id is None:
         return
@@ -497,6 +538,6 @@ def notify_llm_fallback(
         create_api(env).send_message(config.telegram.owner_chat_id, notice)
     except Exception as e:
         logger.error(
-            f"予備の利用の知らせを送れない: {type(e).__name__}: {e}",
+            f"{what}を送れない: {type(e).__name__}: {e}",
             extra={"run_id": run_id, "stage": "run"},
         )

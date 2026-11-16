@@ -556,7 +556,7 @@ def run(
     from app.db import apply_migrations, connect
     from app.http import HttpClient
     from app.logs import DEFAULT_LOG_DIR, setup_logging
-    from app.run import notify_llm_fallback, run_pipeline
+    from app.run import notify_analysis_review, notify_llm_fallback, run_pipeline
 
     config = load_config(config_dir)
     env = load_env(config_dir)
@@ -578,6 +578,8 @@ def run(
     )
     # 予備(GH#156)を使ったら知らせる。段が成功していても Codex は止まっているため
     notify_llm_fallback(conn, config, env, run_id, logger)
+    # 分析の確かめ(GH#423)を経ないまま使った分析が残ったら知らせる。段の失敗にはしないため
+    notify_analysis_review(conn, config, env, run_id, logger)
     if failures:
         # 朝バッチ失敗通知(設計 05 §4)。通知の失敗は notify 側でログのみに握る
         from app.delivery import create_api, is_telegram_configured, notify_run_failure

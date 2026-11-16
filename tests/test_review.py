@@ -536,3 +536,123 @@ def test_check_constraint_requires_fixed_row_for_fixed_verdict(conn) -> None:
             " VALUES (?, ?, ?, 'fixed')",
             (analysis_id, a, call),
         )
+
+
+# --- 確かめなかった分析の知らせ(朝バッチの後) ---
+
+
+def test_unreviewed_count_includes_delivered_and_skips_reviewed(conn, tmp_path) -> None:
+    from app.analysis.review import unreviewed_count
+
+    ok_item, fixed_item = add_item(conn, 1), add_item(conn, 2)
+    add_analysis(conn, ok_item)
+    add_analysis(conn, fixed_item)
+    engine = FakeClaude([{"results": [ok(ok_item), fixed(fixed_item, relevance=80)]}])
+    review_analyses(conn, make_config(tmp_path), engine, "# 関心", logger, run_id="R")
+    left = add_item(conn, 3)
+    add_analysis(conn, left)  # 数える
+    add_analysis(conn, add_item(conn, 4, status="digested"))  # 確かめずに配信した分も数える
+    add_analysis(conn, add_item(conn, 5), degraded=1)  # 劣化は対象外
+    add_analysis(conn, add_item(conn, 6), engine="anthropic-api")  # 予備の Claude は対象外
+    add_analysis(conn, add_item(conn, 7), analyzed_at="2000-01-01T00:00:00Z")  # 別の日
+
+    assert unreviewed_count(conn, today_jst()) == 2
+    assert unreviewed_count(conn, "2000-01-01") == 1
+
+
+def test_review_notice_lists_count_and_reasons_of_this_run(conn, tmp_path) -> None:
+    from app.analysis.review import run_review_notice
+
+    # 1 束目がタイムアウト(費用 $0.05 を積む)、上限 $0.05 に達して 2 束目は確かめない
+    config = make_config(tmp_path, monthly_cap_usd=0.05)
+    for n in (1, 2, 3):
+        add_analysis(conn, add_item(conn, n))
+    engine = FakeClaude([LLMError("タイムアウト(300s)")])
+    review_analyses(conn, config, engine, "# 関心", logger, run_id="R")
+
+    notice = run_review_notice(conn, config, {}, "R", today_jst())
+
+    assert notice == (
+        "⚠️ 今日の分析のうち 3 件は、Claude が確かめていません(Codex の値のまま)\n"
+        "・確かめの呼び出しの失敗: タイムアウト 1 回\n"
+        "・今月の確かめの費用 $0.05 が上限 $0.05 に達した\n"
+        "・.env に INTEL_ANTHROPIC_API_KEY が無い\n"
+        "morning.log の「分析の確かめ」の WARNING を見てください(runbook §17)"
+    )
+    # 別の実行の失敗は並べない。キーがあればキーの行は出ない
+    other = run_review_notice(conn, config, {"INTEL_ANTHROPIC_API_KEY": "k"}, "OTHER", today_jst())
+    assert other is not None
+    assert "呼び出しの失敗" not in other and "INTEL_ANTHROPIC_API_KEY" not in other
+
+
+def test_review_notice_is_quiet_when_all_reviewed_or_disabled(conn, tmp_path) -> None:
+    from app.analysis.review import run_review_notice
+
+    config = make_config(tmp_path)
+    item = add_item(conn, 1)
+    add_analysis(conn, item)
+    disabled = replace(config, analysis_review=AnalysisReviewConfig(enabled=False))
+    assert run_review_notice(conn, disabled, {}, "R", today_jst()) is None
+    assert run_review_notice(conn, config, {}, "R", today_jst()) is not None  # 対照
+    review_analyses(conn, config, FakeClaude([{"results": [ok(item)]}]), "# 関心", logger)
+    assert run_review_notice(conn, config, {}, "R", today_jst()) is None
+
+
+class SentMessages:
+    def __init__(self, error: Exception | None = None):
+        self.sent: list[tuple[int, str]] = []
+        self.error = error
+
+    def send_message(self, chat_id, text, **kwargs):
+        if self.error is not None:
+            raise self.error
+        self.sent.append((chat_id, text))
+        return 1
+
+
+def telegram_config(tmp_path: Path) -> Config:
+    from app.config import TelegramConfig
+
+    return replace(
+        make_config(tmp_path), telegram=TelegramConfig(owner_user_id=1, owner_chat_id=10)
+    )
+
+
+def test_notify_sends_unreviewed_notice_to_owner(conn, tmp_path, monkeypatch) -> None:
+    from app import run as run_module
+
+    api = SentMessages()
+    monkeypatch.setattr(run_module, "create_api", lambda env: api)
+    add_analysis(conn, add_item(conn, 1))
+    config = telegram_config(tmp_path)
+
+    disabled = replace(config, analysis_review=AnalysisReviewConfig(enabled=False))
+    run_module.notify_analysis_review(conn, disabled, {"TELEGRAM_BOT_TOKEN": "t"}, "R", logger)
+    assert api.sent == []
+    run_module.notify_analysis_review(conn, config, {"TELEGRAM_BOT_TOKEN": "t"}, "R", logger)
+
+    ((chat_id, text),) = api.sent
+    assert chat_id == 10
+    assert text.startswith("⚠️ 今日の分析のうち 1 件は、Claude が確かめていません")
+
+
+def test_notify_failures_are_only_logged(conn, tmp_path, monkeypatch, caplog) -> None:
+    from app import run as run_module
+    from app.analysis import review as review_module
+
+    add_analysis(conn, add_item(conn, 1))
+    config = telegram_config(tmp_path)
+    env = {"TELEGRAM_BOT_TOKEN": "t"}
+    monkeypatch.setattr(run_module, "create_api", lambda env: SentMessages(RuntimeError("x")))
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        run_module.notify_analysis_review(conn, config, env, "R", logger)  # 送れない
+        monkeypatch.setattr(
+            review_module, "run_review_notice", lambda *a, **k: (_ for _ in ()).throw(KeyError())
+        )
+        run_module.notify_analysis_review(conn, config, env, "R", logger)  # 作れない
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert messages == [
+        "分析の確かめの知らせを送れない: RuntimeError: x",
+        "分析の確かめの知らせを作れない(KeyError)",
+    ]
