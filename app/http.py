@@ -61,6 +61,11 @@ _CLIENT_HEADERS = (
     ("User-Agent", USER_AGENT),
 )
 _EXPANDING_CODINGS = frozenset({"gzip", "deflate", "br", "zstd"})  # httpx が展開しうる符号化
+# 名乗らない取得を時計の 1 分に 1 回までしか受けない domain と、続けて送るときに空ける秒数
+# (GH#424)。Reddit は 1 回で x-ratelimit-remaining が 0 になり、毎分 0 秒に戻る。同じ HttpClient
+# (朝バッチの 1 回)で続けて送るときは、前の取得の終わりからこの秒数を空ける。subdomain も同じ
+# 枠に数える。待つのは取得の全体の期限(FETCH_DEADLINE_S)の外
+_SLOW_DOMAINS = {"reddit.com": 61.0}
 # 期限で見捨てた名前解決のスレッドは止められないので、同時に走る数に上限を付ける。収集と本文
 # 抽出は直列に取得するので、ふだん走るのは 1 本。埋まっていれば新しく作らずに失敗にする(GH#203)
 _MAX_RESOLVER_THREADS = 4
@@ -91,6 +96,26 @@ class FetchedResponse:
     response: httpx.Response
     final_url: str  # リダイレクト追跡後の URL
     permanently_moved: bool  # 301/308 を経由した(RSS の警告表示用。設計 02 §3)
+
+
+def _slow_domain(url: str) -> str | None:
+    """URL の host が _SLOW_DOMAINS のどれか(subdomain を含む)なら、その domain。"""
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".")
+    except ValueError:  # 分解できない URL は、取得の側が接続先の検査で失敗にする
+        return None
+    for domain in _SLOW_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return domain
+    return None
+
+
+def is_slow_host(url: str) -> bool:
+    """名乗らない取得を 1 分に 1 回しか受けない host か(GH#424)。
+
+    本文抽出は、この host のページを記事ごとに取りに行かない(フィードの中身だけを使う)。
+    """
+    return _slow_domain(url) is not None
 
 
 def _default_resolve_host(host: str) -> list[str]:
@@ -193,6 +218,7 @@ class HttpClient:
         self._resolve_host = resolve_host
         self._sleep = sleep
         self._clock = clock  # 取得の全体の期限の計測用(GH#203)
+        self._slow_last_done: dict[str, float] = {}  # _SLOW_DOMAINS の domain → 前の取得の終わり
         self._client = httpx.Client(
             transport=transport,
             follow_redirects=False,  # 各ホップで SSRF 再検査するため手動追跡
@@ -247,7 +273,31 @@ class HttpClient:
         read_body: bool,
         retries: int = MAX_RETRIES,
     ) -> FetchedResponse:
-        """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。"""
+        """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。
+
+        1 分に 1 回の domain(_SLOW_DOMAINS)は、前の取得の終わりから間を空けてから送る。
+        """
+        domain = _slow_domain(url)
+        if domain is None:
+            return self._fetch_with_retries(url, headers, read_body=read_body, retries=retries)
+        last_done = self._slow_last_done.get(domain)
+        if last_done is not None:
+            remaining = last_done + _SLOW_DOMAINS[domain] - self._clock()
+            if remaining > 0:
+                self._sleep(remaining)
+        try:
+            return self._fetch_with_retries(url, headers, read_body=read_body, retries=retries)
+        finally:
+            self._slow_last_done[domain] = self._clock()
+
+    def _fetch_with_retries(
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        *,
+        read_body: bool,
+        retries: int,
+    ) -> FetchedResponse:
         deadline = self._clock() + FETCH_DEADLINE_S
         last_error: Exception | None = None
         for attempt in range(retries + 1):

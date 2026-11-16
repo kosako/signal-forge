@@ -21,6 +21,7 @@ from app.http import (
     HttpClient,
     ResponseTooLargeError,
     SsrfBlockedError,
+    is_slow_host,
 )
 
 PUBLIC = {"example.com": ["93.184.216.34"], "cdn.example": ["93.184.216.35"]}
@@ -454,6 +455,47 @@ def test_accept_encoding_is_limited_to_gzip_and_deflate(monkeypatch) -> None:
 
     make_client(handler).get("https://example.com/")
     assert seen[0].headers["accept-encoding"] == "gzip, deflate"
+
+
+def test_slow_domain_waits_between_requests() -> None:
+    # Reddit は名乗らない取得を時計の 1 分に 1 回しか受けない(GH#424)。前の取得の終わりから
+    # 61 秒を空ける。subdomain も同じ枠に数え、ほかの host は待たない
+    clock = FakeClock()
+    seen: list[tuple[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.headers["host"], clock.now))
+        return httpx.Response(500 if request.url.path == "/fail" else 200)
+
+    reddit = {"www.reddit.com": ["151.101.1.140"], "old.reddit.com": ["151.101.1.140"]}
+    client = make_client(handler, hosts=reddit, clock=clock)
+    client.get("https://www.reddit.com/r/a/top/.rss")
+    clock.now += 10
+    client.get("https://example.com/")
+    client.get("https://old.reddit.com/r/b/top/.rss")
+    with pytest.raises(RetryableError):
+        client.get("https://www.reddit.com/fail", retries=0)
+    client.get("https://www.reddit.com/r/c/top/.rss")  # 失敗した取得の後も空ける
+    clock.now += 100
+    client.get("https://www.reddit.com/r/d/top/.rss")  # 間が空いていれば待たない
+
+    assert seen == [
+        ("www.reddit.com", 0.0),
+        ("example.com", 10.0),
+        ("old.reddit.com", 61.0),
+        ("www.reddit.com", 122.0),
+        ("www.reddit.com", 183.0),
+        ("www.reddit.com", 283.0),
+    ]
+    assert clock.sleeps == [51.0, 61.0, 61.0]
+
+
+def test_is_slow_host_matches_the_domain_and_subdomains() -> None:
+    assert is_slow_host("https://www.reddit.com/r/a/")
+    assert is_slow_host("https://reddit.com/r/a/")
+    assert not is_slow_host("https://notreddit.com/r/a/")
+    assert not is_slow_host("https://i.redd.it/x.png")
+    assert not is_slow_host("http://[::1")  # 分解できない URL は取得の側で失敗にする
 
 
 def test_client_headers_keep_the_usual_order() -> None:

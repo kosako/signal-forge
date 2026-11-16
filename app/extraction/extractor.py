@@ -28,10 +28,12 @@ import trafilatura
 from app.config import Config
 from app.connectors.base import FatalError, RetryableError
 from app.db import record_budget_cut
-from app.http import HttpClient
+from app.http import HttpClient, is_slow_host
 
 # これ未満の抽出結果は partial(本文の体をなしていない可能性が高く、分析品質に注意が要る)
 MIN_OK_CHARS = 200
+# 1 分に 1 回の host のページを取りに行かなかった記録(extraction_error。GH#424)
+_SLOW_HOST_SKIPPED = "取得しない host(フィードの中身だけを使う)"
 
 # HTML 内の文字コード宣言。宣言は <head> の冒頭に置かれるので先頭だけを、WHATWG の prescan と
 # 同じく先頭から順に、コメント・タグ(引用符の中の値は値として読み飛ばす)・<! や <? の区切りに
@@ -123,10 +125,15 @@ def _extract_item(
         text = _extract_text(raw_content)
 
     if not _is_sufficient(text):
-        fetched_text, error = _fetch_and_extract(http, row["canonical_url"])
-        # HTTP 側が失敗しても raw_content 由来の短い本文があればそちらを使う
-        if fetched_text is not None and len(fetched_text) > len(text or ""):
-            text = fetched_text
+        if is_slow_host(row["canonical_url"]):
+            # 1 分に 1 回しか受けない host(Reddit。GH#424)のページは記事ごとに取りに行かない
+            # (段の時間を使い切る)。フィードの中身だけで、足りなければ短いまま分析に回す
+            error = _SLOW_HOST_SKIPPED
+        else:
+            fetched_text, error = _fetch_and_extract(http, row["canonical_url"])
+            # HTTP 側が失敗しても raw_content 由来の短い本文があればそちらを使う
+            if fetched_text is not None and len(fetched_text) > len(text or ""):
+                text = fetched_text
 
     status = ("ok" if len(text) >= MIN_OK_CHARS else "partial") if text else "failed"
     # partial でも HTTP 失敗の経緯は記録する(「短い記事」と「取得失敗して raw_content に
