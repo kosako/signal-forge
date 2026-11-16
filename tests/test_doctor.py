@@ -302,6 +302,20 @@ def test_llm_fallback_requires_anthropic_key(config_dir, tmp_path) -> None:
     assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
 
 
+def test_analysis_review_requires_anthropic_key(config_dir, tmp_path) -> None:
+    # 分析の確かめ(GH#423)を使う設定ならキーが要る。無いと確かめずに配信する
+    config_path = config_dir / "config.toml"
+    base = config_path.read_text(encoding="utf-8")
+    config_path.write_text(base + "\n[analysis_review]\nenabled = true\n", encoding="utf-8")
+    result = by_number(doctor(config_dir, tmp_path), 2)
+    assert result.status == "FAIL"
+    assert "INTEL_ANTHROPIC_API_KEY" in result.detail and "確かめ" in result.detail
+    (config_dir / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=tok\nINTEL_ANTHROPIC_API_KEY=k\n", encoding="utf-8"
+    )
+    assert by_number(doctor(config_dir, tmp_path), 2).status == "PASS"
+
+
 def test_pending_migration_fails(config_dir, tmp_path) -> None:
     # 台帳を1件消して「未適用」状態を作る
     conn = sqlite3.connect(tmp_path / "intel.db")

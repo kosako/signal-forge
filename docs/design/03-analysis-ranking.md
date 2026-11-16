@@ -142,6 +142,21 @@ analyses への写像(01 §3 の列に対応): `relevance` → relevance_score /
 - **失敗時**: 対象が少ない・LLM の失敗・接地のある出来事が 0 件のときは節を省く。digest を当日生成済みで作り直さない(`--force` でない)ときは呼ばない。
 - **載せる先**: `digests.trend_json`(migration 034。出来事とリンクにする記事の id と、出来事を報じた記事の id(`source_ids`。リンクにしない分も含めて最大 8 件。出来事の調査の材料。GH#415・設計 06 §9))と `digests.trend_markdown`(migration 003。リンクを含まないプレーンテキストの写し)に保存する。Telegram のヘッダメッセージは trend_json から、配信のときに items の正規 URL を引いてリンク付きで組む(設計 04 §2)。Obsidian の Daily ノートには digest の Markdown として、リンク付きで出す。degraded 配信では付けない。trend_json の無い前の digest は、今までどおり trend_markdown の文を出す。
 
+### 3.6 分析の確かめ(GH#423。`app/analysis/review.py`・`prompts/analyze-review-v001.md`)
+
+Codex(主のエンジン)が書いた分析を、別系統の AI(Claude API。既定 Sonnet 5.5)が同じ材料と照らして確かめ、誤りを直す。config `[analysis_review]`(既定 off)。ユーザーの判断(2026-11-16): 分析の費用は増えてよいので、件数を増やし(`[analysis].daily_llm_limit` を 200 に)、全件を確かめる。配信の候補だけを確かめる案は、Codex が低く付けた良い記事(拾い漏れ)を救えないので採らなかった。
+
+- **いつ・どれを**: analyze 段の本分析の後、同じ分析のロック(GH#334)の中で動く。本分析が途中で止まったとき(環境障害・全滅)も、保存できた分を確かめてから失敗を伝える(確かめないまま digest に載ると、digested になって対象から外れるため。確かめの側の想定外の失敗は種類だけをログに残し、本分析の失敗を隠さない)。対象は、その日(JST の暦日)に Codex が書き、まだ確かめていない、item の最新の分析(`engine = 'codex-cli'`・degraded でない・item が `analyzed` = digest 前)。予備の Claude が書いた分析(`engine = 'anthropic-api'`)は、確かめと同じ系統なので省く(深掘りのレビューの GH#180 と同じ考え)。ブックマークの item も対象(配信の 🔖 節に載るため)。
+- **材料**: §3.1 と同じ関心プロファイル・配信済みタイトル・アイテムのブロック(§3.2 のサニタイズと nonce の囲み)に、最初の分析(analyses の行を ItemAnalysis の形の JSON にしたもの)を `<first_analysis id="…">` として同じ nonce で囲んで足す。最初の分析も外部の記事に由来する LLM の出力なので、未検証データとして扱う(§8)。束は分析と同じ大きさ(`[analysis].batch_size`)。
+- **確かめる観点(prompt)**: 見出しと要約が本文と食い違っていないか(本文に無い事実・数字・固有名を足していないか)、relevance がプロファイルに照らして妥当か(↑基準に直撃する記事を低く・↓基準だけの記事を高く付けていないか)、novelty・negative・category・topic・reason・implication が合っているか。直すのは誤りか、判断が明らかにずれているときだけで、言い回しの好みや 10 点未満の差では直さない。
+- **出力**: アイテムごとに `verdict`(`ok` / `fixed`)・`fixed` のときの直した分析(全項目)・直した理由の 1 文(`note`)。Pydantic で検証し、束の中の item_id にだけ写す(§8)。`fixed` でも値が最初の分析と同じなら `ok` として扱う。`fixed` なのに直した分析が無い結果は、結果の無いアイテムと同じく確かめた記録を残さない(直すべきという判断を `ok` として失わない)。
+- **直した値の使い方**: 直した分析を analyses に**新しい行**として足す(`engine = 'anthropic-api'`・`prompt_version = 'analyze-review-v001'`)。item の最新の分析になるので、ランキング(§6)・digest・今日の IT ニュース(§3.5)・Obsidian の書き出し・深掘りの候補は、今までどおり最新の行を読むだけで直した値を使う。Codex の行は書き換えずに残す。日次上限の使用量(Stage 1 の規則 4・GH#178)は Codex の分析の件数なので、確かめで足した行は数えない(`prompt_version` が `analyze-review-` で始まる行を外す)。
+- **台帳(migration 038)**: `analysis_reviews` は確かめた分析ごとに 1 行(確かめた Codex の行・`ok` / `fixed`・足した行・変わった項目の名前・理由)。直した数と項目は ここから数える。`analysis_review_calls` は呼び出しごとに 1 行(失敗も)で、費用の正本(足した analyses の行の `estimated_cost_usd` は 0)。
+- **試し直さない**: 1 束 1 回の呼び出しで、失敗しても同じ束を試し直さない(費用を有界に保つ)。失敗した束の分析は Codex の値のまま配信し、同じ日の次の実行(`intel analyze` など)で確かめ直す。結果の無いアイテムも同じ。環境障害(`LLMUnavailableError`。キーの不正・認証の失敗)は続けても同じなので、残りの束を確かめない。確かめのエンジンを作れない(キーが無い)ときも確かめない。どれも analyze 段の失敗にしない(分析は Codex の値のまま使える。ログに残す)。
+- **待つ間の食い違い**: 結果を保存する前に、確かめた分析が今も item の最新で、item が `analyzed` のままかを確かめる。違えば(別の分析が足された・digest 済み)保存しない。
+- **費用**: 月(UTC の暦月。doctor #9 の当月と同じ)の上限 `[analysis_review].monthly_cap_usd`(既定 $30)。束ごとに、呼び出す前に当月の台帳の合計と比べ、達していればその月は残りを確かめない。費用は応答の usage の実額で、usage を受け取れず費用が分からない呼び出しは課金されうる最大の額を積む(予備と同じ。GH#241)。doctor #9 の LLM の費用に含め、内訳と上限を添える。見積もり: 1 束 $0.05〜0.08(11-01 に予備の Claude が 15 件の分析をやり直した実費 $0.067 から)、1 日 200 件で月 $20〜30。
+- **時間**: 呼び出しは並べずに順に送る(1 日 14 回ほど)。朝の配信はその分だけ遅れる(実測で見直す)。
+
 ## 4. interest-profile.md の形式
 
 配置: `~/.config/intel/interest-profile.md`(config.toml `analysis.profile_path`)。自作ファイルなので trusted としてプロンプトに verbatim 注入する。パースは front matter のみ(本文は構造解釈しない。理由: 自由文チューニングを毎日コード変更なしで行うため)。

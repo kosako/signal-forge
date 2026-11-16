@@ -540,6 +540,38 @@ def test_llm_fallback_rejects_bad_values(tmp_path: Path, body: str, match: str) 
         load_config(tmp_path)
 
 
+def test_analysis_review_defaults_and_overrides(tmp_path: Path) -> None:
+    # 分析の確かめ(GH#423): 既定は off・Sonnet 5.5・effort low・月 $30
+    default = load_config(empty_config(tmp_path)).analysis_review
+    assert (default.enabled, default.model, default.effort) == (False, "claude-sonnet-5-5", "low")
+    assert (default.max_tokens, default.timeout_s, default.monthly_cap_usd) == (16_000, 300, 30.0)
+    assert (default.input_usd_per_mtok, default.output_usd_per_mtok) == (2.0, 10.0)
+    write_config(
+        tmp_path,
+        "[analysis_review]\nenabled = true\neffort = \"medium\"\nmonthly_cap_usd = 12.5\n",
+    )
+    config = load_config(tmp_path).analysis_review
+    assert (config.enabled, config.effort, config.monthly_cap_usd) == (True, "medium", 12.5)
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ('effort = "minimal"', "effort"),
+        ('model = " "', "model"),
+        ("max_tokens = 0", "max_tokens"),
+        ("timeout_s = 0", "timeout_s"),
+        ("input_usd_per_mtok = -1", "input_usd_per_mtok"),
+        ("monthly_cap_usd = 0", "monthly_cap_usd"),
+        ("monthly_cap_usd = inf", "monthly_cap_usd"),
+    ],
+)
+def test_analysis_review_rejects_bad_values(tmp_path: Path, body: str, match: str) -> None:
+    write_config(tmp_path, f"[analysis_review]\n{body}\n")
+    with pytest.raises(ConfigError, match=match):
+        load_config(tmp_path)
+
+
 def test_investigate_x_defaults_and_bounds(tmp_path: Path) -> None:
     # 出来事の調査の X の反応(GH#415 の 3 本目): 1 回 20 件・月 $5(ユーザーの判断)
     config = load_config(empty_config(tmp_path))

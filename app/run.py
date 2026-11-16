@@ -25,10 +25,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from app.analysis.fallback import run_fallback_notice
-from app.analysis.llm import LLMEngine
+from app.analysis.llm import AnthropicApiEngine, LLMEngine
 from app.backup import backup_daily
 from app.collect import collect_all
-from app.config import Config
+from app.config import AnthropicApiConfig, Config
 from app.connectors.base import Connector
 from app.delivery import create_api, deliver_digest, is_telegram_configured
 from app.digest.builder import DigestHeldError, generate_digest
@@ -247,12 +247,16 @@ def analyze_stage(
     *,
     run_id: str | None = None,
     primary: Callable[[str], LLMEngine] | None = None,
+    review_engine: Callable[[], AnthropicApiEngine] | None = None,
 ) -> dict[str, int]:
-    """analyze 段: 関心プロファイル → 予備つきのエンジン → 事前選別 → 本分析。件数を返す。
+    """analyze 段: 関心プロファイル → 予備つきのエンジン → 事前選別 → 本分析 → 確かめ。件数を返す。
 
     朝バッチと `intel analyze` が呼ぶ(GH#206)。primary は主のエンジンの作り方
     (None = config の `[llm].engine`)。事前選別から保存までは同じ DB の分析どうしで直列化し、
-    後の実行は先の実行を待ってから残りの枠を選ぶ(GH#334)。
+    後の実行は先の実行を待ってから残りの枠を選ぶ(GH#334)。`[analysis_review].enabled` なら、
+    同じロックの中で、その日の確かめていない分析を Claude API が確かめる(GH#423)。review_engine は
+    確かめのエンジンの作り方(None = config と .env から作る)。確かめが動かなくても、分析は Codex の
+    値のまま使えるので、段の失敗にしない(ログに残す)。
     """
     # プロファイル欠落・エンジン未実装は analyze 段の失敗として局所化する
     # (import をここに置くのは循環回避でなく段の失敗系に含めるため)
@@ -268,9 +272,63 @@ def analyze_stage(
     )("low")
     with analysis_lock(conn, logger, run_id):
         result = preselect(conn, config, logger, run_id=run_id)
-        return analyze_selected(
-            conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
+        try:
+            counts = analyze_selected(
+                conn, config, engine, profile.body, result.selected_ids, logger, run_id=run_id
+            )
+        except Exception:
+            # 本分析が途中で止まっても(環境障害・全滅)、保存できた分は確かめてから失敗を伝える。
+            # 確かめないまま digest に載ると、digested になって確かめの対象から外れるため。
+            # 確かめの側の想定外の失敗で、本分析の失敗を隠さない
+            if config.analysis_review.enabled:
+                try:
+                    _review_stage(conn, config, env, profile.body, logger, run_id, review_engine)
+                except Exception as review_error:  # 種類だけを書く(例外の文に外部の文が混ざりうる)
+                    logger.warning(
+                        f"本分析の失敗の後の分析の確かめも失敗した({type(review_error).__name__})",
+                        extra={"run_id": run_id, "stage": "analyze"},
+                    )
+            raise
+        if config.analysis_review.enabled:
+            _review_stage(conn, config, env, profile.body, logger, run_id, review_engine)
+        return counts
+
+
+def _review_stage(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: dict[str, str],
+    profile_body: str,
+    logger: logging.Logger,
+    run_id: str | None,
+    review_engine: Callable[[], AnthropicApiEngine] | None,
+) -> None:
+    """分析の確かめ(GH#423)。エンジンを作れない(キーが無いなど)ときは確かめずにログに残す。"""
+    from app.analysis.llm import LLMUnavailableError, create_anthropic_engine
+    from app.analysis.review import review_analyses
+
+    settings = config.analysis_review
+    try:
+        if review_engine is not None:
+            engine = review_engine()
+        else:
+            engine = create_anthropic_engine(
+                AnthropicApiConfig(
+                    model=settings.model,
+                    effort=settings.effort,
+                    max_tokens=settings.max_tokens,
+                    input_usd_per_mtok=settings.input_usd_per_mtok,
+                    output_usd_per_mtok=settings.output_usd_per_mtok,
+                ),
+                env,
+            )
+    except LLMUnavailableError as e:
+        logger.warning(
+            f"分析の確かめのエンジンを作れないので、確かめない: {e}",
+            extra={"run_id": run_id, "stage": "analyze"},
         )
+        return
+    review_analyses(conn, config, engine, profile_body, logger, run_id=run_id)
 
 
 def dig_stage(
