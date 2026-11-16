@@ -16,6 +16,7 @@
 - §14: Codex が失敗したときの予備(Claude API でやり直す。既定は off)
 - §15: 配信の記帳に失敗したとき(届いた 1 通を台帳に入れてから再走する)
 - §16: 配信が日をまたいで届かなかったとき(日付を指定して送り直す)
+- §17: 分析の確かめ(Codex の記事の分析を Claude API が確かめて直す。既定は off)
 
 ## 前提
 
@@ -616,3 +617,70 @@ digest の配信で、Telegram には送れたのに台帳(`digest_messages`)に
    - ERROR「送信済みの message を台帳に記帳できない」が出たときは、先に §15 の 1〜3 を済ませる。
 
 - 遅れて届いた記事へのボタン(👍・🔖 など)の記録は、送った日ではなく digest の日付に帰属する(設計 01 §7)。
+
+## 17. 分析の確かめ(GH#423・設計 03 §3.6)
+
+Codex が書いた記事の分析(見出し・要約・点・分類など)を、別系統の AI(Claude API。既定 Sonnet 5.5)が
+同じ材料と照らして確かめ、誤りを直す。ランキングと digest は直した値で作る。既定は off。
+
+**有効にする**:
+
+1. §13 と同じキー(`.env` の `INTEL_ANTHROPIC_API_KEY`)を使う。
+2. `config.toml` に足す:
+   ```toml
+   [analysis_review]
+   enabled = true
+   # monthly_cap_usd = 30.0   # 月(UTC の暦月)の上限。達したらその月は確かめない
+   # model = "claude-sonnet-5-5"   # 替えたら input_usd_per_mtok / output_usd_per_mtok も
+   ```
+3. 月の費用が増えるので、`[budget].monthly_cap_usd`(doctor #9 の上限)も見直す。1 日 200 件で月 $20 前後が増える。
+4. `uv run intel doctor` で #2 が PASS になること(キーが無いと FAIL)。
+
+朝バッチと `intel analyze` は毎回 config を読むので、poller の入れ直しは要らない。
+
+**「⚠️ 今日の分析のうち N 件は、Claude の確かめを経ずに Codex の値のまま使いました」が届いたら**:
+
+その N 件は Codex の値のまま digest に使われている。配信は止まっていない。
+
+1. 知らせの行で理由を見る。
+   - 「確かめの呼び出しの失敗」: 種類を見る。`Anthropic API 401`・`403` はキー(期限切れを含む)、`404` は
+     モデル名、`400` はクレジット残高の不足や利用上限のことがある。`529`・`タイムアウト` は Anthropic の側の
+     混雑で、続かなければ何もしなくてよい。
+   - 「今月の確かめの費用 … が上限 … に達した」: 上限を上げるか、その月は確かめないままにする。
+   - 「.env に INTEL_ANTHROPIC_API_KEY が無い」: キーを足す。
+   - 理由の行が無いときは、応答に結果が無かった件。続くときは 2. を見る。
+2. `morning.log` の「分析の確かめ」の WARNING で、どの束が失敗したかを見る(本文は書かない)。
+3. digest に載った分は確かめ直さない。載らなかった分は、同じ日の次の `intel run`・`intel analyze` で
+   確かめ直す。
+
+**結果を見る**:
+
+```sh
+db=~/.local/share/intel/intel.db   # [storage].db_path を設定していればその値
+# 日ごとの確かめた数と直した数
+sqlite3 -readonly -header -column "$db" <<'SQL'
+SELECT date(created_at, '+9 hours') AS day, count(*) AS reviewed, sum(verdict = 'fixed') AS fixed
+FROM analysis_reviews GROUP BY day ORDER BY day DESC LIMIT 14;
+SQL
+# 直した中身(変わった項目・理由・点の前後)
+sqlite3 -readonly -header -column "$db" <<'SQL'
+SELECT r.item_id, r.changed_fields, r.note,
+       a.relevance_score AS before, f.relevance_score AS after
+FROM analysis_reviews AS r
+JOIN analyses AS a ON a.id = r.analysis_id
+JOIN analyses AS f ON f.id = r.fixed_analysis_id
+WHERE r.verdict = 'fixed' ORDER BY r.id DESC LIMIT 20;
+SQL
+# 呼び出しごとの記録(失敗の種類と費用)
+sqlite3 -readonly -header -column "$db" <<'SQL'
+SELECT created_at, run_id, ok, error_kind, item_count, round(cost_usd, 3) AS usd
+FROM analysis_review_calls ORDER BY id DESC LIMIT 20;
+SQL
+```
+
+- 当月の費用は `uv run intel doctor --cost` の LLM に「うち分析の確かめ $… / 上限 $…」として出る。
+- 送った後に応答が来なかった呼び出し(時間切れ・応答の切断)と、応答の usage を読めなかった呼び出しは、費用が
+  分からないので、課金されうる最大の額で `usd` に積む(§14 の 3. と同じ)。実際の額はふつうこれより少ない。
+
+**止める**: `[analysis_review].enabled = false`(キーは残してよい)。それまでに直した行は残り、その日の digest は
+直した値のまま。

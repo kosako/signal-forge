@@ -24,6 +24,7 @@ import logging
 import re
 import secrets
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +39,12 @@ from app.analysis.analyzer import (
     _load_rows,
     _recent_titles,
 )
-from app.analysis.llm import AnthropicApiEngine, LLMError, LLMUnavailableError
+from app.analysis.llm import (
+    ANTHROPIC_API_KEY_ENV,
+    AnthropicApiEngine,
+    LLMError,
+    LLMUnavailableError,
+)
 from app.config import Config
 from app.jst import jst_day_bounds_utc, today_jst
 from app.prompting import fill_template, sanitize, sanitize_body
@@ -115,26 +121,78 @@ def review_cost_this_month(conn: sqlite3.Connection) -> float:
     ).fetchone()["cost"]
 
 
+# その日(analyzed_at の範囲)に Codex が書き、まだ確かめていない、item の最新の分析。
+# 確かめの対象(pending_reviews)と、確かめずに残った件数の知らせ(unreviewed_count)が共有する
+_UNREVIEWED_WHERE = """
+    a.analyzed_at >= ? AND a.analyzed_at < ?
+    AND a.degraded = 0
+    AND a.engine = 'codex-cli'
+    AND NOT EXISTS (SELECT 1 FROM analysis_reviews AS r WHERE r.analysis_id = a.id)
+    AND a.id = (
+      SELECT id FROM analyses WHERE item_id = a.item_id
+      ORDER BY analyzed_at DESC, id DESC LIMIT 1
+    )
+"""
+
+
 def pending_reviews(conn: sqlite3.Connection, day: str) -> list[sqlite3.Row]:
     """JST の暦日 day に Codex が書き、まだ確かめていない分析(item の最新のもの)を id 順に。"""
     start, end = jst_day_bounds_utc(day)
     return conn.execute(
-        """
-        SELECT a.* FROM analyses AS a
-        JOIN items ON items.id = a.item_id
-        WHERE a.analyzed_at >= ? AND a.analyzed_at < ?
-          AND a.degraded = 0
-          AND a.engine = 'codex-cli'
-          AND items.status = 'analyzed'
-          AND NOT EXISTS (SELECT 1 FROM analysis_reviews AS r WHERE r.analysis_id = a.id)
-          AND a.id = (
-            SELECT id FROM analyses WHERE item_id = a.item_id
-            ORDER BY analyzed_at DESC, id DESC LIMIT 1
-          )
-        ORDER BY a.id
-        """,
+        "SELECT a.* FROM analyses AS a JOIN items ON items.id = a.item_id"
+        f" WHERE {_UNREVIEWED_WHERE} AND items.status = 'analyzed' ORDER BY a.id",
         (start, end),
     ).fetchall()
+
+
+def unreviewed_count(conn: sqlite3.Connection, day: str) -> int:
+    """JST の暦日 day に Codex が書き、確かめないまま item の最新の分析になっている件数。
+
+    digest に載った後の item も数える(確かめずに配信に使った件数を知らせるため)。
+    """
+    start, end = jst_day_bounds_utc(day)
+    return conn.execute(
+        f"SELECT count(*) AS n FROM analyses AS a WHERE {_UNREVIEWED_WHERE}", (start, end)
+    ).fetchone()["n"]
+
+
+def run_review_notice(
+    conn: sqlite3.Connection,
+    config: Config,
+    env: Mapping[str, str],
+    run_id: str,
+    day: str,
+) -> str | None:
+    """朝バッチ 1 回の後の、確かめなかった分析の知らせ(無効か、全件を確かめたなら None)。
+
+    確かめなくても分析は Codex の値のまま使えるので、段の失敗にはしない。それでも、確かめを
+    経ないまま配信した日は知らせる(黙って Codex だけの判定に戻らない)。文言は固定の語と数と、
+    台帳の失敗の種類(_failure_kind の固定の語)だけ。
+    """
+    settings = config.analysis_review
+    if not settings.enabled:
+        return None
+    left = unreviewed_count(conn, day)
+    if left == 0:
+        return None
+    lines = [f"⚠️ 今日の分析のうち {left} 件は、Claude の確かめを経ずに Codex の値のまま使いました"]
+    failures = conn.execute(
+        "SELECT error_kind, count(*) AS calls FROM analysis_review_calls"
+        " WHERE run_id = ? AND ok = 0 GROUP BY error_kind ORDER BY min(id)",
+        (run_id,),
+    ).fetchall()
+    if failures:
+        kinds = "・".join(f"{row['error_kind']} {row['calls']} 回" for row in failures)
+        lines.append(f"・確かめの呼び出しの失敗: {kinds}")
+    spent = review_cost_this_month(conn)
+    if spent >= settings.monthly_cap_usd:
+        lines.append(
+            f"・今月の確かめの費用 ${spent:.2f} が上限 ${settings.monthly_cap_usd:.2f} に達した"
+        )
+    if not env.get(ANTHROPIC_API_KEY_ENV, "").strip():
+        lines.append(f"・.env に {ANTHROPIC_API_KEY_ENV} が無い")
+    lines.append("morning.log の「分析の確かめ」の WARNING を見てください(runbook §17)")
+    return "\n".join(lines)
 
 
 def review_analyses(
