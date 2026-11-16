@@ -148,7 +148,8 @@ def pending_reviews(conn: sqlite3.Connection, day: str) -> list[sqlite3.Row]:
 def unreviewed_count(conn: sqlite3.Connection, day: str) -> int:
     """JST の暦日 day に Codex が書き、確かめないまま item の最新の分析になっている件数。
 
-    digest に載った後の item も数える(確かめずに配信に使った件数を知らせるため)。
+    digest に載った後の item も、digest の選外の分析も数える(確かめを経ずに digest に載った分を
+    数え落とさないため)。digest に載った数や、配信できたかは表さない。
     """
     start, end = jst_day_bounds_utc(day)
     return conn.execute(
@@ -165,8 +166,8 @@ def run_review_notice(
 ) -> str | None:
     """朝バッチ 1 回の後の、確かめなかった分析の知らせ(無効か、全件を確かめたなら None)。
 
-    確かめなくても分析は Codex の値のまま使えるので、段の失敗にはしない。それでも、確かめを
-    経ないまま配信した日は知らせる(黙って Codex だけの判定に戻らない)。文言は固定の語と数と、
+    確かめなくても分析は Codex の値のまま使えるので、段の失敗にはしない。それでも、確かめていない
+    分析が残った日は知らせる(黙って Codex だけの判定に戻らない)。文言は固定の語と数と、
     台帳の失敗の種類(_failure_kind の固定の語)だけ。
     """
     settings = config.analysis_review
@@ -175,7 +176,7 @@ def run_review_notice(
     left = unreviewed_count(conn, day)
     if left == 0:
         return None
-    lines = [f"⚠️ 今日の分析のうち {left} 件は、Claude の確かめを経ずに Codex の値のまま使いました"]
+    lines = [f"⚠️ 今日の分析のうち {left} 件は、Claude が確かめていません(Codex の値のまま)"]
     failures = conn.execute(
         "SELECT error_kind, count(*) AS calls FROM analysis_review_calls"
         " WHERE run_id = ? AND ok = 0 GROUP BY error_kind ORDER BY min(id)",

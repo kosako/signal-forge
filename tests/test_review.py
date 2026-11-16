@@ -573,7 +573,7 @@ def test_review_notice_lists_count_and_reasons_of_this_run(conn, tmp_path) -> No
     notice = run_review_notice(conn, config, {}, "R", today_jst())
 
     assert notice == (
-        "⚠️ 今日の分析のうち 3 件は、Claude の確かめを経ずに Codex の値のまま使いました\n"
+        "⚠️ 今日の分析のうち 3 件は、Claude が確かめていません(Codex の値のまま)\n"
         "・確かめの呼び出しの失敗: タイムアウト 1 回\n"
         "・今月の確かめの費用 $0.05 が上限 $0.05 に達した\n"
         "・.env に INTEL_ANTHROPIC_API_KEY が無い\n"
@@ -633,7 +633,7 @@ def test_notify_sends_unreviewed_notice_to_owner(conn, tmp_path, monkeypatch) ->
 
     ((chat_id, text),) = api.sent
     assert chat_id == 10
-    assert text.startswith("⚠️ 今日の分析のうち 1 件は、Claude の確かめを経ずに")
+    assert text.startswith("⚠️ 今日の分析のうち 1 件は、Claude が確かめていません")
 
 
 def test_notify_failures_are_only_logged(conn, tmp_path, monkeypatch, caplog) -> None:
