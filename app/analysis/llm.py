@@ -417,7 +417,12 @@ def anthropic_output_schema(schema: type[BaseModel]) -> dict[str, Any]:
 
 
 def _reject_recursion(root: dict[str, Any]) -> None:
-    """$ref をたどって自分に戻る schema(再帰)を止める。"""
+    """$ref をたどって自分に戻る schema(再帰)を止める。
+
+    たどれるのは、root と root 直下の $defs・definitions の名前を指す形(Pydantic の既定の
+    "#/$defs/<名前>")だけ。ほかの形(escape した名前・入れ子の $defs など)は、再帰を確かめ
+    られないので止める。
+    """
     graph = {
         f"#/{key}/{name}": _schema_refs(sub)
         for key in ("definitions", "$defs")
@@ -429,9 +434,11 @@ def _reject_recursion(root: dict[str, Any]) -> None:
     def visit(ref: str, path: frozenset[str]) -> None:
         if ref in path:
             raise LLMError("構造化出力に送れない schema(再帰)")
+        if ref not in graph:
+            raise LLMError("構造化出力に送れない schema(たどれない $ref)")
         if ref in done:
             return
-        for sub in graph.get(ref, ()):
+        for sub in graph[ref]:
             visit(sub, path | {ref})
         done.add(ref)
 

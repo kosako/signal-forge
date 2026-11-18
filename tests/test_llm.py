@@ -912,6 +912,42 @@ def test_anthropic_refuses_recursive_schema_before_sending(schema) -> None:
     _refused_before_sending(schema, "再帰")
 
 
+class _EscapedRef(BaseModel):
+    # escape した $ref("%24defs")で自分を指す。表でたどれないので、再帰を確かめられない
+    children: list["_EscapedRef"] = []
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        kwargs["ref_template"] = "#/%24defs/{model}"
+        return super().model_json_schema(*args, **kwargs)
+
+
+class _NestedDefsRef(BaseModel):
+    # 入れ子の $defs を指す $ref(再帰ではないが、たどれない)
+    value: int
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        return {
+            "type": "object",
+            "properties": {
+                "value": {"$ref": "#/properties/holder/$defs/Int"},
+                "holder": {
+                    "type": "object",
+                    "properties": {},
+                    "$defs": {"Int": {"type": "integer"}},
+                },
+            },
+            "required": ["value"],
+        }
+
+
+@pytest.mark.parametrize("schema", [_EscapedRef, _NestedDefsRef])
+def test_anthropic_refuses_unresolvable_ref_before_sending(schema) -> None:
+    # root 直下の $defs の名前を指さない $ref は、再帰かを確かめられないので送らない
+    _refused_before_sending(schema, "たどれない \\$ref")
+
+
 # API が受ける keyword(structured outputs の JSON Schema limitations。2026-11-19 に確認)
 _API_KEYWORDS = {
     "type", "required", "$ref", "title", "description", "enum", "const", "default",
