@@ -35,7 +35,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -386,6 +386,59 @@ _ANTHROPIC_UNAVAILABLE_STATUSES = frozenset({401, 403, 404})
 _ANTHROPIC_OK_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
 # 接続を張れなかった通信の失敗(リクエストを送っていないので課金されない。GH#241)
 _ANTHROPIC_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+# 構造化出力(output_config.format。GH#430)に送る JSON schema の keyword のうち、値をそのまま
+# 送るもの。schema を値に持つ keyword(properties・items・anyOf など)は _wire_schema が中へ
+# 進む。ほか(文字数・数値の範囲、maxItems など)は API が受けないので送る schema から外し、
+# description に書き足す。外した制約は、応答を読むときの Pydantic の検証(parse_structured)で
+# 今までどおり確かめる
+_WIRE_SCHEMA_KEYWORDS = frozenset(
+    {"type", "required", "$ref", "title", "description", "enum", "const", "default"}
+)
+_WIRE_SCHEMA_FORMATS = frozenset(
+    {"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
+)
+
+
+def anthropic_output_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """Pydantic の schema から、構造化出力に送る JSON schema を作る(GH#430)。
+
+    API は JSON schema の一部だけを受ける(受けない keyword は 400)。受けない制約は外して
+    description に書き足し(モデルに上限を伝える)、object にはすべて
+    additionalProperties: false を付ける。任意のキーの object(dict 型など)は、API が
+    キーを返せないので送らずに止める。
+    """
+    return _wire_schema(schema.model_json_schema())
+
+
+def _wire_schema(node: dict[str, Any]) -> dict[str, Any]:
+    wire: dict[str, Any] = {}
+    dropped: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in ("properties", "$defs", "definitions"):
+            wire[key] = {name: _wire_schema(sub) for name, sub in value.items()}
+        elif key in ("anyOf", "allOf"):
+            wire[key] = [_wire_schema(sub) for sub in value]
+        elif key == "items" and isinstance(value, dict):
+            wire[key] = _wire_schema(value)
+        elif key == "additionalProperties":
+            if value is not False:
+                raise LLMError("構造化出力に送れない schema(任意のキーの object)")
+        elif (
+            key in _WIRE_SCHEMA_KEYWORDS
+            or (key == "format" and value in _WIRE_SCHEMA_FORMATS)
+            # minItems は 0 と 1 だけを受ける
+            or (key == "minItems" and value in (0, 1) and not isinstance(value, bool))
+        ):
+            wire[key] = value
+        else:
+            dropped[key] = value
+    if wire.get("type") == "object" or "properties" in wire:
+        wire["additionalProperties"] = False
+    if dropped:
+        note = json.dumps(dropped, ensure_ascii=False, sort_keys=True)
+        description = wire.get("description")
+        wire["description"] = f"{description} {note}" if description else note
+    return wire
 
 
 @dataclass(frozen=True)
@@ -442,14 +495,21 @@ class AnthropicApiEngine:
         self, prompt: str, schema: type[M], timeout_s: int = DEFAULT_TIMEOUT_S
     ) -> M:
         self.last_usage = None
+        self.last_cost_bound_usd = None
+        # 応答の形は構造化出力で API に守らせる(prompt の指示だけだと、まれに JSON として
+        # 読めない本文が返る。GH#430)。長さ・範囲は API が受けないので、読むときに確かめる
+        output_schema = anthropic_output_schema(schema)
         # 送った後は、応答の usage を受け取るまで費用が分からない。それまでは課金されうる
         # 最大の額を持ち、費用が分かったら(実額・課金されない失敗)消す(GH#241)
-        self.last_cost_bound_usd = self._max_cost_usd(prompt)
+        self.last_cost_bound_usd = self._max_cost_usd(prompt, output_schema)
         body = {
             "model": self.model,
             "max_tokens": self._max_tokens,
             "messages": [{"role": "user", "content": prompt}],
-            "output_config": {"effort": self._effort},
+            "output_config": {
+                "effort": self._effort,
+                "format": {"type": "json_schema", "schema": output_schema},
+            },
         }
         headers = {
             "x-api-key": self._api_key,
@@ -512,13 +572,15 @@ class AnthropicApiEngine:
             # つながない。GH#156 のレビュー)
             raise LLMError(_content_free_parse_error(e, _ANTHROPIC_PARSE_LABELS)) from None
 
-    def _max_cost_usd(self, prompt: str) -> float:
+    def _max_cost_usd(self, prompt: str, output_schema: dict[str, Any]) -> float:
         """この prompt の呼び出しで課金されうる最大の額(費用が分からないときの見積もり。GH#241)。
 
-        出力は上限の max_tokens(思考 + 本文)。入力は多めに見るため、トークン数を prompt の
-        UTF-8 のバイト数とみなす(実際のトークン数はふつうこれより少ない)。
+        出力は上限の max_tokens(思考 + 本文)。入力は多めに見るため、トークン数を prompt と
+        構造化出力の schema(API が入力に足す。GH#430)の UTF-8 のバイト数とみなす(実際の
+        トークン数はふつうこれより少ない)。
         """
-        input_tokens = len(prompt.encode("utf-8"))
+        schema_bytes = json.dumps(output_schema, ensure_ascii=False).encode("utf-8")
+        input_tokens = len(prompt.encode("utf-8")) + len(schema_bytes)
         cost = (
             input_tokens * self._input_price + self._max_tokens * self._output_price
         ) / 1_000_000

@@ -1,5 +1,6 @@
 """主のエンジンが失敗した呼び出しを予備でやり直す(GH#156)。"""
 
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ from app.analysis.llm import (
     LLMError,
     LLMUnavailableError,
     LLMUsage,
+    anthropic_output_schema,
     complete_with_retry,
 )
 from app.config import Config, LLMFallbackConfig
@@ -165,9 +167,10 @@ _CLAUDE_REPLY = {
     "stop_reason": "end_turn",
     "usage": {"input_tokens": 10, "output_tokens": 5},
 }
-# 費用が分からない呼び出しの最大の額: 入力は prompt「記事」の UTF-8 のバイト数(6)、出力は
-# max_tokens(1000)。6 × $2/M + 1000 × $10/M
-_UNKNOWN_COST_BOUND = 0.010012
+# 費用が分からない呼び出しの最大の額: 入力は prompt「記事」(6 バイト)と送る schema の UTF-8 の
+# バイト数(GH#430)、出力は max_tokens(1000)。(6 + schema) × $2/M + 1000 × $10/M
+_SCHEMA_BYTES = len(json.dumps(anthropic_output_schema(Verdict), ensure_ascii=False))
+_UNKNOWN_COST_BOUND = round((6 + _SCHEMA_BYTES) * 2 / 1_000_000 + 0.01, 6)
 
 
 def claude(handler) -> AnthropicApiEngine:

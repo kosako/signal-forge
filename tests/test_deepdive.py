@@ -23,6 +23,7 @@ from app.analysis.llm import (
     LLMError,
     LLMUnavailableError,
     LLMUsage,
+    anthropic_output_schema,
     create_anthropic_engine,
 )
 from app.config import Config, DigConfig, LLMFallbackConfig, ObsidianConfig, TelegramConfig
@@ -1981,10 +1982,12 @@ def claude_review_engine(config, *outcomes: str):
 
 
 def cost_bound(config, prompt: str) -> float:
-    """費用が分からない呼び出しの最大の額(入力 = prompt の UTF-8 のバイト数、出力 = max_tokens)。"""
+    """費用が分からない呼び出しの最大の額(入力 = prompt と送る schema の UTF-8 のバイト数、
+    出力 = max_tokens。GH#430)。"""
     settings = config.anthropic_api
+    schema = json.dumps(anthropic_output_schema(DigReview), ensure_ascii=False)
     cost = (
-        len(prompt.encode("utf-8")) * settings.input_usd_per_mtok
+        (len(prompt.encode("utf-8")) + len(schema.encode("utf-8"))) * settings.input_usd_per_mtok
         + settings.max_tokens * settings.output_usd_per_mtok
     ) / 1_000_000
     return round(cost, 6)
