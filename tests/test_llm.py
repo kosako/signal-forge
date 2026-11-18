@@ -8,7 +8,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import httpx
 import pytest
@@ -859,22 +859,57 @@ def test_anthropic_still_validates_dropped_constraints() -> None:
 
 
 class _ArbitraryKeys(BaseModel):
-    counts: dict[str, int]
+    counts: dict[str, int]  # additionalProperties に値の schema
 
 
-def test_anthropic_refuses_schema_with_arbitrary_keys_before_sending() -> None:
-    # 任意のキーの object は、API がキーを返せない(空の object しか返らない)ので送らない
+class _PatternKeys(BaseModel):
+    counts: dict[Annotated[str, Field(pattern="^metric_")], int]  # patternProperties
+
+
+class _AnyDict(BaseModel):
+    extra: dict  # additionalProperties: true
+
+
+class _Node(BaseModel):
+    name: str
+    children: list["_Node"] = []
+
+
+class _Left(BaseModel):
+    right: "_Right | None" = None
+
+
+class _Right(BaseModel):
+    left: _Left | None = None
+
+
+_Left.model_rebuild()
+
+
+def _refused_before_sending(schema: type[BaseModel], match: str) -> None:
     sent: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent.append(request)
-        return httpx.Response(200, json=anthropic_reply())
+        return httpx.Response(200, json=anthropic_reply(text="{}"))
 
     engine = anthropic_engine(handler)
-    with pytest.raises(LLMError, match="任意のキーの object"):
-        engine.complete_structured("p", _ArbitraryKeys)
+    with pytest.raises(LLMError, match=match):
+        engine.complete_structured("p", schema)
     assert sent == []
     assert engine.last_cost_bound_usd is None  # 送っていないので費用は無い
+
+
+@pytest.mark.parametrize("schema", [_ArbitraryKeys, _PatternKeys, _AnyDict])
+def test_anthropic_refuses_schema_with_arbitrary_keys_before_sending(schema) -> None:
+    # 任意のキーの object は、API がキーを返せない(空の object しか返らない)ので送らない
+    _refused_before_sending(schema, "任意のキーの object")
+
+
+@pytest.mark.parametrize("schema", [_Node, _Left])
+def test_anthropic_refuses_recursive_schema_before_sending(schema) -> None:
+    # 再帰の schema(自分を指す・互いに指す)は API が受けない(400)ので送らない
+    _refused_before_sending(schema, "再帰")
 
 
 # API が受ける keyword(structured outputs の JSON Schema limitations。2026-11-19 に確認)

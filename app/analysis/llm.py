@@ -397,6 +397,10 @@ _WIRE_SCHEMA_KEYWORDS = frozenset(
 _WIRE_SCHEMA_FORMATS = frozenset(
     {"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
 )
+# 任意のキーを受ける object の keyword(dict 型。キーに pattern があれば patternProperties)。
+# API は additionalProperties: false しか受けず、properties に並べたキーしか返せない
+_ARBITRARY_KEY_KEYWORDS = frozenset({"additionalProperties", "patternProperties", "propertyNames"})
+_ARBITRARY_KEYS_ERROR = "構造化出力に送れない schema(任意のキーの object)"
 
 
 def anthropic_output_schema(schema: type[BaseModel]) -> dict[str, Any]:
@@ -404,10 +408,49 @@ def anthropic_output_schema(schema: type[BaseModel]) -> dict[str, Any]:
 
     API は JSON schema の一部だけを受ける(受けない keyword は 400)。受けない制約は外して
     description に書き足し(モデルに上限を伝える)、object にはすべて
-    additionalProperties: false を付ける。任意のキーの object(dict 型など)は、API が
-    キーを返せないので送らずに止める。
+    additionalProperties: false を付ける。任意のキーの object(dict 型など)は API が
+    キーを返せず、再帰の schema は API が受けないので、どちらも送らずに止める。
     """
-    return _wire_schema(schema.model_json_schema())
+    source = schema.model_json_schema()
+    _reject_recursion(source)
+    return _wire_schema(source)
+
+
+def _reject_recursion(root: dict[str, Any]) -> None:
+    """$ref をたどって自分に戻る schema(再帰)を止める。"""
+    graph = {
+        f"#/{key}/{name}": _schema_refs(sub)
+        for key in ("definitions", "$defs")
+        for name, sub in root.get(key, {}).items()
+    }
+    graph["#"] = _schema_refs(root)
+    done: set[str] = set()
+
+    def visit(ref: str, path: frozenset[str]) -> None:
+        if ref in path:
+            raise LLMError("構造化出力に送れない schema(再帰)")
+        if ref in done:
+            return
+        for sub in graph.get(ref, ()):
+            visit(sub, path | {ref})
+        done.add(ref)
+
+    visit("#", frozenset())
+
+
+def _schema_refs(node: dict[str, Any]) -> set[str]:
+    """schema の節が指す $ref(入れ子の節を含む。$defs の中身は別の節として数える)。"""
+    refs: set[str] = set()
+    if isinstance(node.get("$ref"), str):
+        refs.add(node["$ref"])
+    for sub in node.get("properties", {}).values():
+        refs |= _schema_refs(sub)
+    for key in ("anyOf", "allOf"):
+        for sub in node.get(key, []):
+            refs |= _schema_refs(sub)
+    if isinstance(node.get("items"), dict):
+        refs |= _schema_refs(node["items"])
+    return refs
 
 
 def _wire_schema(node: dict[str, Any]) -> dict[str, Any]:
@@ -420,9 +463,9 @@ def _wire_schema(node: dict[str, Any]) -> dict[str, Any]:
             wire[key] = [_wire_schema(sub) for sub in value]
         elif key == "items" and isinstance(value, dict):
             wire[key] = _wire_schema(value)
-        elif key == "additionalProperties":
-            if value is not False:
-                raise LLMError("構造化出力に送れない schema(任意のキーの object)")
+        elif key in _ARBITRARY_KEY_KEYWORDS:
+            if not (key == "additionalProperties" and value is False):  # false は下で付け直す
+                raise LLMError(_ARBITRARY_KEYS_ERROR)
         elif (
             key in _WIRE_SCHEMA_KEYWORDS
             or (key == "format" and value in _WIRE_SCHEMA_FORMATS)
@@ -432,6 +475,8 @@ def _wire_schema(node: dict[str, Any]) -> dict[str, Any]:
             wire[key] = value
         else:
             dropped[key] = value
+    if wire.get("type") == "object" and "properties" not in wire:
+        raise LLMError(_ARBITRARY_KEYS_ERROR)  # 並べたキーが無い object(素の dict 型など)
     if wire.get("type") == "object" or "properties" in wire:
         wire["additionalProperties"] = False
     if dropped:
