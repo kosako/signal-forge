@@ -20,9 +20,10 @@ CREATE TABLE focus_topics (
 -- 振り分けたシグナルごとに 1 行。signal_kind と signal_ref で元の行(x_signals・signals・
 -- item_notes・news_investigations の id)を指し、同じシグナルは 1 回だけ振り分ける。どの話題にも
 -- 当てはまらなかったシグナルも topic_id を空にして残す(次の実行で振り分け直さない)。
--- subject はシグナルが向いた記事・投稿('item:<items.id>'・'tweet:<tweet id>'・
--- 'investigation:<id>')。重みは記事・投稿ごとに一番強いシグナル 1 つだけを数える(1 本の記事への
--- 👍・🔖・感想の重なりで、その記事だけの話題が重点に入らないように)。
+-- subject はシグナルが向いた先を、寄せる前の形で持つ(X のシグナルは 'tweet:<tweet id>'、反応と感想は
+-- 'item:<items.id>'、調査は 'investigation:<id>')。重みは、重みの計算のたびに同じ投稿の記事へ寄せて、
+-- 記事・投稿ごとに一番強いシグナル 1 つだけを数える(1 本の記事への 👍・🔖・感想の重なりで、その
+-- 記事だけの話題が重点に入らないように。寄せ方は app/focus.py の _subject_sql)。
 -- observed_at は元のシグナルの時刻(新しさの減衰に使う。元の行が消えても重みを計算できるよう写す)。
 CREATE TABLE focus_evidence (
   id           INTEGER PRIMARY KEY,

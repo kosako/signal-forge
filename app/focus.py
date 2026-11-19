@@ -11,6 +11,9 @@
 - 重み = 記事・投稿ごとに max(種類の重み × 0.5^(経過日数 / 半減期)) を足したもの。1 本の記事への
   👍・🔖・感想の重なりは一番強い 1 つだけを数え、複数の記事・投稿にまたがる話題を重点にする。毎回
   focus_evidence から計算するので、新しいシグナルが無い日も、減衰で重点から外れる
+- 台帳には、シグナルが向いた先を寄せる前の形で残す(X のシグナルは投稿、反応と感想は記事)。どの
+  記事・投稿として数えるかは、重みの計算のたびに _subject_sql で決める。後から投稿の記事ができた・
+  ブックマークが別の記事に合流したときも、保存済みの証拠を今の対応で数え直すため
 - 重点に入るのは enter_score 以上、外れるのは exit_score 未満(出入りのばたつきを防ぐ)。数は
   max_active まで。満ちているときは、重みの高い候補が来ても入れ替えない(外れるのを待つ)
 - 話題の名前と検索の語は、外部の本文から LLM が作った文。prompt には nonce の囲みの中の data として
@@ -93,7 +96,9 @@ class FocusSignal:
     key: str  # prompt の中の id("s1")
     kind: str  # focus_evidence.signal_kind
     ref: int  # 元の行の id
-    subject: str  # シグナルが向いた記事・投稿('item:12'・'tweet:<id>'・'investigation:3')
+    # シグナルが向いた先('tweet:<id>'・'item:12'・'investigation:3')。寄せる前の形で、重みの計算の
+    # たびに同じ記事・投稿へ寄せる
+    subject: str
     observed_at: str  # 元のシグナルの時刻(UTC の 'YYYY-MM-DDTHH:MM:SSZ')
     text: str  # 材料の本文(外部由来。prompt に入れるときに sanitize する)
 
@@ -179,8 +184,7 @@ def _tweet_item_sql(tweet: str) -> str:
     """投稿(tweet id の SQL 式)を記事(items.id)に寄せる SQL 式。寄せる先が無ければ NULL。
 
     ブックマークが記事に合流した投稿は、その記事(x_signals の item_id。外部リンクの先の RSS の記事の
-    こともある)に寄せる。無ければ、X の投稿として取り込んだ記事に寄せる。集め方と重みの計算の両方で
-    使い、同じ投稿へのいいね・ブックマーク・記事への反応を 1 つの記事として数える。
+    こともある)に寄せる。無ければ、X の投稿として取り込んだ記事に寄せる。
     """
     return (
         "coalesce("
@@ -188,6 +192,26 @@ def _tweet_item_sql(tweet: str) -> str:
         "AND x2.item_id IS NOT NULL ORDER BY x2.id LIMIT 1), "
         "(SELECT i2.id FROM items i2 JOIN sources so2 ON so2.id = i2.source_id AND so2.type = 'x' "
         f"WHERE i2.external_id = {tweet} ORDER BY i2.id LIMIT 1))"
+    )
+
+
+def _subject_sql(subject: str) -> str:
+    """台帳の subject(SQL 式)を、数えるときの記事・投稿に寄せる SQL 式。
+
+    投稿('tweet:<id>')は _tweet_item_sql で記事に寄せる。X の投稿として取り込んだ記事('item:<id>' で
+    external_id が投稿の id)も、元の投稿を通して同じ先に寄せる(その投稿のブックマークが別の記事に
+    合流していれば、その記事)。寄せる先が無ければ subject のまま。
+    """
+    tweet_of_item = (
+        "(SELECT i3.external_id FROM items i3 JOIN sources so3 ON so3.id = i3.source_id "
+        f"AND so3.type = 'x' WHERE i3.id = CAST(substr({subject}, 6) AS INTEGER))"
+    )
+    return (
+        f"CASE WHEN {subject} LIKE 'tweet:%' "
+        f"THEN coalesce('item:' || {_tweet_item_sql(f'substr({subject}, 7)')}, {subject}) "
+        f"WHEN {subject} LIKE 'item:%' AND {tweet_of_item} IS NOT NULL "
+        f"THEN coalesce('item:' || {_tweet_item_sql(tweet_of_item)}, {subject}) "
+        f"ELSE {subject} END"
     )
 
 
@@ -209,7 +233,7 @@ def collect_signals(conn: sqlite3.Connection, config: Config, now: datetime) -> 
                (SELECT title FROM items WHERE id = r.item_id) AS item_title
         FROM (
           SELECT s.id, s.kind, s.tweet_id, s.observed_at, s.text_excerpt,
-                 -- 同じ投稿の記事があれば、その記事への反応と同じ記事に数え、見出しもそこから取る
+                 -- 本文の抜粋が消えていたら、同じ投稿の記事の見出しを使う
                  coalesce(s.item_id, {_tweet_item_sql("s.tweet_id")}) AS item_id
           FROM x_signals s
           WHERE s.observed_at >= ?
@@ -223,7 +247,8 @@ def collect_signals(conn: sqlite3.Connection, config: Config, now: datetime) -> 
     ):
         text = row["text_excerpt"] or row["title_ja"] or row["item_title"]
         if text:
-            subject = f"item:{row['item_id']}" if row["item_id"] else f"tweet:{row['tweet_id']}"
+            # 台帳には投稿のまま残す(記事への寄せ方は重みの計算のたびに決める)
+            subject = f"tweet:{row['tweet_id']}"
             found.append((f"x_{row['kind']}", row["id"], subject, row["observed_at"], text))
     for row in conn.execute(
         """
@@ -321,10 +346,8 @@ def topic_scores(conn: sqlite3.Connection, config: Config, now: datetime) -> lis
     for row in conn.execute(
         f"""
         SELECT t.id, t.name, t.terms, t.status, e.signal_kind, e.observed_at,
-               -- 振り分けた後に投稿の記事ができた(ブックマークが合流した)ときも、同じ記事に寄せる
-               CASE WHEN e.subject LIKE 'tweet:%'
-                 THEN coalesce('item:' || {_tweet_item_sql("substr(e.subject, 7)")}, e.subject)
-                 ELSE e.subject END AS subject
+               -- 振り分けた後に投稿の記事ができた・ブックマークが合流したときも、今の対応で寄せる
+               {_subject_sql("e.subject")} AS subject
         FROM focus_topics t
         LEFT JOIN focus_evidence e ON e.topic_id = t.id
         ORDER BY t.id, e.id

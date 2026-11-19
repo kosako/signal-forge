@@ -205,7 +205,7 @@ def test_signals_on_the_same_article_count_once(conn, tmp_path) -> None:
     add_x_signal(conn, "bookmark", "77", text="同じ投稿")  # item_id は無いが同じ投稿の記事がある
     add_x_signal(conn, "like", "88", text="別の投稿")
     signals = collect_signals(conn, config, NOW)
-    assert {s.subject for s in signals} == {f"item:{article}", "tweet:88"}
+    assert {s.subject for s in signals} == {f"item:{article}", "tweet:77", "tweet:88"}
 
     run_focus(conn, config, FakeEngine(lambda _p: drafts(
         ("new", "話題", [], [s.key for s in signals]),
@@ -377,7 +377,7 @@ def test_like_and_bookmark_merged_into_an_article_count_as_one(conn, tmp_path) -
     add_x_signal(conn, "bookmark", "55", text="リンク付きの投稿", item_id=article)
     add_x_signal(conn, "self_rt", "55", text="リンク付きの投稿")
     signals = collect_signals(conn, config, NOW)
-    assert {s.subject for s in signals} == {f"item:{article}"}  # 合流した記事に寄せる
+    assert {s.subject for s in signals} == {"tweet:55"}  # 台帳には投稿のまま残す
     topic_id = conn.execute("SELECT id FROM focus_topics").fetchone()[0]
     run_focus(conn, config, FakeEngine(lambda _p: drafts(
         (f"t{topic_id}", "話題", [], [s.key for s in signals]),
@@ -400,7 +400,7 @@ def test_x_signal_without_excerpt_uses_the_resolved_article_title(conn, tmp_path
     )
     add_x_signal(conn, "like", "66", days_ago=8)  # 抜粋は保存期間を過ぎて消えた
     (signal,) = collect_signals(conn, config, NOW)
-    assert (signal.subject, signal.text) == (f"item:{tweet_item}", "投稿の見出し")
+    assert (signal.subject, signal.text) == ("tweet:66", "投稿の見出し")
 
 
 def test_reaction_on_a_degraded_article_uses_its_original_title(conn, tmp_path) -> None:
@@ -449,3 +449,38 @@ def test_signals_assigned_by_another_run_are_not_counted_again(conn, tmp_path) -
     names = [r[0] for r in conn.execute("SELECT name FROM focus_topics")]
     assert names == ["残りの話題"]
     assert conn.execute("SELECT count(*) FROM focus_evidence").fetchone()[0] == 2
+
+
+def test_x_article_evidence_follows_a_later_bookmark_merge(conn, tmp_path) -> None:
+    # Codex F1(round 2): X の投稿として取り込んだ記事 A への反応を先に振り分け、後で同じ投稿の
+    # ブックマークが RSS の記事 B に合流しても、A と B を別の記事として二重に数えない
+    config = make_config(tmp_path)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'x:home')")
+    x_article = add_item(conn, "xa", title_ja="X の投稿の記事")
+    conn.execute(
+        "UPDATE items SET source_id = (SELECT id FROM sources WHERE type = 'x'), "
+        "external_id = '99' WHERE id = ?",
+        (x_article,),
+    )
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('reaction', ?, 'dig', '2026-11-19', ?)",
+        (x_article, iso(1)),
+    )
+    add_x_signal(conn, "self_rt", "99", text="投稿", days_ago=1)
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(("new", "話題", [], ["s1", "s2"]))),
+              logger, now=NOW)
+    topic_id = conn.execute("SELECT id FROM focus_topics").fetchone()[0]
+
+    rss_article = add_item(conn, "rb", title_ja="リンク先の記事")
+    add_x_signal(conn, "bookmark", "99", text="投稿", item_id=rss_article)
+    add_x_signal(conn, "like", "100", text="別の投稿")
+    signals = collect_signals(conn, config, NOW)
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(
+        (f"t{topic_id}", "話題", [], [s.key for s in signals]),
+    )), logger, now=NOW)
+
+    (score,) = topic_scores(conn, config, NOW)
+    # 投稿 99 は 1 つの記事(一番強いのは今日の 🔖 の 3.0)、別の投稿の ❤️ が 1.0
+    assert (score.score, score.subjects) == (pytest.approx(4.0), 2)
+    assert score.status == "candidate"
