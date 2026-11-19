@@ -514,3 +514,30 @@ def test_active_focus_lists_active_topics_by_weight(conn, tmp_path) -> None:
     assert parse_focus_json('{"topics": [{"topic_id": 1, "name": "x", "subjects": 2}]}') == [
         FocusEntry(1, "x", 2)
     ]
+
+
+def test_dismissed_topic_stays_out_and_restored_topic_returns_by_weight(conn, tmp_path) -> None:
+    # GH#433 の 3 本目: 外した話題は重みがあっても重点に戻さず、戻すと次の更新で重みで入る
+    from app.focus import dismiss_topic, restore_topic
+
+    config = make_config(tmp_path)
+    add_x_signal(conn, "self_rt", "1", text="a")
+    add_x_signal(conn, "self_rt", "2", text="b")
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(("new", "話題", [], ["s1", "s2"]))),
+              logger, now=NOW)
+    topic_id = conn.execute("SELECT id FROM focus_topics").fetchone()[0]
+
+    assert dismiss_topic(conn, topic_id, NOW) == "dismissed"
+    assert dismiss_topic(conn, topic_id, NOW) == "already"
+    row = conn.execute("SELECT status, dismissed_at, deactivated_at FROM focus_topics").fetchone()
+    assert (row["status"], row["dismissed_at"], row["deactivated_at"]) == (
+        "dismissed", iso(0), iso(0)
+    )
+    run_focus(conn, config, FakeEngine(), logger, now=NOW)
+    assert scores_by_name(conn, config)["話題"][1] == "dismissed"
+
+    assert restore_topic(conn, topic_id) == "restored"
+    assert restore_topic(conn, topic_id) == "already"
+    assert restore_topic(conn, 999) == dismiss_topic(conn, 999, NOW) == "missing"
+    run_focus(conn, config, FakeEngine(), logger, now=NOW)
+    assert scores_by_name(conn, config)["話題"][1] == "active"

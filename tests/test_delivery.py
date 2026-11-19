@@ -1158,3 +1158,68 @@ def test_header_shows_focus_names_escaped_and_bounded(conn, tmp_path) -> None:
     recorder = ApiRecorder()
     deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
     assert "🎯" not in recorder.texts()[0]
+
+
+def add_focus_topics(conn, *names: str, dismissed: tuple[str, ...] = ()) -> list[int]:
+    ids = []
+    for name in names:
+        ids.append(
+            conn.execute(
+                "INSERT INTO focus_topics (name, status, dismissed_at) VALUES (?, ?, ?)",
+                (name, "dismissed" if name in dismissed else "active",
+                 "2026-11-20T00:00:00Z" if name in dismissed else None),
+            ).lastrowid
+        )
+    return ids
+
+
+def test_header_has_focus_buttons_after_investigate_buttons(conn, tmp_path) -> None:
+    # GH#433 の 3 本目: 今の重点を外すボタンを、出来事の調査のボタンの後ろの行に付け、写しを台帳の
+    # ヘッダの行に残す。名前は 12 字で切る。外した話題は「戻す」にする
+    from app.models import FocusEntry, focus_to_json
+
+    report = add_item(conn, "https://news.example/1")
+    trend = json.dumps(
+        {"events": [{"label": "出来事", "summary": "s", "item_ids": [report],
+                     "source_ids": [report]}]},
+        ensure_ascii=False,
+    )
+    ids = add_focus_topics(conn, "A", "とても長い話題の名前ですよ", "C", dismissed=("C",))
+    focus = focus_to_json(
+        [FocusEntry(ids[0], "A", 3), FocusEntry(ids[1], "とても長い話題の名前ですよ", 2),
+         FocusEntry(ids[2], "C", 2)]
+    )
+    digest_id = add_digest(conn, [report], trend_json=trend, focus_json=focus)
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    assert json.loads(recorder.requests[0]["reply_markup"]) == {
+        "inline_keyboard": [
+            [{"text": "🔎 1", "callback_data": f"e:{digest_id}:1"}],
+            [{"text": "🎯 外す: A", "callback_data": f"t:{digest_id}:1"},
+             {"text": "🎯 外す: とても長い話題の名前で…", "callback_data": f"t:{digest_id}:2"}],
+            [{"text": "↩️ 戻す: C", "callback_data": f"u:{digest_id}:3"}],
+        ]
+    }
+    row = conn.execute(
+        "SELECT news_json, focus_json FROM digest_messages WHERE item_id IS NULL"
+    ).fetchone()
+    assert (row["news_json"], row["focus_json"]) == (trend, focus)
+
+
+def test_header_focus_buttons_without_investigate_buttons(conn, tmp_path) -> None:
+    # 深掘りの段が止まっていても、今の重点のボタンは付ける(調査のボタンと写しは付けない)
+    from app.models import FocusEntry, focus_to_json
+
+    (topic,) = add_focus_topics(conn, "A")
+    focus = focus_to_json([FocusEntry(topic, "A", 3)])
+    digest_id = add_digest(conn, [], trend_markdown="傾向。", focus_json=focus)
+    recorder = ApiRecorder()
+    config = replace(make_config(tmp_path), dig=DigConfig(daily_cap=0))
+    deliver_digest(conn, config, recorder.api(), digest_id, logger)
+
+    assert json.loads(recorder.requests[0]["reply_markup"]) == {
+        "inline_keyboard": [[{"text": "🎯 外す: A", "callback_data": f"t:{digest_id}:1"}]]
+    }
+    row = conn.execute("SELECT news_json, focus_json FROM digest_messages").fetchone()
+    assert (row["news_json"], row["focus_json"]) == (None, focus)

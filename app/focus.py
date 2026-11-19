@@ -607,6 +607,45 @@ def refresh_status(
     return activated, deactivated
 
 
+def dismiss_topic(conn: sqlite3.Connection, topic_id: int, now: datetime) -> str:
+    """人が話題を外す(GH#433 の 3 本目。ヘッダの「🎯 外す」)。
+
+    呼び出し側のトランザクションの中で使う。外した話題は重みが上がっても重点に戻さない
+    (refresh_status が動かさない)。重点だったときは、外れた時刻も残す。返すのは "dismissed"
+    (外した)・"already"(外し済み)・"missing"(話題が無い)。
+    """
+    row = conn.execute("SELECT status FROM focus_topics WHERE id = ?", (topic_id,)).fetchone()
+    if row is None:
+        return "missing"
+    if row["status"] == "dismissed":
+        return "already"
+    stamp = _iso(now)
+    conn.execute(
+        "UPDATE focus_topics SET status = 'dismissed', dismissed_at = ?, "
+        "deactivated_at = CASE WHEN status = 'active' THEN ? ELSE deactivated_at END "
+        "WHERE id = ?",
+        (stamp, stamp, topic_id),
+    )
+    return "dismissed"
+
+
+def restore_topic(conn: sqlite3.Connection, topic_id: int) -> str:
+    """外した話題を戻す(「↩️ 戻す」)。候補に戻し、次の refresh_status から重みで出入りを決める。
+
+    返すのは "restored"(戻した)・"already"(外していない)・"missing"(話題が無い)。
+    """
+    row = conn.execute("SELECT status FROM focus_topics WHERE id = ?", (topic_id,)).fetchone()
+    if row is None:
+        return "missing"
+    if row["status"] != "dismissed":
+        return "already"
+    conn.execute(
+        "UPDATE focus_topics SET status = 'candidate', dismissed_at = NULL WHERE id = ?",
+        (topic_id,),
+    )
+    return "restored"
+
+
 def active_focus(
     conn: sqlite3.Connection, config: Config, *, now: datetime | None = None
 ) -> list[FocusEntry]:

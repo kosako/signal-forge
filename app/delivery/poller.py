@@ -54,8 +54,9 @@ from app.delivery.telegram import (
     DeliveryError,
     TelegramApi,
     dig_card_keyboard,
+    dismissed_topic_ids,
     escape_and_truncate,
-    investigate_keyboard,
+    header_keyboard,
     pack_lines,
     reaction_keyboard,
 )
@@ -89,7 +90,7 @@ from app.dig_take import (
 from app.export.obsidian import note_projection_date
 from app.investigate_ledger import RequestOutcome, investigated_labels, request_investigation
 from app.jst import JST
-from app.models import NEWS_MAX_EVENTS, parse_news_json
+from app.models import FOCUS_MAX_TOPICS, NEWS_MAX_EVENTS, parse_focus_json, parse_news_json
 from app.normalize import (
     content_hash,
     is_dedup_eligible,
@@ -455,6 +456,15 @@ def _handle_callback(
             _record_investigation(
                 conn, config, api, callback, callback_id, int(arg), int(code), logger,
                 dig_now_worker,
+            )
+            return
+        # ヘッダの今の重点を外す(t)・戻す(u)。N は写しの番号(1 桁の ASCII の数字。GH#433)
+        if prefix in ("t", "u") and re.fullmatch(r"[0-9]{1,9}", arg) and re.fullmatch(
+            r"[0-9]", code
+        ):
+            _record_focus_toggle(
+                conn, config, api, callback, callback_id, int(arg), int(code),
+                dismiss=prefix == "t", logger=logger, now=now_fn(),
             )
             return
     # 不正形式・未対応 prefix は記帳せずログのみ(設計 04 §3)。応答は返して
@@ -1382,8 +1392,8 @@ def _record_investigation(
     chat_id = chat.get("id") if isinstance(chat, dict) else None
     row = (
         conn.execute(
-            "SELECT news_json FROM digest_messages WHERE message_id = ? AND digest_id = ? "
-            "AND item_id IS NULL AND news_json IS NOT NULL",
+            "SELECT news_json, focus_json FROM digest_messages WHERE message_id = ? "
+            "AND digest_id = ? AND item_id IS NULL AND news_json IS NOT NULL",
             (message_id, digest_id),
         ).fetchone()
         if type(message_id) is int
@@ -1408,6 +1418,8 @@ def _record_investigation(
                 conn, digest_id, number, entries[number - 1], callback_id=callback_id
             )
             marked = investigated_labels(conn, digest_id)
+            focus_entries = parse_focus_json(row["focus_json"]) or []
+            dismissed = dismissed_topic_ids(conn, focus_entries)
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1423,7 +1435,100 @@ def _record_investigation(
     api.answer_callback_query(callback_id, text=_INVESTIGATE_ANSWERS[outcome].format(n=number))
     if outcome in _INVESTIGATE_KICK and dig_now_worker is not None:
         dig_now_worker.kick(logger)
-    keyboard = investigate_keyboard(digest_id, entries, marked=marked)
+    # 今の重点のボタン(GH#433)を消さないよう、盤面は両方のボタンで作り直す
+    keyboard = header_keyboard(
+        digest_id, entries, focus_entries, marked=marked, dismissed=dismissed
+    )
+    if keyboard is not None:
+        _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+# 今の重点のボタンの答え(GH#433 の 3 本目)。固定の文言だけ(外部の本文から作った話題の名前を入れない)
+_FOCUS_ANSWERS = {
+    "dismissed": "🎯 外しました。重みが上がっても戻しません",
+    "restored": "↩️ 戻しました。次の朝から重みで決めます",
+}
+_FOCUS_ALREADY = {True: "🎯 外し済みです", False: "↩️ 外していません"}
+
+
+def _record_focus_toggle(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    digest_id: int,
+    number: int,
+    *,
+    dismiss: bool,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """ヘッダの「🎯 外す」「↩️ 戻す」(GH#433 の 3 本目。設計 03 §4.1・04 §3)。
+
+    押されたメッセージが、その digest のヘッダとしてボタンを付けて送ったメッセージ(digest_messages。
+    置換の前の世代も含む)で owner の chat にあることを確かめ、そのメッセージを送ったときの写し
+    (focus_json)の N 番目の話題を外す・戻す(callback_data だけを信じない)。外すと戻すは別の
+    callback なので、同じ callback が再配達されても状態は変わらない(済みと答える)。押した後は、
+    出来事の調査のボタンを残したまま、盤面を作り直す。
+    """
+    from app.focus import dismiss_topic, restore_topic
+
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    row = (
+        conn.execute(
+            "SELECT news_json, focus_json FROM digest_messages WHERE message_id = ? "
+            "AND digest_id = ? AND item_id IS NULL AND focus_json IS NOT NULL",
+            (message_id, digest_id),
+        ).fetchone()
+        if type(message_id) is int
+        else None
+    )
+    entries = (parse_focus_json(row["focus_json"]) or []) if row is not None else []
+    if (
+        chat_id != config.telegram.owner_chat_id
+        or not 1 <= number <= min(len(entries), FOCUS_MAX_TOPICS)
+    ):
+        logger.warning("ヘッダの今の重点と結び付かないボタンを破棄", extra={"stage": "poll"})
+        api.answer_callback_query(callback_id, text="⚠️ この話題には対応できません")
+        return
+    topic_id = entries[number - 1].topic_id
+    log_extra = {"stage": "poll", "extra": {"digest_id": digest_id, "topic_id": topic_id}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcome = (
+                dismiss_topic(conn, topic_id, now) if dismiss else restore_topic(conn, topic_id)
+            )
+            dismissed = dismissed_topic_ids(conn, entries)
+            news_entries = parse_news_json(row["news_json"]) or []
+            marked = investigated_labels(conn, digest_id) if news_entries else set()
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"今の重点のボタンを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 受け付けに失敗、もう一度押してください")
+        return
+    logger.info(f"今の重点のボタン: {outcome}", extra=log_extra)
+    if outcome == "missing":
+        api.answer_callback_query(callback_id, text="⚠️ この話題には対応できません")
+        return
+    api.answer_callback_query(
+        callback_id,
+        text=_FOCUS_ALREADY[dismiss] if outcome == "already" else _FOCUS_ANSWERS[outcome],
+    )
+    # 出来事の調査のボタンは、深掘りの段が動いているときに付けたもの(写しがあるときだけ)を残す
+    keyboard = header_keyboard(
+        digest_id, news_entries, entries, marked=marked, dismissed=dismissed
+    )
     if keyboard is not None:
         _edit_markup_best_effort(api, callback, keyboard, logger)
 

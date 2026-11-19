@@ -38,9 +38,11 @@ from app.digest.builder import BOOKMARK_SECTION_MAX
 from app.models import (
     EXTRACTION_FAILED_NOTE,
     FOCUS_HEADING,
+    FOCUS_MAX_TOPICS,
     NEWS_HEADING,
     NEWS_MAX_EVENTS,
     NEWS_MAX_LINKS,
+    FocusEntry,
     NewsEntry,
     NewsEvent,
     NewsLink,
@@ -105,6 +107,14 @@ _DIG_NOW_LABEL = "⚡ 今すぐ深掘り"
 # 04 §3)。N はヘッダの今日の IT ニュースの番号。1 行に 3 つまで並べる
 INVESTIGATE_LABEL = "🔎 {n}"
 _INVESTIGATE_PER_ROW = 3
+# ヘッダの今の重点を外す・戻すボタン(GH#433 の 3 本目。callback_data `t:{digest_id}:{N}`(外す)と
+# `u:{digest_id}:{N}`(戻す)の正本は設計 04 §3)。N は台帳のヘッダの行の写し
+# (digest_messages.focus_json)の何番目か。名前は外部の本文から LLM が作った文なので、1 行に潰して
+# 短く切る(ボタンの文字は HTML でない)。外した話題のボタンは「戻す」にする
+FOCUS_DISMISS_LABEL = "🎯 外す: {name}"
+FOCUS_RESTORE_LABEL = "↩️ 戻す: {name}"
+FOCUS_BUTTON_NAME_MAX = 12
+_FOCUS_PER_ROW = 2
 
 
 class DeliveryError(Exception):
@@ -317,20 +327,28 @@ def _deliver_locked(
         if not header_sent:
             news_events = _load_news_events(conn, digest)
             # 出来事の調査のボタン(GH#415)は、深掘りの段が動いていて、材料の記事のある出来事にだけ
-            # 付ける。付けたときは、押したときに読む出来事の写しを台帳の行に残す
-            keyboard = (
-                investigate_keyboard(digest_id, parse_news_json(digest["trend_json"]) or [])
+            # 付ける。今の重点を外すボタン(GH#433)は、digest に今の重点があるときに付ける。
+            # 付けたときは、押したときに読む写しを、それぞれ台帳のヘッダの行に残す
+            news_entries = (
+                parse_news_json(digest["trend_json"]) or []
                 if news_events and config.dig.daily_cap > 0
-                else None
+                else []
             )
+            focus_entries = parse_focus_json(digest["focus_json"]) or []
+            with_news = investigate_keyboard(digest_id, news_entries) is not None
+            with_focus = bool(focus_buttons(digest_id, focus_entries))
             message_id = api.send_message(
                 chat_id,
                 _header_text(digest, _load_bookmark_rows(conn, digest), news_events),
-                reply_markup=keyboard,
+                reply_markup=header_keyboard(
+                    digest_id, news_entries, focus_entries,
+                    dismissed=dismissed_topic_ids(conn, focus_entries),
+                ),
             )
             _record_message(
                 conn, digest_id, None, message_id, logger, run_id, sleep,
-                news_json=digest["trend_json"] if keyboard else None,
+                news_json=digest["trend_json"] if with_news else None,
+                focus_json=digest["focus_json"] if with_focus else None,
             )
             sent += 1
         for position, row in enumerate(items, start=1):
@@ -476,6 +494,67 @@ def investigate_keyboard(
         buttons[i : i + _INVESTIGATE_PER_ROW] for i in range(0, len(buttons), _INVESTIGATE_PER_ROW)
     ]
     return {"inline_keyboard": rows}
+
+
+def focus_buttons(
+    digest_id: int, entries: list[FocusEntry], *, dismissed: Collection[int] = ()
+) -> list[list[dict]]:
+    """ヘッダの今の重点を外す・戻すボタンの行(GH#433 の 3 本目)。付けるボタンが無ければ空。
+
+    N は写しの何番目か(1 から。FOCUS_MAX_TOPICS まで)。名前が空の重点には付けない。dismissed
+    (外した話題の id)のボタンは「戻す」にする。1 行に 2 つまで並べる。
+    """
+    buttons = []
+    for number, entry in enumerate(entries[:FOCUS_MAX_TOPICS], start=1):
+        names = focus_names([entry])
+        if not names:
+            continue
+        name = names[0]
+        if len(name) > FOCUS_BUTTON_NAME_MAX:
+            name = name[: FOCUS_BUTTON_NAME_MAX - 1] + "…"
+        restore = entry.topic_id in dismissed
+        buttons.append(
+            {
+                "text": (FOCUS_RESTORE_LABEL if restore else FOCUS_DISMISS_LABEL).format(name=name),
+                "callback_data": f"{'u' if restore else 't'}:{digest_id}:{number}",
+            }
+        )
+    return [buttons[i : i + _FOCUS_PER_ROW] for i in range(0, len(buttons), _FOCUS_PER_ROW)]
+
+
+def header_keyboard(
+    digest_id: int,
+    news_entries: list[NewsEntry],
+    focus_entries: list[FocusEntry],
+    *,
+    marked: Collection[str] = (),
+    dismissed: Collection[int] = (),
+) -> dict | None:
+    """ヘッダの盤面。出来事の調査のボタン(🔎 N)の行の後ろに、今の重点のボタンの行を並べる。
+
+    配信のときと、poller がどちらかのボタンを押されて盤面を作り直すときの両方で使い、片方のボタンを
+    押しても、もう片方のボタンを消さない。付けるボタンが無ければ None。
+    """
+    news = investigate_keyboard(digest_id, news_entries, marked=marked)
+    rows = (news["inline_keyboard"] if news else []) + focus_buttons(
+        digest_id, focus_entries, dismissed=dismissed
+    )
+    return {"inline_keyboard": rows} if rows else None
+
+
+def dismissed_topic_ids(conn: sqlite3.Connection, entries: list[FocusEntry]) -> set[int]:
+    """写しの重点のうち、外した話題(focus_topics の status が dismissed)の id。"""
+    ids = [entry.topic_id for entry in entries]
+    if not ids:
+        return set()
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row[0]
+        for row in conn.execute(
+            f"SELECT id FROM focus_topics WHERE status = 'dismissed' AND id IN ({placeholders})",
+            ids,
+        )
+    }
 
 
 def _load_news_events(conn: sqlite3.Connection, digest: sqlite3.Row) -> list[NewsEvent] | None:
@@ -799,8 +878,12 @@ def _record_message(
     sleep: Callable[[float], None],
     *,
     news_json: str | None = None,
+    focus_json: str | None = None,
 ) -> None:
-    """news_json は、出来事の調査のボタンを付けたヘッダの今日の IT ニュースの写し(GH#415)。"""
+    """news_json は、出来事の調査のボタンを付けたヘッダの今日の IT ニュースの写し(GH#415)。
+
+    focus_json は、今の重点のボタンを付けたヘッダの今の重点の写し(GH#433)。
+    """
     # 接続は autocommit(app/db.py)。1通ごとに即確定し、途中クラッシュでも
     # 台帳と送信実績がずれない。
     # 送信は済んでいるので、記帳に失敗しても送り直さず記帳だけをやり直す(GH#225。ディスクの
@@ -812,9 +895,9 @@ def _record_message(
             sleep(BACKOFF_S[attempt - 1])
         try:
             conn.execute(
-                "INSERT INTO digest_messages (digest_id, item_id, message_id, news_json) "
-                "VALUES (?, ?, ?, ?)",
-                (digest_id, item_id, message_id, news_json),
+                "INSERT INTO digest_messages "
+                "(digest_id, item_id, message_id, news_json, focus_json) VALUES (?, ?, ?, ?, ?)",
+                (digest_id, item_id, message_id, news_json, focus_json),
             )
             return
         except sqlite3.OperationalError as e:  # ディスク満杯・I/O エラーなど。やり直す
