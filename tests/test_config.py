@@ -588,3 +588,23 @@ def test_investigate_x_defaults_and_bounds(tmp_path: Path) -> None:
         write_config(tmp_path, f"[investigate]\n{body}")
         with pytest.raises(ConfigError, match=message):
             load_config(tmp_path)
+
+
+def test_focus_defaults_and_validation(tmp_path: Path) -> None:
+    # 今の重点(GH#433)は既定で off。外れる値が入る値より高い設定は、入った日に外れるので止める
+    focus = load_config(empty_config(tmp_path)).focus
+    assert (focus.enabled, focus.enter_score, focus.exit_score) == (False, 6.0, 3.0)
+    config = load_config(
+        write_config(tmp_path, "[focus]\nenabled = true\nenter_score = 4\nexit_score = 4\n")
+    )
+    assert (config.focus.enabled, config.focus.exit_score) == (True, 4.0)
+    for body, key in (
+        ("[focus]\nexit_score = 7.0\n", "exit_score"),
+        ("[focus]\nhalf_life_days = 0\n", "half_life_days"),
+        ("[focus]\nhalf_life_days = nan\n", "half_life_days"),
+        ("[focus]\nmax_active = 0\n", "max_active"),
+        ("[focus]\nwindow_days = 0\n", "window_days"),
+        ("[focus]\nweight_note = -1.0\n", "weight_note"),
+    ):
+        with pytest.raises(ConfigError, match=key):
+            load_config(write_config(tmp_path, body))

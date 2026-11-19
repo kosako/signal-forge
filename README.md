@@ -17,7 +17,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
         │
         ▼
  朝バッチ  intel run(launchd。既定 06:30 起動)
-   collect → x_signals → extract → analyze → digest → export → deliver → dig → purge → backup
+   collect → x_signals → focus → extract → analyze → digest → export → deliver → dig → purge → backup
                                                         │         │        │
                                                         ▼         ▼        ▼
                                                   Obsidian    Telegram   DeepDive ノート(vault)
@@ -37,7 +37,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 ```
 
 - **朝バッチ `intel run`**: 上の段を順に実行して終わる。段の順序の正本は [設計 00 §2](docs/design/00-architecture.md)。
-  - x_signals は `[x_signals].daily_read_cap > 0`、dig は `[dig].daily_cap > 0` のときだけ動く。deliver は Telegram が完全に未設定(`owner_chat_id` も bot token も無い)なら WARN を出して飛ばす。片方だけの設定は設定ミスとして deliver 段が失敗する。
+  - x_signals は `[x_signals].daily_read_cap > 0`、focus は `[focus].enabled`、dig は `[dig].daily_cap > 0` のときだけ動く。deliver は Telegram が完全に未設定(`owner_chat_id` も bot token も無い)なら WARN を出して飛ばす。片方だけの設定は設定ミスとして deliver 段が失敗する。
   - 段の失敗はその段で止め、後の段は続ける。失敗した段があれば(Telegram が完全に未設定でなければ)Telegram に知らせ、exit 1 で終わる。
   - export を deliver より前に置くので、Telegram が失敗しても Obsidian への蓄積は済む。
   - 冪等なので再実行してよい。配信済みのダイジェストは送り直さない(`--force` を付けたときを除く)。
@@ -108,7 +108,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 
    中身を自分の関心に書き換える(形式は [設計 03 §4](docs/design/03-analysis-ranking.md))。
 
-5. DB を作る。migration は collect・run・poll などのコマンドが起動時に当てる。`doctor`(フラグなし)・`x-auth`・`x-insights` は当てない。副作用の少ない次のコマンドを 1 回走らせると、DB(既定 `~/.local/share/intel/intel.db`)と表ができる。
+5. DB を作る。migration は collect・run・poll などのコマンドが起動時に当てる。`doctor`(フラグなし)・`x-auth`・`x-insights`・`focus`(`--update` なし)は当てない。副作用の少ない次のコマンドを 1 回走らせると、DB(既定 `~/.local/share/intel/intel.db`)と表ができる。
 
    ```sh
    uv run intel doctor --cost   # migration を当て、当月コストを表示するだけ
@@ -154,6 +154,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
 | `x-auth` | X OAuth 2.0(PKCE)の認可を行い token を保存する | `[x_oauth2].client_id` が必要(runbook §9) |
 | `x-signals` | X の興味シグナル(ブックマーク・いいね・自分の RT)を取り込む | `--backfill` 初回の種まき(`--limit N` で kind ごとの件数。既定 100)/ `--kind bookmark\|like\|self_rt` |
 | `x-insights` | X の興味シグナルの週次インサイトを表示する | 読み取り専用(migration も当てない) |
+| `focus` | 今の重点(興味シグナルから見つけた話題と重み)を表示する。`--update` で朝バッチの focus 段を走らせてから表示する([設計 03 §4.1](docs/design/03-analysis-ranking.md)) | 既定は読み取り専用(migration も当てない)。`--update` は LLM を呼び、台帳に書く |
 | `poll` | 受信デーモン(long polling で常駐、内蔵タイマー付き) | 通常は launchd が起動する |
 | `run` | 朝バッチの全段を順に実行する | `--force` 当日のダイジェストを作り直し、Telegram にも送り直す |
 | `doctor` | 14 項目を検査する。FAIL があれば exit 1 | `--purge` 期限切れの削除だけを行う / `--cost` 当月コストだけを表示する |
