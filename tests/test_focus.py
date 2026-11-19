@@ -362,3 +362,90 @@ def test_render_focus_lists_active_and_candidates(conn, tmp_path) -> None:
     assert "検索の語: focus term" in active
     assert "3.0  候補の 話題(🔁1・記事と投稿 1 件・直近 2026-11-20)" in candidates  # 1 行に潰す
     assert "振り分けたシグナル 3 件(どの話題にも当てはまらなかったもの 0 件)" in text
+
+
+def test_like_and_bookmark_merged_into_an_article_count_as_one(conn, tmp_path) -> None:
+    # Codex F1: ブックマークが RSS の記事に合流した投稿へのいいねも、その記事に寄せる。
+    # 先に投稿として振り分けたいいねも、後でブックマークが合流したら、重みの計算で同じ記事に寄せる
+    config = make_config(tmp_path)
+    article = add_item(conn, "rss", title_ja="リンク先の記事")
+    add_x_signal(conn, "like", "55", text="リンク付きの投稿", days_ago=1)
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(("new", "話題", [], ["s1"]))),
+              logger, now=NOW)
+    assert conn.execute("SELECT subject FROM focus_evidence").fetchone()[0] == "tweet:55"
+
+    add_x_signal(conn, "bookmark", "55", text="リンク付きの投稿", item_id=article)
+    add_x_signal(conn, "self_rt", "55", text="リンク付きの投稿")
+    signals = collect_signals(conn, config, NOW)
+    assert {s.subject for s in signals} == {f"item:{article}"}  # 合流した記事に寄せる
+    topic_id = conn.execute("SELECT id FROM focus_topics").fetchone()[0]
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(
+        (f"t{topic_id}", "話題", [], [s.key for s in signals]),
+    )), logger, now=NOW)
+
+    (score,) = topic_scores(conn, config, NOW)
+    assert (score.score, score.subjects) == (pytest.approx(3.0), 1)  # 1 本の投稿の一番強い 🔖 だけ
+
+
+def test_x_signal_without_excerpt_uses_the_resolved_article_title(conn, tmp_path) -> None:
+    # Codex F2: 本文の抜粋が消えたいいねも、同じ投稿の記事(X の投稿として取り込んだもの)の見出しで
+    # 振り分ける
+    config = make_config(tmp_path, window_days=14)
+    conn.execute("INSERT INTO sources (type, name) VALUES ('x', 'x:home')")
+    tweet_item = add_item(conn, "tw", title_ja="投稿の見出し")
+    conn.execute(
+        "UPDATE items SET source_id = (SELECT id FROM sources WHERE type = 'x'), "
+        "external_id = '66' WHERE id = ?",
+        (tweet_item,),
+    )
+    add_x_signal(conn, "like", "66", days_ago=8)  # 抜粋は保存期間を過ぎて消えた
+    (signal,) = collect_signals(conn, config, NOW)
+    assert (signal.subject, signal.text) == (f"item:{tweet_item}", "投稿の見出し")
+
+
+def test_reaction_on_a_degraded_article_uses_its_original_title(conn, tmp_path) -> None:
+    # Codex F3: 分析が degraded の記事も元の見出しで配信するので、その記事への反応も数える
+    config = make_config(tmp_path)
+    item_id = add_item(conn, "deg")  # 分析なし(degraded と同じく title_ja が無い)
+    conn.execute(
+        "INSERT INTO analyses (item_id, summary, category, topic, relevance_score, novelty, "
+        "negative_labels, recommendation_reason, implication, degraded, engine, model, "
+        "prompt_version, input_hash) VALUES (?, 's', 'その他', 't', 0, 'new', '[]', 'r', 'i', 1, "
+        "'codex-cli', 'm', 'v', 'h')",
+        (item_id,),
+    )
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('reaction', ?, 'dig', '2026-11-20', ?)",
+        (item_id, iso(0)),
+    )
+    (signal,) = collect_signals(conn, config, NOW)
+    assert (signal.kind, signal.text) == ("tg_dig", "title deg")
+
+
+def test_signals_assigned_by_another_run_are_not_counted_again(conn, tmp_path) -> None:
+    # Codex F4: LLM を待つ間に別の実行が同じ材料を振り分けていたら、こちらでは数えず、
+    # 話題も作らない
+    from app.focus import apply_assignments
+
+    add_x_signal(conn, "like", "1", text="a")
+    add_x_signal(conn, "like", "2", text="b")
+    signals = collect_signals(conn, make_config(tmp_path), NOW)
+    first = signals[0]
+    conn.execute(
+        "INSERT INTO focus_evidence (signal_kind, signal_ref, subject, observed_at) "
+        "VALUES (?, ?, ?, ?)",
+        (first.kind, first.ref, first.subject, first.observed_at),
+    )
+
+    assigned, new_topics = apply_assignments(
+        conn, signals,
+        drafts(("new", "先に振られた材料だけの話題", [], [first.key]),
+               ("new", "残りの話題", [], [signals[1].key])),
+        set(),
+    )
+
+    assert (assigned, new_topics) == (1, 1)
+    names = [r[0] for r in conn.execute("SELECT name FROM focus_topics")]
+    assert names == ["残りの話題"]
+    assert conn.execute("SELECT count(*) FROM focus_evidence").fetchone()[0] == 2

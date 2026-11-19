@@ -175,6 +175,22 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _tweet_item_sql(tweet: str) -> str:
+    """投稿(tweet id の SQL 式)を記事(items.id)に寄せる SQL 式。寄せる先が無ければ NULL。
+
+    ブックマークが記事に合流した投稿は、その記事(x_signals の item_id。外部リンクの先の RSS の記事の
+    こともある)に寄せる。無ければ、X の投稿として取り込んだ記事に寄せる。集め方と重みの計算の両方で
+    使い、同じ投稿へのいいね・ブックマーク・記事への反応を 1 つの記事として数える。
+    """
+    return (
+        "coalesce("
+        f"(SELECT x2.item_id FROM x_signals x2 WHERE x2.tweet_id = {tweet} "
+        "AND x2.item_id IS NOT NULL ORDER BY x2.id LIMIT 1), "
+        "(SELECT i2.id FROM items i2 JOIN sources so2 ON so2.id = i2.source_id AND so2.type = 'x' "
+        f"WHERE i2.external_id = {tweet} ORDER BY i2.id LIMIT 1))"
+    )
+
+
 def collect_signals(conn: sqlite3.Connection, config: Config, now: datetime) -> list[FocusSignal]:
     """まだ振り分けていない、window_days 以内のシグナル(新しい側から max_signals 件)。
 
@@ -189,31 +205,33 @@ def collect_signals(conn: sqlite3.Connection, config: Config, now: datetime) -> 
     )
     for row in conn.execute(
         f"""
-        SELECT s.id, s.kind, s.tweet_id, s.observed_at, s.text_excerpt,
-               {latest_title.format(item="s.item_id")} AS title_ja,
-               -- 同じ投稿を記事として配信していれば、その記事への反応と同じ記事に数える
-               coalesce(s.item_id, (
-                 SELECT i.id FROM items i JOIN sources so ON so.id = i.source_id AND so.type = 'x'
-                 WHERE i.external_id = s.tweet_id ORDER BY i.id LIMIT 1
-               )) AS item_id
-        FROM x_signals s
-        WHERE s.observed_at >= ?
-          AND NOT EXISTS (
-            SELECT 1 FROM focus_evidence e
-            WHERE e.signal_kind = 'x_' || s.kind AND e.signal_ref = s.id
-          )
+        SELECT r.*, {latest_title.format(item="r.item_id")} AS title_ja,
+               (SELECT title FROM items WHERE id = r.item_id) AS item_title
+        FROM (
+          SELECT s.id, s.kind, s.tweet_id, s.observed_at, s.text_excerpt,
+                 -- 同じ投稿の記事があれば、その記事への反応と同じ記事に数え、見出しもそこから取る
+                 coalesce(s.item_id, {_tweet_item_sql("s.tweet_id")}) AS item_id
+          FROM x_signals s
+          WHERE s.observed_at >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM focus_evidence e
+              WHERE e.signal_kind = 'x_' || s.kind AND e.signal_ref = s.id
+            )
+        ) r
         """,
         (cutoff,),
     ):
-        text = row["text_excerpt"] or row["title_ja"]
+        text = row["text_excerpt"] or row["title_ja"] or row["item_title"]
         if text:
             subject = f"item:{row['item_id']}" if row["item_id"] else f"tweet:{row['tweet_id']}"
             found.append((f"x_{row['kind']}", row["id"], subject, row["observed_at"], text))
     for row in conn.execute(
         """
-        SELECT g.id, g.item_id, g.value, g.created_at, a.title_ja, a.topic
+        SELECT g.id, g.item_id, g.value, g.created_at, a.title_ja, a.topic, i.title
         FROM signals g
-        JOIN analyses a ON a.id = (
+        JOIN items i ON i.id = g.item_id
+        -- 分析が degraded の記事も元の見出しで配信するので、その記事への反応も元の見出しで数える
+        LEFT JOIN analyses a ON a.id = (
             SELECT id FROM analyses WHERE item_id = g.item_id AND degraded = 0
             ORDER BY analyzed_at DESC, id DESC LIMIT 1
         )
@@ -226,9 +244,10 @@ def collect_signals(conn: sqlite3.Connection, config: Config, now: datetime) -> 
         """,
         (cutoff,),
     ):
-        if row["title_ja"]:
+        title = row["title_ja"] or row["title"]
+        if title:
             kind = "tg_useful" if row["value"] == "useful" else "tg_dig"
-            text = row["title_ja"] + (f"(topic: {row['topic']})" if row["topic"] else "")
+            text = title + (f"(topic: {row['topic']})" if row["topic"] else "")
             found.append((kind, row["id"], f"item:{row['item_id']}", row["created_at"], text))
     for row in conn.execute(
         f"""
@@ -300,8 +319,12 @@ def topic_scores(conn: sqlite3.Connection, config: Config, now: datetime) -> lis
     """
     topics: dict[int, dict] = {}
     for row in conn.execute(
-        """
-        SELECT t.id, t.name, t.terms, t.status, e.signal_kind, e.subject, e.observed_at
+        f"""
+        SELECT t.id, t.name, t.terms, t.status, e.signal_kind, e.observed_at,
+               -- 振り分けた後に投稿の記事ができた(ブックマークが合流した)ときも、同じ記事に寄せる
+               CASE WHEN e.subject LIKE 'tweet:%'
+                 THEN coalesce('item:' || {_tweet_item_sql("substr(e.subject, 7)")}, e.subject)
+                 ELSE e.subject END AS subject
         FROM focus_topics t
         LEFT JOIN focus_evidence e ON e.topic_id = t.id
         ORDER BY t.id, e.id
@@ -426,13 +449,18 @@ def apply_assignments(
     材料の id は渡した一覧のものだけを受け、1 つの材料は最初に振られた話題にだけ数える。話題の id は
     prompt に渡した一覧のものだけを受け、それ以外(幻の id・"new")は名前で探して、無ければ作る。
     振られなかった材料は、話題なしとして残す(次の実行で振り分け直さない)。
+
+    書き込みのロックを取ってから、まだ振り分けていない材料だけに絞る。LLM を待つ間に別の実行
+    (朝バッチと `intel focus --update`)が同じ材料を振り分けていたら、先の振り分けを残し、こちらでは
+    数えず、その材料のための話題も作らない。
     """
-    by_key = {s.key: s for s in signals}
     used: set[str] = set()
     assigned = 0
     new_topics = 0
     conn.execute("BEGIN IMMEDIATE")
     try:
+        pending = [s for s in signals if not _assigned(conn, s)]
+        by_key = {s.key: s for s in pending}
         names = {
             row["name"].casefold(): row["id"]
             for row in conn.execute("SELECT id, name FROM focus_topics")
@@ -469,7 +497,7 @@ def apply_assignments(
                 _insert_evidence(conn, by_key[key], topic_id, run_id)
                 used.add(key)
                 assigned += 1
-        for signal in signals:
+        for signal in pending:
             if signal.key not in used:
                 _insert_evidence(conn, signal, None, run_id)
         conn.execute("COMMIT")
@@ -477,6 +505,16 @@ def apply_assignments(
         conn.execute("ROLLBACK")
         raise
     return assigned, new_topics
+
+
+def _assigned(conn: sqlite3.Connection, signal: FocusSignal) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM focus_evidence WHERE signal_kind = ? AND signal_ref = ?",
+            (signal.kind, signal.ref),
+        ).fetchone()
+        is not None
+    )
 
 
 def _existing_ref(ref: str, allowed: set[int]) -> int | None:
@@ -490,9 +528,9 @@ def _existing_ref(ref: str, allowed: set[int]) -> int | None:
 def _insert_evidence(
     conn: sqlite3.Connection, signal: FocusSignal, topic_id: int | None, run_id: str | None
 ) -> None:
-    # 同じシグナルを別の実行が先に振り分けていたら、先の振り分けを残す
+    # 書き込みのロックの中で振り分けていないと確かめた材料だけを書く(UNIQUE の衝突は起きない)
     conn.execute(
-        "INSERT OR IGNORE INTO focus_evidence "
+        "INSERT INTO focus_evidence "
         "(signal_kind, signal_ref, topic_id, subject, observed_at, run_id) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (signal.kind, signal.ref, topic_id, signal.subject, signal.observed_at, run_id),

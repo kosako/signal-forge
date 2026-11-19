@@ -39,3 +39,7 @@ CREATE TABLE focus_evidence (
 ) STRICT;
 
 CREATE INDEX ix_focus_evidence_topic ON focus_evidence (topic_id, observed_at);
+
+-- 投稿を記事に寄せるとき(app/focus.py の _tweet_item_sql)に、同じ投稿のシグナルを tweet_id で引く。
+-- 既存の UNIQUE (kind, tweet_id) は kind が先頭なので、tweet_id だけの検索に使えない
+CREATE INDEX ix_x_signals_tweet ON x_signals (tweet_id);
