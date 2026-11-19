@@ -44,3 +44,7 @@ CREATE INDEX ix_focus_evidence_topic ON focus_evidence (topic_id, observed_at);
 -- 投稿を記事に寄せるとき(app/focus.py の _tweet_item_sql)に、同じ投稿のシグナルを tweet_id で引く。
 -- 既存の UNIQUE (kind, tweet_id) は kind が先頭なので、tweet_id だけの検索に使えない
 CREATE INDEX ix_x_signals_tweet ON x_signals (tweet_id);
+
+-- X の投稿として取り込んだ記事を、投稿の id(items.external_id)で引く(同じ _tweet_item_sql と
+-- _subject_sql)。既存の ux_items_src_ext は source_id が先頭なので、external_id だけの検索に使えない
+CREATE INDEX ix_items_external_id ON items (external_id) WHERE external_id IS NOT NULL;
