@@ -656,3 +656,27 @@ def test_force_replace_rewrites_news_section(conn, tmp_path) -> None:
     generate_digest(conn, config, logger, force=True, news=second)
     row = conn.execute("SELECT trend_json FROM digests").fetchone()
     assert json.loads(row["trend_json"])["events"][0]["label"] == "新しい出来事"
+
+
+def test_focus_line_is_stored_and_rendered_even_on_degraded_digest(
+    conn, tmp_path, fixed_today
+) -> None:
+    # GH#433: 今の重点は分析に依存しないので、degraded 配信でも冒頭に出す。--force の置換で
+    # 重点が無くなれば、列も行も消える
+    from app.models import FocusEntry, parse_focus_json
+
+    a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+    set_analyzed_at(conn, TODAY_AT, a)
+    focus = [FocusEntry(3, "ソフトウェアファクトリー", 4), FocusEntry(7, "外部\nサンドボックス", 2)]
+    config = make_config(tmp_path)
+
+    generate_digest(conn, config, logger, focus=focus)
+
+    row = conn.execute("SELECT status, focus_json, markdown FROM digests").fetchone()
+    assert row["status"] == "degraded"
+    assert parse_focus_json(row["focus_json"]) == focus
+    assert "🎯 今の重点: ソフトウェアファクトリー・外部 サンドボックス\n" in row["markdown"]
+
+    generate_digest(conn, config, logger, force=True, focus=[])
+    row = conn.execute("SELECT focus_json, markdown FROM digests").fetchone()
+    assert row["focus_json"] is None and "🎯" not in row["markdown"]

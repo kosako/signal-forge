@@ -484,3 +484,33 @@ def test_x_article_evidence_follows_a_later_bookmark_merge(conn, tmp_path) -> No
     # 投稿 99 は 1 つの記事(一番強いのは今日の 🔖 の 3.0)、別の投稿の ❤️ が 1.0
     assert (score.score, score.subjects) == (pytest.approx(4.0), 2)
     assert score.status == "candidate"
+
+
+def test_active_focus_lists_active_topics_by_weight(conn, tmp_path) -> None:
+    # GH#433 の 2 本目: digest 段が写す今の重点は、重点の話題だけを重みの高い順に
+    from app.focus import active_focus
+    from app.models import FocusEntry, focus_to_json, parse_focus_json
+
+    config = make_config(tmp_path, enter_score=1.0, exit_score=0.5)
+    for index in range(1, 5):
+        add_x_signal(conn, "bookmark", str(index), text=f"post {index}")
+    run_focus(conn, config, FakeEngine(lambda _p: drafts(
+        ("new", "B", [], ["s1"]),
+        ("new", "A", [], ["s2", "s3"]),
+        ("new", "外した", [], ["s4"]),
+    )), logger, now=NOW)
+    conn.execute(
+        "UPDATE focus_topics SET status = 'dismissed', dismissed_at = ? WHERE name = '外した'",
+        (iso(0),),
+    )
+
+    entries = active_focus(conn, config, now=NOW)
+
+    assert [(e.name, e.subjects) for e in entries] == [("A", 2), ("B", 1)]
+    assert parse_focus_json(focus_to_json(entries)) == entries
+    for broken in ("", "[]", '{"topics": [{"topic_id": true, "name": "x", "subjects": 1}]}',
+                   '{"topics": []}', "not json"):
+        assert parse_focus_json(broken) is None
+    assert parse_focus_json('{"topics": [{"topic_id": 1, "name": "x", "subjects": 2}]}') == [
+        FocusEntry(1, "x", 2)
+    ]
