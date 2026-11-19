@@ -66,13 +66,16 @@ def add_item(
 
 
 def add_digest(
-    conn, item_ids, *, status="ok", trend_markdown=None, bookmark_item_ids=None, trend_json=None
+    conn, item_ids, *, status="ok", trend_markdown=None, bookmark_item_ids=None, trend_json=None,
+    focus_json=None,
 ) -> int:
     return conn.execute(
         "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status, "
-        "trend_markdown, bookmark_item_ids, trend_json) VALUES (?, '# md', ?, ?, ?, ?, ?, ?)",
+        "trend_markdown, bookmark_item_ids, trend_json, focus_json) "
+        "VALUES (?, '# md', ?, ?, ?, ?, ?, ?, ?)",
         (today_jst(), json.dumps(item_ids), len(item_ids), status, trend_markdown,
-         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None, trend_json),
+         json.dumps(bookmark_item_ids) if bookmark_item_ids is not None else None, trend_json,
+         focus_json),
     ).lastrowid
 
 
@@ -935,6 +938,10 @@ def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_pa
     bookmarks = [
         add_item(conn, f"https://b/{i}?q=" + "x" * 2000, title="保" * 500) for i in range(12)
     ]
+    # 今の重点(GH#433)の名前も LLM の出力で長さを検証していない。上限の 5 個を絵文字で埋める
+    from app.models import FocusEntry, focus_to_json
+
+    focus = focus_to_json([FocusEntry(i, "😀" * 200, 1) for i in range(8)])
     digest_id = add_digest(
         conn,
         [],
@@ -942,12 +949,14 @@ def test_header_with_every_section_full_stays_within_telegram_limit(conn, tmp_pa
         trend_markdown=trend,
         bookmark_item_ids=bookmarks,
         trend_json=news.to_json(),
+        focus_json=focus,
     )
     recorder = ApiRecorder()
 
     assert deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger) == 1
     header = recorder.texts()[0]
     assert "📰 今日の IT ニュース" in header and "🔖 保存(12件)" in header
+    assert header.count("<b>😀") == 5 + 6  # 重点 5 + 出来事の見出し 6
     assert header.count("<a href=") == 6 * 3 + 10  # 出来事 6 × リンク 3 + 保存節 10
     assert conn.execute("SELECT delivery_status FROM digests").fetchone()[0] == "sent"
 
@@ -1127,3 +1136,25 @@ def test_investigate_keyboard_marks_requested_events() -> None:
         ]
     }
     assert investigate_keyboard(7, [entries[2]]) is None
+
+
+def test_header_shows_focus_names_escaped_and_bounded(conn, tmp_path) -> None:
+    # GH#433: 今の重点は日付の行の次に出す。名前は LLM の出力なので escape し、UTF-16 で切る。
+    # 形の壊れた focus_json は行ごと出さない
+    from app.models import FocusEntry, focus_to_json
+
+    focus = focus_to_json([FocusEntry(1, "A<b>&B", 3), FocusEntry(2, "長" * 40, 2)])
+    digest_id = add_digest(conn, [], trend_markdown="傾向。", focus_json=focus)
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+    header = recorder.texts()[0]
+    first, second = header.split("\n")[:2]
+    assert first.startswith("📡 ")
+    long_name = "長" * 29 + "…"  # 名前の上限の 30 字で切る(Telegram の上限にも収まる)
+    assert second == f"🎯 今の重点: <b>A&lt;b&gt;&amp;B</b>・<b>{long_name}</b>"
+
+    conn.execute("DELETE FROM digest_messages")
+    conn.execute("UPDATE digests SET focus_json = '{\"topics\": [1]}', delivery_status = 'pending'")
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+    assert "🎯" not in recorder.texts()[0]

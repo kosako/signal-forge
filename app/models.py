@@ -125,6 +125,67 @@ def _is_id_list(value: object) -> bool:
     return isinstance(value, list) and all(type(i) is int for i in value)
 
 
+# 冒頭の「今の重点」の行(GH#433)。focus 段が決めた重点を digest 段が digests.focus_json に写し、
+# Telegram のヘッダと Daily ノートが出す。3 つの段で共通なので共通の層に置く(設計 00 §3)
+FOCUS_HEADING = "🎯 今の重点"
+FOCUS_MAX_TOPICS = 5  # 行に出す重点の上限([focus].max_active を大きくしても、ヘッダを長くしない)
+# 話題の名前の上限。名前は外部の本文から LLM が作った文で、app/focus.py も 30 字で切って保存する
+FOCUS_NAME_MAX = 30
+
+
+class FocusEntry(NamedTuple):
+    """digest を作ったときの今の重点の 1 つ(digests.focus_json の要素)。"""
+
+    topic_id: int
+    name: str  # 外部の本文から LLM が作った名前(出す側で escape する)
+    subjects: int  # 重みに数えた記事・投稿の数
+
+
+def focus_to_json(entries: list[FocusEntry]) -> str:
+    return json.dumps(
+        {"topics": [entry._asdict() for entry in entries]}, ensure_ascii=False
+    )
+
+
+def parse_focus_json(text: str | None) -> list[FocusEntry] | None:
+    """digests.focus_json を重点の並びにする。空・形が違えば None(呼び出し側は行を出さない)。"""
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    topics = data.get("topics") if isinstance(data, dict) else None
+    if not isinstance(topics, list):
+        return None
+    parsed: list[FocusEntry] = []
+    for topic in topics:
+        if not isinstance(topic, dict):
+            return None
+        topic_id, name, subjects = topic.get("topic_id"), topic.get("name"), topic.get("subjects")
+        if not (type(topic_id) is int and isinstance(name, str) and type(subjects) is int):
+            return None
+        parsed.append(FocusEntry(topic_id, name, subjects))
+    return parsed or None
+
+
+def focus_names(entries: list[FocusEntry]) -> list[str]:
+    """行に出す名前。1 行に潰して FOCUS_NAME_MAX 字で切り、空の名前は出さない。
+
+    出すのは FOCUS_MAX_TOPICS 個まで。
+    """
+    names: list[str] = []
+    for entry in entries:
+        name = " ".join(entry.name.split())
+        if len(name) > FOCUS_NAME_MAX:
+            name = name[: FOCUS_NAME_MAX - 1] + "…"
+        if name:
+            names.append(name)
+        if len(names) >= FOCUS_MAX_TOPICS:
+            break
+    return names
+
+
 NEWS_LINK_LABEL_MAX = 40  # リンクの文字(host 名)の上限。host は外部由来で長さを検証していない
 
 

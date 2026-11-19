@@ -181,6 +181,8 @@ def digest_stage(
 ) -> int | None:
     """digest 段: 先に「今日の IT ニュース」を synthesis(付加機能・失敗は節省略)し digest に渡す。
 
+    `[focus].enabled` なら、今の重点(GH#433)も読んで渡す(付加機能・失敗は行の省略)。
+
     朝バッチと `intel digest` が呼ぶ(GH#206)。作った digest の id を返す(生成済みで skip なら
     None)。primary は主のエンジンの作り方(None = config の `[llm].engine`)。
     hold_if_empty: analyze 段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
@@ -202,8 +204,19 @@ def digest_stage(
                 f"トレンド synthesis が例外(節を省略): {type(e).__name__}",
                 extra={"run_id": run_id, "stage": "digest"},
             )
+    focus = None
+    if config.focus.enabled and (force or not _digest_exists_today(conn)):
+        from app.focus import active_focus
+
+        try:
+            focus = active_focus(conn, config)
+        except Exception as e:  # 今の重点は付加機能。読めなくても digest 本体を止めない
+            logger.warning(
+                f"今の重点を読めない(行を省略): {type(e).__name__}",
+                extra={"run_id": run_id, "stage": "digest"},
+            )
     return generate_digest(
-        conn, config, logger, run_id=run_id, force=force, news=trend,
+        conn, config, logger, run_id=run_id, force=force, news=trend, focus=focus,
         hold_if_empty=hold_if_empty,
     )
 

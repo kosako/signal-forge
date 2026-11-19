@@ -20,7 +20,16 @@ import sqlite3
 from app.config import Config
 from app.deliver_lock import delivery_lock
 from app.jst import jst_day_bounds_utc, today_jst
-from app.models import EXTRACTION_FAILED_NOTE, NEWS_HEADING, NewsSection, link_label
+from app.models import (
+    EXTRACTION_FAILED_NOTE,
+    FOCUS_HEADING,
+    NEWS_HEADING,
+    FocusEntry,
+    NewsSection,
+    focus_names,
+    focus_to_json,
+    link_label,
+)
 from app.ranking import RankedItem, digest_candidates, rank_for_digest
 
 # 🔖 保存節(GH#99)の表示上限。超過は件数のみ示す(全件は Obsidian の Items ノートへ)
@@ -43,11 +52,13 @@ def generate_digest(
     run_id: str | None = None,
     force: bool = False,
     news: NewsSection | None = None,
+    focus: list[FocusEntry] | None = None,
     hold_if_empty: bool = False,
 ) -> int | None:
     """当日ダイジェストを生成し digests.id を返す(skip 時は None)。
 
     news: 冒頭の「今日の IT ニュース」節(GH#75・GH#413)。付加機能なので None 可(節を省く)。
+    focus: 冒頭の「🎯 今の重点」(GH#433)。digests.focus_json に写す。None・空なら行を出さない。
     hold_if_empty: 分析の段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
 
     --force は配信と同じロック(deliver.lock)を置換のトランザクションの前に取り、先の配信が
@@ -59,7 +70,7 @@ def generate_digest(
     if not force:
         return _generate_digest(
             conn, config, logger, run_id=run_id, force=False,
-            news=news, hold_if_empty=hold_if_empty,
+            news=news, focus=focus, hold_if_empty=hold_if_empty,
         )
     # 当日の行があるかはロックの中で読む(取る前に読むと、待つ間に変わった状態で置換しうる)
     with delivery_lock(
@@ -68,7 +79,7 @@ def generate_digest(
     ):
         return _generate_digest(
             conn, config, logger, run_id=run_id, force=True,
-            news=news, hold_if_empty=hold_if_empty,
+            news=news, focus=focus, hold_if_empty=hold_if_empty,
         )
 
 
@@ -80,6 +91,7 @@ def _generate_digest(
     run_id: str | None,
     force: bool,
     news: NewsSection | None,
+    focus: list[FocusEntry] | None,
     hold_if_empty: bool,
 ) -> int | None:
     """generate_digest の本体(--force のときは delivery_lock の中で呼ぶ)。"""
@@ -150,8 +162,11 @@ def _generate_digest(
             )
             # ニュース節は degraded 配信では付けない(分析が無いため意味を成さない)
             section = None if degraded_digest else news
+            # 今の重点は分析に依存しない(興味シグナルから作る)ので、degraded 配信でも付ける
+            focus_json = focus_to_json(focus) if focus else None
             markdown = _render_markdown(
-                digest_date, ranked, degraded=degraded_digest, news=section, bookmarks=bookmarks
+                digest_date, ranked, degraded=degraded_digest, news=section, bookmarks=bookmarks,
+                focus=focus,
             )
             # trend_markdown はリンクを含まないプレーンテキスト、trend_json は出来事とリンクの
             # 記事の id(Telegram のヘッダがリンク付きで組む。GH#413)
@@ -169,7 +184,7 @@ def _generate_digest(
                         generated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
                         status = ?, markdown = ?, item_ids = ?, item_count = ?,
                         delivery_status = 'pending', sent_at = NULL, trend_markdown = ?,
-                        trend_json = ?, bookmark_item_ids = ?
+                        trend_json = ?, bookmark_item_ids = ?, focus_json = ?
                     WHERE id = ?
                     """,
                     (
@@ -181,6 +196,7 @@ def _generate_digest(
                         trend,
                         trend_json,
                         json.dumps(bookmark_item_ids),
+                        focus_json,
                         existing["id"],
                     ),
                 )
@@ -190,8 +206,8 @@ def _generate_digest(
                     """
                     INSERT INTO digests
                         (digest_date, run_id, status, markdown, item_ids, item_count,
-                         trend_markdown, trend_json, bookmark_item_ids)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         trend_markdown, trend_json, bookmark_item_ids, focus_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         digest_date,
@@ -203,6 +219,7 @@ def _generate_digest(
                         trend,
                         trend_json,
                         json.dumps(bookmark_item_ids),
+                        focus_json,
                     ),
                 ).lastrowid
             for item_id in item_ids + bookmark_item_ids:
@@ -330,10 +347,16 @@ def _render_markdown(
     degraded: bool,
     news: NewsSection | None = None,
     bookmarks: list[sqlite3.Row] = (),
+    focus: list[FocusEntry] | None = None,
 ) -> str:
     lines = [f"# 朝のダイジェスト {digest_date}", ""]
     if degraded:
         lines.append("> ⚠️ LLM 分析が失敗したため、タイトルのみの degraded 配信です。")
+        lines.append("")
+    names = focus_names(focus or [])
+    # 今の重点(GH#433)。今日の IT ニュースの見出しと同じく、vault に書く前に neutralize する
+    if names:
+        lines.append(f"{FOCUS_HEADING}: " + "・".join(names))
         lines.append("")
     if news:  # 「今日の IT ニュース」節を全体感として冒頭に(GH#75・GH#413)
         lines.extend(_render_news_markdown(news))

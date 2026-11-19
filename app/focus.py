@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from app.analysis.llm import LLMEngine, LLMError, complete_with_retry
 from app.config import Config
+from app.models import FOCUS_MAX_TOPICS, FocusEntry
 from app.prompting import fill_template, sanitize
 
 PROMPT_VERSION = "focus-v001"
@@ -604,6 +605,18 @@ def refresh_status(
         conn.execute("ROLLBACK")
         raise
     return activated, deactivated
+
+
+def active_focus(
+    conn: sqlite3.Connection, config: Config, *, now: datetime | None = None
+) -> list[FocusEntry]:
+    """今の重点(重みの高い順に FOCUS_MAX_TOPICS 個まで)。digest 段が digests.focus_json に写す。"""
+    now = now or datetime.now(UTC)
+    return [
+        FocusEntry(topic_id=s.topic_id, name=s.name, subjects=s.subjects)
+        for s in topic_scores(conn, config, now)
+        if s.status == "active"
+    ][:FOCUS_MAX_TOPICS]
 
 
 def render_focus(conn: sqlite3.Connection, config: Config, *, now: datetime | None = None) -> str:

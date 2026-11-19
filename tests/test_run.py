@@ -1221,3 +1221,40 @@ def test_focus_llm_failure_does_not_fail_the_run(conn, tmp_path) -> None:
     )
     assert "focus" not in failures
     assert conn.execute("SELECT count(*) FROM focus_evidence").fetchone()[0] == 0
+
+
+def test_digest_stage_passes_the_current_focus_only_when_enabled(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # GH#433 の 2 本目: [focus] が有効なら、digest 段が今の重点を読んで digest に渡す。読めなくても
+    # digest 本体は作る(行を省くだけ)
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import FocusConfig
+    from app.models import FocusEntry
+
+    passed: list = []
+
+    def spy(db, config, stage_logger, **kwargs):
+        passed.append(kwargs["focus"])
+        return 1
+
+    monkeypatch.setattr("app.digest.builder.generate_digest", spy)
+    monkeypatch.setattr(run_module, "generate_digest", spy)
+    monkeypatch.setattr("app.analysis.trend.synthesize_trend", lambda *a, **k: None)
+    entries = [FocusEntry(1, "話題", 2)]
+    monkeypatch.setattr("app.focus.active_focus", lambda db, config: entries)
+    primary = lambda _effort: ScriptedEngine(conn)  # noqa: E731
+
+    run_module.digest_stage(conn, make_config(tmp_path), {}, logger, primary=primary)
+    enabled = replace(make_config(tmp_path), focus=FocusConfig(enabled=True))
+    run_module.digest_stage(conn, enabled, {}, logger, primary=primary)
+
+    def broken(db, config):
+        raise sqlite3.OperationalError("no such table")
+
+    monkeypatch.setattr("app.focus.active_focus", broken)
+    run_module.digest_stage(conn, enabled, {}, logger, primary=primary)
+
+    assert passed == [None, entries, None]

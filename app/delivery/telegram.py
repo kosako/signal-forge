@@ -37,13 +37,16 @@ from app.dig import items_with_material
 from app.digest.builder import BOOKMARK_SECTION_MAX
 from app.models import (
     EXTRACTION_FAILED_NOTE,
+    FOCUS_HEADING,
     NEWS_HEADING,
     NEWS_MAX_EVENTS,
     NEWS_MAX_LINKS,
     NewsEntry,
     NewsEvent,
     NewsLink,
+    focus_names,
     link_host,
+    parse_focus_json,
     parse_news_json,
 )
 
@@ -71,6 +74,9 @@ SOURCE_NAME_MAX_CHARS = 80
 NEWS_LABEL_MAX_CHARS = 40
 NEWS_SUMMARY_MAX_CHARS = 160
 NEWS_LINK_LABEL_MAX_CHARS = 40
+# 今の重点(GH#433)の名前の上限。名前は外部の本文から LLM が作った文で長さを検証していないので、
+# escape_and_truncate で UTF-16 の code unit で数えて切る(5 個でも 200 字ほど)
+FOCUS_NAME_MAX_CHARS = 30
 
 # 🔖 保存節(GH#99)のタイトル上限。ヘッダ 1 通に同梱するため短めに取り、可視テキストを
 # 4096 字制限に収める(URL は href 側で不算入)。表示件数上限は builder と共通
@@ -396,6 +402,11 @@ def _header_text(
     if digest["status"] == "degraded":
         # LLM の全滅によるタイトルのみの配信。本文の抽出の失敗は記事ごとに出す(GH#240)
         header += "\n⚠️ 分析縮退あり(LLM の失敗でタイトルのみ)"
+    focus = focus_names(parse_focus_json(digest["focus_json"]) or [])
+    if focus:  # 今の重点(GH#433)。分析に依存しないので degraded 配信でも出す
+        header += f"\n{FOCUS_HEADING}: " + "・".join(
+            f"<b>{escape_and_truncate(name, FOCUS_NAME_MAX_CHARS)}</b>" for name in focus
+        )
     if news_events:  # 「今日の IT ニュース」節を冒頭メッセージに同梱(GH#75・GH#413)
         header += "\n\n" + _news_html(news_events)
     elif digest["trend_markdown"]:  # trend_json の無い前の digest は、今までどおり文だけで出す
