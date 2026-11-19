@@ -1,8 +1,9 @@
 """intel run — 朝バッチの直列実行(設計 00 §2・§6)。
 
-順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ extract → analyze →
-digest → export → deliver → dig(cap > 0 のときのみ。GH#105)→ purge → backup
-(backup は設計 05 §5 の「朝バッチ末尾」)。dig を deliver の後に置くのは、
+順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ focus([focus].enabled の
+ときのみ。GH#433)→ extract → analyze → digest → export → deliver → dig(cap > 0 のときのみ。
+GH#105)→ purge → backup(backup は設計 05 §5 の「朝バッチ末尾」)。focus を x_signals の後に
+置くのは、その朝に取り込んだシグナルも数えるため。dig を deliver の後に置くのは、
 ダイジェスト配信を深掘り生成(分オーダー)で遅らせないため。purge より前なのは
 X 由来 documents の TTL 失効前に本文を材料として使うため。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
@@ -42,6 +43,7 @@ from app.vault_guard import VaultGuard
 if TYPE_CHECKING:
     from app.connectors.x_search import XPostsResult
     from app.deepdive import DigCandidate
+    from app.focus import FocusRunResult
     from app.investigate import XRead
 
 
@@ -101,6 +103,8 @@ def run_pipeline(
     ))
     if config.x_signals.daily_read_cap > 0:  # 0 = S1b 取込無効(段ごと省く)
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
+    if config.focus.enabled:
+        stage("focus", lambda: focus_stage(conn, config, logger, run_id=run_id, primary=primary))
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
     stage(
         "analyze",
@@ -237,6 +241,31 @@ def _collect_x_signals(
             client_secret=env.get(ENV_CLIENT_SECRET),
         )
         collect_x_signals(conn, config, session, logger, run_id=run_id)
+
+
+def focus_stage(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
+) -> FocusRunResult:
+    """focus 段: 新しい興味シグナルを話題に振り分け、今の重点を更新する(GH#433)。
+
+    朝バッチと `intel focus --update` が呼ぶ。primary は主のエンジンの作り方(None = config の
+    `[llm].engine`)。予備(Claude API)には切り替えない(付加機能なので、主が失敗した日は振り分けを
+    次の実行へ回し、重みの減衰だけを進める)。
+    """
+    from app.analysis.llm import create_engine
+    from app.focus import run_focus
+
+    if primary is None:
+
+        def primary(effort: str) -> LLMEngine:
+            return create_engine(config.llm.engine, model_reasoning_effort=effort)
+
+    return run_focus(conn, config, primary("low"), logger, run_id=run_id)
 
 
 def analyze_stage(

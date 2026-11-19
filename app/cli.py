@@ -522,6 +522,55 @@ def x_insights(
 
 
 @app.command()
+def focus(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    update: bool = typer.Option(
+        False,
+        "--update",
+        help="朝バッチの focus 段と同じく、新しいシグナルを振り分けて今の重点を更新し、表示する",
+    ),
+) -> None:
+    """今の重点(興味シグナルから見つけた話題と重み。GH#433)。既定は表示だけ。"""
+    import sqlite3
+
+    from app.config import load_config
+    from app.focus import render_focus
+
+    config = load_config(config_dir)
+    if update:
+        from app.db import apply_migrations, connect
+        from app.logs import DEFAULT_LOG_DIR, setup_logging
+        from app.run import focus_stage
+
+        conn = connect(config.db_path)
+        apply_migrations(conn, config.db_path)
+        logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+        result = focus_stage(conn, config, logger)  # 朝バッチと同じ段の組み立て(GH#206)
+        typer.echo(
+            f"signals={result.signals} assigned={result.assigned} new_topics={result.new_topics}"
+            + (" llm_failed" if result.llm_failed else "")
+        )
+    else:
+        # 表示だけのときは x-insights と同じく読み取りの接続(DB の作成・migration をしない)
+        try:
+            conn = sqlite3.connect(f"file:{config.db_path}?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            typer.echo(
+                f"DB がまだ無い({config.db_path})。先に intel run / collect で初期化する",
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+        conn.row_factory = sqlite3.Row
+    try:
+        typer.echo(render_focus(conn, config))
+    except sqlite3.OperationalError as e:
+        typer.echo(f"DB が読めない({e})。migration 未適用なら intel run で適用", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        conn.close()
+
+
+@app.command()
 def poll(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:

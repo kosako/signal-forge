@@ -231,6 +231,29 @@ class AnalysisReviewConfig:
 
 
 @dataclass(frozen=True)
+class FocusConfig:
+    """今の重点(GH#433 / 設計 03 §4.1)。既定は off。
+
+    直近の興味シグナルを LLM で話題に振り分け、話題ごとの重み(種類の重み × 新しさの減衰)で
+    今の重点を決める。X のシグナルの種類の重みは `[x_signals].weight_*` を使う。
+    """
+
+    enabled: bool = False
+    half_life_days: float = 7.0  # 新しさの減衰の半減期(日)
+    enter_score: float = 6.0  # この重み以上で重点に入る
+    # この重みを下回ると重点から外れる。入る値より低くして、出入りのばたつきを防ぐ
+    exit_score: float = 3.0
+    max_active: int = 3  # 重点の数の上限(重みの高い順)
+    # 振り分けるシグナルの古さの上限(日)。X の本文の保存期間([retention].x_cache_ttl_days)に合わせる
+    window_days: int = 7
+    max_signals: int = 60  # 1 回に LLM へ渡すシグナルの上限(新しい側から。残りは次の実行へ)
+    weight_tg_useful: float = 2.0  # Telegram の 👍 価値あり
+    weight_tg_dig: float = 3.0  # Telegram の 🔖 深掘りしたい
+    weight_note: float = 3.0  # カードへの感想・リプライ(item_notes)
+    weight_investigation: float = 3.0  # 🔎 出来事の調査の依頼
+
+
+@dataclass(frozen=True)
 class CollectConfig:
     """collect の段の上限(GH#340 / 設計 02 §3・05 §8)。使い切った残りは次の実行へ回す。"""
 
@@ -330,6 +353,7 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     analysis_review: AnalysisReviewConfig = field(default_factory=AnalysisReviewConfig)
+    focus: FocusConfig = field(default_factory=FocusConfig)
     ranking: RankingConfig = field(default_factory=RankingConfig)
 
     @property
@@ -371,6 +395,7 @@ _SECTIONS = {
     "storage": StorageConfig,
     "analysis": AnalysisConfig,
     "analysis_review": AnalysisReviewConfig,
+    "focus": FocusConfig,
     "ranking": RankingConfig,
 }
 
@@ -466,6 +491,7 @@ def _validate(path: Path, config: Config) -> None:
             raise ConfigError(
                 f"{path}: [x_signals].{key} は 0 以上の有限値(負のシグナルは無い)"
             )
+    _validate_focus(path, config.focus)
     signals_cap = config.x_signals.daily_read_cap
     if 0 < signals_cap < X_SIGNALS_MIN_PAGE:
         raise ConfigError(
@@ -654,6 +680,26 @@ def _validate_x_search(path: Path, config: Config) -> None:
             f"{path}: X 読取の内訳合計({cap_sum})が [x].combined_daily_read_cap"
             f"({config.x.combined_daily_read_cap})を超えている(ADR 0001 予算配分)"
         )
+
+
+def _validate_focus(path: Path, focus: FocusConfig) -> None:
+    """[focus] の値域(GH#433)。nan/inf は重みの比較を壊すので有限値だけを受ける。"""
+    for key in ("half_life_days", "enter_score", "exit_score"):
+        value = getattr(focus, key)
+        if not (math.isfinite(value) and value > 0):
+            raise ConfigError(f"{path}: [focus].{key} は正の有限値: {value}")
+    if focus.exit_score > focus.enter_score:
+        raise ConfigError(
+            f"{path}: [focus].exit_score は enter_score 以下(外れる値が入る値より高いと、"
+            f"入った日に外れる): {focus.exit_score} > {focus.enter_score}"
+        )
+    for key in ("max_active", "window_days", "max_signals"):
+        if getattr(focus, key) <= 0:
+            raise ConfigError(f"{path}: [focus].{key} は正の整数であること: {getattr(focus, key)}")
+    for key in ("weight_tg_useful", "weight_tg_dig", "weight_note", "weight_investigation"):
+        value = getattr(focus, key)
+        if not (math.isfinite(value) and value >= 0):
+            raise ConfigError(f"{path}: [focus].{key} は 0 以上の有限値: {value}")
 
 
 def _parens_balanced(slot: str) -> bool:

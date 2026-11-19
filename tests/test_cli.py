@@ -9,7 +9,7 @@ runner = CliRunner()
 
 ALL_COMMANDS = (
     "collect", "extract", "analyze", "digest", "deliver", "dig", "answer", "poll", "run",
-    "doctor", "x-auth", "x-signals", "x-insights",
+    "doctor", "x-auth", "x-signals", "x-insights", "focus",
 )
 
 
@@ -713,7 +713,8 @@ def test_run_releases_material_request_only_after_failure_notice_is_sent(
 _CONFIG_REQUIRED = [
     ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["dig-now"],
     ["investigate", "--event", "1"],
-    ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"],
+    ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"], ["focus"],
+    ["focus", "--update"],
     ["doctor", "--purge"], ["doctor", "--cost"],
 ]
 

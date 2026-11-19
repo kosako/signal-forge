@@ -1159,3 +1159,65 @@ def test_investigation_x_read_needs_x_enabled_and_keys(monkeypatch) -> None:
     for _ in range(2):
         result = read("障害", start=start, end=end, max_results=20)
     assert result.api_reads == 1 and len(sent) == 2 and len(built) == 1
+
+
+def test_focus_stage_runs_before_extract_only_when_enabled(conn, tmp_path, monkeypatch) -> None:
+    # 今の重点(GH#433)は既定で段ごと省く。有効なら x_signals の後・extract の前に、朝バッチの
+    # run_id と主の作り方で呼ぶ
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import FocusConfig
+
+    order: list[str] = []
+    calls: dict = {}
+
+    def focus_spy(db, config, stage_logger, **kwargs):
+        order.append("focus")
+        calls.update(kwargs)
+
+    def extract_spy(db, config, http, stage_logger, *, run_id=None):
+        order.append("extract")
+        return {"ok": 0, "partial": 0, "failed": 0}
+
+    monkeypatch.setattr(run_module, "focus_stage", focus_spy)
+    monkeypatch.setattr(run_module, "extract_pending", extract_spy)
+    primary = ScriptedEngine(conn)
+    args = (conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http())
+    assert run_pipeline(*args, lambda: primary, logger, "01RUNID") == []
+    assert order == ["extract"]
+
+    order.clear()
+    config = replace(make_config(tmp_path), focus=FocusConfig(enabled=True))
+    run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(), lambda: primary, logger,
+        "01RUNID",
+    )
+    assert order == ["focus", "extract"]
+    assert calls["run_id"] == "01RUNID"
+    assert calls["primary"]("low") is primary
+
+
+def test_focus_llm_failure_does_not_fail_the_run(conn, tmp_path) -> None:
+    # 振り分けの失敗は付加機能の失敗として段を止めない(重みの更新だけ進める)
+    from dataclasses import replace
+
+    from app.analysis.llm import LLMError
+    from app.config import FocusConfig
+
+    class FailingEngine:
+        name = "failing"
+
+        def complete_structured(self, prompt, schema, timeout_s=0):
+            raise LLMError("down")
+
+    conn.execute(
+        "INSERT INTO x_signals (kind, tweet_id, text_excerpt) VALUES ('like', '1', 'post')"
+    )
+    config = replace(make_config(tmp_path), focus=FocusConfig(enabled=True))
+    failures = run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(),
+        lambda: FailingEngine(), logger, "01RUNID",
+    )
+    assert "focus" not in failures
+    assert conn.execute("SELECT count(*) FROM focus_evidence").fetchone()[0] == 0
