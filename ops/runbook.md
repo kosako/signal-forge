@@ -455,10 +455,9 @@ sqlite3 -readonly -header -column "$db" \
   INSERT INTO sources (type, name, config) VALUES ('rss', '<名前>', json_object('url', '<URL>'));
   SQL
   ```
-- Reddit の subreddit を足すときは、1 日の top のフィード `https://www.reddit.com/r/<名前>/top/.rss?t=day`
-  を上の SQL で入れる(名前は `reddit-<名前>` など)。Reddit は名乗らない取得を 1 分に 1 回しか受けないので、
-  1 本足すごとに朝バッチが 1 分ほど延びる。本文はフィードの中の投稿の文だけで、スレッドのページは取りに
-  行かない(設計 02 §3)。数週間後に、週 1 回の健康診断の 👍・🔖 の率で残すかを決める。
+- Reddit の subreddit は足せない。Reddit が 2026-11-13 に RSS を止め、公式の API も新しい申請の受付を
+  2026-10-31 で終えた(設計 02 §3。GH#424)。止めてある `reddit-localllama` と `reddit-claudeai` の行は、
+  `enabled = 1` に戻しても 404 になる。
 
 ## 13. 深掘りノートのレビュー(GH#153・設計 06 §4)
 
