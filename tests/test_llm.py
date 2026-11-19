@@ -8,10 +8,11 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Annotated, Literal
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.analysis.llm import (
     ANTHROPIC_API_KEY_ENV,
@@ -20,6 +21,7 @@ from app.analysis.llm import (
     LLMError,
     LLMUnavailableError,
     LLMUsage,
+    anthropic_output_schema,
     complete_with_retry,
     create_anthropic_engine,
     create_engine,
@@ -563,12 +565,28 @@ def test_anthropic_request_has_no_tools_and_fixed_destination() -> None:
     assert request.headers["x-api-key"] == FAKE_KEY
     assert request.headers["anthropic-version"] == "2023-06-01"
     body = json.loads(request.content)
-    # 推論専用は構造で作る: ツール・MCP・コンテナの類は一切付けない(この 4 キーだけ)
+    # 推論専用は構造で作る: ツール・MCP・コンテナの類は一切付けない(この 4 キーだけ)。
+    # 応答の形は構造化出力で API に守らせる(GH#430)
     assert body == {
         "model": "claude-opus-5-5",
         "max_tokens": 16_000,
         "messages": [{"role": "user", "content": "プロンプト本文"}],
-        "output_config": {"effort": "medium"},
+        "output_config": {
+            "effort": "medium",
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "properties": {
+                        "score": {"title": "Score", "type": "integer"},
+                        "reason": {"title": "Reason", "type": "string"},
+                    },
+                    "required": ["score", "reason"],
+                    "title": "Verdict",
+                    "type": "object",
+                    "additionalProperties": False,
+                },
+            },
+        },
     }
 
 
@@ -671,8 +689,13 @@ def test_anthropic_cost_bound_only_while_cost_is_unknown() -> None:
     engine = anthropic_engine(lambda request: next(outcomes)(request))
     with pytest.raises(LLMError):
         engine.complete_structured("p", Verdict)
-    # 入力は prompt の UTF-8 のバイト数(1)、出力は max_tokens: 1 × $4/M + 16k × $20/M
-    assert engine.last_cost_bound_usd == pytest.approx(0.320004)
+    # 入力は prompt と送る schema の UTF-8 のバイト数(GH#430)、出力は max_tokens:
+    # (1 + schema) × $4/M + 16k × $20/M
+    schema_bytes = len(json.dumps(anthropic_output_schema(Verdict), ensure_ascii=False))
+    assert engine.last_cost_bound_usd == pytest.approx(
+        round((1 + schema_bytes) * 4 / 1_000_000 + 0.32, 6)
+    )
+    assert schema_bytes > 100
     engine.complete_structured("p", Verdict)
     assert engine.last_cost_bound_usd is None
     with pytest.raises(LLMError):
@@ -761,3 +784,223 @@ def test_anthropic_parse_failure_does_not_echo_reply_body() -> None:
             engine.complete_structured("p", Verdict)
         assert excinfo.value.__cause__ is None
         assert marker not in "".join(traceback.format_exception(excinfo.value))
+
+
+# --- 構造化出力に送る schema(GH#430) ---
+
+
+class _Inner(BaseModel):
+    label: Literal["a", "b"]
+    note: str = Field(default="", max_length=20)
+
+
+class _Constrained(BaseModel):
+    score: int = Field(ge=0, le=100, description="点")
+    tags: list[str] = Field(min_length=1, max_length=3)
+    names: list[str] = Field(min_length=2)
+    inner: _Inner | None = None
+
+
+def test_anthropic_output_schema_drops_unsupported_constraints() -> None:
+    # API が受けない制約(数値の範囲・文字数・2 以上の minItems・maxItems)は外して description に
+    # 書き足す。object にはすべて additionalProperties: false を付ける
+    assert anthropic_output_schema(_Constrained) == {
+        "$defs": {
+            "_Inner": {
+                "properties": {
+                    "label": {"enum": ["a", "b"], "title": "Label", "type": "string"},
+                    "note": {
+                        "default": "",
+                        "title": "Note",
+                        "type": "string",
+                        "description": '{"maxLength": 20}',
+                    },
+                },
+                "required": ["label"],
+                "title": "_Inner",
+                "type": "object",
+                "additionalProperties": False,
+            }
+        },
+        "properties": {
+            "score": {
+                "description": '点 {"maximum": 100, "minimum": 0}',
+                "title": "Score",
+                "type": "integer",
+            },
+            "tags": {
+                "items": {"type": "string"},
+                "minItems": 1,
+                "title": "Tags",
+                "type": "array",
+                "description": '{"maxItems": 3}',
+            },
+            "names": {
+                "items": {"type": "string"},
+                "title": "Names",
+                "type": "array",
+                "description": '{"minItems": 2}',
+            },
+            "inner": {"anyOf": [{"$ref": "#/$defs/_Inner"}, {"type": "null"}], "default": None},
+        },
+        "required": ["score", "tags", "names"],
+        "title": "_Constrained",
+        "type": "object",
+        "additionalProperties": False,
+    }
+
+
+def test_anthropic_still_validates_dropped_constraints() -> None:
+    # 送る schema から外した制約も、応答を読むときに Pydantic で確かめる
+    reply = anthropic_reply(text=json.dumps({"score": 150, "tags": ["x"], "names": ["a", "b"]}))
+    engine = anthropic_engine(lambda request: httpx.Response(200, json=reply))
+    with pytest.raises(LLMError, match="スキーマに合わない.*score: less_than_equal"):
+        engine.complete_structured("p", _Constrained)
+
+
+class _ArbitraryKeys(BaseModel):
+    counts: dict[str, int]  # additionalProperties に値の schema
+
+
+class _PatternKeys(BaseModel):
+    counts: dict[Annotated[str, Field(pattern="^metric_")], int]  # patternProperties
+
+
+class _AnyDict(BaseModel):
+    extra: dict  # additionalProperties: true
+
+
+class _Node(BaseModel):
+    name: str
+    children: list["_Node"] = []
+
+
+class _Left(BaseModel):
+    right: "_Right | None" = None
+
+
+class _Right(BaseModel):
+    left: _Left | None = None
+
+
+_Left.model_rebuild()
+
+
+def _refused_before_sending(schema: type[BaseModel], match: str) -> None:
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=anthropic_reply(text="{}"))
+
+    engine = anthropic_engine(handler)
+    with pytest.raises(LLMError, match=match):
+        engine.complete_structured("p", schema)
+    assert sent == []
+    assert engine.last_cost_bound_usd is None  # 送っていないので費用は無い
+
+
+@pytest.mark.parametrize("schema", [_ArbitraryKeys, _PatternKeys, _AnyDict])
+def test_anthropic_refuses_schema_with_arbitrary_keys_before_sending(schema) -> None:
+    # 任意のキーの object は、API がキーを返せない(空の object しか返らない)ので送らない
+    _refused_before_sending(schema, "任意のキーの object")
+
+
+@pytest.mark.parametrize("schema", [_Node, _Left])
+def test_anthropic_refuses_recursive_schema_before_sending(schema) -> None:
+    # 再帰の schema(自分を指す・互いに指す)は API が受けない(400)ので送らない
+    _refused_before_sending(schema, "再帰")
+
+
+class _EscapedRef(BaseModel):
+    # escape した $ref("%24defs")で自分を指す。表でたどれないので、再帰を確かめられない
+    children: list["_EscapedRef"] = []
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        kwargs["ref_template"] = "#/%24defs/{model}"
+        return super().model_json_schema(*args, **kwargs)
+
+
+class _NestedDefsRef(BaseModel):
+    # 入れ子の $defs を指す $ref(再帰ではないが、たどれない)
+    value: int
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        return {
+            "type": "object",
+            "properties": {
+                "value": {"$ref": "#/properties/holder/$defs/Int"},
+                "holder": {
+                    "type": "object",
+                    "properties": {},
+                    "$defs": {"Int": {"type": "integer"}},
+                },
+            },
+            "required": ["value"],
+        }
+
+
+@pytest.mark.parametrize("schema", [_EscapedRef, _NestedDefsRef])
+def test_anthropic_refuses_unresolvable_ref_before_sending(schema) -> None:
+    # root 直下の $defs の名前を指さない $ref は、再帰かを確かめられないので送らない
+    _refused_before_sending(schema, "たどれない \\$ref")
+
+
+# API が受ける keyword(structured outputs の JSON Schema limitations。2026-11-19 に確認)
+_API_KEYWORDS = {
+    "type", "required", "$ref", "title", "description", "enum", "const", "default",
+    "properties", "$defs", "definitions", "anyOf", "allOf", "items", "additionalProperties",
+    "format", "minItems",
+}
+# 送る schema から外してよい制約(Pydantic の検証で確かめる)。これ以外が外れるなら、schema の
+# 形そのものが変わるので、送り方を見直す
+_DROPPABLE = {"maxLength", "minLength", "maximum", "minimum", "maxItems"}
+
+
+def _schema_nodes(node: dict, path: str = "$"):
+    """schema の各節(properties・$defs の名前の表、default などの値は除く)を順に返す。"""
+    yield path, node
+    for key in ("properties", "$defs", "definitions"):
+        for name, sub in node.get(key, {}).items():
+            yield from _schema_nodes(sub, f"{path}.{key}.{name}")
+    for key in ("anyOf", "allOf"):
+        for i, sub in enumerate(node.get(key, [])):
+            yield from _schema_nodes(sub, f"{path}.{key}[{i}]")
+    if isinstance(node.get("items"), dict):
+        yield from _schema_nodes(node["items"], f"{path}.items")
+
+
+def test_app_schemas_fit_structured_outputs() -> None:
+    # 予備(fallback.py)はどの段の呼び出しも Claude API に回すので、アプリの schema をすべて見る
+    from app.analysis.analyzer import AnalysisBatch
+    from app.analysis.review import ReviewBatch
+    from app.analysis.trend import TrendSummary
+    from app.deepdive import DigDraft, DigReview, TranslationChunk
+    from app.dig_answer import DigAnswer, DigIntent
+    from app.doctor import CanaryProbe
+    from app.investigate import InvestigationDraft, SearchPlan
+
+    schemas = [
+        AnalysisBatch, ReviewBatch, TrendSummary, DigDraft, DigReview, TranslationChunk,
+        DigAnswer, DigIntent, CanaryProbe, InvestigationDraft, SearchPlan,
+    ]
+    for schema in schemas:
+        dropped = {
+            key
+            for _, node in _schema_nodes(schema.model_json_schema())
+            for key in node.keys() - _API_KEYWORDS
+        }
+        assert dropped <= _DROPPABLE, (schema.__name__, dropped)
+        optional = unions = 0
+        for path, node in _schema_nodes(anthropic_output_schema(schema)):
+            assert node.keys() <= _API_KEYWORDS, (schema.__name__, path)
+            if node.get("type") == "object":
+                assert node["additionalProperties"] is False, (schema.__name__, path)
+                optional += len(node.get("properties", {}).keys() - set(node.get("required", [])))
+            if "anyOf" in node:
+                assert not {"type", "properties"} & node.keys(), (schema.__name__, path)
+                unions += 1
+        # API の上限(1 回の要求で、省略できる項目 24・union 16)
+        assert optional <= 24 and unions <= 16, schema.__name__
