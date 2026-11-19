@@ -2521,3 +2521,126 @@ def test_malformed_investigate_callback_is_discarded(conn, tmp_path, data) -> No
     api = FakeApi([[investigate_press(digest_id, 1, data=data)]])
     poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
     assert api.answered == [("cb1", None)] and investigations(conn) == []
+
+
+# --- ヘッダの今の重点を外す・戻すボタン(GH#433 の 3 本目) ---
+
+
+def add_header_with_focus(conn, *, with_news: bool = True) -> tuple[int, list[int]]:
+    """今日の digest のヘッダを、今の重点のボタン(と調査のボタン)と写しを付けて送ったことにする。"""
+    from app.models import FocusEntry, focus_to_json
+
+    ids = [
+        conn.execute(
+            "INSERT INTO focus_topics (name, status) VALUES (?, 'active')", (name,)
+        ).lastrowid
+        for name in ("A", "B")
+    ]
+    focus = focus_to_json([FocusEntry(ids[0], "A", 3), FocusEntry(ids[1], "B", 2)])
+    digest_id = add_header_with_buttons(conn) if with_news else add_digest(conn, [])
+    if with_news:
+        conn.execute("UPDATE digest_messages SET focus_json = ?", (focus,))
+    else:
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id, focus_json) "
+            "VALUES (?, NULL, ?, ?)",
+            (digest_id, HEADER_MESSAGE_ID, focus),
+        )
+    return digest_id, ids
+
+
+def focus_press(digest_id, number, *, restore=False, update_id=1, **kwargs) -> dict:
+    prefix = "u" if restore else "t"
+    return investigate_press(
+        digest_id, number, update_id=update_id, data=f"{prefix}:{digest_id}:{number}", **kwargs
+    )
+
+
+def topic_status(conn, topic_id) -> tuple:
+    row = conn.execute(
+        "SELECT status, dismissed_at IS NOT NULL FROM focus_topics WHERE id = ?", (topic_id,)
+    ).fetchone()
+    return tuple(row)
+
+
+def test_focus_dismiss_button_dismisses_and_keeps_investigate_buttons(conn, tmp_path) -> None:
+    digest_id, (a, b) = add_header_with_focus(conn)
+    api = FakeApi([[focus_press(digest_id, 2)], [focus_press(digest_id, 2, update_id=2)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert topic_status(conn, b) == ("dismissed", 1)
+    assert topic_status(conn, a) == ("active", 0)
+    assert api.answered == [("cb1", "🎯 外しました。重みが上がっても戻しません")]
+    keyboard = api.edited[0][2]["inline_keyboard"]
+    assert [button["text"] for button in keyboard[0]] == ["🔎 1", "🔎 2", "🔎 3"]
+    assert keyboard[1] == [
+        {"text": "🎯 外す: A", "callback_data": f"t:{digest_id}:1"},
+        {"text": "↩️ 戻す: B", "callback_data": f"u:{digest_id}:2"},
+    ]
+
+    poll_once(conn, make_config(tmp_path), api, logger)  # 同じ「外す」がもう一度届いた
+    assert topic_status(conn, b) == ("dismissed", 1)
+    assert api.answered[-1] == ("cb2", "🎯 外し済みです")
+
+
+def test_focus_restore_button_returns_the_topic_to_candidates(conn, tmp_path) -> None:
+    digest_id, (a, b) = add_header_with_focus(conn, with_news=False)
+    conn.execute(
+        "UPDATE focus_topics SET status = 'dismissed', dismissed_at = '2026-11-20T00:00:00Z' "
+        "WHERE id = ?",
+        (a,),
+    )
+    api = FakeApi([[focus_press(digest_id, 1, restore=True)],
+                   [focus_press(digest_id, 1, restore=True, update_id=2)]])
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert topic_status(conn, a) == ("candidate", 0)
+    assert api.answered == [("cb1", "↩️ 戻しました。次の朝から重みで決めます")]
+    assert api.edited[0][2] == {
+        "inline_keyboard": [[
+            {"text": "🎯 外す: A", "callback_data": f"t:{digest_id}:1"},
+            {"text": "🎯 外す: B", "callback_data": f"t:{digest_id}:2"},
+        ]]
+    }
+
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert api.answered[-1] == ("cb2", "↩️ 外していません")
+
+
+def test_investigate_button_keeps_the_focus_buttons(conn, tmp_path) -> None:
+    digest_id, (a, b) = add_header_with_focus(conn)
+    conn.execute(
+        "UPDATE focus_topics SET status = 'dismissed', dismissed_at = '2026-11-20T00:00:00Z' "
+        "WHERE id = ?",
+        (b,),
+    )
+    api = FakeApi([[investigate_press(digest_id, 1)]])
+    poll_once(conn, make_config(tmp_path), api, logger, dig_now_worker=FakeWorker())
+    keyboard = api.edited[0][2]["inline_keyboard"]
+    assert keyboard[0][0]["text"] == "🔎 1 ✓"
+    assert [button["text"] for button in keyboard[1]] == ["🎯 外す: A", "↩️ 戻す: B"]
+
+
+@pytest.mark.parametrize(
+    "case", ["other_chat", "no_snapshot", "other_digest", "zero", "beyond", "missing_topic"]
+)
+def test_focus_button_not_tied_to_a_header_is_rejected(conn, tmp_path, case) -> None:
+    digest_id, (a, b) = add_header_with_focus(conn)
+    press = {
+        "other_chat": lambda: focus_press(digest_id, 1, chat_id=CHAT_ID + 1),
+        "no_snapshot": lambda: focus_press(digest_id, 1),
+        "other_digest": lambda: focus_press(digest_id + 1, 1),
+        "zero": lambda: focus_press(digest_id, 0),
+        "beyond": lambda: focus_press(digest_id, 3),  # 写しは 2 件
+        "missing_topic": lambda: focus_press(digest_id, 1),
+    }[case]()
+    if case == "no_snapshot":  # 重点のボタンを付けずに送ったヘッダ(この PR より前の配信など)
+        conn.execute("UPDATE digest_messages SET focus_json = NULL")
+    if case == "missing_topic":  # 写しの話題が台帳に無い
+        conn.execute("DELETE FROM focus_topics WHERE id = ?", (a,))
+    api = FakeApi([[press]])
+    poll_once(conn, make_config(tmp_path), api, logger)
+    assert api.answered == [("cb1", "⚠️ この話題には対応できません")]
+    assert api.edited == []
+    statuses = [row[0] for row in conn.execute("SELECT status FROM focus_topics")]
+    assert "dismissed" not in statuses
