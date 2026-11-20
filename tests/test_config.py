@@ -594,6 +594,7 @@ def test_focus_defaults_and_validation(tmp_path: Path) -> None:
     # 今の重点(GH#433)は既定で off。外れる値が入る値より高い設定は、入った日に外れるので止める
     focus = load_config(empty_config(tmp_path)).focus
     assert (focus.enabled, focus.enter_score, focus.exit_score) == (False, 6.0, 3.0)
+    assert (focus.score_bonus, focus.bonus_items) == (15.0, 5)
     config = load_config(
         write_config(tmp_path, "[focus]\nenabled = true\nenter_score = 4\nexit_score = 4\n")
     )
@@ -605,6 +606,9 @@ def test_focus_defaults_and_validation(tmp_path: Path) -> None:
         ("[focus]\nmax_active = 0\n", "max_active"),
         ("[focus]\nwindow_days = 0\n", "window_days"),
         ("[focus]\nweight_note = -1.0\n", "weight_note"),
+        ("[focus]\nscore_bonus = -1.0\n", "score_bonus"),
+        ("[focus]\nscore_bonus = inf\n", "score_bonus"),
+        ("[focus]\nbonus_items = -1\n", "bonus_items"),
     ):
         with pytest.raises(ConfigError, match=key):
             load_config(write_config(tmp_path, body))

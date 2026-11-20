@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Config, DigestConfig, RankingConfig
+from app.config import Config, DigestConfig, FocusConfig, RankingConfig
 from app.db import apply_migrations, connect
-from app.ranking import rank_for_digest
+from app.ranking import focus_pool, rank_for_digest
 
 logger = logging.getLogger("test-ranking")
 
@@ -56,11 +56,14 @@ def add_analyzed(
     return item_id
 
 
-def make_config(tmp_path, *, max_items=10, **ranking_kwargs) -> Config:
+def make_config(
+    tmp_path, *, max_items=10, score_bonus=15.0, bonus_items=5, **ranking_kwargs
+) -> Config:
     return Config(
         config_dir=tmp_path,
         digest=DigestConfig(max_items=max_items),
         ranking=RankingConfig(**ranking_kwargs),
+        focus=FocusConfig(enabled=True, score_bonus=score_bonus, bonus_items=bonus_items),
     )
 
 
@@ -152,3 +155,93 @@ def test_bookmark_items_excluded_from_ranking(conn, tmp_path) -> None:
 
     selected = rank_for_digest(conn, make_config(tmp_path))
     assert [item.canonical_url for item in selected] == ["https://a/normal"]
+
+
+
+# --- 今の重点の点(GH#433 の 4 本目) ---
+
+
+def test_focus_bonus_lifts_items_near_the_cutoff(conn, tmp_path) -> None:
+    # 重点に当たる記事の点に 15 を足す。上位の少し下の記事だけが上がり、並びは足した後の点
+    top = [add_analyzed(conn, f"https://b/{i}", relevance=90 - i, source_id=3) for i in range(3)]
+    near = add_analyzed(conn, "https://a/near", relevance=80)  # 80 + 15 = 95
+    far = add_analyzed(conn, "https://a/far", relevance=60)  # 60 + 15 = 75 は 88 に届かない
+
+    config = make_config(tmp_path, max_items=3)
+    selected = rank_for_digest(conn, config, focus_items={near: 7, far: 7})
+    assert [item.item_id for item in selected] == [near, top[0], top[1]]
+    assert [item.score for item in selected] == [95.0, 90.0, 89.0]
+    assert [item.focus_topic_id for item in selected] == [7, None, None]
+    assert score_of(conn, far) == 75  # total_score も足した点(選外も書く)
+
+    # 重点が無ければ点の順のまま
+    assert [i.item_id for i in rank_for_digest(conn, config)] == top
+    assert score_of(conn, near) == 80
+
+
+def test_focus_bonus_keeps_order_beyond_100_and_respects_min_score(conn, tmp_path) -> None:
+    # 足して 100 を超えても、足す前の差で並べる(total_score は 100 で止める)。min_score は足す前の
+    # 点で見る(30 + 15 = 45 でも、30 は 40 未満なので入れない)
+    lower = add_analyzed(conn, "https://a/1", relevance=88)
+    higher = add_analyzed(conn, "https://a/2", relevance=95)
+    weak = add_analyzed(conn, "https://a/3", relevance=30)
+
+    selected = rank_for_digest(
+        conn, make_config(tmp_path), focus_items={lower: 1, higher: 1, weak: 1}
+    )
+    assert [item.item_id for item in selected] == [higher, lower]
+    assert [item.score for item in selected] == [100.0, 100.0]
+    assert score_of(conn, weak) == 30  # 足していない
+
+
+def test_focus_bonus_ties_at_100_keep_the_unboosted_item_first(conn, tmp_path) -> None:
+    # Codex R1(round 1): 重点でない 100 点の記事と、90 + 15 で 100 に揃った重点の記事は、足す前の点
+    # の順(重点でない記事が先)。max_items = 1 では重点でない記事を採る
+    plain = add_analyzed(conn, "https://b/plain", relevance=100, source_id=3)
+    focused = add_analyzed(conn, "https://a/focus", relevance=90)
+    selected = rank_for_digest(conn, make_config(tmp_path), focus_items={focused: 1})
+    assert [(item.item_id, item.score) for item in selected] == [(plain, 100.0), (focused, 100.0)]
+    one = rank_for_digest(conn, make_config(tmp_path, max_items=1), focus_items={focused: 1})
+    assert [item.item_id for item in one] == [plain]
+
+
+def test_ties_at_100_without_focus_keep_item_id_order(conn, tmp_path) -> None:
+    # Codex R1(round 1): 重点の無い日は今までの順(100 で揃ったら item_id 順)。novelty の係数を
+    # 1 より大きくした設定で、clamp 前の点の大きい記事を先にしない
+    first = add_analyzed(conn, "https://a/1", relevance=90)  # 90 × 1.2 = 108
+    second = add_analyzed(conn, "https://a/2", relevance=100)  # 100 × 1.2 = 120
+    config = make_config(tmp_path, max_items=1, novelty_new=1.2)
+    assert [item.item_id for item in rank_for_digest(conn, config)] == [first]
+    assert second
+
+
+def test_focus_bonus_goes_to_the_highest_bonus_items_only(conn, tmp_path) -> None:
+    # 点を足すのは重点の記事のうち点の高い bonus_items 件まで。0 なら足さない
+    focus = [add_analyzed(conn, f"https://a/{i}", relevance=70 - i) for i in range(3)]
+    items = dict.fromkeys(focus, 1)
+    rank_for_digest(conn, make_config(tmp_path, bonus_items=2), focus_items=items)
+    assert [score_of(conn, i) for i in focus] == [85, 84, 68]
+    rank_for_digest(conn, make_config(tmp_path, bonus_items=0), focus_items=items)
+    assert [score_of(conn, i) for i in focus] == [70, 69, 68]
+    rank_for_digest(conn, make_config(tmp_path, score_bonus=0.0), focus_items=items)
+    assert [score_of(conn, i) for i in focus] == [70, 69, 68]
+
+
+def test_focus_pool_asks_only_items_the_bonus_can_lift(conn, tmp_path) -> None:
+    # 聞くのは、足す前の点が「点の順の最後の記事 − score_bonus」以上の記事(上位も含む)と、
+    # --force で置き換える digest の記事。degraded は聞かない
+    top = [add_analyzed(conn, f"https://b/{i}", relevance=90 - i, source_id=3) for i in range(2)]
+    near = add_analyzed(conn, "https://a/near", relevance=76)  # 89 − 15 = 74 以上
+    add_analyzed(conn, "https://a/far", relevance=73)
+    add_analyzed(conn, "https://a/degraded", relevance=88, degraded=1)
+    digested = add_analyzed(conn, "https://a/digested", relevance=80)
+    conn.execute("UPDATE items SET status = 'digested' WHERE id = ?", (digested,))
+
+    config = make_config(tmp_path, max_items=2)
+    assert [row["item_id"] for row in focus_pool(conn, config)] == [*top, near]
+    with_replaced = focus_pool(conn, config, include_item_ids=[digested])
+    assert [row["item_id"] for row in with_replaced] == [*top, digested, near]
+
+    # 上位が埋まらない日は min_score 以上をすべて聞く
+    roomy = make_config(tmp_path, max_items=10)
+    assert len(focus_pool(conn, roomy)) == 4  # 90・89・76・73(degraded と 40 未満なし)

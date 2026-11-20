@@ -19,6 +19,7 @@ run_pipeline に、CLI の表示は cli.py に残す。
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     from app.deepdive import DigCandidate
     from app.focus import FocusRunResult
     from app.investigate import XRead
+    from app.models import FocusEntry
 
 
 class RunFailures(list[str]):
@@ -181,7 +183,8 @@ def digest_stage(
 ) -> int | None:
     """digest 段: 先に「今日の IT ニュース」を synthesis(付加機能・失敗は節省略)し digest に渡す。
 
-    `[focus].enabled` なら、今の重点(GH#433)も読んで渡す(付加機能・失敗は行の省略)。
+    `[focus].enabled` なら、今の重点(GH#433)も読んで渡す(付加機能・失敗は行の省略)。重点があれば、
+    重点に当たる記事を LLM に選ばせて渡す(4 本目。付加機能・失敗は点を足さないだけ)。
 
     朝バッチと `intel digest` が呼ぶ(GH#206)。作った digest の id を返す(生成済みで skip なら
     None)。primary は主のエンジンの作り方(None = config の `[llm].engine`)。
@@ -205,6 +208,7 @@ def digest_stage(
                 extra={"run_id": run_id, "stage": "digest"},
             )
     focus = None
+    focus_items = None
     if config.focus.enabled and (force or not _digest_exists_today(conn)):
         from app.focus import active_focus
 
@@ -215,10 +219,57 @@ def digest_stage(
                 f"今の重点を読めない(行を省略): {type(e).__name__}",
                 extra={"run_id": run_id, "stage": "digest"},
             )
+        if focus:
+            focus_items = _focus_items(conn, config, logger, focus, run_id=run_id, primary=primary)
     return generate_digest(
         conn, config, logger, run_id=run_id, force=force, news=trend, focus=focus,
-        hold_if_empty=hold_if_empty,
+        focus_items=focus_items, hold_if_empty=hold_if_empty,
     )
+
+
+def _focus_items(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    focus: list[FocusEntry],
+    *,
+    run_id: str | None,
+    primary: Callable[[str], LLMEngine] | None,
+) -> dict[int, int]:
+    """今の重点に当たる記事(item_id → 話題の id。GH#433 の 4 本目)を選ぶ。
+
+    主のエンジン(effort medium)だけを使う(予備には切り替えない。focus 段と同じ)。候補は点を
+    足すと上位に届きうる記事で、その日の digest を置き換えるときは、置き換える記事も候補に戻して
+    聞く。付加機能なので、どこで失敗しても digest 本体は作る(点を足さない)。
+    """
+    from app.analysis.llm import create_engine
+    from app.focus import focus_topic_refs
+    from app.focus_match import MATCH_EFFORT, select_focus_items
+    from app.ranking import focus_pool
+
+    if primary is None:
+
+        def primary(effort: str) -> LLMEngine:
+            return create_engine(config.llm.engine, model_reasoning_effort=effort)
+
+    digest_date = today_jst()
+    try:
+        replaced = conn.execute(
+            "SELECT item_ids FROM digests WHERE digest_date = ?", (digest_date,)
+        ).fetchone()
+        pool = focus_pool(
+            conn, config, include_item_ids=json.loads(replaced["item_ids"]) if replaced else []
+        )
+        return select_focus_items(
+            conn, primary(MATCH_EFFORT), logger, digest_date=digest_date,
+            topics=focus_topic_refs(conn, focus), pool=pool, run_id=run_id,
+        )
+    except Exception as e:  # 種類だけを書く(例外の文に外部の文が混ざりうる)
+        logger.warning(
+            f"今の重点に当たる記事を選べない(点を足さない): {type(e).__name__}",
+            extra={"run_id": run_id, "stage": "digest"},
+        )
+        return {}
 
 
 def _digest_exists_today(conn: sqlite3.Connection) -> bool:
