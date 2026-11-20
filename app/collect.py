@@ -124,15 +124,16 @@ def collect_ranked(
     connector: Connector,
     logger: logging.Logger,
     *,
-    limit: int,
+    remaining: Callable[[sqlite3.Connection], int],
     run_id: str | None = None,
 ) -> None:
-    """collect の段の外で、1 ソースを並びの順に limit 件まで取り込む(今の重点の検索。GH#433)。
+    """collect の段の外で、1 ソースを並びの順に残りの件数まで取り込む(今の重点の検索。GH#433)。
 
-    connector が返す並び(良い順)のまま、保存すると新しい行になる記事だけを limit 件まで保存する。
-    取り込み済み・ほかのソースと同じ URL の記事は除き、上限にも数えない(毎日同じ記事が枠を
-    埋めない)。
-    limit を超えた分は次の実行へ回さない(次の実行は新しく検索し直す)。短縮 URL は解決しない。
+    connector が返す並び(良い順)のまま、保存すると新しい行になる記事だけを、remaining(conn)
+    件まで保存する。取り込み済み・ほかのソースと同じ URL の記事は除き、上限にも数えない(毎日
+    同じ記事が枠を埋めない)。remaining は取得の後に 1 回、保存の書き込みのトランザクションの中で
+    もう 1 回数える(同じ日の別の実行が先に保存した分を引き、重なった実行でも上限を超えない)。
+    上限を超えた分は次の実行へ回さない(次の実行は新しく検索し直す)。短縮 URL は解決しない。
     ソースの成否・collect_runs の記録・失敗の隔離は collect の段と同じ。
     """
     _collect_source(
@@ -145,7 +146,7 @@ def collect_ranked(
         rss_max_items=0,
         deadline=float("inf"),
         clock=time.monotonic,
-        ranked_limit=limit,
+        ranked_remaining=remaining,
     )
 
 
@@ -160,11 +161,12 @@ def _collect_source(
     rss_max_items: int,
     deadline: float,
     clock: Callable[[], float],
-    ranked_limit: int | None = None,
+    ranked_remaining: Callable[[sqlite3.Connection], int] | None = None,
 ) -> bool:
     """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。
 
-    ranked_limit があれば、並びの順に新しい記事だけをその件数まで準備する(collect_ranked)。
+    ranked_remaining があれば、並びの順に新しい記事だけを残りの件数まで準備し、保存の
+    トランザクションの中で残りを数え直す(collect_ranked)。
     """
     log_ctx = {"run_id": run_id, "stage": "collect", "source_id": source.id}
     run_row_id = conn.execute(
@@ -179,8 +181,10 @@ def _collect_source(
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
-        if ranked_limit is not None:
-            prepared = _prepare_ranked(conn, source, result.items, ranked_limit)
+        if ranked_remaining is not None:
+            prepared = _prepare_ranked(
+                conn, source, result.items, max(0, ranked_remaining(conn))
+            )
         elif source.type == "rss":
             prepared = _prepare_rss(
                 conn, source, result.items, rss_max_items, resolve_short, deadline, clock
@@ -201,6 +205,7 @@ def _collect_source(
             partial_error=partial_error,
             budget_exhausted=result.budget_exhausted,
             skipped_slots=result.skipped_slots,
+            cap=ranked_remaining,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
@@ -279,6 +284,7 @@ def _store_result(
     partial_error: str | None,
     budget_exhausted: bool = False,
     skipped_slots: bool = False,
+    cap: Callable[[sqlite3.Connection], int] | None = None,
 ) -> dict[str, int]:
     """準備した全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
@@ -294,10 +300,16 @@ def _store_result(
     成功で消さない)。skipped_slots は X 検索で要求しなかったスロットを残した正常な終わり(GH#331)。
     items とカーソルを保存し、ソースの成否の状態は budget_exhausted と同じく変えない(要求しなかった
     スロットの失敗の続きを、ほかのスロットの成功で消さない)。
+    cap は保存してよい残りの件数を数える関数(collect_ranked)。書き込みのトランザクションの中で
+    数え、超えた分は保存しない(重なった実行が先に保存した分を引く。counts の capped に数える)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if cap is not None:
+            allowed = max(0, cap(conn))
+            counts["capped"] = max(0, len(prepared) - allowed)
+            prepared = prepared[:allowed]
         for raw, canonical in prepared:
             counts[_store_item(conn, source, raw, canonical)] += 1
         if partial_error is None and (budget_exhausted or skipped_slots):

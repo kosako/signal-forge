@@ -7,7 +7,9 @@
   段では回さない(ブックマークの `x:bookmark` と同じく、collect の「type → Connector 1:1」の契約に
   持ち込まない)。type を rss にするのは、記事の扱い(本文の抽出・保存の期間・ノートへの書き出し)が
   RSS の記事と同じだから
-- 1 日(JST の暦日)に取り込むのは [focus].hn_items 件まで。同じ日の実行が取り込んだ分を引く
+- 1 日(JST の暦日)に取り込むのは [focus].hn_items 件まで。同じ日の実行が取り込んだ分を引く。
+  朝バッチに 2 本同時に走るのを止める仕組みは無いので、残りは保存の書き込みのトランザクションの
+  中で数え直す
 - 語は今の重点の検索の語のうち、英字を含むもの(app.focus.search_terms)。外部の検索に送るのは
   語だけで、話題の名前と証拠は送らない
 - 付加機能: 検索の失敗はソースの失敗として記録し(collect と同じ隔離)、朝バッチを止めない。ログには
@@ -61,6 +63,10 @@ def collect_focus_items(
         logger.info("今の重点に英字の検索の語が無いので、HN を検索しない", extra=extra)
         return FocusCollectResult()
     source = ensure_source(conn)
+
+    def remaining(db: sqlite3.Connection) -> int:
+        return config.focus.hn_items - collected_on(db, source.id, now)
+
     before = collected_on(conn, source.id, now)
     limit = config.focus.hn_items - before
     if limit <= 0:
@@ -73,7 +79,8 @@ def collect_focus_items(
         window_hours=config.focus.hn_window_hours,
         now=lambda: now,
     )
-    collect_ranked(conn, source, connector, logger, limit=limit, run_id=run_id)
+    # 残りは保存の書き込みのトランザクションの中でも数え直す(重なった実行で上限を超えない)
+    collect_ranked(conn, source, connector, logger, remaining=remaining, run_id=run_id)
     logger.info(
         "今の重点の語で HN を検索した",
         extra={

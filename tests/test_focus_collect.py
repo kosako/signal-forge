@@ -164,14 +164,65 @@ def test_no_latin_terms_makes_no_request_and_no_source(conn, tmp_path, now) -> N
     assert conn.execute("SELECT 1 FROM sources WHERE name = ?", (SOURCE_NAME,)).fetchone() is None
 
 
-def test_search_failure_is_recorded_on_the_source_without_raising(conn, tmp_path, now) -> None:
+@pytest.mark.parametrize("status", [403, 500])
+def test_search_failure_is_recorded_on_the_source_without_raising(
+    conn, tmp_path, now, status
+) -> None:
     add_topic(conn, "話題", ["software factory"])
-    http = make_http(responder({"software factory": 403}, []))
+    http = make_http(responder({"software factory": status}, []))
     collect_focus_items(conn, make_config(tmp_path), http, logger, now=now)
     source = conn.execute("SELECT * FROM sources WHERE name = ?", (SOURCE_NAME,)).fetchone()
-    assert source["consecutive_failures"] == 1 and "403" in source["last_error"]
-    assert conn.execute("SELECT status FROM collect_runs").fetchone()[0] == "error"
+    assert source["consecutive_failures"] == 1
+    run = conn.execute("SELECT status, error FROM collect_runs").fetchone()
+    assert run["status"] == "error"
+    # 失敗の文に検索の語を残さない(共通 HTTP クライアントの例外の文は URL を含む)
+    for text in (source["last_error"], run["error"]):
+        assert text and "software" not in text and "algolia" not in text
     assert stored(conn) == []
+
+
+def test_overlapping_runs_do_not_exceed_the_daily_limit(conn, tmp_path, now) -> None:
+    # 朝バッチが 2 本重なっても、同じ日の上限を超えて取り込まない。別の接続の実行が、先の実行の
+    # 検索の最中に上限まで取り込んだ場合(残りは取得の後と保存の中で数え直す)
+    add_topic(conn, "話題", ["software factory"])
+    config = make_config(tmp_path, hn_items=2)
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    other = connect(db_path)
+    hits = [hit(str(n), 50 - n, now) for n in range(1, 6)]
+    other_http = make_http(responder({"software factory": hits}, []))
+    started: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not started:
+            started.append(True)
+            collect_focus_items(other, config, other_http, logger, now=now)
+        return httpx.Response(200, json={"hits": hits})
+
+    collect_focus_items(conn, config, make_http(handler), logger, now=now)
+    other.close()
+    assert len(stored(conn)) == 2
+
+
+def test_the_limit_is_counted_again_inside_the_write_transaction(conn, now) -> None:
+    # 取得の後に数えた残りより、保存のときの残りが少なければ、保存のときの残りまでにする
+    from app.collect import collect_ranked
+    from app.connectors.base import FetchResult, FetchStats, RawItem
+
+    source = ensure_source(conn)
+
+    class Static:
+        source_type = "rss"
+
+        def fetch(self, source_row, cursor):
+            items = [
+                RawItem(f"g{n}", f"https://example.com/{n}", f"t{n}", None, now, None)
+                for n in range(3)
+            ]
+            return FetchResult(items, {}, FetchStats(3, 0, 0.0, 200, 0))
+
+    answers = iter([3, 1])
+    collect_ranked(conn, source, Static(), logger, remaining=lambda db: next(answers))
+    assert [row[0] for row in stored(conn)] == ["g0"]
 
 
 def test_refuses_a_different_source_row_with_the_same_name(conn, tmp_path, now) -> None:

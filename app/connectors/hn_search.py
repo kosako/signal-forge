@@ -10,7 +10,10 @@ Algolia の HN Search API(https://hn.algolia.com/api。公式の無料の API �
 - 対象は投稿(tags=story)。作られたのが直近 window_hours 時間以内で、点数が min_points 以上のもの
 - 語を探すのは見出しだけ(restrictSearchableAttributes=title)。本文まで探すと、長い本文の投稿
   (Launch HN など)が語の一部の一致で多くの語に当たる
-- 記事の URL が無い投稿(Ask HN など)は、HN の投稿のページを URL にし、投稿の本文を同梱する
+- 記事の URL が無い投稿(Ask HN など)は、HN の投稿のページを URL にし、投稿の本文を同梱する。
+  URL が http/https として読めない投稿、点数・時刻の形が合わない投稿は、その 1 件だけを捨てる
+- 失敗の文には検索の語を入れない(共通 HTTP クライアントの例外の文は URL を含むので、種類だけの
+  文にし直す)。ログと台帳に語を残さないため
 - 応答は外部由来の未検証データ。見出し・URL・本文は、RSS の記事と同じく collect・抽出・分析の
   段が扱う
 """
@@ -29,6 +32,7 @@ from app.models import Source
 SEARCH_URL = "https://hn.algolia.com/api/v1/search"
 ITEM_URL = "https://news.ycombinator.com/item?id={id}"
 HITS_PER_QUERY = 20  # 1 つの語で受け取る投稿の上限(関連の順)
+FUTURE_SLACK_S = 3600  # 作られた時刻がこれより先の投稿は捨てる(時計のずれの余裕。応答は未検証)
 _TITLE_MAX_CHARS = 300
 
 
@@ -59,7 +63,9 @@ class HnFocusConnector:
 
     def fetch(self, source_row: Source, cursor: dict) -> FetchResult:
         started = time.monotonic()
-        since = int((self._now() - self._window).timestamp())
+        now = self._now()
+        since = int((now - self._window).timestamp())
+        until = int(now.timestamp()) + FUTURE_SLACK_S
         found: dict[str, tuple[int, int, RawItem]] = {}  # 投稿の id → (点数, 作られた時刻, 記事)
         errors: list[Exception] = []
         status: int | None = None
@@ -70,12 +76,14 @@ class HnFocusConnector:
                 errors.append(e)
                 continue
             for hit in hits:
-                parsed = _parse_hit(hit, query)
+                # 条件は API に渡しているが、応答は未検証なので確かめ直す。形の合わない投稿は
+                # その 1 件だけを捨てる(ほかの投稿は残す)
+                parsed = _parse_hit(
+                    hit, query, min_points=self._min_points, since=since, until=until
+                )
                 if parsed is None:
                     continue
                 story_id, points, created, item = parsed
-                if points < self._min_points or created < since:
-                    continue  # 条件は API に渡しているが、応答は未検証なので確かめ直す
                 if story_id not in found or points > found[story_id][0]:
                     found[story_id] = (points, created, item)
         if errors and len(errors) == len(self._queries):
@@ -104,7 +112,14 @@ class HnFocusConnector:
             "numericFilters": f"created_at_i>{since},points>={self._min_points}",
             "hitsPerPage": HITS_PER_QUERY,
         }
-        fetched = self._http.get(f"{SEARCH_URL}?{urlencode(params)}")
+        try:
+            fetched = self._http.get(f"{SEARCH_URL}?{urlencode(params)}")
+        except RetryableError as e:
+            # 共通 HTTP クライアントの例外の文は URL(= 検索の語)を含む。語をログと台帳
+            # (collect_runs・sources の last_error)に残さないよう、種類だけの文にし直す
+            raise RetryableError(f"HN の検索に失敗: {type(e).__name__}") from None
+        except FatalError as e:
+            raise FatalError(f"HN の検索に失敗: {type(e).__name__}") from None
         status = fetched.response.status_code
         if status == 429 or status >= 500:
             raise RetryableError(f"HN の検索が HTTP {status}")
@@ -112,16 +127,22 @@ class HnFocusConnector:
             raise FatalError(f"HN の検索が HTTP {status}")
         try:
             payload = fetched.response.json()
-        except ValueError as e:
-            raise RetryableError("HN の検索の応答を JSON として読めない") from e
+        except ValueError:
+            raise RetryableError("HN の検索の応答を JSON として読めない") from None
         hits = payload.get("hits") if isinstance(payload, dict) else None
         if not isinstance(hits, list):
             raise RetryableError("HN の検索の応答に hits が無い")
         return hits, status
 
 
-def _parse_hit(hit: object, query: str) -> tuple[str, int, int, RawItem] | None:
-    """1 件の投稿を (id, 点数, 作られた時刻, 記事) にする。形の合わない投稿は None で、捨てる。"""
+def _parse_hit(
+    hit: object, query: str, *, min_points: int, since: int, until: int
+) -> tuple[str, int, int, RawItem] | None:
+    """1 件の投稿を (id, 点数, 作られた時刻, 記事) にする。
+
+    形・値が合わない投稿は None で、捨てる(点数が下限より低い、作られた時刻が期間の外、
+    記事の URL が http/https として読めない、など)。例外は外へ出さない。
+    """
     if not isinstance(hit, dict):
         return None
     story_id = hit.get("objectID")
@@ -132,17 +153,21 @@ def _parse_hit(hit: object, query: str) -> tuple[str, int, int, RawItem] | None:
         return None
     if not isinstance(title, str) or not (flat := " ".join(title.split())[:_TITLE_MAX_CHARS]):
         return None
-    if isinstance(points, bool) or not isinstance(points, int):
+    if isinstance(points, bool) or not isinstance(points, int) or points < min_points:
         return None
-    if isinstance(created, bool) or not isinstance(created, int):
+    # 期間の内側だけを受ける(日時に変換できない値を、変換の前に除く)
+    if isinstance(created, bool) or not isinstance(created, int) or not since <= created <= until:
         return None
     item_url = ITEM_URL.format(id=story_id)
     url = hit.get("url")
     text = hit.get("story_text")
-    if isinstance(url, str) and urlsplit(url.strip()).scheme in ("http", "https"):
-        body = None
-    else:
+    if url is None or (isinstance(url, str) and not url.strip()):
+        # 記事の URL の無い投稿(Ask HN など)は、HN の投稿のページにし、投稿の本文を同梱する
         url, body = item_url, text if isinstance(text, str) and text.strip() else None
+    elif isinstance(url, str) and _is_web_url(url):
+        url, body = url.strip(), None
+    else:
+        return None
     author = hit.get("author")
     comments = hit.get("num_comments")
     item = RawItem(
@@ -159,3 +184,11 @@ def _parse_hit(hit: object, query: str) -> tuple[str, int, int, RawItem] | None:
         },
     )
     return story_id, points, created, item
+
+
+def _is_web_url(value: str) -> bool:
+    try:
+        parts = urlsplit(value.strip())
+        return parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:  # 分解できない URL(閉じていない [ など)
+        return False

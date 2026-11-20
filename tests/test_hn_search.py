@@ -127,7 +127,7 @@ def test_post_without_article_url_uses_item_page_and_bundles_text() -> None:
             {
                 "q": [
                     hit("1", 9, url="", story_text="<p>Ask HN body</p>"),
-                    hit("2", 8, url="javascript:alert(1)"),  # http/https でない
+                    {**hit("2", 8), "url": None},
                 ]
             }
         )
@@ -135,6 +135,36 @@ def test_post_without_article_url_uses_item_page_and_bundles_text() -> None:
     first, second = connector(http, ["q"]).fetch(SOURCE, {}).items
     assert (first.url, first.raw_content) == (ITEM_URL.format(id="1"), "<p>Ask HN body</p>")
     assert (second.url, second.raw_content) == (ITEM_URL.format(id="2"), None)
+
+
+def test_a_malformed_post_is_dropped_without_losing_the_others() -> None:
+    # 応答は未検証の外部データ。分解できない URL や日時に変換できない時刻でも、その 1 件だけを捨てる
+    http = make_http(
+        responder(
+            {
+                "q": [
+                    hit("1", 9, url="https://[broken"),
+                    hit("2", 9, url="javascript:alert(1)"),  # http/https でない
+                    hit("3", 9, url="https://"),  # host が無い
+                    {**hit("4", 9), "created_at_i": 10**20},
+                    {**hit("5", 9), "created_at_i": created(-2)},  # 2 時間先(時計のずれの外)
+                    hit("6", 9),
+                ]
+            }
+        )
+    )
+    items = connector(http, ["q"]).fetch(SOURCE, {}).items
+    assert [item.external_id for item in items] == [ITEM_URL.format(id="6")]
+
+
+def test_failure_text_does_not_carry_the_search_terms() -> None:
+    # 共通 HTTP クライアントの例外の文は URL(= 語)を含む。ログと台帳に語を残さない
+    http = make_http(responder({"secret words": 500}))
+    with pytest.raises(RetryableError) as raised:
+        connector(http, ["secret words"]).fetch(SOURCE, {})
+    text = str(raised.value)
+    assert "secret" not in text and "algolia" not in text
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
 
 
 def test_partial_failure_keeps_the_queries_that_were_read() -> None:
