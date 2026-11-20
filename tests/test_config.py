@@ -595,6 +595,7 @@ def test_focus_defaults_and_validation(tmp_path: Path) -> None:
     focus = load_config(empty_config(tmp_path)).focus
     assert (focus.enabled, focus.enter_score, focus.exit_score) == (False, 6.0, 3.0)
     assert (focus.score_bonus, focus.bonus_items) == (15.0, 5)
+    assert (focus.hn_items, focus.hn_min_points, focus.hn_window_hours) == (5, 5, 48)
     config = load_config(
         write_config(tmp_path, "[focus]\nenabled = true\nenter_score = 4\nexit_score = 4\n")
     )
@@ -609,6 +610,10 @@ def test_focus_defaults_and_validation(tmp_path: Path) -> None:
         ("[focus]\nscore_bonus = -1.0\n", "score_bonus"),
         ("[focus]\nscore_bonus = inf\n", "score_bonus"),
         ("[focus]\nbonus_items = -1\n", "bonus_items"),
+        ("[focus]\nhn_items = -1\n", "hn_items"),
+        ("[focus]\nhn_min_points = -1\n", "hn_min_points"),
+        ("[focus]\nhn_window_hours = 0\n", "hn_window_hours"),
+        ("[focus]\nhn_window_hours = 169\n", "hn_window_hours"),
     ):
         with pytest.raises(ConfigError, match=key):
             load_config(write_config(tmp_path, body))

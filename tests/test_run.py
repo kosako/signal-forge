@@ -1180,7 +1180,14 @@ def test_focus_stage_runs_before_extract_only_when_enabled(conn, tmp_path, monke
         order.append("extract")
         return {"ok": 0, "partial": 0, "failed": 0}
 
+    def focus_collect_spy(db, config, http, stage_logger, *, run_id=None):
+        # GH#433 の 5 本目: 今の重点の語の HN の検索は、focus の後・extract の前
+        order.append("focus_collect")
+        calls["collect_run_id"] = run_id
+        calls["http"] = http
+
     monkeypatch.setattr(run_module, "focus_stage", focus_spy)
+    monkeypatch.setattr(run_module, "focus_collect_stage", focus_collect_spy)
     monkeypatch.setattr(run_module, "extract_pending", extract_spy)
     primary = ScriptedEngine(conn)
     args = (conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http())
@@ -1188,14 +1195,22 @@ def test_focus_stage_runs_before_extract_only_when_enabled(conn, tmp_path, monke
     assert order == ["extract"]
 
     order.clear()
+    http = make_http()
     config = replace(make_config(tmp_path), focus=FocusConfig(enabled=True))
     run_pipeline(
-        conn, config, {}, {"rss": StaticConnector()}, make_http(), lambda: primary, logger,
-        "01RUNID",
+        conn, config, {}, {"rss": StaticConnector()}, http, lambda: primary, logger, "01RUNID"
+    )
+    assert order == ["focus", "focus_collect", "extract"]
+    assert calls["run_id"] == calls["collect_run_id"] == "01RUNID"
+    assert calls["primary"]("low") is primary
+    assert calls["http"] is http
+
+    order.clear()  # [focus].hn_items = 0 で HN の検索だけを省く
+    config = replace(make_config(tmp_path), focus=FocusConfig(enabled=True, hn_items=0))
+    run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, http, lambda: primary, logger, "01RUNID"
     )
     assert order == ["focus", "extract"]
-    assert calls["run_id"] == "01RUNID"
-    assert calls["primary"]("low") is primary
 
 
 def test_focus_llm_failure_does_not_fail_the_run(conn, tmp_path) -> None:

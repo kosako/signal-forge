@@ -584,3 +584,30 @@ def test_focus_topic_refs_add_newest_examples_from_evidence(conn, tmp_path) -> N
         FocusTopicRef(topic, "話題", ("投稿の 本文", "記事の見出し", "title u"))
     ]
 
+
+
+def test_search_terms_send_latin_terms_of_the_active_topics_in_weight_order(conn, tmp_path) -> None:
+    # GH#433 の 5 本目: HN の検索に送る語は、digest に出す重点の話題の語のうち英字を含むもの。
+    # 重みの高い話題から順に、話題の中の語の順で並べ、同じ語は 1 つにする。台帳の値も送る前に
+    # clean_terms をかけ直す(引用符と演算子を外す)
+    from app.focus import search_terms
+
+    config = make_config(tmp_path)
+
+    def topic(name: str, terms: list[str], status: str = "active") -> int:
+        return conn.execute(
+            "INSERT INTO focus_topics (name, terms, status) VALUES (?, ?, ?)",
+            (name, json.dumps(terms, ensure_ascii=False), status),
+        ).lastrowid
+
+    light = topic("軽い", ['"quoted" term', "Agent Review", "OR"])
+    heavy = topic("重い", ["日本語の語", "Agent Review", "agent review"])
+    topic("候補", ["candidate term"], status="candidate")
+    for ref, topic_id in ((1, heavy), (2, heavy), (3, light)):
+        conn.execute(
+            "INSERT INTO focus_evidence (signal_kind, signal_ref, topic_id, subject, observed_at) "
+            "VALUES ('tg_dig', ?, ?, ?, ?)",
+            (ref, topic_id, f"tweet:{ref}", iso(0)),
+        )
+
+    assert search_terms(conn, config, now=NOW) == ["Agent Review", "quoted term"]

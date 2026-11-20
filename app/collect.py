@@ -118,6 +118,37 @@ def collect_all(
             return
 
 
+def collect_ranked(
+    conn: sqlite3.Connection,
+    source: Source,
+    connector: Connector,
+    logger: logging.Logger,
+    *,
+    limit: int,
+    run_id: str | None = None,
+) -> None:
+    """collect の段の外で、1 ソースを並びの順に limit 件まで取り込む(今の重点の検索。GH#433)。
+
+    connector が返す並び(良い順)のまま、保存すると新しい行になる記事だけを limit 件まで保存する。
+    取り込み済み・ほかのソースと同じ URL の記事は除き、上限にも数えない(毎日同じ記事が枠を
+    埋めない)。
+    limit を超えた分は次の実行へ回さない(次の実行は新しく検索し直す)。短縮 URL は解決しない。
+    ソースの成否・collect_runs の記録・失敗の隔離は collect の段と同じ。
+    """
+    _collect_source(
+        conn,
+        source,
+        connector,
+        logger,
+        run_id=run_id,
+        resolve_short=None,
+        rss_max_items=0,
+        deadline=float("inf"),
+        clock=time.monotonic,
+        ranked_limit=limit,
+    )
+
+
 def _collect_source(
     conn: sqlite3.Connection,
     source: Source,
@@ -129,8 +160,12 @@ def _collect_source(
     rss_max_items: int,
     deadline: float,
     clock: Callable[[], float],
+    ranked_limit: int | None = None,
 ) -> bool:
-    """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。"""
+    """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。
+
+    ranked_limit があれば、並びの順に新しい記事だけをその件数まで準備する(collect_ranked)。
+    """
     log_ctx = {"run_id": run_id, "stage": "collect", "source_id": source.id}
     run_row_id = conn.execute(
         "INSERT INTO collect_runs (source_id) VALUES (?)", (source.id,)
@@ -144,7 +179,9 @@ def _collect_source(
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
-        if source.type == "rss":
+        if ranked_limit is not None:
+            prepared = _prepare_ranked(conn, source, result.items, ranked_limit)
+        elif source.type == "rss":
             prepared = _prepare_rss(
                 conn, source, result.items, rss_max_items, resolve_short, deadline, clock
             )
@@ -418,6 +455,36 @@ def _prepare_rss(
         capped=0 if timed_out else deferred,
         timed_out=timed_out and deferred > 0,
     )
+
+
+def _prepare_ranked(
+    conn: sqlite3.Connection, source: Source, items: list[RawItem], limit: int
+) -> _Prepared:
+    """並びの順に、保存すると新しい行になる記事を limit 件まで準備する(collect_ranked)。
+
+    既知かは _prepare_rss と同じく guid と正規化した URL で見る(短縮 URL は解決しない)。同じ取得の
+    中の重複も除く。limit の後ろは数えない(次の実行へ回さず、既知の数にも入れない)。
+    """
+    kept: list[tuple[RawItem, str | None]] = []
+    kept_urls: set[str] = set()
+    kept_guids: set[str] = set()
+    known = 0
+    for raw in items:
+        if len(kept) >= limit:
+            break
+        canonical = _canonical_url(raw, None)
+        if (
+            (raw.external_id is not None and raw.external_id in kept_guids)
+            or (canonical or raw.url) in kept_urls
+            or _known_without_resolution(conn, source, raw, None)
+        ):
+            known += 1
+            continue
+        kept.append((raw, canonical))
+        kept_urls.add(canonical or raw.url)
+        if raw.external_id is not None:
+            kept_guids.add(raw.external_id)
+    return _Prepared(kept, known=known)
 
 
 def _needs_resolution(raw: RawItem, resolve_short: Callable[[str], str] | None) -> bool:

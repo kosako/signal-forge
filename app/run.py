@@ -1,9 +1,11 @@
 """intel run — 朝バッチの直列実行(設計 00 §2・§6)。
 
 順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ focus([focus].enabled の
-ときのみ。GH#433)→ extract → analyze → digest → export → deliver → dig(cap > 0 のときのみ。
-GH#105)→ purge → backup(backup は設計 05 §5 の「朝バッチ末尾」)。focus を x_signals の後に
-置くのは、その朝に取り込んだシグナルも数えるため。dig を deliver の後に置くのは、
+ときのみ。GH#433)→ focus_collect(focus があり [focus].hn_items > 0 のときのみ。GH#433 の 5 本目)
+→ extract → analyze → digest → export → deliver → dig(cap > 0 のときのみ。GH#105)→ purge →
+backup(backup は設計 05 §5 の「朝バッチ末尾」)。focus を x_signals の後に置くのは、その朝に
+取り込んだシグナルも数えるため。focus_collect を focus の後・extract の前に置くのは、その朝の
+今の重点で検索し、取り込んだ記事を同じ実行で分析するため。dig を deliver の後に置くのは、
 ダイジェスト配信を深掘り生成(分オーダー)で遅らせないため。purge より前なのは
 X 由来 documents の TTL 失効前に本文を材料として使うため。
 原則「段ごとに局所化し、進めるものは進め、止まったことは必ず通知する」:
@@ -107,6 +109,11 @@ def run_pipeline(
         stage("x_signals", lambda: _collect_x_signals(conn, config, env, logger, run_id))
     if config.focus.enabled:
         stage("focus", lambda: focus_stage(conn, config, logger, run_id=run_id, primary=primary))
+        if config.focus.hn_items > 0:  # 今の重点の語の HN の検索(GH#433 の 5 本目)。0 で省く
+            stage(
+                "focus_collect",
+                lambda: focus_collect_stage(conn, config, http, logger, run_id=run_id),
+            )
     stage("extract", lambda: extract_pending(conn, config, http, logger, run_id=run_id))
     stage(
         "analyze",
@@ -330,6 +337,23 @@ def focus_stage(
             return create_engine(config.llm.engine, model_reasoning_effort=effort)
 
     return run_focus(conn, config, primary("low"), logger, run_id=run_id)
+
+
+def focus_collect_stage(
+    conn: sqlite3.Connection,
+    config: Config,
+    http: HttpClient,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+) -> None:
+    """focus_collect 段: 今の重点の語で Hacker News を検索し、記事として取り込む(GH#433 の 5 本目)。
+
+    focus 段で今の重点を更新した後に走り、取り込んだ記事は同じ実行の extract・analyze 段が扱う。
+    """
+    from app.focus_collect import collect_focus_items
+
+    collect_focus_items(conn, config, http, logger, run_id=run_id)
 
 
 def analyze_stage(
