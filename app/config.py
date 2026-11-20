@@ -251,6 +251,10 @@ class FocusConfig:
     weight_tg_dig: float = 3.0  # Telegram の 🔖 深掘りしたい
     weight_note: float = 3.0  # カードへの感想・リプライ(item_notes)
     weight_investigation: float = 3.0  # 🔎 出来事の調査の依頼
+    # 今の重点に当たる記事の点に足す値(GH#433 の 4 本目・設計 03 §6)。0 で足さない
+    score_bonus: float = 15.0
+    # 点を足す記事の数の上限(重点の記事のうち点の高い順)。重点の記事で上位が埋まらないように
+    bonus_items: int = 5
 
 
 @dataclass(frozen=True)
@@ -696,10 +700,14 @@ def _validate_focus(path: Path, focus: FocusConfig) -> None:
     for key in ("max_active", "window_days", "max_signals"):
         if getattr(focus, key) <= 0:
             raise ConfigError(f"{path}: [focus].{key} は正の整数であること: {getattr(focus, key)}")
-    for key in ("weight_tg_useful", "weight_tg_dig", "weight_note", "weight_investigation"):
+    for key in (
+        "weight_tg_useful", "weight_tg_dig", "weight_note", "weight_investigation", "score_bonus"
+    ):
         value = getattr(focus, key)
         if not (math.isfinite(value) and value >= 0):
             raise ConfigError(f"{path}: [focus].{key} は 0 以上の有限値: {value}")
+    if focus.bonus_items < 0:
+        raise ConfigError(f"{path}: [focus].bonus_items は 0 以上の整数: {focus.bonus_items}")
 
 
 def _parens_balanced(slot: str) -> bool:

@@ -32,6 +32,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel
 
@@ -53,6 +54,7 @@ MAX_NOTE = 200  # 感想の本文の上限(記事の見出しと並べる分)
 MAX_PROMPT_TOPICS = 30
 PROMPT_TOPIC_WINDOW_FACTOR = 4
 CANDIDATE_DISPLAY = 10
+MATCH_EXAMPLES = 3  # 重点に当たる記事を選ぶ prompt に添える、話題の証拠の例の数(GH#433 の 4 本目)
 MIN_DISPLAY_SCORE = 0.1
 
 KIND_LABELS = {
@@ -114,6 +116,19 @@ class TopicScore:
     counts: dict[str, int]  # 種類ごとのシグナルの数
     subjects: int  # 記事・投稿の数
     last_observed: str | None
+
+
+class FocusTopicRef(NamedTuple):
+    """重点に当たる記事を選ぶ prompt に渡す今の重点の 1 つ(GH#433 の 4 本目・app/focus_match.py)。
+
+    examples は話題の証拠になった投稿・記事の見出し(新しい順)。名前だけでは話題の意味が広く
+    読まれるので、例で絞る。name は外部の本文から LLM が作った文、examples は外部の本文なので、
+    prompt では nonce の囲みの中に入れる。
+    """
+
+    topic_id: int
+    name: str
+    examples: tuple[str, ...] = ()
 
 
 @dataclass
@@ -656,6 +671,72 @@ def active_focus(
         for s in topic_scores(conn, config, now)
         if s.status == "active"
     ][:FOCUS_MAX_TOPICS]
+
+
+def focus_topic_refs(conn: sqlite3.Connection, entries: list[FocusEntry]) -> list[FocusTopicRef]:
+    """重点に当たる記事を選ぶ prompt に渡す今の重点(GH#433 の 4 本目)。
+
+    digest に出す今の重点(active_focus)と同じ話題に、証拠の例を添える。検索の語は渡さない
+    (投稿の一言から作った語が、話題を広く読ませた。11-20 の本番の写しの比較)。
+    """
+    return [
+        FocusTopicRef(topic_id=e.topic_id, name=e.name, examples=topic_examples(conn, e.topic_id))
+        for e in entries
+    ]
+
+
+def topic_examples(
+    conn: sqlite3.Connection, topic_id: int, limit: int = MATCH_EXAMPLES
+) -> tuple[str, ...]:
+    """話題の証拠になった投稿・記事の見出し(新しい順に limit 個まで。同じ文は 1 つ)。
+
+    記事・投稿は重みの計算と同じく寄せた先で 1 つに数える。記事は分析の日本語の見出し(degraded を
+    除く)か元の見出し、記事の無い投稿は本文の抜粋、調査は出来事の名前。本文の無いものは飛ばす。
+    """
+    examples: list[str] = []
+    for row in conn.execute(
+        f"""
+        SELECT {_subject_sql("e.subject")} AS subject, max(e.observed_at) AS last
+        FROM focus_evidence e WHERE e.topic_id = ?
+        GROUP BY 1 ORDER BY last DESC, subject
+        """,
+        (topic_id,),
+    ):
+        text = _subject_text(conn, row["subject"])
+        if text and text not in examples:
+            examples.append(text)
+        if len(examples) >= limit:
+            break
+    return tuple(examples)
+
+
+def _subject_text(conn: sqlite3.Connection, subject: str) -> str | None:
+    kind, _, ref = subject.partition(":")
+    if kind == "item" and ref.isdigit():
+        row = conn.execute(
+            """
+            SELECT coalesce(
+                     nullif((SELECT a.title_ja FROM analyses a
+                             WHERE a.item_id = items.id AND a.degraded = 0
+                             ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1), ''),
+                     nullif(items.title, '')) AS text
+            FROM items WHERE items.id = ?
+            """,
+            (int(ref),),
+        ).fetchone()
+    elif kind == "tweet":
+        row = conn.execute(
+            "SELECT text_excerpt AS text FROM x_signals WHERE tweet_id = ? "
+            "AND coalesce(text_excerpt, '') != '' ORDER BY id LIMIT 1",
+            (ref,),
+        ).fetchone()
+    elif kind == "investigation" and ref.isdigit():
+        row = conn.execute(
+            "SELECT label AS text FROM news_investigations WHERE id = ?", (int(ref),)
+        ).fetchone()
+    else:
+        return None
+    return _one_line(row["text"]) if row is not None and row["text"] else None
 
 
 def render_focus(conn: sqlite3.Connection, config: Config, *, now: datetime | None = None) -> str:

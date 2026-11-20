@@ -1258,3 +1258,71 @@ def test_digest_stage_passes_the_current_focus_only_when_enabled(
     run_module.digest_stage(conn, enabled, {}, logger, primary=primary)
 
     assert passed == [None, entries, None]
+
+
+def test_digest_stage_selects_focus_items_with_the_replaced_digest(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # GH#433 の 4 本目: 重点があれば、digest 段が重点に当たる記事を選んで digest に渡す。
+    # --force では、置き換える digest の記事も候補に戻して聞く。選べなくても digest は作る
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import FocusConfig
+    from app.models import FocusEntry
+
+    passed: list = []
+    pools: list = []
+
+    def spy(db, config, stage_logger, **kwargs):
+        passed.append(kwargs["focus_items"])
+        return 1
+
+    monkeypatch.setattr(run_module, "generate_digest", spy)
+    monkeypatch.setattr("app.analysis.trend.synthesize_trend", lambda *a, **k: None)
+    entries = [FocusEntry(1, "話題", 2)]
+    monkeypatch.setattr("app.focus.active_focus", lambda db, config: entries)
+
+    def pool(db, config, *, include_item_ids):
+        pools.append(list(include_item_ids))
+        return ["row"]
+
+    monkeypatch.setattr("app.ranking.focus_pool", pool)
+    calls: list = []
+
+    def select(db, engine, stage_logger, *, digest_date, topics, pool, run_id):
+        calls.append((engine.effort, [t.topic_id for t in topics], pool))
+        return {5: 1}
+
+    monkeypatch.setattr("app.focus_match.select_focus_items", select)
+
+    class Engine:
+        def __init__(self, effort):
+            self.effort = effort
+
+    enabled = replace(make_config(tmp_path), focus=FocusConfig(enabled=True))
+    run_module.digest_stage(conn, enabled, {}, logger, primary=Engine)
+    conn.execute(
+        "INSERT INTO digests (digest_date, item_ids, item_count, markdown) "
+        "VALUES (?, '[7, 8]', 2, 'm')",
+        (run_module.today_jst(),),
+    )
+    run_module.digest_stage(conn, enabled, {}, logger, primary=Engine, force=True)
+    assert pools == [[], [7, 8]]
+    assert calls == [("medium", [1], ["row"])] * 2
+    assert passed == [{5: 1}, {5: 1}]
+
+    # 重点が無い日・無効の日は聞かない。選ぶ途中で失敗しても digest は作る(点を足さない)
+    monkeypatch.setattr("app.focus.active_focus", lambda db, config: [])
+    run_module.digest_stage(conn, enabled, {}, logger, primary=Engine, force=True)
+    run_module.digest_stage(conn, make_config(tmp_path), {}, logger, primary=Engine, force=True)
+    monkeypatch.setattr("app.focus.active_focus", lambda db, config: entries)
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("no such table")
+
+    monkeypatch.setattr("app.ranking.focus_pool", broken)
+    run_module.digest_stage(conn, enabled, {}, logger, primary=Engine, force=True)
+    assert len(calls) == 2
+    assert passed[2:] == [None, None, {}]
+

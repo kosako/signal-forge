@@ -680,3 +680,30 @@ def test_focus_line_is_stored_and_rendered_even_on_degraded_digest(
     generate_digest(conn, config, logger, force=True, focus=[])
     row = conn.execute("SELECT focus_json, markdown FROM digests").fetchone()
     assert row["focus_json"] is None and "🎯" not in row["markdown"]
+
+
+def test_digest_adds_focus_bonus_only_for_topics_of_the_digest(conn, tmp_path, fixed_today) -> None:
+    # GH#433 の 4 本目: digest に出す今の重点の話題に当たる記事だけ、点を足して上げる。
+    # 渡された当たりでも、digest の重点に無い話題(外した話題など)の記事は足さない
+    from dataclasses import replace
+
+    from app.config import FocusConfig
+    from app.models import FocusEntry
+
+    high = [add_analyzed(conn, f"https://a/{i}", relevance=90 - i) for i in range(2)]
+    focused = add_analyzed(conn, "https://a/focus", relevance=80)
+    other = add_analyzed(conn, "https://a/other", relevance=82)
+    config = replace(make_config(tmp_path, max_items=2), focus=FocusConfig(enabled=True))
+
+    generate_digest(
+        conn, config, logger, focus=[FocusEntry(3, "重点", 2)],
+        focus_items={focused: 3, other: 9},
+    )
+    row = conn.execute("SELECT item_ids FROM digests").fetchone()
+    assert json.loads(row["item_ids"]) == [focused, high[0]]  # 80 + 15 = 95
+
+    # 重点が無い(外した・[focus] が無効)ときは点の順だけ
+    generate_digest(conn, config, logger, force=True, focus=None, focus_items={focused: 3})
+    row = conn.execute("SELECT item_ids FROM digests").fetchone()
+    assert json.loads(row["item_ids"]) == high
+

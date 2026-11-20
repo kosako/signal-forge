@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Mapping
 
 from app.config import Config
 from app.deliver_lock import delivery_lock
@@ -53,12 +54,15 @@ def generate_digest(
     force: bool = False,
     news: NewsSection | None = None,
     focus: list[FocusEntry] | None = None,
+    focus_items: Mapping[int, int] | None = None,
     hold_if_empty: bool = False,
 ) -> int | None:
     """当日ダイジェストを生成し digests.id を返す(skip 時は None)。
 
     news: 冒頭の「今日の IT ニュース」節(GH#75・GH#413)。付加機能なので None 可(節を省く)。
     focus: 冒頭の「🎯 今の重点」(GH#433)。digests.focus_json に写す。None・空なら行を出さない。
+    focus_items: 今の重点に当たる記事(item_id → 話題の id。GH#433 の 4 本目)。focus の話題の
+    ものだけを使い、ランキングがその記事の点を足す。
     hold_if_empty: 分析の段が失敗した日。載せる記事が無ければ DigestHeldError(GH#191)。
 
     --force は配信と同じロック(deliver.lock)を置換のトランザクションの前に取り、先の配信が
@@ -70,7 +74,7 @@ def generate_digest(
     if not force:
         return _generate_digest(
             conn, config, logger, run_id=run_id, force=False,
-            news=news, focus=focus, hold_if_empty=hold_if_empty,
+            news=news, focus=focus, focus_items=focus_items, hold_if_empty=hold_if_empty,
         )
     # 当日の行があるかはロックの中で読む(取る前に読むと、待つ間に変わった状態で置換しうる)
     with delivery_lock(
@@ -79,7 +83,7 @@ def generate_digest(
     ):
         return _generate_digest(
             conn, config, logger, run_id=run_id, force=True,
-            news=news, focus=focus, hold_if_empty=hold_if_empty,
+            news=news, focus=focus, focus_items=focus_items, hold_if_empty=hold_if_empty,
         )
 
 
@@ -92,6 +96,7 @@ def _generate_digest(
     force: bool,
     news: NewsSection | None,
     focus: list[FocusEntry] | None,
+    focus_items: Mapping[int, int] | None,
     hold_if_empty: bool,
 ) -> int | None:
     """generate_digest の本体(--force のときは delivery_lock の中で呼ぶ)。"""
@@ -145,7 +150,16 @@ def _generate_digest(
             ranked = _all_degraded_candidates(conn, config, digest_date)
             degraded_digest = bool(ranked)
             if not degraded_digest:
-                ranked = rank_for_digest(conn, config)
+                # 今の重点に当たる記事の点を足す(GH#433)。digest に出す重点の話題のものだけ
+                focus_ids = {entry.topic_id for entry in focus or []}
+                ranked = rank_for_digest(
+                    conn, config,
+                    focus_items={
+                        item_id: topic_id
+                        for item_id, topic_id in (focus_items or {}).items()
+                        if topic_id in focus_ids
+                    },
+                )
             if hold_if_empty and not ranked:
                 # 分析の障害の空を「該当なし」として確定しない(GH#191)。下の except が
                 # ROLLBACK して送出する(--force の旧採用 item の復帰も戻す)

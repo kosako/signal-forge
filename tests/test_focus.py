@@ -541,3 +541,46 @@ def test_dismissed_topic_stays_out_and_restored_topic_returns_by_weight(conn, tm
     assert restore_topic(conn, 999) == dismiss_topic(conn, 999, NOW) == "missing"
     run_focus(conn, config, FakeEngine(), logger, now=NOW)
     assert scores_by_name(conn, config)["話題"][1] == "active"
+
+
+def test_focus_topic_refs_add_newest_examples_from_evidence(conn, tmp_path) -> None:
+    # GH#433 の 4 本目: 当たる記事を選ぶ prompt に渡す重点は、digest に出す重点の話題に、証拠の
+    # 見出しを新しい順に 3 つまで添える。記事・投稿は重みと同じく寄せた先で 1 つに数え、本文の
+    # 無いものは飛ばす
+    from app.focus import FocusTopicRef, active_focus, focus_topic_refs
+
+    config = make_config(tmp_path)
+    topic = conn.execute(
+        "INSERT INTO focus_topics (name, status, activated_at) VALUES ('話題', 'active', ?)",
+        (iso(0),),
+    ).lastrowid
+    candidate = conn.execute("INSERT INTO focus_topics (name) VALUES ('候補')").lastrowid
+    article = add_item(conn, "a", title_ja="記事の見出し")
+    unanalyzed = add_item(conn, "u")  # 分析の無い記事は元の見出し
+    add_x_signal(conn, "like", "500", text="投稿の\n本文")
+    add_x_signal(conn, "bookmark", "600", text="合流した投稿", item_id=article)
+    add_x_signal(conn, "like", "800", text="古い投稿")
+    add_x_signal(conn, "like", "900", text="投稿の 本文")  # 別の投稿でも同じ文は 1 つ
+    evidence = [
+        ("tg_dig", 1, "tweet:700", 0.05, topic),  # 本文が無い投稿は飛ばす
+        ("x_like", 2, "tweet:500", 0.1, topic),
+        ("x_like", 8, "tweet:900", 0.15, topic),
+        ("x_bookmark", 3, "tweet:600", 0.2, topic),  # 合流した記事に寄せる
+        ("tg_useful", 4, f"item:{article}", 3, topic),  # 同じ記事なので 1 つ
+        ("note", 5, f"item:{unanalyzed}", 4, topic),
+        ("x_like", 6, "tweet:800", 6, topic),  # 3 つを超えた分
+        ("tg_useful", 7, f"item:{article}", 0, candidate),  # 候補の話題は渡さない
+    ]
+    for kind, ref, subject, days_ago, topic_id in evidence:
+        conn.execute(
+            "INSERT INTO focus_evidence (signal_kind, signal_ref, topic_id, subject, observed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (kind, ref, topic_id, subject, iso(days_ago)),
+        )
+
+    entries = active_focus(conn, config, now=NOW)
+    assert [e.topic_id for e in entries] == [topic]  # 候補の話題は渡さない
+    assert focus_topic_refs(conn, entries) == [
+        FocusTopicRef(topic, "話題", ("投稿の 本文", "記事の見出し", "title u"))
+    ]
+
