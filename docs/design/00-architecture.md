@@ -42,7 +42,7 @@
 
 ### 2プロセスの責務分離
 
-- **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ focus(今の重点。`[focus].enabled` のときのみ。GH#433 / 設計 03 §4.1)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ dig(深掘り調査。`[dig].daily_cap > 0` のときのみ。GH#105 / 設計 06)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。focus を x_signals の後に置く理由: その朝に取り込んだシグナルも数える。dig を deliver の後に置く理由: ダイジェスト配信を深掘り生成(分オーダー)で遅らせない。purge より前に置く理由: X 由来 documents の TTL 失効前に本文を材料に使う。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
+- **朝バッチ** `intel run`: **collect → x_signals(S1b 興味シグナル取込。`[x_signals].daily_read_cap > 0` のときのみ)→ focus(今の重点。`[focus].enabled` のときのみ。GH#433 / 設計 03 §4.1)→ focus_collect(今の重点の語で Hacker News を検索して記事を取り込む。focus があり `[focus].hn_items > 0` のときのみ。GH#433 / 設計 02 §7)→ extract → analyze → digest → export(Obsidian)→ deliver(配信)→ dig(深掘り調査。`[dig].daily_cap > 0` のときのみ。GH#105 / 設計 06)→ purge(期限切れ documents / raw_payload / x_signals 本文抜粋の削除)→ backup(日次バックアップ。設計 05 §5「朝バッチ末尾」)** を直列実行し終了(**本節がステージ順序の正本**。05・plan は本順序に従う)。focus を x_signals の後に置く理由: その朝に取り込んだシグナルも数える。focus_collect を focus の後・extract の前に置く理由: その朝の今の重点で検索し、取り込んだ記事を同じ実行で分析する。dig を deliver の後に置く理由: ダイジェスト配信を深掘り生成(分オーダー)で遅らせない。purge より前に置く理由: X 由来 documents の TTL 失効前に本文を材料に使う。段の失敗はその段で捕捉して記録し、後続の段は継続する(失敗の局所化。§6)。export を deliver より先に置く理由: Telegram 失敗でも Obsidian への蓄積は完了させる(PROPOSAL のエラー方針)。deliver 失敗時は export 済みのまま `digests.delivery_status='failed'` とし、再送は digest_messages 台帳(設計 04 §2)による未送信のみ再送。launchd StartCalendarInterval(配信時刻前、pmset wake 併設)。
 - **受信デーモン** `intel poll`: getUpdates を long polling し、(1) callback(👍🔖✅👎・深掘り追い掛け)→ 検証+signals へ記録後、結果に応じて answerCallbackQuery(記帳成功=記録しました / 検証失敗・期限切れ・DB 失敗など記帳できなかった場合=警告。answer は 1 callback に1回しか返せないため記帳が先。設計 04 §3) (2) URL メッセージ → items(source=manual)へ投入 (3) 夜アンケート回答 → signals へ記録 (4) 深掘りカード・その返事へのリプライ → 感想として記録し、質問として台帳に積んで `intel answer` を別プロセスで起動(返事の送信は子が行う。LLM の待ちで受信を止めないため。GH#126 / 設計 05 §1.2) (5) ダイジェストの記事メッセージ・ヘッダへのリプライ → 感想として item_notes / digest_notes に記録(GH#92 / GH#96) (6) 未消化一覧へのリプライ → 深掘りの指定として dig_queue を更新(GH#104 / 設計 06 §2)。allowlist 外の from.id はログ記録のみで破棄。加えて**内蔵タイマー**で夜アンケート送信(21:30 JST 仮)と watchdog(7:15 JST)、週 1 回のソースの健康診断(日曜の夜アンケートの時刻。GH#150)を実行する(設計 05 §1.2。plist を2枚に抑え、Telegram 送信経路を集約するため。デーモンは「受信+定時送信タイマー」であり、朝バッチ以外の Telegram 送信はここに寄せる)。
 - 両プロセスは **SQLite を介してのみ通信**する(理由: IPC を増やさず、片方が死んでももう片方が壊れない)。WAL モードを有効にし、busy_timeout を設定して同時書き込みに耐える。書き込みのトランザクションは短く保ち、外部への通信(HTTP など)はトランザクションを始める前に済ませる(理由: 通信を待つ間ずっと書き込みロックを持つと、もう片方の書き込みが busy_timeout を超えて失敗する。例: collect の短縮 URL の解決。GH#179)。
 
@@ -80,10 +80,12 @@ app/
                   #   — items を produce(カーソル・冪等)。gdelt.py・google_news.py(報道の検索と、予備の
                   #   見出しの検索。出来事の調査が材料を探すのに使う。items は作らない。GH#415)。
                   #   x_search.py の search_posts は出来事の調査の X の反応を読む(items は作らない)
+                  #   hn_search.py(今の重点の語で HN を検索する。保存は focus_collect.py。GH#433)
                   #   manual は専用コネクタを持たず、受信デーモンが直接投入(設計 02 §4)
   insights.py     # X 興味シグナルの週次インサイト(読取専用・S1c)
   focus.py        # 今の重点(GH#433。興味シグナルを話題に振り分け、重みで重点を決める。設計 03 §4.1)
   focus_match.py  # 今の重点に当たる記事を LLM に選ばせる(digest 段が呼び、ランキングが点を足す。設計 03 §6)
+  focus_collect.py # focus_collect 段(今の重点の語で HN を検索し、記事として取り込む。設計 02 §6)
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
   analysis/       # llm.py(LLMEngine 抽象層)、fallback.py(主のエンジンが失敗した呼び出しを予備で
                   #   やり直す。GH#156)、stage1.py(事前選別)、analyzer.py(本分析)、

@@ -17,11 +17,11 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
         │
         ▼
  朝バッチ  intel run(launchd。既定 06:30 起動)
-   collect → x_signals → focus → extract → analyze → digest → export → deliver → dig → purge → backup
-                                                        │         │        │
-                                                        ▼         ▼        ▼
-                                                  Obsidian    Telegram   DeepDive ノート(vault)
-                                                  vault      (ダイジェスト) + 概要カード(Telegram)
+   collect → x_signals → focus → focus_collect → extract → analyze → digest → export → deliver → dig → purge → backup
+                                                                        │         │        │
+                                                                        ▼         ▼        ▼
+                                                                  Obsidian    Telegram   DeepDive ノート(vault)
+                                                                  vault      (ダイジェスト) + 概要カード(Telegram)
         ▲
         │ 読み書き(2 つのプロセスは SQLite を介してだけやり取りする)
         ▼

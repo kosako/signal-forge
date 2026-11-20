@@ -118,6 +118,38 @@ def collect_all(
             return
 
 
+def collect_ranked(
+    conn: sqlite3.Connection,
+    source: Source,
+    connector: Connector,
+    logger: logging.Logger,
+    *,
+    remaining: Callable[[sqlite3.Connection], int],
+    run_id: str | None = None,
+) -> None:
+    """collect の段の外で、1 ソースを並びの順に残りの件数まで取り込む(今の重点の検索。GH#433)。
+
+    connector が返す並び(良い順)のまま、保存すると新しい行になる記事だけを、remaining(conn)
+    件まで保存する。取り込み済み・ほかのソースと同じ URL の記事は除き、上限にも数えない(毎日
+    同じ記事が枠を埋めない)。remaining は取得の後に 1 回、保存の書き込みのトランザクションの中で
+    もう 1 回数える(同じ日の別の実行が先に保存した分を引き、重なった実行でも上限を超えない)。
+    上限を超えた分は次の実行へ回さない(次の実行は新しく検索し直す)。短縮 URL は解決しない。
+    ソースの成否・collect_runs の記録・失敗の隔離は collect の段と同じ。
+    """
+    _collect_source(
+        conn,
+        source,
+        connector,
+        logger,
+        run_id=run_id,
+        resolve_short=None,
+        rss_max_items=0,
+        deadline=float("inf"),
+        clock=time.monotonic,
+        ranked_remaining=remaining,
+    )
+
+
 def _collect_source(
     conn: sqlite3.Connection,
     source: Source,
@@ -129,8 +161,13 @@ def _collect_source(
     rss_max_items: int,
     deadline: float,
     clock: Callable[[], float],
+    ranked_remaining: Callable[[sqlite3.Connection], int] | None = None,
 ) -> bool:
-    """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。"""
+    """1 ソースを取り込む。段の時間の上限にソースの途中で達したら True(残りは次の実行へ)。
+
+    ranked_remaining があれば、並びの順に新しい記事だけを残りの件数まで準備し、保存の
+    トランザクションの中で残りを数え直す(collect_ranked)。
+    """
     log_ctx = {"run_id": run_id, "stage": "collect", "source_id": source.id}
     run_row_id = conn.execute(
         "INSERT INTO collect_runs (source_id) VALUES (?)", (source.id,)
@@ -144,7 +181,11 @@ def _collect_source(
         partial_error = (
             None if result.partial_error is None else _safe_error_text(result.partial_error)
         )
-        if source.type == "rss":
+        if ranked_remaining is not None:
+            prepared = _prepare_ranked(
+                conn, source, result.items, max(0, ranked_remaining(conn))
+            )
+        elif source.type == "rss":
             prepared = _prepare_rss(
                 conn, source, result.items, rss_max_items, resolve_short, deadline, clock
             )
@@ -164,6 +205,7 @@ def _collect_source(
             partial_error=partial_error,
             budget_exhausted=result.budget_exhausted,
             skipped_slots=result.skipped_slots,
+            cap=ranked_remaining,
         )
     except Exception as e:
         # 分類済み(Retryable/Fatal)以外の想定外例外もソース単位で隔離する
@@ -242,6 +284,7 @@ def _store_result(
     partial_error: str | None,
     budget_exhausted: bool = False,
     skipped_slots: bool = False,
+    cap: Callable[[sqlite3.Connection], int] | None = None,
 ) -> dict[str, int]:
     """準備した全 RawItem の INSERT とカーソル保存を同一トランザクションで行う。
 
@@ -257,10 +300,16 @@ def _store_result(
     成功で消さない)。skipped_slots は X 検索で要求しなかったスロットを残した正常な終わり(GH#331)。
     items とカーソルを保存し、ソースの成否の状態は budget_exhausted と同じく変えない(要求しなかった
     スロットの失敗の続きを、ほかのスロットの成功で消さない)。
+    cap は保存してよい残りの件数を数える関数(collect_ranked)。書き込みのトランザクションの中で
+    数え、超えた分は保存しない(重なった実行が先に保存した分を引く。counts の capped に数える)。
     """
     counts = {"inserted": 0, "ignored": 0, "duplicate": 0, "error": 0}
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if cap is not None:
+            allowed = max(0, cap(conn))
+            counts["capped"] = max(0, len(prepared) - allowed)
+            prepared = prepared[:allowed]
         for raw, canonical in prepared:
             counts[_store_item(conn, source, raw, canonical)] += 1
         if partial_error is None and (budget_exhausted or skipped_slots):
@@ -418,6 +467,36 @@ def _prepare_rss(
         capped=0 if timed_out else deferred,
         timed_out=timed_out and deferred > 0,
     )
+
+
+def _prepare_ranked(
+    conn: sqlite3.Connection, source: Source, items: list[RawItem], limit: int
+) -> _Prepared:
+    """並びの順に、保存すると新しい行になる記事を limit 件まで準備する(collect_ranked)。
+
+    既知かは _prepare_rss と同じく guid と正規化した URL で見る(短縮 URL は解決しない)。同じ取得の
+    中の重複も除く。limit の後ろは数えない(次の実行へ回さず、既知の数にも入れない)。
+    """
+    kept: list[tuple[RawItem, str | None]] = []
+    kept_urls: set[str] = set()
+    kept_guids: set[str] = set()
+    known = 0
+    for raw in items:
+        if len(kept) >= limit:
+            break
+        canonical = _canonical_url(raw, None)
+        if (
+            (raw.external_id is not None and raw.external_id in kept_guids)
+            or (canonical or raw.url) in kept_urls
+            or _known_without_resolution(conn, source, raw, None)
+        ):
+            known += 1
+            continue
+        kept.append((raw, canonical))
+        kept_urls.add(canonical or raw.url)
+        if raw.external_id is not None:
+            kept_guids.add(raw.external_id)
+    return _Prepared(kept, known=known)
 
 
 def _needs_resolution(raw: RawItem, resolve_short: Callable[[str], str] | None) -> bool:

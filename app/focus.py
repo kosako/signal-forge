@@ -81,6 +81,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # 検索の語から外す文字(演算子と引用。外へ送る前の検査は使う側が別に持つ)
 _TERM_STRIP = re.compile(r"[\"'()\[\]{}]")
 _TERM_OPERATORS = frozenset({"OR", "AND", "NOT"})
+_LATIN = re.compile(r"[A-Za-z]")
 
 
 class FocusTopicDraft(BaseModel):
@@ -665,12 +666,33 @@ def active_focus(
     conn: sqlite3.Connection, config: Config, *, now: datetime | None = None
 ) -> list[FocusEntry]:
     """今の重点(重みの高い順に FOCUS_MAX_TOPICS 個まで)。digest 段が digests.focus_json に写す。"""
-    now = now or datetime.now(UTC)
     return [
         FocusEntry(topic_id=s.topic_id, name=s.name, subjects=s.subjects)
-        for s in topic_scores(conn, config, now)
-        if s.status == "active"
-    ][:FOCUS_MAX_TOPICS]
+        for s in _active_scores(conn, config, now or datetime.now(UTC))
+    ]
+
+
+def search_terms(
+    conn: sqlite3.Connection, config: Config, *, now: datetime | None = None
+) -> list[str]:
+    """今の重点の検索の語のうち、英字を含むもの(GH#433 の 5 本目。HN の検索に送る)。
+
+    話題は active_focus と同じもの・同じ順(重みの高い順)で、話題ごとの語の順に並べる。同じ語は
+    1 つにする。語は保存の前に clean_terms を通しているが、外へ送る前にもう一度通す(台帳の値を
+    そのまま外へ出さない)。英字の無い語(日本語だけの語)は、英語の投稿の検索に当たらないので送らない。
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for score in _active_scores(conn, config, now or datetime.now(UTC)):
+        for term in clean_terms([t for t in score.terms if isinstance(t, str)]):
+            if _LATIN.search(term) and term.casefold() not in seen:
+                seen.add(term.casefold())
+                terms.append(term)
+    return terms
+
+
+def _active_scores(conn: sqlite3.Connection, config: Config, now: datetime) -> list[TopicScore]:
+    return [s for s in topic_scores(conn, config, now) if s.status == "active"][:FOCUS_MAX_TOPICS]
 
 
 def focus_topic_refs(conn: sqlite3.Connection, entries: list[FocusEntry]) -> list[FocusTopicRef]:

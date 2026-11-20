@@ -255,6 +255,13 @@ class FocusConfig:
     score_bonus: float = 15.0
     # 点を足す記事の数の上限(重点の記事のうち点の高い順)。重点の記事で上位が埋まらないように
     bonus_items: int = 5
+    # 今の重点の検索の語で Hacker News を検索し、取り込む記事の 1 日(JST の暦日)の上限
+    # (GH#433 の 5 本目・設計 02 §6)。点数の高い順に取り込む。0 で検索しない
+    hn_items: int = 5
+    # 取り込む投稿の点数の下限。投稿した本人の 1 点だけの投稿など、誰も推していない投稿を外す
+    hn_min_points: int = 5
+    # 検索する投稿の新しさ(時間)。事前選別の鮮度([analysis].freshness_hours)より短くする
+    hn_window_hours: int = 48
 
 
 @dataclass(frozen=True)
@@ -686,6 +693,9 @@ def _validate_x_search(path: Path, config: Config) -> None:
         )
 
 
+HN_WINDOW_MAX_HOURS = 168  # [focus].hn_window_hours の上限(1 週間。古い投稿は鮮度の規則で落ちる)
+
+
 def _validate_focus(path: Path, focus: FocusConfig) -> None:
     """[focus] の値域(GH#433)。nan/inf は重みの比較を壊すので有限値だけを受ける。"""
     for key in ("half_life_days", "enter_score", "exit_score"):
@@ -706,8 +716,13 @@ def _validate_focus(path: Path, focus: FocusConfig) -> None:
         value = getattr(focus, key)
         if not (math.isfinite(value) and value >= 0):
             raise ConfigError(f"{path}: [focus].{key} は 0 以上の有限値: {value}")
-    if focus.bonus_items < 0:
-        raise ConfigError(f"{path}: [focus].bonus_items は 0 以上の整数: {focus.bonus_items}")
+    for key in ("bonus_items", "hn_items", "hn_min_points"):
+        if getattr(focus, key) < 0:
+            raise ConfigError(f"{path}: [focus].{key} は 0 以上の整数: {getattr(focus, key)}")
+    if not 1 <= focus.hn_window_hours <= HN_WINDOW_MAX_HOURS:
+        raise ConfigError(
+            f"{path}: [focus].hn_window_hours は 1〜{HN_WINDOW_MAX_HOURS}: {focus.hn_window_hours}"
+        )
 
 
 def _parens_balanced(slot: str) -> bool:
