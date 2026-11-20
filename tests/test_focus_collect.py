@@ -17,7 +17,7 @@ from app.focus_collect import (
     SOURCE_NAME,
     FocusSourceError,
     collect_focus_items,
-    collected_on,
+    collected_today,
     ensure_source,
 )
 from tests.test_extraction import make_http
@@ -146,13 +146,37 @@ def test_daily_limit_counts_what_the_same_day_already_collected(conn, tmp_path, 
 
     assert collect_focus_items(conn, config, http, logger, now=now).limit == 1
     assert [row[0] for row in stored(conn)][-1] == ITEM_URL.format(id="1")
-    assert collected_on(conn, source.id, now) == 5
+    assert collected_today(conn, source.id) == 5
 
     # 上限に達した日は検索しない
     assert collect_focus_items(conn, config, http, logger, now=now).limit == 0
     assert seen == ["software factory"]
-    # 次の暦日は数え直す
-    assert collected_on(conn, source.id, now + timedelta(days=1)) == 0
+    # 前の JST の暦日に取り込んだ分は数えない(JST の 0 時 = UTC の 15 時が境目)
+    conn.execute(
+        "UPDATE items SET fetched_at = strftime('%Y-%m-%dT%H:%M:%SZ', date('now', '+9 hours'), "
+        "'-9 hours', '-1 second') WHERE source_id = ?",
+        (source.id,),
+    )
+    assert collected_today(conn, source.id) == 0
+
+
+def test_the_day_is_the_db_clock_not_the_start_of_the_stage(conn, tmp_path, now) -> None:
+    # 日付をまたいで重なった実行: 前の日に始めた実行(now が前の日)も、保存の時刻と同じ DB の
+    # 時計で今日の使用量を数える。今日の枠を別の実行が使い切っていれば、取り込まない
+    add_topic(conn, "話題", ["software factory"])
+    source = ensure_source(conn)
+    for n in range(2):
+        conn.execute(
+            "INSERT INTO items (source_id, url, canonical_url, title, content_hash) "
+            "VALUES (?, ?, ?, 't', ?)",
+            (source.id, f"https://today/{n}", f"https://today/{n}", f"sha256:{n}"),
+        )
+    started = now - timedelta(days=1)
+    seen: list[str] = []
+    http = make_http(responder({"software factory": [hit("1", 20, started)]}, seen))
+    config = make_config(tmp_path, hn_items=2)
+    assert collect_focus_items(conn, config, http, logger, now=started).limit == 0
+    assert seen == [] and len(stored(conn)) == 2
 
 
 def test_no_latin_terms_makes_no_request_and_no_source(conn, tmp_path, now) -> None:

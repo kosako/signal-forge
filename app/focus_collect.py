@@ -9,7 +9,8 @@
   RSS の記事と同じだから
 - 1 日(JST の暦日)に取り込むのは [focus].hn_items 件まで。同じ日の実行が取り込んだ分を引く。
   朝バッチに 2 本同時に走るのを止める仕組みは無いので、残りは保存の書き込みのトランザクションの
-  中で数え直す
+  中で数え直す。暦日は保存の時刻(items.fetched_at)と同じ DB の時計で決める(日付をまたいだ実行も、
+  保存した記事と同じ日の使用量を数える)
 - 語は今の重点の検索の語のうち、英字を含むもの(app.focus.search_terms)。外部の検索に送るのは
   語だけで、話題の名前と証拠は送らない
 - 付加機能: 検索の失敗はソースの失敗として記録し(collect と同じ隔離)、朝バッチを止めない。ログには
@@ -29,11 +30,11 @@ from app.config import Config
 from app.connectors.hn_search import HnFocusConnector
 from app.focus import search_terms
 from app.http import HttpClient
-from app.jst import JST, jst_day_bounds_utc
 from app.models import Source
 
 SOURCE_NAME = "hn:focus"
 SOURCE_MODE = "hn_focus"
+_UTC_FORMAT = "'%Y-%m-%dT%H:%M:%SZ'"  # items.fetched_at の形(SQL の文字列の literal)
 
 
 class FocusSourceError(Exception):
@@ -65,10 +66,12 @@ def collect_focus_items(
     source = ensure_source(conn)
 
     def remaining(db: sqlite3.Connection) -> int:
-        return config.focus.hn_items - collected_on(db, source.id, now)
+        return config.focus.hn_items - collected_today(db, source.id)
 
-    before = collected_on(conn, source.id, now)
-    limit = config.focus.hn_items - before
+    last_id = conn.execute(
+        "SELECT coalesce(max(id), 0) FROM items WHERE source_id = ?", (source.id,)
+    ).fetchone()[0]
+    limit = remaining(conn)
     if limit <= 0:
         logger.info("今日の HN の取り込みは上限に達している", extra=extra)
         return FocusCollectResult()
@@ -79,7 +82,8 @@ def collect_focus_items(
         window_hours=config.focus.hn_window_hours,
         now=lambda: now,
     )
-    # 残りは保存の書き込みのトランザクションの中でも数え直す(重なった実行で上限を超えない)
+    # 残りは取得の後と、保存の書き込みのトランザクションの中でも数え直す(重なった実行で上限を
+    # 超えない)。数える暦日は、そのときの DB の時計で決める(段を始めた now ではない)
     collect_ranked(conn, source, connector, logger, remaining=remaining, run_id=run_id)
     logger.info(
         "今の重点の語で HN を検索した",
@@ -88,7 +92,10 @@ def collect_focus_items(
             "extra": {
                 "queries": len(queries),
                 "limit": limit,
-                "inserted": collected_on(conn, source.id, now) - before,
+                "inserted": conn.execute(
+                    "SELECT count(*) FROM items WHERE source_id = ? AND id > ?",
+                    (source.id, last_id),
+                ).fetchone()[0],
             },
         },
     )
@@ -114,10 +121,19 @@ def ensure_source(conn: sqlite3.Connection) -> Source:
     return source
 
 
-def collected_on(conn: sqlite3.Connection, source_id: int, now: datetime) -> int:
-    """now の JST の暦日に、このソースへ取り込んだ記事の数(日次の上限の使用量)。"""
-    start, end = jst_day_bounds_utc(now.astimezone(JST).strftime("%Y-%m-%d"))
+def collected_today(conn: sqlite3.Connection, source_id: int) -> int:
+    """今の JST の暦日に、このソースへ取り込んだ記事の数(日次の上限の使用量)。
+
+    暦日は DB の時計で決める。items.fetched_at の既定値(保存の時刻)と同じ時計なので、段の途中で
+    日付をまたいでも、保存した記事と同じ日の使用量を数える(段を始めた時刻で数えると、日付を
+    またいだ実行が前の日の使用量を見て、次の日の上限を超える)。JST は +9 時間で、夏時間は無い。
+    """
     return conn.execute(
-        "SELECT count(*) FROM items WHERE source_id = ? AND fetched_at >= ? AND fetched_at < ?",
-        (source_id, start, end),
+        f"""
+        SELECT count(*) FROM items
+        WHERE source_id = ?
+          AND fetched_at >= strftime({_UTC_FORMAT}, date('now', '+9 hours'), '-9 hours')
+          AND fetched_at < strftime({_UTC_FORMAT}, date('now', '+9 hours'), '+1 day', '-9 hours')
+        """,
+        (source_id,),
     ).fetchone()[0]
