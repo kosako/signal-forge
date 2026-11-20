@@ -7,7 +7,7 @@ score = clamp(relevance × novelty係数 − negativeペナルティ − 鮮度�
   同一ソース上限 max_per_source 件(超過は次点繰上げ)
 - 今の重点(GH#433 の 4 本目): 今の重点に当たる記事(app/focus_match.py が選ぶ)のうち、点の高い
   `[focus].bonus_items` 件の点に `[focus].score_bonus` を足す。min_score は足す前の点で見る
-  (重点でも質の下限は守る)。並びは足した後の点(100 で揃っても足す前の差で並べる)
+  (重点でも質の下限は守る)。並びは足した後の点で、同点(100 で揃ったときなど)は足す前の点の順
 """
 
 from __future__ import annotations
@@ -223,16 +223,17 @@ def _select(
 ) -> list[RankedItem]:
     # min_score は足す前の点で見る(重点の点を足しても質の下限は守る。GH#433)
     eligible = [
-        (row, _clamp(final), final)
+        (row, _clamp(final), _clamp(base))
         for row, base, final in scored
         if _clamp(base) >= config.ranking.min_score
     ]
-    # score 降順、100 で揃ったら clamp 前の点の順、同点は item_id 昇順(決定性)
+    # score 降順、同点は足す前の点(clamp 後)の順、なお同点は item_id 昇順(決定性)。足さない記事は
+    # 足す前と後が同じなので、今までの順(score が同じなら item_id 順)のまま
     eligible.sort(key=lambda t: (-t[1], -t[2], t[0]["item_id"]))
 
     selected: list[RankedItem] = []
     per_source: dict[int, int] = {}
-    for row, score, _raw in eligible:
+    for row, score, _base in eligible:
         if len(selected) >= config.digest.max_items:
             break
         if per_source.get(row["source_id"], 0) >= config.ranking.max_per_source:

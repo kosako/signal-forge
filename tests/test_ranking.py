@@ -194,6 +194,27 @@ def test_focus_bonus_keeps_order_beyond_100_and_respects_min_score(conn, tmp_pat
     assert score_of(conn, weak) == 30  # 足していない
 
 
+def test_focus_bonus_ties_at_100_keep_the_unboosted_item_first(conn, tmp_path) -> None:
+    # Codex R1(round 1): 重点でない 100 点の記事と、90 + 15 で 100 に揃った重点の記事は、足す前の点
+    # の順(重点でない記事が先)。max_items = 1 では重点でない記事を採る
+    plain = add_analyzed(conn, "https://b/plain", relevance=100, source_id=3)
+    focused = add_analyzed(conn, "https://a/focus", relevance=90)
+    selected = rank_for_digest(conn, make_config(tmp_path), focus_items={focused: 1})
+    assert [(item.item_id, item.score) for item in selected] == [(plain, 100.0), (focused, 100.0)]
+    one = rank_for_digest(conn, make_config(tmp_path, max_items=1), focus_items={focused: 1})
+    assert [item.item_id for item in one] == [plain]
+
+
+def test_ties_at_100_without_focus_keep_item_id_order(conn, tmp_path) -> None:
+    # Codex R1(round 1): 重点の無い日は今までの順(100 で揃ったら item_id 順)。novelty の係数を
+    # 1 より大きくした設定で、clamp 前の点の大きい記事を先にしない
+    first = add_analyzed(conn, "https://a/1", relevance=90)  # 90 × 1.2 = 108
+    second = add_analyzed(conn, "https://a/2", relevance=100)  # 100 × 1.2 = 120
+    config = make_config(tmp_path, max_items=1, novelty_new=1.2)
+    assert [item.item_id for item in rank_for_digest(conn, config)] == [first]
+    assert second
+
+
 def test_focus_bonus_goes_to_the_highest_bonus_items_only(conn, tmp_path) -> None:
     # 点を足すのは重点の記事のうち点の高い bonus_items 件まで。0 なら足さない
     focus = [add_analyzed(conn, f"https://a/{i}", relevance=70 - i) for i in range(3)]
