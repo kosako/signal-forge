@@ -714,7 +714,7 @@ _CONFIG_REQUIRED = [
     ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["dig-now"],
     ["investigate", "--event", "1"],
     ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"], ["focus"],
-    ["focus", "--update"],
+    ["focus", "--update"], ["weekly"], ["weekly", "--preview"],
     ["doctor", "--purge"], ["doctor", "--cost"],
 ]
 

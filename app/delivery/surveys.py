@@ -1,4 +1,4 @@
-"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認
+"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認と仮説の問い
 (設計 04 §4 / 05 §1.2, §4)。
 
 - 起動は受信デーモン(intel poll)の内蔵タイマー(送信経路をポーラーに集約)。
@@ -27,6 +27,7 @@ from app.delivery.telegram import (
     TelegramApi,
     escape_and_truncate,
     escape_attr,
+    escape_text,
     pack_line_groups,
     visible_length,
 )
@@ -41,12 +42,14 @@ from app.dig import (
 from app.dig_take import dismissed_items, read_items
 from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
+from app.weekly import ANSWER_CODES, ANSWER_LABELS, evidence_line
 
 STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
 STATE_RUN_FAILURE_NOTIFIED = "run_failure_notified_date"
 STATE_SOURCE_REPORT_SENT = "source_report_sent_date"
 STATE_READ_CONFIRM_SENT = "read_confirm_sent_date"
+STATE_WEEKLY_SENT = "weekly_sent_date"
 
 READ_MIN_CHOICES = ("5", "10", "15", "20", "30")  # 質問2の5択(設計 04 §4)
 
@@ -99,6 +102,14 @@ READ_CONFIRM_MAX_ITEMS = 15
 READ_CONFIRM_BUTTONS_PER_ROW = 3
 READ_CONFIRM_ALL_LABEL = "✅ 全部読んだにする"
 
+# 週の仮説の問い(GH#440。設計 04 §4)。日曜の夜、読んだのまとめ確認の後に 1 つずつ送る
+WEEKLY_WEEKDAY = 6  # datetime.weekday() の日曜(作る朝と同じ。app/weekly.py の WEEKDAY)
+WEEKLY_QUESTION_MAX_CHARS = 300  # 問いの表示の上限(作るときに 120 字を超える問いは捨てている)
+WEEKLY_INTRO = (
+    "今週の行動から立てた仮説です。合っているかをボタンで答えてください。"
+    "補足は、そのメッセージへのリプライで書けます"
+)
+
 
 def _mark(text: str, is_selected: bool) -> str:
     return f"{text} ✓" if is_selected else text
@@ -123,6 +134,19 @@ def q2_keyboard(date_compact: str, *, selected: str | None = None) -> dict:
                 "callback_data": f"q2:{date_compact}:{minutes}",
             }
             for minutes in READ_MIN_CHOICES
+        ]]
+    }
+
+
+def weekly_keyboard(question_id: int, *, selected: str | None = None) -> dict:
+    """週の仮説の問い(GH#440)。selected は yes|no|unsure(✓ 反映用)。"""
+    return {
+        "inline_keyboard": [[
+            {
+                "text": _mark(ANSWER_LABELS[value], selected == value),
+                "callback_data": f"w:{question_id}:{code}",
+            }
+            for code, value in ANSWER_CODES.items()
         ]]
     }
 
@@ -266,6 +290,16 @@ def run_due_timers(
     ):
         send_read_confirm(conn, config, api, logger, today, unrecorded_read_confirms)
         set_state(conn, STATE_READ_CONFIRM_SENT, today)
+    # 週の仮説の問い(GH#440)。日曜の夜、まとめ確認の後。問いがあって全部送れたときだけ state を
+    # 立てる(朝バッチが作れなかった日は、同じ日の再走で作られたら送れるよう、夜のうちは見続ける)
+    if (
+        config.weekly.enabled
+        and now.weekday() == WEEKLY_WEEKDAY
+        and _is_due(now, config.telegram.survey_time)
+        and get_state(conn, STATE_WEEKLY_SENT) != today
+        and send_weekly_questions(conn, config, api, logger, today)
+    ):
+        set_state(conn, STATE_WEEKLY_SENT, today)
 
 
 def send_evening_survey(
@@ -435,6 +469,60 @@ def send_read_confirm(
         extra={"stage": "poll", "extra": {"items": len(item_ids), "candidates": len(rows)}},
     )
     record_unrecorded_read_confirms(conn, unrecorded)
+
+
+def weekly_question_text(row: Mapping, total: int, *, first: bool) -> str:
+    """週の仮説の問いの 1 通の本文(GH#440)。問いと根拠は外部の本文に由来するので escape する。"""
+    lines = [WEEKLY_INTRO, ""] if first else []
+    lines.append(f"🔎 今週の仮説 {row['position']}/{total}")
+    question = " ".join(str(row["question"]).split())
+    lines.append(escape_and_truncate(question, WEEKLY_QUESTION_MAX_CHARS))
+    evidence = evidence_line(row["evidence_json"])
+    if evidence:
+        lines.append(escape_text(evidence))
+    return "\n".join(lines)
+
+
+def send_weekly_questions(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    day: str,
+) -> bool:
+    """その日(JST の日曜)の仮説の問いを、まだ送っていないものから 1 つずつ送る(GH#440)。
+
+    送れたらすぐに message_id を台帳に残す(ボタンの照合とリプライの帰属に使う)。途中で送れなかった
+    ときは投げる(内蔵タイマーの失敗として次の周期に試し直し、送れた分は送り直さない)。記録の前に
+    止まった分は次の周期に送り直す(無配信より二重送信)。問いが無ければ False(送らない)。
+    """
+    rows = conn.execute(
+        "SELECT * FROM weekly_questions WHERE week_date = ? ORDER BY position", (day,)
+    ).fetchall()
+    if not rows:
+        return False
+    chat_id = _require_chat_id(config)
+    sent = 0
+    for row in rows:
+        if row["message_id"] is not None:
+            continue
+        message_id = api.send_message(
+            chat_id,
+            weekly_question_text(row, len(rows), first=row["position"] == rows[0]["position"]),
+            reply_markup=weekly_keyboard(row["id"]),
+        )
+        conn.execute(
+            "UPDATE weekly_questions SET message_id = ?, "
+            "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND message_id IS NULL",
+            (message_id, row["id"]),
+        )
+        conn.commit()
+        sent += 1
+    logger.info(
+        "週の仮説の問いを送った",
+        extra={"stage": "poll", "extra": {"sent": sent, "questions": len(rows)}},
+    )
+    return True
 
 
 def record_unrecorded_read_confirms(

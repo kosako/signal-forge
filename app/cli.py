@@ -571,6 +571,60 @@ def focus(
 
 
 @app.command()
+def weekly(
+    config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
+    preview: bool = typer.Option(
+        False,
+        "--preview",
+        help="曜日を問わず、今の材料で週の仮説を作って表示する(台帳には残さず、送らない)",
+    ),
+) -> None:
+    """週の仮説の問い(GH#440)。既定は最新の週の問いと答え・補足の表示だけ。"""
+    import sqlite3
+
+    from app.config import load_config
+    from app.weekly import render_preview, render_week
+
+    config = load_config(config_dir)
+    if preview:
+        from app.db import apply_migrations, connect
+        from app.logs import DEFAULT_LOG_DIR, setup_logging
+        from app.run import weekly_stage
+
+        conn = connect(config.db_path)
+        apply_migrations(conn, config.db_path)
+        logger = setup_logging(DEFAULT_LOG_DIR, "morning.log")
+        try:
+            result, questions = weekly_stage(conn, config, logger, store=False)
+        finally:
+            conn.close()
+        if result.llm_failed:
+            typer.echo("LLM の呼び出しに失敗した(morning.log を参照)", err=True)
+            raise typer.Exit(code=1)
+        if result.skipped:
+            typer.echo(f"作らなかった({result.skipped}。材料 {result.signals} 件)")
+            return
+        typer.echo(render_preview(questions))
+        typer.echo(f"(材料 {result.signals} 件・捨てた仮説 {result.dropped} 件)")
+        return
+    try:
+        conn = sqlite3.connect(f"file:{config.db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        typer.echo(
+            f"DB がまだ無い({config.db_path})。先に intel run / collect で初期化する", err=True
+        )
+        raise typer.Exit(code=1) from None
+    conn.row_factory = sqlite3.Row
+    try:
+        typer.echo(render_week(conn))
+    except sqlite3.OperationalError as e:
+        typer.echo(f"DB が読めない({e})。migration 未適用なら intel run で適用", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        conn.close()
+
+
+@app.command()
 def poll(
     config_dir: Path = typer.Option(DEFAULT_CONFIG_DIR, help="config.toml / .env の置き場"),
 ) -> None:

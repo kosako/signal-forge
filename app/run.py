@@ -2,8 +2,9 @@
 
 順序: collect → x_signals(cap > 0 のときのみ。GH#58 S1b)→ focus([focus].enabled の
 ときのみ。GH#433)→ focus_collect(focus があり [focus].hn_items > 0 のときのみ。GH#433 の 5 本目)
-→ extract → analyze → digest → export → deliver → dig(cap > 0 のときのみ。GH#105)→ purge →
-backup(backup は設計 05 §5 の「朝バッチ末尾」)。focus を x_signals の後に置くのは、その朝に
+→ extract → analyze → digest → export → deliver → dig(cap > 0 のときのみ。GH#105)→ weekly
+([weekly].enabled のときのみ。作るのは日曜だけ。GH#440)→ purge → backup(backup は設計 05 §5 の
+「朝バッチ末尾」)。focus を x_signals の後に置くのは、その朝に
 取り込んだシグナルも数えるため。focus_collect を focus の後・extract の前に置くのは、その朝の
 今の重点で検索し、取り込んだ記事を同じ実行で分析するため。dig を deliver の後に置くのは、
 ダイジェスト配信を深掘り生成(分オーダー)で遅らせないため。purge より前なのは
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from app.focus import FocusRunResult
     from app.investigate import XRead
     from app.models import FocusEntry
+    from app.weekly import Question, WeeklyRunResult
 
 
 class RunFailures(list[str]):
@@ -167,6 +169,8 @@ def run_pipeline(
 
     if config.dig.daily_cap > 0:  # 0 = 調査段無効(段ごと省く。x_signals と同じ流儀)
         stage("dig", dig)
+    if config.weekly.enabled:  # 週の仮説の問い(GH#440)。作るのは日曜だけ(段の中で決める)
+        stage("weekly", lambda: weekly_stage(conn, config, logger, run_id=run_id, primary=primary))
     stage("purge", lambda: purge_expired(conn, config, logger, run_id=run_id))
     stage("backup", lambda: backup_daily(conn, config, logger, run_id=run_id))
 
@@ -337,6 +341,32 @@ def focus_stage(
             return create_engine(config.llm.engine, model_reasoning_effort=effort)
 
     return run_focus(conn, config, primary("low"), logger, run_id=run_id)
+
+
+def weekly_stage(
+    conn: sqlite3.Connection,
+    config: Config,
+    logger: logging.Logger,
+    *,
+    run_id: str | None = None,
+    primary: Callable[[str], LLMEngine] | None = None,
+    store: bool = True,
+) -> tuple[WeeklyRunResult, list[Question]]:
+    """weekly 段: 日曜なら、その週の行動から仮説を立てて台帳に残す(GH#440)。
+
+    朝バッチと `intel weekly --preview`(store=False。曜日を問わず作って表示だけ)が呼ぶ。primary は
+    主のエンジンの作り方(None = config の `[llm].engine`)。予備(Claude API)には切り替えない
+    (付加機能なので、主が失敗した週は作らない)。effort は medium(材料の多い 1 回の呼び出し)。
+    """
+    from app.analysis.llm import create_engine
+    from app.weekly import run_weekly
+
+    if primary is None:
+
+        def primary(effort: str) -> LLMEngine:
+            return create_engine(config.llm.engine, model_reasoning_effort=effort)
+
+    return run_weekly(conn, config, primary("medium"), logger, run_id=run_id, store=store)
 
 
 def focus_collect_stage(
