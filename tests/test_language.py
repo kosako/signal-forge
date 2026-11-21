@@ -2,7 +2,13 @@
 
 import pytest
 
-from app.language import LANGUAGE_LABELS, LANGUAGES, detect_language, language_mark
+from app.language import (
+    LANGUAGE_LABELS,
+    LANGUAGES,
+    detect_language,
+    has_language_text,
+    language_mark,
+)
 
 EN = (
     "The team released a new version of the tool. It is faster and uses less memory than the "
@@ -52,6 +58,9 @@ AR = "تخيّل أن يلعب البرنامج اللعبة بدلًا منك �
         ("iPod 25周年 - Apple Music", None),
         # URL の部分(au・es)はほかの言語の機能語として数えない
         ("https://www.abc.net.au/news/es/di/la Comments", "en"),
+        # 英語の技術の見出しの単位・略語の 1 つ(em・dos)だけで外国語にしない
+        ("CSS em units explained", "en"),
+        ("DOS memory management explained", "en"),
         # 1 字の語(1Y の Y)はスペイン語の y と数えない
         ("CVE Tracker Loading Resolution Day Week Month Year Range 30D 1Y 5Y View", "en"),
         # 引用の中は数えない(日本語の文を引く英語の記事は英語)
@@ -66,12 +75,31 @@ AR = "تخيّل أن يلعب البرنامج اللعبة بدلًا منك �
     ],
     ids=[
         "ja", "en", "en-title", "de", "fr", "pt", "zh", "ko", "ar", "ja-quoting-en",
-        "ja-in-x-chrome", "kanji-only-short", "latin-with-kanji", "url-parts", "one-letter",
+        "ja-in-x-chrome", "kanji-only-short", "latin-with-kanji", "url-parts", "en-unit",
+        "en-acronym", "one-letter",
         "en-quoting-ja", "tie", "pdf", "no-letters", "blank", "empty", "none",
     ],
 )
 def test_detect_language(text, expected) -> None:
     assert detect_language(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (EN, True),
+        ("試しました。", True),
+        ("", False),
+        (None, False),
+        ("   \n", False),
+        ("2026-10-23 12:00 / 100%", False),  # 文字が無い
+        ("%PDF-1.7 obj stream the and of", False),  # 取り出しに失敗したファイルの中身
+        ("  %PDF-1.5 %", False),
+    ],
+)
+def test_has_language_text(text, expected) -> None:
+    # 分析が見出しに戻るのは、本文がこれを満たさないときだけ(GH#439)
+    assert has_language_text(text) is expected
 
 
 def test_detected_values_are_the_stored_ones() -> None:

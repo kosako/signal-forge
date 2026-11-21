@@ -125,7 +125,7 @@ CREATE TABLE analyses (
   title_ja              TEXT,                         -- 日本語見出し(002 で追加のため末尾列。
                                                       -- NULL = v001 世代 / degraded。表示側は
                                                       -- title_ja 優先・無ければ items.title)
-  extraction_failed     INTEGER NOT NULL DEFAULT 0 CHECK (extraction_failed IN (0,1))
+  extraction_failed     INTEGER NOT NULL DEFAULT 0 CHECK (extraction_failed IN (0,1)),
                                                       -- 021(GH#240)。1 = 本文の抽出に失敗し、本文なしで
                                                       -- LLM に渡した(degraded とは別。設計 03 §2)。
                                                       -- 021 より前の行は 0

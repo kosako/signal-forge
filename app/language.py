@@ -57,6 +57,8 @@ _OTHER_LATIN_WORDS = _words(
     "il di che gli della sono "
     "em não um uma das dos"
 )
+# ほかの言語と決めるのに要る、ほかの言語の機能語の数の下限(_latin_language)
+_OTHER_MIN_HITS = 2
 _LATIN_WORD_RE = re.compile(r"[^\W\d_]+")
 
 
@@ -85,12 +87,12 @@ def detect_language(text: str | None) -> str | None:
        外国語と誤らない。かなを含む外国語の記事は印が出ないだけになる
     3. 語の数が一番多い文字の種類で決める。ハングルなら ko。漢字なら、漢字が _ZH_MIN_HAN_CHARS 字
        以上のとき zh(短いものは None)。ローマ字なら、漢字が混じらないときだけ、機能語で英語(en)か
-       ほかの言語(other)かを決める。それ以外の文字(キリル文字・アラビア文字など)なら other。
-       種類が拮抗すれば None
-    2 と 3 では URL を除いて数える。文字が無い(空・数字と記号・URL だけ)ときと、PDF のバイト列
-    (取り出しに失敗した中身)は None。
+       ほかの言語(other)かを決める(ほかの言語は、その機能語が 2 個以上で、英語の機能語より多い
+       ときだけ)。それ以外の文字(キリル文字・アラビア文字など)なら other。種類が拮抗すれば None
+    2 と 3 では URL を除いて数える。材料にならない文(has_language_text が False。空・文字が無い・
+    PDF のバイト列)と、URL を除くと文字が無い文は None。
     """
-    if not text or not text.strip() or text.lstrip().startswith(_BINARY_PREFIXES):
+    if not has_language_text(text):
         return None
     if looks_japanese(text):
         return "ja"
@@ -117,6 +119,14 @@ def detect_language(text: str | None) -> str | None:
         # 漢字の混じるローマ字の文(「iPod 25周年 - Apple Music」のような日本語の見出し)は決めない
         return _latin_language(plain) if counts.han_chars == 0 else None
     return leader
+
+
+def has_language_text(text: str | None) -> bool:
+    """言語を決める材料になる文か。空・文字が無い(数字と記号だけ)・PDF のバイト列(取り出しに失敗した
+    中身)なら False。分析は、本文がこれを満たさないときだけ見出しで決める(GH#439)。"""
+    if not text or text.lstrip().startswith(_BINARY_PREFIXES):
+        return False
+    return any(ch.isalpha() for ch in text)
 
 
 def strip_quotes(text: str) -> str:
@@ -203,7 +213,12 @@ def _count_scripts(text: str) -> _ScriptCounts:
 
 
 def _latin_language(text: str) -> str:
-    """ローマ字の文が英語(en)か、ほかの言語(other)か。機能語の数で決める(同じなら英語)。"""
+    """ローマ字の文が英語(en)か、ほかの言語(other)か。機能語の数で決める。
+
+    ほかの言語の機能語が _OTHER_MIN_HITS 個以上あり、英語の機能語より多いときだけ other にする。
+    英語の技術の見出しにある単位や略語(CSS の em、MS-DOS の dos など)の 1 つだけで、外国語に
+    しないため(機能語の多い本文なら、ほかの言語の文は何個も当たる)。
+    """
     english = other = 0
     for word in _LATIN_WORD_RE.findall(text):
         lowered = word.casefold()
@@ -211,7 +226,7 @@ def _latin_language(text: str) -> str:
             english += 1
         elif lowered in _OTHER_LATIN_WORDS:
             other += 1
-    return "other" if other > english else "en"
+    return "other" if other >= _OTHER_MIN_HITS and other > english else "en"
 
 
 def _char_script(ch: str) -> str:
