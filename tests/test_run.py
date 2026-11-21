@@ -1249,6 +1249,35 @@ def test_weekly_stage_runs_after_dig_only_when_enabled(conn, tmp_path, monkeypat
     assert calls["primary"]("medium") is primary
 
 
+def test_pipeline_builds_engines_at_the_effort_each_stage_asks(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # intel run は engine_for_effort を渡し、段が求める effort で主を作る。週の仮説と重点の
+    # 照合は medium(GH#440・GH#437)。渡さなければ engine_factory のまま(テストの差し替え)
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import WeeklyConfig
+
+    primary = ScriptedEngine(conn)
+    efforts: list[str] = []
+
+    def weekly_spy(db, config, stage_logger, **kwargs):
+        assert kwargs["primary"]("medium") is primary
+
+    def engine_for_effort(effort: str):
+        efforts.append(effort)
+        return primary
+
+    monkeypatch.setattr(run_module, "weekly_stage", weekly_spy)
+    config = replace(make_config(tmp_path), weekly=WeeklyConfig(enabled=True))
+    run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(), lambda: primary, logger,
+        "01RUNID", engine_for_effort=engine_for_effort,
+    )
+    assert "medium" in efforts
+
+
 def test_weekly_stage_creates_engine_at_medium_effort(conn, tmp_path, monkeypatch) -> None:
     # 単独の intel weekly --preview は config の主を effort medium で作る
     from app import run as run_module

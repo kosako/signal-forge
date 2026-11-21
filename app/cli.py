@@ -678,6 +678,10 @@ def run(
         logger,
         run_id,
         force_digest=force_digest,
+        # 段が求める effort で主を作る(重点の照合と週の仮説は medium。GH#437・GH#440)
+        engine_for_effort=lambda effort: create_engine(
+            config.llm.engine, model_reasoning_effort=effort
+        ),
     )
     # 予備(GH#156)を使ったら知らせる。段が成功していても Codex は止まっているため
     notify_llm_fallback(conn, config, env, run_id, logger)

@@ -190,7 +190,9 @@ def collect_signals(conn: sqlite3.Connection, now: datetime) -> list[Material]:
     """直近 WINDOW_DAYS 日の行動(新しい側から、種類ごとに MAX_PER_KIND 件まで)。
 
     記事への反応は、記事ごとにその週の最新の 1 つ(押し直しは最新を採る)。読んだは、その週に
-    読んだにして今も読んだのままの記事。本文の無い材料(X の本文の保存期間が過ぎたなど)は渡さない。
+    読んだにして、週の終わり(now)の時点でも読んだのままの記事。最新は週の終わりより前の行から
+    選ぶ(集める間に受信デーモンが now の後の行を書いても、週の材料を変えない)。本文の無い材料
+    (X の本文の保存期間が過ぎたなど)は渡さない。
     """
     start, end = _iso(now - timedelta(days=WINDOW_DAYS)), _iso(now)
     found: list[tuple[str, str, str, str | None]] = []  # (kind, at, text, title)
@@ -205,9 +207,10 @@ def collect_signals(conn: sqlite3.Connection, now: datetime) -> list[Material]:
         JOIN sources src ON src.id = i.source_id
         WHERE s.kind = 'reaction' AND s.created_at >= ? AND s.created_at < ?
           AND s.id = (SELECT id FROM signals s2 WHERE s2.kind = 'reaction'
-                      AND s2.item_id = s.item_id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+                      AND s2.item_id = s.item_id AND s2.created_at < ?
+                      ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         """,
-        (start, end),
+        (start, end, end),
     ):
         if row["title"]:
             text = f"{row['title']}(ソース: {row['source_name']} / {row['category'] or '分類なし'})"
@@ -240,9 +243,10 @@ def collect_signals(conn: sqlite3.Connection, now: datetime) -> list[Material]:
         FROM signals f
         WHERE f.kind = 'followup_dig' AND f.value = 'yes' AND f.created_at >= ? AND f.created_at < ?
           AND f.id = (SELECT id FROM signals f2 WHERE f2.kind = 'followup_dig'
-                      AND f2.item_id = f.item_id ORDER BY f2.created_at DESC, f2.id DESC LIMIT 1)
+                      AND f2.item_id = f.item_id AND f2.created_at < ?
+                      ORDER BY f2.created_at DESC, f2.id DESC LIMIT 1)
         """,
-        (start, end),
+        (start, end, end),
     ):
         if row["title"]:
             found.append(("read", row["created_at"], row["title"], row["title"]))
@@ -304,9 +308,11 @@ def collect_stats(conn: sqlite3.Connection, config: Config, now: datetime) -> li
             for value in ("useful", "dig", "known", "noise")
         )
 
+    # 配信した記事 = 記事のメッセージを送れた記事(台帳 digest_messages の記事の行。--force の置換で
+    # 外れた前の世代も、送れていれば数える)。digest を作っただけで送れなかった記事は数えない
     delivered = conn.execute(
-        "SELECT count(*) FROM digests d, json_each(d.item_ids) "
-        "WHERE d.generated_at >= ? AND d.generated_at < ?",
+        "SELECT count(DISTINCT item_id) FROM digest_messages "
+        "WHERE item_id IS NOT NULL AND sent_at >= ? AND sent_at < ?",
         (this_start, end),
     ).fetchone()[0]
     lines.append(
@@ -439,10 +445,11 @@ def collect_stats(conn: sqlite3.Connection, config: Config, now: datetime) -> li
         JOIN sources src ON src.id = i.source_id
         WHERE s.kind = 'reaction' AND s.created_at >= ? AND s.created_at < ?
           AND s.id = (SELECT id FROM signals s2 WHERE s2.kind = 'reaction'
-                      AND s2.item_id = s.item_id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+                      AND s2.item_id = s.item_id AND s2.created_at < ?
+                      ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         GROUP BY src.name
         """,
-        (this_start, end),
+        (this_start, end, end),
     ).fetchall()
     good = sorted((r for r in by_source if r["good"]), key=lambda r: (-r["good"], r["source_name"]))
     bad = sorted((r for r in by_source if r["bad"]), key=lambda r: (-r["bad"], r["source_name"]))

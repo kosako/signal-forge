@@ -83,13 +83,20 @@ def run_pipeline(
     run_id: str,
     *,
     force_digest: bool = False,
+    engine_for_effort: Callable[[str], LLMEngine] | None = None,
 ) -> RunFailures:
-    """全段を直列実行し、失敗した段の名前リストを返す(空 = 全段成功。保留は digest_held)。"""
+    """全段を直列実行し、失敗した段の名前リストを返す(空 = 全段成功。保留は digest_held)。
+
+    engine_for_effort は、段が求める effort で主のエンジンを作る関数(CLI の intel run が渡す)。
+    渡さなければ、どの effort でも engine_factory() を使う(テストで主を差し替えられる。設計 00 §5)。
+    """
     failures = RunFailures()
 
-    def primary(_effort: str) -> LLMEngine:
-        # analyze・トレンドの予備(GH#156)が包む主は、渡された作り方のまま(テストで主を
-        # 差し替えられる。設計 00 §5)。dig は config の主を effort 可変で作る
+    def primary(effort: str) -> LLMEngine:
+        # analyze・トレンド・focus は low、重点の照合と週の仮説は medium を求める(GH#437・GH#440)。
+        # 予備(GH#156)が包む主もこの作り方。dig は config の主を effort 可変で自分で作る
+        if engine_for_effort is not None:
+            return engine_for_effort(effort)
         return engine_factory()
 
     def stage(name: str, action: Callable[[], object]) -> None:

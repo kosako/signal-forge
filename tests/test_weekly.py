@@ -172,6 +172,46 @@ def test_collect_signals_takes_this_weeks_actions_newest_first(conn) -> None:
     assert all("先週" not in m.text for m in materials)  # 先週の行動は材料にしない
 
 
+def test_collect_signals_ignores_reactions_after_the_week(conn, tmp_path) -> None:
+    # 集める間に受信デーモンが now の後に押し直しを書いても、週の材料と集計を変えない
+    item = add_item(conn, 1)
+    react(conn, item, "useful", SUNDAY_MORNING - timedelta(days=1))
+    react(conn, item, "noise", SUNDAY_MORNING + timedelta(minutes=5))
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date, created_at) "
+        "VALUES ('followup_dig', ?, 'yes', ?, ?), ('followup_dig', ?, 'no', ?, ?)",
+        (item, WEEK, at(SUNDAY_MORNING - timedelta(hours=2)),
+         item, WEEK, at(SUNDAY_MORNING + timedelta(minutes=5))),
+    )
+
+    kinds = [m.kind for m in collect_signals(conn, SUNDAY_MORNING)]
+    stats = [m.text for m in collect_stats(conn, weekly_config(tmp_path), SUNDAY_MORNING)]
+
+    assert sorted(kinds) == ["read", "tg_useful"]
+    assert "👍・📌 の多いソース: feed-a 1 / 👎 の多いソース: なし" in stats
+
+
+def test_delivered_count_is_articles_actually_sent(conn, tmp_path) -> None:
+    # digest を作っただけで送れなかった記事は数えない(記事のメッセージの台帳で数える)
+    a, b, c = (add_item(conn, n) for n in range(1, 4))
+    digest_id = conn.execute(
+        "INSERT INTO digests (digest_date, markdown, item_ids, item_count, status, generated_at) "
+        "VALUES (?, '# md', ?, 3, 'ok', ?)",
+        ("2026-10-24", json.dumps([a, b, c]), at(SUNDAY_MORNING - timedelta(days=1))),
+    ).lastrowid
+    sent_at = at(SUNDAY_MORNING - timedelta(days=1))
+    for message_id, item_id in ((1, None), (2, a), (3, b)):  # ヘッダと 2 件だけ送れた
+        conn.execute(
+            "INSERT INTO digest_messages (digest_id, item_id, message_id, sent_at) "
+            "VALUES (?, ?, ?, ?)",
+            (digest_id, item_id, message_id, sent_at),
+        )
+
+    stats = {m.key: m.text for m in collect_stats(conn, weekly_config(tmp_path), SUNDAY_MORNING)}
+
+    assert stats["k1"].startswith("配信した記事 2 件への反応")
+
+
 def test_collect_signals_caps_each_kind(conn, monkeypatch) -> None:
     from app import weekly
 
