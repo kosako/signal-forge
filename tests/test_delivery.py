@@ -46,6 +46,7 @@ def add_item(
     implication="示唆テキスト。",
     degraded=0,
     extraction_failed=0,
+    source_language=None,
 ) -> int:
     item_id = conn.execute(
         "INSERT INTO items (source_id, url, canonical_url, title, published_at, content_hash, "
@@ -55,11 +56,12 @@ def add_item(
     conn.execute(
         "INSERT INTO analyses (item_id, title_ja, summary, category, relevance_score, novelty, "
         "recommendation_reason, implication, degraded, engine, model, prompt_version, "
-        "input_hash, extraction_failed) "
-        "VALUES (?, ?, ?, '課題直結', 80, 'new', ?, ?, ?, 'codex-cli', 'm', 'analyze-v001', ?, ?)",
+        "input_hash, extraction_failed, source_language) "
+        "VALUES (?, ?, ?, '課題直結', 80, 'new', ?, ?, ?, 'codex-cli', 'm', 'analyze-v001', "
+        "?, ?, ?)",
         (
             item_id, title_ja, summary, reason, implication, degraded, f"sha256:{url}",
-            extraction_failed,
+            extraction_failed, source_language,
         ),
     )
     return item_id
@@ -331,6 +333,25 @@ def test_extraction_failed_item_shows_note_and_keeps_reason(conn, tmp_path) -> N
         "🎯 理由。",
         "💡 示唆。",
     ]
+
+
+def test_source_line_shows_original_language_only_when_not_japanese(conn, tmp_path) -> None:
+    # GH#439: 見出しと要約は日本語にして出すので、元の記事が日本語でないときだけ、出典の行の
+    # 最後に元の言語を出す。日本語・未判定(NULL)の記事には出さない
+    en = add_item(conn, "https://a/en", title_ja="見出し", source_language="en")
+    other = add_item(conn, "https://a/other", title_ja="見出し", source_language="other")
+    ja = add_item(conn, "https://a/ja", source_language="ja")
+    unknown = add_item(conn, "https://a/unknown")
+    digest_id = add_digest(conn, [en, other, ja, unknown])
+    recorder = ApiRecorder()
+    deliver_digest(conn, make_config(tmp_path), recorder.api(), digest_id, logger)
+
+    source_lines = [text.splitlines()[1] for text in recorder.texts()[1:]]
+    assert source_lines[0].endswith(" ・🌐 英語")
+    assert source_lines[1].endswith(" ・🌐 外国語")
+    assert all("🌐" not in line for line in source_lines[2:])
+    # 見出しは今のまま
+    assert all("🌐" not in text.splitlines()[0] for text in recorder.texts()[1:])
 
 
 def test_normal_item_has_no_extraction_note(conn, tmp_path) -> None:

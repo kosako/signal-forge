@@ -368,6 +368,34 @@ def test_all_extraction_failed_today_is_not_full_degradation(conn, tmp_path, fix
     assert md.count("**推薦理由**: 理由") == 2  # 理由・示唆もそのまま
 
 
+def test_source_line_shows_original_language_only_when_not_japanese(conn, tmp_path) -> None:
+    # GH#439: Daily ノートの記事の行にも、日本語でない記事だけ元の言語を出す(Telegram と同じ印)
+    en = add_analyzed(conn, "https://a/en", relevance=90)
+    ja = add_analyzed(conn, "https://a/ja", relevance=80)
+    conn.execute("UPDATE analyses SET source_language = 'en' WHERE item_id = ?", (en,))
+    conn.execute("UPDATE analyses SET source_language = 'ja' WHERE item_id = ?", (ja,))
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+
+    markdown = conn.execute("SELECT markdown FROM digests WHERE id = ?", (digest_id,)).fetchone()[0]
+    first, second = markdown.split("## 2. ")
+    assert "/ スコア: 90 / 🌐 英語\n" in first
+    assert "🌐" not in second
+
+
+def test_all_degraded_digest_keeps_original_language(conn, tmp_path, fixed_today) -> None:
+    # LLM 全滅の日のタイトルのみの digest でも、元の言語は分析の行の値で出す(GH#439)
+    a = add_analyzed(conn, "https://a/1", relevance=0, degraded=1)
+    conn.execute("UPDATE analyses SET source_language = 'zh' WHERE item_id = ?", (a,))
+    set_analyzed_at(conn, TODAY_AT, a)
+
+    digest_id = generate_digest(conn, make_config(tmp_path), logger)
+
+    row = conn.execute("SELECT status, markdown FROM digests WHERE id = ?", (digest_id,)).fetchone()
+    assert row["status"] == "degraded"
+    assert "/ 🌐 中国語\n" in row["markdown"]
+
+
 def test_extraction_note_only_on_failed_item(conn, tmp_path) -> None:
     # 本文を読めた通常の記事の項目は変わらない(印は抽出に失敗した記事だけ。GH#240)
     failed = add_analyzed(conn, "https://a/failed", relevance=90)

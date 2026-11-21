@@ -35,6 +35,7 @@ from app.config import Config
 from app.deliver_lock import delivery_lock
 from app.dig import items_with_material
 from app.digest.builder import BOOKMARK_SECTION_MAX
+from app.language import language_mark
 from app.models import (
     EXTRACTION_FAILED_NOTE,
     FOCUS_HEADING,
@@ -616,6 +617,10 @@ def _item_text(position: int, row: sqlite3.Row) -> str:
     published = _published_md(row["published_at"])
     if published:
         source_line += f" ・{published}"
+    # 元の記事の言語(GH#439)。見出しと要約は日本語にして出すので、日本語でない記事だけ印を出す
+    mark = language_mark(row["source_language"])
+    if mark:
+        source_line += f" ・{mark}"
 
     fixed_lines = [f"{position}. <b>{title}</b>", source_line]
     # 本文を読めず見出しだけで作った分析は、本文に基づく要約と見分けられるよう印を出す(GH#240)。
@@ -838,7 +843,8 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
         SELECT items.id AS item_id, items.title, items.canonical_url, items.published_at,
                sources.name AS source_name,
                analyses.title_ja, analyses.summary, analyses.implication,
-               analyses.recommendation_reason, analyses.degraded, analyses.extraction_failed
+               analyses.recommendation_reason, analyses.degraded, analyses.extraction_failed,
+               analyses.source_language
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (

@@ -165,6 +165,24 @@ def test_fixed_analysis_becomes_latest_and_codex_row_is_kept(conn, tmp_path) -> 
     assert tuple(call) == (1, None, 2, 1000, 200, 0.05)
 
 
+def test_fixed_analysis_keeps_source_language_and_extraction_mark(conn, tmp_path) -> None:
+    # 元の記事の言語(GH#439)と本文の抽出の印(GH#240)は入力から決めた値なので、直した行にも
+    # 元の行の値を写す(直した中身に依らない)
+    a = add_item(conn, 1)
+    codex_a = add_analysis(conn, a)
+    conn.execute(
+        "UPDATE analyses SET source_language = 'en', extraction_failed = 1 WHERE id = ?",
+        (codex_a,),
+    )
+    engine = FakeClaude([{"results": [fixed(a, relevance=85)]}])
+
+    review_analyses(conn, make_config(tmp_path), engine, "# 関心", logger, run_id="R")
+
+    latest = {row["item_id"]: row for row in digest_candidates(conn)}[a]
+    assert latest["analysis_id"] != codex_a
+    assert (latest["source_language"], latest["extraction_failed"]) == ("en", 1)
+
+
 def test_fixed_without_change_is_recorded_as_ok(conn, tmp_path) -> None:
     # fixed と答えても値が同じなら行を足さない(直した数に数えない)。negative は順序を見ない
     a = add_item(conn, 1)

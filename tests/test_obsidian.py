@@ -252,6 +252,33 @@ def test_item_note_marks_summary_made_without_body(conn, tmp_path) -> None:
     assert "本文を読めていない" not in note_text(degraded)
 
 
+def test_item_note_shows_original_language(conn, tmp_path) -> None:
+    # GH#439: 元の記事の言語を frontmatter の language に残し、日本語でない記事だけ要約の頭に
+    # 印を出す。未判定(NULL)は空で、印は出さない
+    en = add_digested(conn, "https://a/en")
+    ja = add_digested(conn, "https://a/ja")
+    unknown = add_digested(conn, "https://a/unknown")
+    conn.execute("UPDATE analyses SET source_language = 'en' WHERE item_id = ?", (en,))
+    conn.execute("UPDATE analyses SET source_language = 'ja' WHERE item_id = ?", (ja,))
+    digest_id = add_digest(conn, [en, ja, unknown])
+    export_digest(conn, make_config(tmp_path), digest_id, logger)
+
+    items_dir = tmp_path / "vault" / "SignalForge" / "Items"
+
+    def note_text(item_id: int) -> str:
+        return next(p for p in items_dir.glob("*.md") if f"-{item_id}-" in p.name).read_text()
+
+    def frontmatter(item_id: int) -> dict:
+        return yaml.safe_load(note_text(item_id).split("---\n")[1])
+
+    assert "## 要約\n> 🌐 英語の記事\n\n要約文\n" in note_text(en)
+    assert frontmatter(en)["language"] == "en"
+    assert "🌐" not in note_text(ja)
+    assert frontmatter(ja)["language"] == "ja"
+    assert "🌐" not in note_text(unknown)
+    assert frontmatter(unknown)["language"] == ""
+
+
 def test_regeneration_preserves_handwritten_and_user_frontmatter(conn, tmp_path) -> None:
     item = add_digested(conn, "https://a/1")
     digest_id = add_digest(conn, [item])

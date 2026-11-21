@@ -289,6 +289,7 @@ class Analysis(_Row):
     analyzed_at: str
     title_ja: str | None  # 002 で追加(ALTER のため実テーブルでは末尾列)
     extraction_failed: int = 0  # migration 021(GH#240。本文なしで分析した = 1)
+    source_language: str | None = None  # migration 043(GH#439。元の記事の言語。NULL = 未判定)
 
 
 @dataclass(frozen=True)

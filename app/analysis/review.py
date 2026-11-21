@@ -399,8 +399,8 @@ def _insert_fixed(
         INSERT INTO analyses
           (item_id, run_id, title_ja, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
-           prompt_version, input_hash, extraction_failed)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+           prompt_version, input_hash, extraction_failed, source_language)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
         """,
         (
             analysis_row["item_id"],
@@ -419,6 +419,8 @@ def _insert_fixed(
             PROMPT_VERSION,
             prompt_hash,
             analysis_row["extraction_failed"],
+            # 元の記事の言語は入力から決めた値で、直した中身に依らない(GH#439)
+            analysis_row["source_language"],
         ),
     )
     return int(cursor.lastrowid)
