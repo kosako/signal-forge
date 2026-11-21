@@ -579,6 +579,27 @@ def test_run_notifies_fallback_after_pipeline(tmp_path, monkeypatch) -> None:
     assert len(calls) == 1 and calls[0]
 
 
+def test_run_passes_engine_factory_by_effort(tmp_path, monkeypatch) -> None:
+    # intel run は段が求める effort で主を作る関数を渡す(重点の照合と週の仮説は medium。
+    # GH#437・GH#440)。渡さないと、どの段も既定の low で動く
+    from app import logs, run
+    from app.analysis import llm
+
+    monkeypatch.setattr(logs, "DEFAULT_LOG_DIR", tmp_path / "logs")
+    _answer_config(tmp_path, telegram=True)
+    seen: dict = {}
+    monkeypatch.setattr(run, "run_pipeline", lambda *args, **kwargs: seen.update(kwargs) or [])
+    made: list[str] = []
+    monkeypatch.setattr(
+        llm, "create_engine",
+        lambda name, *, model_reasoning_effort="low": made.append(model_reasoning_effort),
+    )
+    result = runner.invoke(app, ["run", "--config-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    seen["engine_for_effort"]("medium")
+    assert made == ["medium"]
+
+
 def test_run_failure_notice_gets_date_of_failed_delivery(tmp_path, monkeypatch) -> None:
     # deliver 段が送ろうとした digest の日付(run_pipeline の戻り値)を失敗通知へ渡す。
     # 通知の時点の日付ではなく、この日付で送り直し方を添える(GH#247)
@@ -714,7 +735,7 @@ _CONFIG_REQUIRED = [
     ["collect"], ["extract"], ["analyze"], ["digest"], ["deliver"], ["dig"], ["dig-now"],
     ["investigate", "--event", "1"],
     ["answer"], ["poll"], ["run"], ["x-auth"], ["x-signals"], ["x-insights"], ["focus"],
-    ["focus", "--update"],
+    ["focus", "--update"], ["weekly"], ["weekly", "--preview"],
     ["doctor", "--purge"], ["doctor", "--cost"],
 ]
 

@@ -590,6 +590,19 @@ def test_investigate_x_defaults_and_bounds(tmp_path: Path) -> None:
             load_config(tmp_path)
 
 
+def test_weekly_defaults_and_validation(tmp_path: Path) -> None:
+    # 週の仮説の問い(GH#440)は既定で off。問いの数は 1〜10(日曜の夜に届くメッセージの数)
+    weekly = load_config(empty_config(tmp_path)).weekly
+    assert (weekly.enabled, weekly.max_questions) == (False, 8)
+    config = load_config(write_config(tmp_path, "[weekly]\nenabled = true\nmax_questions = 10\n"))
+    assert (config.weekly.enabled, config.weekly.max_questions) == (True, 10)
+    for body in ("[weekly]\nmax_questions = 0\n", "[weekly]\nmax_questions = 11\n"):
+        with pytest.raises(ConfigError, match="max_questions"):
+            load_config(write_config(tmp_path, body))
+    with pytest.raises(ConfigError, match="enabled"):
+        load_config(write_config(tmp_path, '[weekly]\nenabled = "yes"\n'))
+
+
 def test_focus_defaults_and_validation(tmp_path: Path) -> None:
     # 今の重点(GH#433)は既定で off。外れる値が入る値より高い設定は、入った日に外れるので止める
     focus = load_config(empty_config(tmp_path)).focus

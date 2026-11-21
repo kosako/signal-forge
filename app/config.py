@@ -265,6 +265,17 @@ class FocusConfig:
 
 
 @dataclass(frozen=True)
+class WeeklyConfig:
+    """週の仮説の問い(GH#440 / 設計 03 §4.2・04 §4)。既定は off。
+
+    日曜の朝バッチがその週の行動から仮説を立て、日曜の夜([telegram].survey_time)に 1 つずつ送る。
+    """
+
+    enabled: bool = False
+    max_questions: int = 8  # 1 週に送る問いの上限(巡回についての問いを含む)
+
+
+@dataclass(frozen=True)
 class CollectConfig:
     """collect の段の上限(GH#340 / 設計 02 §3・05 §8)。使い切った残りは次の実行へ回す。"""
 
@@ -365,6 +376,7 @@ class Config:
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     analysis_review: AnalysisReviewConfig = field(default_factory=AnalysisReviewConfig)
     focus: FocusConfig = field(default_factory=FocusConfig)
+    weekly: WeeklyConfig = field(default_factory=WeeklyConfig)
     ranking: RankingConfig = field(default_factory=RankingConfig)
 
     @property
@@ -407,6 +419,7 @@ _SECTIONS = {
     "analysis": AnalysisConfig,
     "analysis_review": AnalysisReviewConfig,
     "focus": FocusConfig,
+    "weekly": WeeklyConfig,
     "ranking": RankingConfig,
 }
 
@@ -503,6 +516,11 @@ def _validate(path: Path, config: Config) -> None:
                 f"{path}: [x_signals].{key} は 0 以上の有限値(負のシグナルは無い)"
             )
     _validate_focus(path, config.focus)
+    if not 1 <= config.weekly.max_questions <= WEEKLY_MAX_QUESTIONS:
+        raise ConfigError(
+            f"{path}: [weekly].max_questions は 1〜{WEEKLY_MAX_QUESTIONS}"
+            f"(巡回についての問いを含む): {config.weekly.max_questions}"
+        )
     signals_cap = config.x_signals.daily_read_cap
     if 0 < signals_cap < X_SIGNALS_MIN_PAGE:
         raise ConfigError(
@@ -693,6 +711,7 @@ def _validate_x_search(path: Path, config: Config) -> None:
         )
 
 
+WEEKLY_MAX_QUESTIONS = 10  # [weekly].max_questions の上限(日曜の夜に届くメッセージの数)
 HN_WINDOW_MAX_HOURS = 168  # [focus].hn_window_hours の上限(1 週間。古い投稿は鮮度の規則で落ちる)
 
 

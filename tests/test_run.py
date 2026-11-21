@@ -1213,6 +1213,95 @@ def test_focus_stage_runs_before_extract_only_when_enabled(conn, tmp_path, monke
     assert order == ["focus", "extract"]
 
 
+def test_weekly_stage_runs_after_dig_only_when_enabled(conn, tmp_path, monkeypatch) -> None:
+    # 週の仮説の問い(GH#440)は既定で段ごと省く。有効なら dig の後・purge の前に、朝バッチの
+    # run_id と主の作り方で呼ぶ(日曜かどうかは段の中で決める)
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import WeeklyConfig
+
+    order: list[str] = []
+    calls: dict = {}
+
+    def weekly_spy(db, config, stage_logger, **kwargs):
+        order.append("weekly")
+        calls.update(kwargs)
+
+    def purge_spy(db, config, stage_logger, *, run_id=None):
+        order.append("purge")
+
+    monkeypatch.setattr(run_module, "weekly_stage", weekly_spy)
+    monkeypatch.setattr(run_module, "purge_expired", purge_spy)
+    primary = ScriptedEngine(conn)
+    args = (conn, make_config(tmp_path), {}, {"rss": StaticConnector()}, make_http())
+    run_pipeline(*args, lambda: primary, logger, "01RUNID")
+    assert order == ["purge"]
+
+    order.clear()
+    config = replace(make_config(tmp_path), weekly=WeeklyConfig(enabled=True))
+    run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(), lambda: primary, logger,
+        "01RUNID",
+    )
+    assert order == ["weekly", "purge"]
+    assert calls["run_id"] == "01RUNID"
+    assert calls["primary"]("medium") is primary
+
+
+def test_pipeline_builds_engines_at_the_effort_each_stage_asks(
+    conn, tmp_path, monkeypatch
+) -> None:
+    # intel run は engine_for_effort を渡し、段が求める effort で主を作る。週の仮説と重点の
+    # 照合は medium(GH#440・GH#437)。渡さなければ engine_factory のまま(テストの差し替え)
+    from dataclasses import replace
+
+    from app import run as run_module
+    from app.config import WeeklyConfig
+
+    primary = ScriptedEngine(conn)
+    efforts: list[str] = []
+
+    def weekly_spy(db, config, stage_logger, **kwargs):
+        assert kwargs["primary"]("medium") is primary
+
+    def engine_for_effort(effort: str):
+        efforts.append(effort)
+        return primary
+
+    monkeypatch.setattr(run_module, "weekly_stage", weekly_spy)
+    config = replace(make_config(tmp_path), weekly=WeeklyConfig(enabled=True))
+    run_pipeline(
+        conn, config, {}, {"rss": StaticConnector()}, make_http(), lambda: primary, logger,
+        "01RUNID", engine_for_effort=engine_for_effort,
+    )
+    assert "medium" in efforts
+
+
+def test_weekly_stage_creates_engine_at_medium_effort(conn, tmp_path, monkeypatch) -> None:
+    # 単独の intel weekly --preview は config の主を effort medium で作る
+    from app import run as run_module
+
+    made: list[str] = []
+    seen: dict = {}
+
+    def fake_create(name, *, model_reasoning_effort="low"):
+        made.append(model_reasoning_effort)
+        return "engine"
+
+    def fake_run_weekly(db, config, engine, stage_logger, **kwargs):
+        seen.update(engine=engine, **kwargs)
+        return "result", []
+
+    monkeypatch.setattr("app.analysis.llm.create_engine", fake_create)
+    monkeypatch.setattr("app.weekly.run_weekly", fake_run_weekly)
+    assert run_module.weekly_stage(conn, make_config(tmp_path), logger, store=False) == (
+        "result", [],
+    )
+    assert made == ["medium"]
+    assert seen == {"engine": "engine", "run_id": None, "store": False}
+
+
 def test_focus_llm_failure_does_not_fail_the_run(conn, tmp_path) -> None:
     # 振り分けの失敗は付加機能の失敗として段を止めない(重みの更新だけ進める)
     from dataclasses import replace

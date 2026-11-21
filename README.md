@@ -17,7 +17,7 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
         │
         ▼
  朝バッチ  intel run(launchd。既定 06:30 起動)
-   collect → x_signals → focus → focus_collect → extract → analyze → digest → export → deliver → dig → purge → backup
+   collect → x_signals → focus → focus_collect → extract → analyze → digest → export → deliver → dig → weekly → purge → backup
                                                                         │         │        │
                                                                         ▼         ▼        ▼
                                                                   Obsidian    Telegram   DeepDive ノート(vault)
@@ -30,14 +30,14 @@ MVP(A-lite)は稼働中。フェーズ 2 として、気になった記事を AI
         │ 読み書き
         ▼
  受信デーモン  intel poll(launchd KeepAlive で常駐。Telegram の long polling)
-   受ける: ボタン / URL / ダイジェストへの感想 / 夜の回答と深掘りの指定 / 深掘りカードへの質問
-   内蔵タイマー: 夜アンケート(既定 21:30)/ watchdog(既定 07:15)/ ソースの健康診断と読んだのまとめ確認(日曜の夜)
+   受ける: ボタン / URL / ダイジェストへの感想 / 夜の回答と深掘りの指定 / 深掘りカードへの質問 / 仮説への補足
+   内蔵タイマー: 夜アンケート(既定 21:30)/ watchdog(既定 07:15)/ ソースの健康診断・読んだのまとめ確認・週の仮説の問い(日曜の夜)
    質問 → intel answer(別プロセス)→ Telegram のリプライで返事
    今すぐの深掘り → intel dig-now(別プロセス)→ 解説ノートと概要カード
 ```
 
 - **朝バッチ `intel run`**: 上の段を順に実行して終わる。段の順序の正本は [設計 00 §2](docs/design/00-architecture.md)。
-  - x_signals は `[x_signals].daily_read_cap > 0`、focus は `[focus].enabled`、dig は `[dig].daily_cap > 0` のときだけ動く。deliver は Telegram が完全に未設定(`owner_chat_id` も bot token も無い)なら WARN を出して飛ばす。片方だけの設定は設定ミスとして deliver 段が失敗する。
+  - x_signals は `[x_signals].daily_read_cap > 0`、focus は `[focus].enabled`、dig は `[dig].daily_cap > 0`、weekly は `[weekly].enabled` のときだけ動く(weekly が仮説を作るのは日曜だけ)。deliver は Telegram が完全に未設定(`owner_chat_id` も bot token も無い)なら WARN を出して飛ばす。片方だけの設定は設定ミスとして deliver 段が失敗する。
   - 段の失敗はその段で止め、後の段は続ける。失敗した段があれば(Telegram が完全に未設定でなければ)Telegram に知らせ、exit 1 で終わる。
   - export を deliver より前に置くので、Telegram が失敗しても Obsidian への蓄積は済む。
   - 冪等なので再実行してよい。配信済みのダイジェストは送り直さない(`--force` を付けたときを除く)。

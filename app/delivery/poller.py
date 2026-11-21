@@ -49,6 +49,7 @@ from app.delivery.surveys import (
     read_confirm_keyboard,
     run_due_timers,
     survey_deadline,
+    weekly_keyboard,
 )
 from app.delivery.telegram import (
     DeliveryError,
@@ -97,6 +98,7 @@ from app.normalize import (
     normalize_text_for_hash,
     normalize_url,
 )
+from app.weekly import ANSWER_CODES, ANSWER_LABELS, latest_answer
 
 OFFSET_KEY = "getupdates_offset"
 RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
@@ -456,6 +458,12 @@ def _handle_callback(
             _record_investigation(
                 conn, config, api, callback, callback_id, int(arg), int(code), logger,
                 dig_now_worker,
+            )
+            return
+        # 週の仮説の問いへの答え(GH#440)。N は weekly_questions の id(ASCII の数字)
+        if prefix == "w" and re.fullmatch(r"[0-9]{1,9}", arg) and code in ANSWER_CODES:
+            _record_weekly_answer(
+                conn, config, api, callback, callback_id, int(arg), ANSWER_CODES[code], logger
             )
             return
         # ヘッダの今の重点を外す(t)・戻す(u)。N は写しの番号(1 桁の ASCII の数字。GH#433)
@@ -1745,6 +1753,73 @@ def _insert_signal(
         return False
 
 
+def _record_weekly_answer(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    question_id: int,
+    value: str,
+    logger: logging.Logger,
+) -> None:
+    """週の仮説の問いのボタン(GH#440。設計 04 §3・§4)。
+
+    押されたメッセージが、その問いとして送ったメッセージ(weekly_questions.message_id)で owner の
+    chat にあることを確かめてから記録する(callback_data の番号だけを信じない)。答えは追記だけで、
+    今の最新の答えと同じなら書かない(押し直し・再配達は記録済みとして答える)。確認と記録は 1 つの
+    トランザクション。押した後は、選んだボタンに ✓ を付けた盤面に差し替える。
+    """
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    log_extra = {"stage": "poll", "extra": {"question_id": question_id}}
+    if chat_id != config.telegram.owner_chat_id or type(message_id) is not int:
+        logger.warning("週の仮説の問いと結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ この問いには対応できません")
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            known = conn.execute(
+                "SELECT 1 FROM weekly_questions WHERE id = ? AND message_id = ?",
+                (question_id, message_id),
+            ).fetchone()
+            recorded = False
+            if known is not None and latest_answer(conn, question_id) != value:
+                conn.execute(
+                    "INSERT INTO weekly_answers (question_id, value) VALUES (?, ?)",
+                    (question_id, value),
+                )
+                recorded = True
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"週の仮説の答えを記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    if known is None:
+        logger.warning("週の仮説の問いと結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ この問いには対応できません")
+        return
+    label = ANSWER_LABELS[value]
+    logger.info(
+        "週の仮説の答えを記録" if recorded else "週の仮説の答えは記録済み",
+        extra={"stage": "poll", "extra": {"question_id": question_id, "value": value}},
+    )
+    api.answer_callback_query(
+        callback_id,
+        text=f"{label} と記録しました" if recorded else f"{label} と記録してあります",
+    )
+    _edit_markup_best_effort(api, callback, weekly_keyboard(question_id, selected=value), logger)
+
+
 def _edit_markup_best_effort(
     api: TelegramApi, callback: dict, markup: dict, logger: logging.Logger
 ) -> None:
@@ -1862,6 +1937,20 @@ def _handle_message(
             reply(
                 "📝 ダイジェストへの感想を記録しました。明朝の export で Daily ノートに反映します"
             )
+            return
+        # 週の仮説の問いへのリプライ = 補足(GH#440)。次の週の仮説の材料にする
+        weekly_question_id = _replied_weekly_question(conn, message.get("reply_to_message"))
+        if weekly_question_id is not None:
+            recorded = _insert_note(
+                conn, _WEEKLY_NOTE_SQL, weekly_question_id, text.strip(), chat_id, message
+            )
+            conn.commit()
+            log_extra = {"stage": "poll", "extra": {"question_id": weekly_question_id}}
+            if not recorded:
+                logger.info("記録済みの仮説の補足の再配達を破棄", extra=log_extra)
+                return
+            logger.info("仮説の補足を記録", extra=log_extra)
+            reply("📝 補足を記録しました。来週の仮説の材料にします")
             return
         # 未消化 🔖 一覧へのリプライ = 深掘り指定(GH#104 / 設計 06 §2)。
         # 感想ルートと同じく owner DM 限定(message_id は chat 単位のため)
@@ -2279,6 +2368,10 @@ _ITEM_NOTE_SQL = (
     "INSERT INTO item_notes (item_id, note, chat_id, message_id) VALUES (?, ?, ?, ?) "
     "ON CONFLICT (chat_id, message_id) DO NOTHING"
 )
+_WEEKLY_NOTE_SQL = (
+    "INSERT INTO weekly_question_notes (question_id, note, chat_id, message_id) "
+    "VALUES (?, ?, ?, ?) ON CONFLICT (chat_id, message_id) DO NOTHING"
+)
 _DIGEST_NOTE_SQL = (
     "INSERT INTO digest_notes (digest_id, note, chat_id, message_id) VALUES (?, ?, ?, ?) "
     "ON CONFLICT (chat_id, message_id) DO NOTHING"
@@ -2297,6 +2390,19 @@ def _insert_note(
     message_id = message.get("message_id")
     key = message_id if type(message_id) is int else None  # bool は int の派生型のため除く
     return conn.execute(sql, (parent_id, note, chat_id, key)).rowcount == 1
+
+
+def _replied_weekly_question(conn: sqlite3.Connection, replied: object) -> int | None:
+    """リプライ先が週の仮説の問いのメッセージなら、その問いの id を返す(GH#440)。"""
+    if not isinstance(replied, dict):
+        return None
+    message_id = replied.get("message_id")
+    if type(message_id) is not int:  # bool は int の派生型のため isinstance では素通りする
+        return None
+    row = conn.execute(
+        "SELECT id FROM weekly_questions WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return row["id"] if row else None
 
 
 def _replied_digest_id(conn: sqlite3.Connection, replied: object) -> int | None:
