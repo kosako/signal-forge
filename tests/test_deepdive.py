@@ -38,7 +38,6 @@ from app.deepdive import (
     DigReview,
     ReviewFinding,
     TranslationChunk,
-    _looks_japanese,
     _revise_draft,
     _select_candidates,
     _select_from_digest,
@@ -56,6 +55,7 @@ from app.dig import DigInstruction, apply_instructions, enqueue_bookmark, reques
 from app.extraction import extract_pending
 from app.http import HttpClient
 from app.jst import today_jst
+from app.language import looks_japanese
 from app.prompting import load_writing_guide
 from app.vault_guard import VaultGuard
 from tests.test_delivery import telegram_text_error
@@ -554,7 +554,7 @@ def test_extracted_article_language_picks_source_note(
     ],
 )
 def test_looks_japanese(text, expected) -> None:
-    assert _looks_japanese(text) is expected
+    assert looks_japanese(text) is expected
 
 
 @pytest.mark.parametrize(

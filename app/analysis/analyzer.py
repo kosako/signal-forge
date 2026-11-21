@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from app.analysis.llm import LLMEngine, LLMError, LLMUnavailableError, complete_with_retry
 from app.config import Config
+from app.language import detect_language, has_language_text
 from app.prompting import fill_template, sanitize, sanitize_body
 
 PROMPT_VERSION = "analyze-v002"
@@ -407,8 +408,8 @@ def _insert_analysis(
         INSERT OR IGNORE INTO analyses
           (item_id, run_id, title_ja, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
-           prompt_version, input_hash, extraction_failed)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           prompt_version, input_hash, extraction_failed, source_language)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
@@ -427,6 +428,7 @@ def _insert_analysis(
             PROMPT_VERSION,
             input_hash,
             _extraction_failed(row),
+            _source_language(row),
         ),
     )
 
@@ -444,8 +446,8 @@ def _insert_degraded(
         INSERT OR IGNORE INTO analyses
           (item_id, run_id, summary, category, topic, relevance_score, novelty,
            negative_labels, recommendation_reason, implication, degraded, engine, model,
-           prompt_version, input_hash, extraction_failed)
-        VALUES (?, ?, ?, 'その他', NULL, 0, 'new', '[]', ?, ?, 1, ?, ?, ?, ?, ?)
+           prompt_version, input_hash, extraction_failed, source_language)
+        VALUES (?, ?, ?, 'その他', NULL, 0, 'new', '[]', ?, ?, 1, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["id"],
@@ -458,8 +460,23 @@ def _insert_degraded(
             PROMPT_VERSION,
             input_hash,
             _extraction_failed(row),
+            _source_language(row),
         ),
     )
+
+
+def _source_language(row: sqlite3.Row) -> str | None:
+    """元の記事の言語(analyses.source_language。GH#439)。取り出した本文(documents.extracted_text)
+    から決め、使える本文が無いときだけ見出しから決める(app/language.py の detect_language。
+    設計 03 §3.3)。
+
+    本文で決めなかった(日本語の混じった本文など、迷うもの)ときは見出しに戻らない。日本語の本文に
+    英語の見出し(製品名など)が付いた記事に、外国語の印を付けないため。使える本文が無いのは、本文が
+    空・文字が無い・PDF のバイト列のとき(has_language_text)。X の投稿は、取り出した本文(投稿の
+    全文か、全文が短いときのリンク先の本文)で決める。
+    """
+    body = row["extracted_text"]
+    return detect_language(body if has_language_text(body) else row["title"])
 
 
 def _extraction_failed(row: sqlite3.Row) -> int:

@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from app.config import Config
 from app.deliver_lock import delivery_lock
 from app.jst import jst_day_bounds_utc, today_jst
+from app.language import language_mark
 from app.models import (
     EXTRACTION_FAILED_NOTE,
     FOCUS_HEADING,
@@ -331,6 +332,7 @@ def _all_degraded_candidates(
             recommendation_reason="",
             implication="",
             degraded=True,
+            source_language=row["source_language"],
         )
         for row in rows[: config.digest.max_items]
     ]
@@ -393,7 +395,9 @@ def _render_markdown(
         # 見出しは日本語タイトル優先(analyze-v002)。degraded / v001 世代は原文に fallback
         title = item.title_ja or item.title or "(タイトルなし)"
         lines.append(f"## {position}. {title}")
-        lines.append(f"- ソース: {item.source_label} / スコア: {item.score:.0f}")
+        source = f"- ソース: {item.source_label} / スコア: {item.score:.0f}"
+        mark = language_mark(item.source_language)  # 元の記事の言語(GH#439。日本語は出さない)
+        lines.append(f"{source} / {mark}" if mark else source)
         lines.append(f"- URL: {item.canonical_url}")  # DB 正規 URL のみ(LLM 出力 URL 不使用)
         if not degraded:
             lines.append(f"- カテゴリ: {item.category}")

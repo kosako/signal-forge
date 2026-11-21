@@ -122,7 +122,12 @@ class AnalysisBatch(BaseModel):
 
 検証追加規則: item_id が入力集合外 → その要素を破棄。入力集合に結果が無い item → 該当 item のみ単発再分析(1 回)、なお欠落なら relevance=0・summary=タイトルで degraded 記録。URL はスキーマに**持たせない**(配信・ノートは DB 正規 URL のみ使用)。
 
-analyses への写像(01 §3 の列に対応): `relevance` → relevance_score / `novelty` → novelty(enum のまま)/ `negative` → negative_labels(JSON 配列のまま保存。ペナルティ計算は ranking/)/ `topic` → topic / `title_ja` → title_ja(表示は title_ja 優先・無ければ items.title)/ `summary`・`category`・`reason`・`implication` → 同名系列。`total_score` は analyze 段では書かず、ranking/ が §6 の式で算出して書き戻す。`extraction_failed` は LLM の出力でなく入力から決める(§3.2 の `extraction` が `failed` = 本文なしで渡した記事が 1。degraded 記録の行にも同じ値を入れる。GH#240)。
+analyses への写像(01 §3 の列に対応): `relevance` → relevance_score / `novelty` → novelty(enum のまま)/ `negative` → negative_labels(JSON 配列のまま保存。ペナルティ計算は ranking/)/ `topic` → topic / `title_ja` → title_ja(表示は title_ja 優先・無ければ items.title)/ `summary`・`category`・`reason`・`implication` → 同名系列。`total_score` は analyze 段では書かず、ranking/ が §6 の式で算出して書き戻す。`extraction_failed` は LLM の出力でなく入力から決める(§3.2 の `extraction` が `failed` = 本文なしで渡した記事が 1。degraded 記録の行にも同じ値を入れる。GH#240)。`source_language`(元の記事の言語。GH#439)も LLM には聞かず、入力からコードで決める(`app/language.py` の detect_language。prompt は変えない)。取り出した本文(`documents.extracted_text`)で決め、使える本文が無い(空・文字が無い・PDF のバイト列)ときだけ見出しで決める。本文で決めなかった(下の規則で迷うもの)ときは見出しに戻らない。日本語の本文に英語の見出し(製品名など)が付いた記事に、外国語の印を付けないため。degraded 記録の行と、確かめ(§3.6)が直した行にも同じ値を入れる。判定の規則は次のとおりで、日本語にして出す記事に元の言語を示す印なので、迷うものは NULL にする(誤った言語を示すより、示さない方がよい)。
+
+- 日本語(深掘りの原文・対訳の判定と同じ looks_japanese。設計 06 §5.2)なら ja。
+- 引用を除いた地の文に、かなが 1 字でもあれば NULL。英語を長く引く日本語の記事や、X の画面の文字(Log in・Show translation など)に埋もれた日本語の投稿を、外国語と誤らないため。
+- それ以外は、URL を除いて語の数が一番多い文字の種類で決める。ハングルなら ko。漢字なら、漢字が 20 字以上のとき zh(漢字だけの短い日本語の見出しを中国語と誤らない)。ローマ字なら、漢字が混じらないときだけ、機能語の数で英語(en)かほかの言語(独・仏・西・葡・伊など。other)かを決める。other は、ほかの言語の機能語が 2 個以上で、英語の機能語より多いときだけ(英語の技術の見出しの単位や略語、CSS の em・MS-DOS の dos などの 1 つで外国語にしない)。それ以外は en(機能語の無い短い見出しはほとんどが英語の記事)。それ以外の文字(キリル文字・アラビア文字など)なら other。種類が拮抗すれば NULL。
+- 文字が無い(空・数字と記号・URL だけ)ときと、PDF のバイト列(取り出しに失敗した中身)は決めない。
 
 ### 3.4 signals 実例の few-shot 還流
 

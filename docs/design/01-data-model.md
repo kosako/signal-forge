@@ -44,7 +44,7 @@ digests↔items に KPI 用の結合表を作らない理由: 参照は表示と
 
 ## 3. DDL(初期スキーマ。migrations/001_init.sql + 002・005・006・019・021・024 の追加)
 
-ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url・budget_cuts・short_url_resolutions・focus_topics と focus_evidence・focus_matches)は §3 末尾・§7・§8・設計 02 §3・設計 03 §4.1 と `migrations/` を正とする。
+ここに載せるのは初期の表と、002(analyses.title_ja)・005(item_notes)・006(digest_notes)・019(感想の受信の冪等キー)・021(analyses.extraction_failed)・024(digest_messages.superseded_at)・043(analyses.source_language)の追加まで。それより後の追加(x_signals 系・digests の列・dig_* の表・sources.moved_url・budget_cuts・short_url_resolutions・focus_topics と focus_evidence・focus_matches)は §3 末尾・§7・§8・設計 02 §3・設計 03 §4.1 と `migrations/` を正とする。
 
 ```sql
 CREATE TABLE sources (
@@ -90,7 +90,7 @@ CREATE TABLE documents (
   id                INTEGER PRIMARY KEY,
   item_id           INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
   extracted_text    TEXT,
-  language          TEXT,                    -- 本文抽出では書かない(NULL)。深掘りは NULL なら本文から判定する(設計 06 §5.2・GH#173)
+  language          TEXT,                    -- 本文抽出では書かない(NULL)。深掘りは NULL なら本文から判定する(設計 06 §5.2・GH#173)。配信に出す元の言語は analyses.source_language(GH#439)
   extraction_status TEXT NOT NULL CHECK (extraction_status IN ('ok','partial','failed')),
   extraction_error  TEXT,
   extracted_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -125,10 +125,15 @@ CREATE TABLE analyses (
   title_ja              TEXT,                         -- 日本語見出し(002 で追加のため末尾列。
                                                       -- NULL = v001 世代 / degraded。表示側は
                                                       -- title_ja 優先・無ければ items.title)
-  extraction_failed     INTEGER NOT NULL DEFAULT 0 CHECK (extraction_failed IN (0,1))
+  extraction_failed     INTEGER NOT NULL DEFAULT 0 CHECK (extraction_failed IN (0,1)),
                                                       -- 021(GH#240)。1 = 本文の抽出に失敗し、本文なしで
                                                       -- LLM に渡した(degraded とは別。設計 03 §2)。
                                                       -- 021 より前の行は 0
+  source_language       TEXT CHECK (source_language IN ('ja','en','zh','ko','other'))
+                                                      -- 043(GH#439)。元の記事の言語。分析の時に
+                                                      -- 本文(無ければ見出し)からコードで決める
+                                                      -- (設計 03 §3.3)。NULL = 決められなかった・
+                                                      -- 043 より前の行
 ) STRICT;
 CREATE UNIQUE INDEX ux_analyses_idem ON analyses(item_id, prompt_version, input_hash);
 CREATE INDEX ix_analyses_item ON analyses(item_id, analyzed_at);

@@ -402,6 +402,52 @@ def test_extraction_failure_recorded_on_degraded_row_too(conn, tmp_path) -> None
     assert (rows[b]["degraded"], rows[b]["extraction_failed"]) == (1, 0)
 
 
+EN_BODY = (
+    "The team released a new version of the tool. It is faster and uses less memory than "
+    "the previous release, and the changes are described in the notes."
+)
+
+
+def test_source_language_recorded_from_body_then_title(conn, tmp_path) -> None:
+    # GH#439: 元の記事の言語を、取り出した本文から決めて残す。使える本文が無い(無い・PDF の
+    # バイト列など)ときだけ見出しから決める。本文で決めなかった(日本語の混じった本文)ときは
+    # 見出しに戻らない(日本語の記事に、英語の見出しから外国語の印を付けない)
+    en = add_item(conn, "https://a.example/en", title="Release notes", body=EN_BODY)
+    ja = add_item(conn, "https://a.example/ja", title="Release", body="新しい版を公開しました。")
+    title_only = add_item(
+        conn, "https://a.example/t", title="新しい版を公開しました", body=None, extraction="failed"
+    )
+    pdf = add_item(
+        conn, "https://a.example/pdf", title="新しい版のお知らせです",
+        body="%PDF-1.7 obj stream the and of", extraction="partial",
+    )
+    unknown = add_item(conn, "https://a.example/u", title="", body=None, extraction="failed")
+    mixed = add_item(
+        conn, "https://a.example/m", title="Claude Code",
+        body="試しました。\nimport os\nprint(os.getcwd())\nfor path in paths: run(path)",
+    )
+    ids = [en, ja, title_only, pdf, unknown, mixed]
+    engine = FakeEngine([AnalysisBatch(results=[analysis_for(i) for i in ids])])
+
+    analyze_selected(conn, make_config(tmp_path), engine, "p", ids, logger)
+
+    langs = dict(conn.execute("SELECT item_id, source_language FROM analyses").fetchall())
+    assert langs == {
+        en: "en", ja: "ja", title_only: "ja", pdf: "ja", unknown: None, mixed: None,
+    }
+
+
+def test_source_language_recorded_on_degraded_row_too(conn, tmp_path) -> None:
+    # LLM の失敗で degraded 記録になっても、入力の言語は同じ規則で残す(GH#439)
+    a = add_item(conn, "https://a.example/1", title="Release notes", body=EN_BODY)
+    b = add_item(conn, "https://a.example/2")
+    engine = FakeEngine([LLMError("落ちた")] * 2)
+    with pytest.raises(FullDegradationError):
+        analyze_selected(conn, make_config(tmp_path), engine, "p", [a, b], logger)
+    rows = dict(conn.execute("SELECT item_id, source_language FROM analyses").fetchall())
+    assert rows == {a: "en", b: "ja"}
+
+
 def test_batching_respects_batch_size(conn, tmp_path) -> None:
     ids = [add_item(conn, f"https://a.example/{i}") for i in range(5)]
     engine = FakeEngine(

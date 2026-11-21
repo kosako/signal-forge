@@ -42,6 +42,8 @@ class RankedItem:
     title_ja: str | None = None
     # 本文の抽出に失敗し、見出しだけで分析した(analyses.extraction_failed。GH#240)。表示用
     extraction_failed: bool = False
+    # 元の記事の言語(analyses.source_language。GH#439)。表示用。None = 未判定
+    source_language: str | None = None
     # 今の重点に当たる記事なら、その話題の id(GH#433)。点を足したかどうかは問わない
     focus_topic_id: int | None = None
 
@@ -118,7 +120,8 @@ def digest_candidates(
                analyses.id AS analysis_id, analyses.relevance_score, analyses.novelty,
                analyses.negative_labels, analyses.topic, analyses.title_ja, analyses.summary,
                analyses.category, analyses.recommendation_reason, analyses.implication,
-               analyses.degraded, analyses.extraction_failed, analyses.analyzed_at
+               analyses.degraded, analyses.extraction_failed, analyses.source_language,
+               analyses.analyzed_at
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (
@@ -255,6 +258,7 @@ def _select(
                 degraded=bool(row["degraded"]),
                 title_ja=row["title_ja"],
                 extraction_failed=bool(row["extraction_failed"]),
+                source_language=row["source_language"],
                 focus_topic_id=focus_items.get(row["item_id"]),
             )
         )

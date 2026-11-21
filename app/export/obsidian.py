@@ -34,6 +34,7 @@ import yaml
 from app.config import Config
 from app.export.neutralize import neutralize_markdown
 from app.jst import JST
+from app.language import language_mark
 from app.models import EXTRACTION_FAILED_NOTE
 from app.vault_dir import (
     VaultDir,
@@ -385,12 +386,18 @@ def _item_frontmatter(row: sqlite3.Row, digest_date: str) -> dict:
         "published": row["published_at"] or "",
         "digest_date": digest_date,
         "score": row["total_score"] if row["total_score"] is not None else 0,
+        # 元の記事の言語(GH#439。ja / en / zh / ko / other。未判定は空)
+        "language": row["source_language"] or "",
         "reaction": None,  # フェーズ2で 👍/🔖/✅/👎 を書き戻す予約フィールド(ユーザー所有)
     }
 
 
 def _item_generated_body(row: sqlite3.Row, notes: list[sqlite3.Row]) -> str:
     lines = ["## 要約"]
+    # 元の記事の言語(GH#439)。要約は日本語なので、日本語でない記事だけ示す
+    mark = language_mark(row["source_language"])
+    if mark:
+        lines += [f"> {mark}の記事", ""]
     # 本文を読めず見出しだけで作った要約であることを示す(GH#240)。degraded は分析が無いので出さない
     if row["extraction_failed"] and not row["degraded"]:
         lines += [f"> {EXTRACTION_FAILED_NOTE}", ""]
@@ -507,7 +514,7 @@ def _load_items(conn: sqlite3.Connection, item_ids: list[int]) -> list[sqlite3.R
                analyses.title_ja, analyses.summary, analyses.recommendation_reason,
                analyses.implication,
                analyses.total_score, analyses.degraded, analyses.extraction_failed,
-               documents.extracted_text
+               analyses.source_language, documents.extracted_text
         FROM items
         JOIN sources ON sources.id = items.source_id
         JOIN analyses ON analyses.id = (
