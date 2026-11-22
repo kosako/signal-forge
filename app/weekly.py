@@ -13,6 +13,13 @@
 - 材料の本文・話題の名前・前の週の問いは外部の本文に由来するので、prompt では nonce の囲みの中の
   data として渡す。関心プロファイルは本人が書いた file なので、囲みの外に置く
 - 付加機能: LLM が失敗した週は作らず(ログには件数と失敗の種類だけ)、朝バッチは止めない
+
+答えを使う(GH#440 の 2 本目):
+- 今の重点ごとに、コードが「来週も重点のままでいい?」の問いを足す(focus_topic_id 付き)。
+  ❌ ちがう はヘッダの 🎯 外すと同じ(受信デーモンが外す)。LLM には重点の当否の仮説を立てさせない
+- 関心が移った・飽きたの仮説には、LLM が関心プロファイルに足す 1 行(profile_line)を添える。
+  ⭕ そう と答えた後に案を送り、人が承認したときだけ「↑ 上げる」「↓ 下げる」の節に足す(外部の
+  本文に由来する文を、人の承認なしに trusted な file に入れない)
 """
 
 from __future__ import annotations
@@ -23,7 +30,8 @@ import re
 import secrets
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, get_args
@@ -35,7 +43,7 @@ from app.config import Config
 from app.jst import JST
 from app.prompting import fill_template, sanitize
 
-PROMPT_VERSION = "weekly-v001"
+PROMPT_VERSION = "weekly-v002"
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 WEEKDAY = 6  # datetime.weekday() の日曜。作る朝と送る夜
@@ -49,14 +57,23 @@ PREVIOUS_WEEKS = 4  # 前の週までの問いを渡す範囲(週)
 MAX_PREVIOUS = 24
 EXAMPLES = 2  # 送るときに添える根拠の見出しの例の数
 EXAMPLE_CHARS = 40
+PROFILE_LINE_CHARS = 60  # 関心プロファイルに足す 1 行の上限(prompt は 40 字以内を指示する)
+FOCUS_NAME_CHARS = 30  # 重点の問いに入れる話題の名前の上限
 
 Kind = Literal["interest_shift", "fatigue", "habit", "source", "focus", "patrol", "other"]
 KINDS: tuple[str, ...] = get_args(Kind)
+# LLM が立てる仮説の種類。今の重点の当否(focus)はコードが話題ごとに問うので、LLM には立てさせない
+DraftKind = Literal["interest_shift", "fatigue", "habit", "source", "patrol", "other"]
+# ⭕ そう のときに関心プロファイルに足す案を送る種類と、足す節
+# (app.analysis.profile.PROFILE_SECTIONS のキー)
+PROFILE_KINDS = {"interest_shift": "up", "fatigue": "down"}
 # 巡回についての仮説が無い週に足す問い(毎晩の質問 1「自分から巡回した?」の代わり)
 PATROL_FALLBACK = "今週も、ダイジェストのほかに、自分から情報を探しに巡回した日が多かった?"
 
 ANSWER_CODES = {"y": "yes", "n": "no", "m": "unsure"}
 ANSWER_LABELS = {"yes": "⭕ そう", "no": "❌ ちがう", "unsure": "🤷 どちらとも"}
+SECTION_LABELS = {"up": "↑ 上げる", "down": "↓ 下げる"}
+PROPOSAL_STATUS_LABELS = {"proposed": "承認待ち", "applied": "足した", "declined": "やめた"}
 
 # 材料の種類と、送るときの根拠の印(今の重点の表示と同じ印。Telegram の 🔖 は 📌 で X の 🔖 と分ける)
 SIGNAL_LABELS = {
@@ -77,9 +94,10 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class HypothesisDraft(BaseModel):
-    kind: Kind
+    kind: DraftKind
     question: str
     evidence: list[str]  # 材料の id("s3")と集計の id("k1")
+    profile_line: str | None = None  # interest_shift・fatigue のときの、関心プロファイルに足す 1 行
 
 
 class WeeklyDraft(BaseModel):
@@ -101,6 +119,8 @@ class Question:
     kind: str
     question: str
     evidence: list[dict] = field(default_factory=list)  # [{"kind": ..., "title": ...}]
+    focus_topic_id: int | None = None  # コードが足した今の重点の問いの話題
+    profile_line: str | None = None  # 検査を通した、関心プロファイルに足す 1 行
 
 
 @dataclass
@@ -154,6 +174,7 @@ def run_weekly(
         logger.warning(f"今週の仮説を作れなかった: {type(e).__name__}", extra=extra)
         return result, []
     questions, result.dropped = select_questions(draft, materials, config.weekly.max_questions)
+    questions = numbered(focus_questions(conn, config, now) + questions)
     result.questions = len(questions)
     if store:
         save_questions(conn, week_date, questions, run_id=run_id)
@@ -539,10 +560,11 @@ def select_questions(
 
     根拠の id は材料と集計の一覧にあるものだけを残し、根拠の無い仮説・長すぎる問い・同じ問いは
     捨てる。巡回についての仮説は 1 つだけにし、無ければ PATROL_FALLBACK を最後に足す(上限の中で。
-    上限に達していれば最後の仮説と入れ替える)。
+    上限に達していれば最後の仮説と入れ替える)。関心プロファイルに足す 1 行は、interest_shift と
+    fatigue の仮説のものだけを clean_profile_line に通して残す(通らなければ問いだけを残す)。
     """
     by_key = {m.key: m for m in materials}
-    selected: list[tuple[str, str, list[dict]]] = []
+    selected: list[tuple[str, str, list[dict], str | None]] = []
     seen: set[str] = set()
     dropped = 0
     has_patrol = False
@@ -567,17 +589,83 @@ def select_questions(
             else {"kind": "stat"}
             for key in keys
         ]
-        selected.append((hypothesis.kind, question, evidence))
+        profile_line = (
+            clean_profile_line(hypothesis.profile_line)
+            if hypothesis.kind in PROFILE_KINDS
+            else None
+        )
+        selected.append((hypothesis.kind, question, evidence, profile_line))
     if not has_patrol:
         if len(selected) >= max_questions:
             selected.pop()
             dropped += 1
-        selected.append(("patrol", PATROL_FALLBACK, []))
+        selected.append(("patrol", PATROL_FALLBACK, [], None))
     questions = [
-        Question(position=position, kind=kind, question=question, evidence=evidence)
-        for position, (kind, question, evidence) in enumerate(selected, start=1)
+        Question(
+            position=position, kind=kind, question=question, evidence=evidence,
+            profile_line=profile_line,
+        )
+        for position, (kind, question, evidence, profile_line) in enumerate(selected, start=1)
     ]
     return questions, dropped
+
+
+def clean_profile_line(value: str | None) -> str | None:
+    """LLM が書いた、関心プロファイルに足す 1 行の案を検査する(通らなければ None = 案を出さない)。
+
+    1 行に潰し、先頭の箇条書き・見出しの記号を外す。長すぎる行と、prompt の囲み・コード・コメントの
+    記号を含む行は捨てる(足した行は関心プロファイルとして分析の prompt に verbatim で入るため)。
+    中身の確かめは人がする(⭕ そう の後に案を送り、承認したときだけ足す)。
+    """
+    if not value:
+        return None
+    line = _one_line(value).lstrip("-*+•・#> ").strip()
+    if not line or len(line) > PROFILE_LINE_CHARS:
+        return None
+    if any(mark in line for mark in ("<<<", ">>>", "```", "<!--", "-->", "DATA-")):
+        return None
+    return line
+
+
+def focus_questions(conn: sqlite3.Connection, config: Config, now: datetime) -> list[Question]:
+    """今の重点ごとに「来週も重点のままでいい?」を問う(GH#440 の 2 本目。❌ ちがう = 🎯 外す)。
+
+    重点は digest と同じ active_focus(重みの高い順に 3 個まで)。話題の名前は外部の本文から LLM が
+    作った文なので、1 行に潰して切る(送るときに escape する)。position は numbered で振り直す。
+    """
+    if not config.focus.enabled:
+        return []
+    from app.focus import active_focus
+
+    questions = []
+    for entry in active_focus(conn, config, now=now):
+        name = _one_line(entry.name)
+        if len(name) > FOCUS_NAME_CHARS:
+            name = name[: FOCUS_NAME_CHARS - 1] + "…"
+        row = conn.execute(
+            "SELECT activated_at FROM focus_topics WHERE id = ?", (entry.topic_id,)
+        ).fetchone()
+        since = ""
+        if row is not None and row["activated_at"]:
+            day = (
+                datetime.strptime(row["activated_at"], "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=UTC)
+                .astimezone(JST)
+            )
+            since = f" {day.month}/{day.day} から"
+        questions.append(
+            Question(
+                position=0,
+                kind="focus",
+                question=f"「{name}」は{since}今の重点。来週も重点のままでいい?",
+                focus_topic_id=entry.topic_id,
+            )
+        )
+    return questions
+
+
+def numbered(questions: list[Question]) -> list[Question]:
+    return [replace(q, position=position) for position, q in enumerate(questions, start=1)]
 
 
 def has_questions(conn: sqlite3.Connection, week_date: str) -> bool:
@@ -599,11 +687,13 @@ def save_questions(
         if not has_questions(conn, week_date):
             conn.executemany(
                 "INSERT INTO weekly_questions (week_date, position, kind, question, "
-                "evidence_json, run_id, prompt_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "evidence_json, run_id, prompt_version, focus_topic_id, profile_line) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         week_date, q.position, q.kind, q.question,
                         json.dumps(q.evidence, ensure_ascii=False), run_id, PROMPT_VERSION,
+                        q.focus_topic_id, q.profile_line,
                     )
                     for q in questions
                 ],
@@ -657,6 +747,15 @@ def evidence_line(evidence_json: str) -> str | None:
     return line
 
 
+def answer_effect(row: Mapping) -> str | None:
+    """答えが次の手になる問いに、送るときに添える 1 行(固定の文言。GH#440 の 2 本目)。"""
+    if row["focus_topic_id"] is not None:
+        return "❌ ちがう と答えると、この話題を今の重点から外します(🎯 外すと同じ)"
+    if row["profile_line"] and row["kind"] in PROFILE_KINDS:
+        return "⭕ そう と答えると、関心のメモに足す 1 行の案を送ります"
+    return None
+
+
 def latest_answer(conn: sqlite3.Connection, question_id: int) -> str | None:
     row = conn.execute(
         "SELECT value FROM weekly_answers WHERE question_id = ? "
@@ -683,6 +782,23 @@ def render_week(conn: sqlite3.Connection, week_date: str | None = None) -> str:
         evidence = evidence_line(q["evidence_json"])
         if evidence:
             lines.append(f"   {evidence}")
+        if q["focus_topic_id"] is not None:
+            lines.append("   ❌ ちがう で今の重点から外す")
+        if q["profile_line"] and q["kind"] in PROFILE_KINDS:
+            proposal = conn.execute(
+                "SELECT status, message_id FROM weekly_profile_proposals WHERE question_id = ?",
+                (q["id"],),
+            ).fetchone()
+            if proposal is None:
+                state = "案は未送信"
+            elif proposal["status"] == "proposed" and proposal["message_id"] is None:
+                state = "案を送れていない"
+            else:
+                state = PROPOSAL_STATUS_LABELS[proposal["status"]]
+            lines.append(
+                f"   関心のメモ({SECTION_LABELS[PROFILE_KINDS[q['kind']]]})に足す案: "
+                f"{_one_line(q['profile_line'])}({state})"
+            )
         for note in conn.execute(
             "SELECT note FROM weekly_question_notes WHERE question_id = ? ORDER BY id", (q["id"],)
         ):
@@ -700,4 +816,10 @@ def render_preview(questions: list[Question]) -> str:
         evidence = evidence_line(json.dumps(q.evidence, ensure_ascii=False))
         if evidence:
             lines.append(f"   {evidence}")
+        if q.focus_topic_id is not None:
+            lines.append("   ❌ ちがう で今の重点から外す")
+        if q.profile_line and q.kind in PROFILE_KINDS:
+            lines.append(
+                f"   関心のメモ({SECTION_LABELS[PROFILE_KINDS[q.kind]]})に足す案: {q.profile_line}"
+            )
     return "\n".join(lines)

@@ -91,7 +91,7 @@ app/
   extraction/     # trafilatura ラッパ — documents を produce(extraction_status 付き)
   analysis/       # llm.py(LLMEngine 抽象層)、fallback.py(主のエンジンが失敗した呼び出しを予備で
                   #   やり直す。GH#156)、stage1.py(事前選別)、analyzer.py(本分析)、
-                  #   trend.py(今日の IT ニュース)、profile.py(関心プロファイルの読込)— analyses を produce
+                  #   trend.py(今日の IT ニュース)、profile.py(関心プロファイルの読込と、承認した 1 行の追記)— analyses を produce
   ranking/        # スコア順選抜・最大10件・ネガティブフィルタ後処理
   digest/         # digests(日本語 Markdown)を produce
   delivery/       # telegram.py(Bot API 直叩き・配信)、poller.py(受信デーモン)、
@@ -123,7 +123,7 @@ tests/
 - 例外として許している依存(段をまたぐ呼び出しそのものが目的のもの。増やすときはここに書く):
   - 差し替え点の抽象: `connectors/base.py`(コネクタの型とエラー。`http.py`・extraction も使う)と `analysis/llm.py`(LLMEngine。§5)は、どの段からも使う。`analysis/fallback.py`(予備への切り替え。§5)は LLMEngine を作る側(cli・run)が使う
   - 受信デーモン(`delivery/poller.py`)は、受け取った操作を各段の入口に渡す(`dig.py`・`dig_answer.py`・出来事の調査の依頼の台帳 `investigate_ledger.py`。返事の起動は `delivery/answer_worker.py` が `dig_answer.py`・`dig_take.py` の未処理を、今すぐの深掘りの起動は `dig.py`・`investigate_ledger.py` の未処理を見て行う)。`investigate_ledger.py` は DB と `models.py` だけに依存する。`investigate.py` は `delivery/telegram.py` を読み込み、`delivery/` を読み込むと poller も読み込まれるので、poller が `investigate.py` を読むと循環する。そのため受け付けの関数だけを分けた(GH#415)
-  - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。出来事の調査(`investigate.py`)は深掘りの段の一部で、`deepdive.py` が dig-now の実行の中で生成を呼び、ノートの公開とカードの送信は深掘りと同じ流れで行う(GH#415)。`investigate.py` もカードとノートの組み立てに `delivery/telegram.py` のエスケープと `export/` の部品を使い、報道の検索に `connectors/gdelt.py` と予備の `connectors/google_news.py`、検索した報道の本文の取得に `extraction/` の取り出し、X の反応に `connectors/x_search.py` の `search_posts` を使う(ADR 0006)。X の検索の口は合成点の `run.py` が X の設定とキーを見て作り、`deepdive.py` を通して渡す(X のキーを調査の側で読まない)。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
+  - 深掘りの段(`deepdive.py`)は、カードの送信と書き出しに `delivery/telegram.py`・`export/obsidian.py` を使う。出来事の調査(`investigate.py`)は深掘りの段の一部で、`deepdive.py` が dig-now の実行の中で生成を呼び、ノートの公開とカードの送信は深掘りと同じ流れで行う(GH#415)。`investigate.py` もカードとノートの組み立てに `delivery/telegram.py` のエスケープと `export/` の部品を使い、報道の検索に `connectors/gdelt.py` と予備の `connectors/google_news.py`、検索した報道の本文の取得に `extraction/` の取り出し、X の反応に `connectors/x_search.py` の `search_posts` を使う(ADR 0006)。X の検索の口は合成点の `run.py` が X の設定とキーを見て作り、`deepdive.py` を通して渡す(X のキーを調査の側で読まない)。深掘りの段と返事(`dig_answer.py`)は、関心プロファイルを `analysis/profile.py` で読む。受信デーモン(`delivery/poller.py`)は、週の仮説の問いから送った案を人が承認したときだけ、同じ `analysis/profile.py` で関心プロファイルに 1 行を足す(GH#440。設計 03 §4)。返事と take の記録(`dig_answer.py`・`dig_take.py`)は、DeepDive の置き場の名前を `deepdive.py` から読む
   - digest 段(`digest/builder.py`)は選抜に `ranking/` を使う(選抜は digest の一部。設計 03 §6)
   - X の興味シグナル(`connectors/x_signals.py`)は、ブックマークを深掘りのキューに積む(`dig.py`)。カードへの返事(`dig_answer.py`)も、調べ直しの依頼を同じ規則でキューに積む(`dig.py`。GH#137)
   - ソースの健康(`source_health.py` の連続の失敗の知らせと週 1 回の健康診断)を、doctor と poller の内蔵タイマー(`delivery/surveys.py`)が使う。🔖 保存節の表示件数(`BOOKMARK_SECTION_MAX`)は、Markdown と Telegram で揃えるため `delivery/telegram.py` が `digest/builder.py` から読む

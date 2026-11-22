@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.analysis.llm import LLMError
 from app.config import FocusConfig, WeeklyConfig
@@ -21,20 +22,26 @@ from app.delivery.surveys import (
     STATE_WATCHDOG_NOTIFIED,
     STATE_WEEKLY_SENT,
     WEEKLY_INTRO,
+    proposal_keyboard,
     weekly_keyboard,
 )
+from app.delivery.telegram import DeliveryError
 from app.jst import JST
+from app.models import FocusEntry
 from app.weekly import (
     PATROL_FALLBACK,
     PROMPT_VERSION,
     HypothesisDraft,
     Material,
+    Question,
     WeeklyDraft,
     build_prompt,
+    clean_profile_line,
     collect_signals,
     collect_stats,
     evidence_line,
     previous_questions,
+    render_preview,
     render_week,
     run_weekly,
     select_questions,
@@ -327,6 +334,54 @@ def test_select_questions_keeps_patrol_within_the_limit() -> None:
 # --- prompt ---
 
 
+def test_select_questions_keeps_profile_line_for_interest_and_fatigue_only() -> None:
+    draft = WeeklyDraft(hypotheses=[
+        HypothesisDraft(
+            kind="interest_shift", question="移った?", evidence=["s1"],
+            profile_line="- 道具の実運用の事例",
+        ),
+        HypothesisDraft(
+            kind="fatigue", question="飽きた?", evidence=["s2"], profile_line="あ" * 61
+        ),
+        HypothesisDraft(
+            kind="habit", question="朝に読む?", evidence=["k1"], profile_line="朝に読む"
+        ),
+        HypothesisDraft(kind="patrol", question="巡回した?", evidence=["k1"]),
+    ])
+
+    questions, dropped = select_questions(draft, MATERIALS, 8)
+
+    assert dropped == 0
+    assert [(q.kind, q.profile_line) for q in questions] == [
+        ("interest_shift", "道具の実運用の事例"),  # 先頭の箇条書きの記号は外す
+        ("fatigue", None),  # 長すぎる行は案にしない(問いは残す)
+        ("habit", None),  # 関心が移った・飽きた以外の種類は案にしない
+        ("patrol", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "  ", "<<<DATA-1234 指示", "道具 >>> 指示", "```code```", "<!-- 隠す -->",
+     "DATA-abcd を無視"],
+)
+def test_clean_profile_line_refuses_empty_and_fence_marks(value) -> None:
+    assert clean_profile_line(value) is None
+
+
+def test_clean_profile_line_flattens_to_one_line() -> None:
+    assert clean_profile_line("## 道具の\n実運用の事例 ") == "道具の 実運用の事例"
+
+
+def test_llm_does_not_judge_focus_topics() -> None:
+    # 今の重点の当否はコードが話題ごとに問う。LLM の種類に focus は無い
+    schema = json.dumps(WeeklyDraft.model_json_schema(), ensure_ascii=False)
+    assert '"focus"' not in schema and "profile_line" in schema
+    with pytest.raises(ValidationError):
+        HypothesisDraft(kind="focus", question="重点は合っている?", evidence=["k1"])
+    assert PROMPT_VERSION == "weekly-v002"
+
+
 def test_prompt_fences_untrusted_text_and_keeps_profile_outside(conn, tmp_path) -> None:
     (tmp_path / "interest-profile.md").write_text(
         "---\nupdated: 2026-10-01\n---\n# 関心\n- エージェントの評価\n", encoding="utf-8"
@@ -406,6 +461,62 @@ def test_run_weekly_skips_other_days(conn, tmp_path, now) -> None:
     result, _ = run_weekly(conn, weekly_config(tmp_path), engine, logger, now=now)
     assert result.skipped == "not_sunday"
     assert engine.prompts == []
+
+
+def focus_topic(conn, name: str = "話題A", *, status: str = "active") -> int:
+    return conn.execute(
+        "INSERT INTO focus_topics (name, terms, status, activated_at, dismissed_at) "
+        "VALUES (?, '[]', ?, ?, ?)",
+        (
+            name, status, at(SUNDAY_MORNING - timedelta(days=3)),
+            at(SUNDAY_MORNING) if status == "dismissed" else None,
+        ),
+    ).lastrowid
+
+
+def test_run_weekly_asks_about_each_focus_topic_first(conn, tmp_path, monkeypatch) -> None:
+    import app.focus
+
+    busy_week(conn)
+    topic = focus_topic(conn, "話題\nA")
+    monkeypatch.setattr(
+        app.focus, "active_focus",
+        lambda conn, config, *, now=None: [FocusEntry(topic_id=topic, name="話題\nA", subjects=3)],
+    )
+    config = replace(weekly_config(tmp_path), focus=FocusConfig(enabled=True))
+    engine = FakeEngine([WeeklyDraft(hypotheses=[
+        HypothesisDraft(
+            kind="interest_shift", question="移った?", evidence=["s1"],
+            profile_line="道具の実運用の事例",
+        ),
+    ])])
+
+    result, _ = run_weekly(conn, config, engine, logger, now=SUNDAY_MORNING)
+
+    rows = conn.execute(
+        "SELECT position, kind, question, focus_topic_id, profile_line FROM weekly_questions "
+        "ORDER BY position"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        (1, "focus", "「話題 A」は 10/22 から今の重点。来週も重点のままでいい?", topic, None),
+        (2, "interest_shift", "移った?", None, "道具の実運用の事例"),
+        (3, "patrol", PATROL_FALLBACK, None, None),
+    ]
+    assert result.questions == 3
+    assert "今の重点が来週も重点でよいかは、別に聞く" in engine.prompts[0]
+
+
+def test_render_preview_shows_what_the_answer_does() -> None:
+    text = render_preview([
+        Question(position=1, kind="focus", question="重点のまま?", focus_topic_id=3),
+        Question(position=2, kind="fatigue", question="飽きた?", profile_line="紹介だけの記事"),
+    ])
+    assert text.splitlines() == [
+        "1. [focus] 重点のまま?",
+        "   ❌ ちがう で今の重点から外す",
+        "2. [fatigue] 飽きた?",
+        "   関心のメモ(↓ 下げる)に足す案: 紹介だけの記事",
+    ]
 
 
 def test_run_weekly_skips_thin_weeks(conn, tmp_path) -> None:
@@ -646,6 +757,309 @@ def test_reply_to_question_is_recorded_once_as_note(conn, tmp_path) -> None:
     assert [text for _, text in api.sent] == ["📝 補足を記録しました。来週の仮説の材料にします"]
     assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 0  # URL の投入に回さない
     assert "補足: X は娯楽で見ている" in render_week(conn)
+
+
+# --- 答えを使う(GH#440 の 2 本目) ---
+
+PROFILE = """---
+updated: 2026-07-15
+---
+# 関心プロファイル
+
+### ↑ 上げる
+
+- 今の課題に直結してすぐ使える
+
+### ↓ 下げる
+
+- 細かい Tips
+"""
+
+
+def answer_week(conn, tmp_path) -> tuple[int, int, int, int]:
+    """重点の問い・関心が移った問い・飽きた問いを送った週(message_id は 901・902・903)。"""
+    only_weekly_due(conn)
+    topic = focus_topic(conn)
+    ids = []
+    for position, (kind, question, topic_id, line) in enumerate([
+        ("focus", "「話題A」は今の重点。来週も重点のままでいい?", topic, None),
+        ("interest_shift", "道具の実運用を追いたい?", None, "道具の <実運用> の事例"),
+        ("fatigue", "紹介だけの記事は減らしていい?", None, "紹介するだけの記事"),
+    ], start=1):
+        ids.append(conn.execute(
+            "INSERT INTO weekly_questions (week_date, position, kind, question, prompt_version, "
+            "focus_topic_id, profile_line) VALUES (?, ?, ?, ?, 'weekly-v002', ?, ?)",
+            (WEEK, position, kind, question, topic_id, line),
+        ).lastrowid)
+    conn.commit()
+    run_due_timers(conn, weekly_config(tmp_path), FakeApi(), logger, SUNDAY_NIGHT)
+    return topic, *ids
+
+
+def poll(conn, tmp_path, *updates, api: FakeApi | None = None) -> FakeApi:
+    api = api or FakeApi()
+    api._batches = [list(updates)]
+    api.sent.extend([(CHAT_ID, "前の 3 通")] * 3)  # 送る案の message_id を 904 からにする
+    api.markups.extend([None] * 3)
+    poll_once(conn, weekly_config(tmp_path), api, logger, now_fn=lambda: SUNDAY_NIGHT)
+    return api
+
+
+def topic_status(conn, topic: int) -> str:
+    return conn.execute("SELECT status FROM focus_topics WHERE id = ?", (topic,)).fetchone()[0]
+
+
+def test_sunday_night_tells_what_the_answer_does(conn, tmp_path) -> None:
+    only_weekly_due(conn)
+    api = FakeApi()
+    topic = focus_topic(conn)
+    conn.execute(
+        "INSERT INTO weekly_questions (week_date, position, kind, question, prompt_version, "
+        "focus_topic_id) VALUES (?, 1, 'focus', '重点のまま?', 'weekly-v002', ?)",
+        (WEEK, topic),
+    )
+    conn.execute(
+        "INSERT INTO weekly_questions (week_date, position, kind, question, prompt_version, "
+        "profile_line) VALUES (?, 2, 'interest_shift', '移った?', 'weekly-v002', '道具の事例')",
+        (WEEK,),
+    )
+    conn.commit()
+
+    run_due_timers(conn, weekly_config(tmp_path), api, logger, SUNDAY_NIGHT)
+
+    assert [text for _, text in api.sent] == [
+        f"{WEEKLY_INTRO}\n\n🔎 今週の仮説 1/2\n重点のまま?\n"
+        "❌ ちがう と答えると、この話題を今の重点から外します(🎯 外すと同じ)",
+        "🔎 今週の仮説 2/2\n移った?\n⭕ そう と答えると、関心のメモに足す 1 行の案を送ります",
+    ]
+
+
+def test_no_on_a_focus_question_dismisses_the_topic_and_a_change_restores_it(
+    conn, tmp_path
+) -> None:
+    topic, focus_q, _, _ = answer_week(conn, tmp_path)
+
+    api = poll(conn, tmp_path, answer_button(f"w:{focus_q}:n", message_id=901))
+    assert api.answered == [("cb1", "❌ ちがう と記録し、🎯 今の重点から外しました")]
+    assert topic_status(conn, topic) == "dismissed"
+
+    api = poll(
+        conn, tmp_path,
+        answer_button(f"w:{focus_q}:n", message_id=901, update_id=2),  # 押し直し
+        answer_button(f"w:{focus_q}:y", message_id=901, update_id=3),  # 答えを直す
+        answer_button(f"w:{focus_q}:m", message_id=901, update_id=4),
+    )
+    assert api.answered == [
+        ("cb2", "❌ ちがう と記録してあります"),
+        ("cb3", "⭕ そう と記録し、↩️ 今の重点の候補に戻しました(次の朝から重みで決めます)"),
+        ("cb4", "🤷 どちらとも と記録しました"),
+    ]
+    assert topic_status(conn, topic) == "candidate"
+    assert api.sent[3:] == []  # 重点の問いには案を送らない
+    assert "   ❌ ちがう で今の重点から外す" in render_week(conn)
+
+
+def test_no_on_a_focus_question_without_a_topic_only_records(conn, tmp_path) -> None:
+    # 1 本目(weekly-v001)の LLM が書いた重点の問いには話題が無い。答えは記録だけ
+    topic = focus_topic(conn)
+    a, _ = sent_week(conn, tmp_path)
+    conn.execute("UPDATE weekly_questions SET kind = 'focus' WHERE id = ?", (a,))
+    conn.commit()
+
+    api = poll(conn, tmp_path, answer_button(f"w:{a}:n", message_id=901))
+
+    assert api.answered == [("cb1", "❌ ちがう と記録しました")]
+    assert topic_status(conn, topic) == "active"
+
+
+def test_no_on_a_topic_already_dismissed_keeps_it_dismissed(conn, tmp_path) -> None:
+    topic, focus_q, _, _ = answer_week(conn, tmp_path)
+    conn.execute("UPDATE focus_topics SET status = 'dismissed', dismissed_at = ? WHERE id = ?",
+                 (at(SUNDAY_NIGHT), topic))
+    conn.commit()
+
+    api = poll(conn, tmp_path, answer_button(f"w:{focus_q}:n", message_id=901))
+
+    assert api.answered == [("cb1", "❌ ちがう と記録しました(🎯 外し済みです)")]
+    assert topic_status(conn, topic) == "dismissed"
+
+
+def proposals(conn) -> list[tuple]:
+    return [
+        tuple(r) for r in conn.execute(
+            "SELECT question_id, section, line, status, message_id FROM weekly_profile_proposals "
+            "ORDER BY id"
+        )
+    ]
+
+
+def test_yes_on_an_interest_question_sends_one_profile_proposal(conn, tmp_path) -> None:
+    _, _, up_q, down_q = answer_week(conn, tmp_path)
+
+    api = poll(
+        conn, tmp_path,
+        answer_button(f"w:{up_q}:y", message_id=902),
+        answer_button(f"w:{up_q}:y", message_id=902, update_id=2),  # 押し直しで送り直さない
+        answer_button(f"w:{down_q}:n", message_id=903, update_id=3),  # ちがう は案にしない
+    )
+
+    assert api.answered == [
+        ("cb1", "⭕ そう と記録しました。関心のメモに足す案を送ります"),
+        ("cb2", "⭕ そう と記録してあります"),
+        ("cb3", "❌ ちがう と記録しました"),
+    ]
+    [(question_id, section, line, status, message_id)] = proposals(conn)
+    assert (question_id, section, line, status, message_id) == (
+        up_q, "up", "道具の <実運用> の事例", "proposed", 904
+    )
+    proposal_id = conn.execute("SELECT id FROM weekly_profile_proposals").fetchone()[0]
+    assert [text for _, text in api.sent[3:]] == [
+        "📝 関心のメモに足す案(今週の仮説 2)\n「↑ 上げる」の節に、次の 1 行を足します。\n"
+        "- 道具の &lt;実運用&gt; の事例\n足すのは「✅ 足す」を押したときだけです。"
+    ]
+    assert api.markups[3:] == [proposal_keyboard(proposal_id)]
+    assert api.markups[3]["inline_keyboard"][0] == [
+        {"text": "✅ 足す", "callback_data": f"p:{proposal_id}:a"},
+        {"text": "やめる", "callback_data": f"p:{proposal_id}:x"},
+    ]
+
+
+def test_proposal_not_sent_is_sent_on_the_next_yes(conn, tmp_path) -> None:
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+
+    class FailingSend(FakeApi):
+        def send_message(self, chat_id, text, *, reply_markup=None):
+            raise DeliveryError("送れない")
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902), api=FailingSend())
+    assert api.answered == [("cb1", "⭕ そう と記録しました。関心のメモに足す案を送ります")]
+    assert [p[4] for p in proposals(conn)] == [None]
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902, update_id=2))
+    assert api.answered == [("cb2", "⭕ そう と記録してあります。関心のメモに足す案を送ります")]
+    assert [p[4] for p in proposals(conn)] == [904]
+
+
+def test_proposal_shows_the_whole_line_it_will_add(conn, tmp_path) -> None:
+    # escape で長くなる行も切らずに出す(承認で足すのは、この行の写しそのもの)
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+    line = "&" * 60
+    conn.execute("UPDATE weekly_questions SET profile_line = ? WHERE id = ?", (line, up_q))
+    conn.commit()
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902))
+
+    assert [p[2] for p in proposals(conn)] == [line]
+    assert f"\n- {'&amp;' * 60}\n" in api.sent[3][1]
+
+
+def test_proposal_is_sent_even_when_the_buttons_cannot_be_updated(conn, tmp_path) -> None:
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+
+    class BrokenEdit(FakeApi):
+        def edit_message_reply_markup(self, chat_id, message_id, reply_markup):
+            raise DeliveryError("Telegram editMessageReplyMarkup が失敗: HTTP 400: 盤面")
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902), api=BrokenEdit())
+
+    assert api.answered == [("cb1", "⭕ そう と記録しました。関心のメモに足す案を送ります")]
+    assert [p[4] for p in proposals(conn)] == [904]
+    assert api.sent[3][1].startswith("📝 関心のメモに足す案(今週の仮説 2)")
+
+
+def sent_proposal(conn, tmp_path) -> int:
+    (tmp_path / "interest-profile.md").write_text(PROFILE, encoding="utf-8")
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+    poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902, update_id=90))
+    return conn.execute("SELECT id FROM weekly_profile_proposals").fetchone()[0]  # message_id 904
+
+
+def test_approving_the_proposal_adds_the_line_once(conn, tmp_path) -> None:
+    proposal_id = sent_proposal(conn, tmp_path)
+
+    api = poll(
+        conn, tmp_path,
+        answer_button(f"p:{proposal_id}:a", message_id=904),
+        answer_button(f"p:{proposal_id}:a", message_id=904, update_id=2),
+        answer_button(f"p:{proposal_id}:x", message_id=904, update_id=3),  # 足した後のやめる
+    )
+
+    assert api.answered == [
+        ("cb1", "✅ 関心のメモに足しました。次の朝の判定から使います"),
+        ("cb2", "✅ 足してあります"),
+        ("cb3", "もう足してあります。外すときは関心のメモを直接直してください"),
+    ]
+    text = (tmp_path / "interest-profile.md").read_text(encoding="utf-8")
+    assert text == PROFILE.replace("updated: 2026-07-15", "updated: 2026-10-25").replace(
+        "- 今の課題に直結してすぐ使える\n",
+        "- 今の課題に直結してすぐ使える\n- 道具の <実運用> の事例\n",
+    )
+    assert [p[3] for p in proposals(conn)] == ["applied"]
+    assert all(
+        edited == (CHAT_ID, 904, proposal_keyboard(proposal_id, selected="applied"))
+        for edited in api.edited
+    )
+    assert api.edited[0][2]["inline_keyboard"][0][0]["text"] == "✅ 足す ✓"
+    assert "関心のメモ(↑ 上げる)に足す案: 道具の <実運用> の事例(足した)" in render_week(conn)
+
+
+def test_declining_keeps_the_profile_and_can_still_be_approved(conn, tmp_path) -> None:
+    proposal_id = sent_proposal(conn, tmp_path)
+
+    api = poll(
+        conn, tmp_path,
+        answer_button(f"p:{proposal_id}:x", message_id=904),
+        answer_button(f"p:{proposal_id}:x", message_id=904, update_id=2),
+    )
+    assert api.answered == [
+        ("cb1", "やめました。関心のメモは変えていません"),
+        ("cb2", "やめてあります"),
+    ]
+    assert (tmp_path / "interest-profile.md").read_text(encoding="utf-8") == PROFILE
+    assert [p[3] for p in proposals(conn)] == ["declined"]
+    assert api.edited[0] == (CHAT_ID, 904, proposal_keyboard(proposal_id, selected="declined"))
+
+    api = poll(conn, tmp_path, answer_button(f"p:{proposal_id}:a", message_id=904, update_id=3))
+    assert api.answered == [("cb3", "✅ 関心のメモに足しました。次の朝の判定から使います")]
+    assert [p[3] for p in proposals(conn)] == ["applied"]
+
+
+def test_approving_without_the_section_changes_nothing(conn, tmp_path) -> None:
+    proposal_id = sent_proposal(conn, tmp_path)
+    broken = "---\nupdated: 2026-07-15\n---\n# 関心プロファイル\n"
+    (tmp_path / "interest-profile.md").write_text(broken, encoding="utf-8")
+
+    api = poll(conn, tmp_path, answer_button(f"p:{proposal_id}:a", message_id=904))
+
+    assert api.answered == [
+        ("cb1", "⚠️ 関心のメモに足せませんでした。file と節の見出しを確かめてください")
+    ]
+    assert (tmp_path / "interest-profile.md").read_text(encoding="utf-8") == broken
+    assert [p[3] for p in proposals(conn)] == ["proposed"]
+    assert api.edited == []
+
+
+@pytest.mark.parametrize(
+    ("data", "message_id", "chat_id"),
+    [
+        ("p:{p}:a", 902, CHAT_ID),  # 問いのメッセージ
+        ("p:{p}:a", 904, CHAT_ID + 1),  # 別の chat
+        ("p:999:a", 904, CHAT_ID),  # 無い案
+    ],
+)
+def test_proposal_button_not_tied_to_the_proposal_is_refused(
+    conn, tmp_path, data, message_id, chat_id
+) -> None:
+    proposal_id = sent_proposal(conn, tmp_path)
+
+    api = poll(
+        conn, tmp_path,
+        answer_button(data.format(p=proposal_id), message_id=message_id, chat_id=chat_id),
+    )
+
+    assert api.answered == [("cb1", "⚠️ この案には対応できません")]
+    assert (tmp_path / "interest-profile.md").read_text(encoding="utf-8") == PROFILE
+    assert [p[3] for p in proposals(conn)] == ["proposed"]
 
 
 # --- intel weekly ---
