@@ -129,6 +129,24 @@ def test_redirect_hop_is_rechecked() -> None:
         client.get("https://example.com/short")
 
 
+def test_allow_url_refuses_a_redirect_hop_before_sending_it() -> None:
+    # 今すぐの深掘りの取り直し(GH#446): X の投稿へ転送されたら、そのホップは送らない
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("host", ""))
+        return httpx.Response(302, headers={"location": "https://x.com/i/web/status/1"})
+
+    client = make_client(handler, hosts={"x.com": ["93.184.216.35"]})
+    allow = lambda url: "x.com" not in url  # noqa: E731
+    with pytest.raises(FatalError, match="取りに行かない URL"):
+        client.get("https://example.com/article", allow_url=allow)
+    assert sent == ["example.com"]
+    with pytest.raises(FatalError, match="取りに行かない URL"):
+        client.get("https://x.com/i/web/status/2", allow_url=allow)
+    assert sent == ["example.com"]  # 最初の URL も送る前に確かめる
+
+
 def test_redirect_followed_and_permanent_flagged() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.headers.get("host", "").startswith("example.com"):

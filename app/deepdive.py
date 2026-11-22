@@ -532,7 +532,6 @@ def _refetch_body(
     config: Config,
     http: HttpClient,
     candidate: DigCandidate,
-    day: str,
     logger: logging.Logger,
     log_extra: dict,
 ) -> DigCandidate | None:
@@ -545,7 +544,9 @@ def _refetch_body(
     from app.extraction.extractor import fetch_article_text
 
     try:
-        text = fetch_article_text(http, candidate.canonical_url)
+        # 転送先のどのホップも同じ条件で確かめる(X の投稿や 1 分に 1 回の host へ転送されたら
+        # 取りに行かない)
+        text = fetch_article_text(http, candidate.canonical_url, allow_url=refetchable)
     except Exception as e:  # 取り直しは付加の手順。失敗しても dig-now 全体は止めない
         logger.warning(f"本文を取り直せなかった: {type(e).__name__}", extra=log_extra)
         return None
@@ -553,10 +554,19 @@ def _refetch_body(
         logger.warning("取り直した本文が短すぎるか、取れなかった", extra=log_extra)
         return None
     assert text is not None
-    save_refetched_document(conn, config, candidate.item_id, text)
-    conn.commit()
+    try:
+        save_refetched_document(conn, config, candidate.item_id, text)
+        conn.commit()
+    except sqlite3.Error as e:
+        # 残せなかった(ロック競合など)。この依頼は閉じて知らせ、後ろの依頼は続ける
+        if conn.in_transaction:
+            conn.rollback()
+        logger.warning(f"取り直した本文を残せなかった: {type(e).__name__}", extra=log_extra)
+        return None
     logger.info("本文をリンク先から取り直した", extra=log_extra)
-    return replace(candidate, body=text, fetched_date=day)
+    # 取り直した日(JST)。取りに行く前の day ではなく、残した後の日付にする(documents の
+    # extracted_at と原文ノートの fetched を合わせる)
+    return replace(candidate, body=text, fetched_date=today_jst())
 
 
 # 今すぐの依頼を作れなかったときの知らせ(GH#388)。固定の文言だけにし、外部由来の本文を入れない
@@ -635,7 +645,7 @@ def _run_dig_now_locked(
             # 本文が保存の期間を過ぎて消えた記事は、リンク先から取り直して掘る(GH#446)
             if http is None:
                 http = HttpClient()
-            refetched = _refetch_body(conn, config, http, candidate, day, logger, log_extra)
+            refetched = _refetch_body(conn, config, http, candidate, logger, log_extra)
             if refetched is None:
                 close_now_request(
                     conn, candidate.item_id, candidate.now_started_at, to_morning=False

@@ -3108,6 +3108,63 @@ def test_dig_now_refetches_a_lost_body_and_digs(conn, config) -> None:
     assert "⚡ 今すぐの依頼" in card
 
 
+REFETCH_FAILED = (
+    "⚠️ {id} は本文をリンク先から取り直せなかったため、今すぐの深掘りを作れませんでした"
+)
+
+
+def test_dig_now_does_not_follow_a_redirect_to_an_x_post(conn, config) -> None:
+    # 取り直しの転送先も確かめる。X の投稿へ転送されたら取りに行かずに閉じて知らせる(GH#446)
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute("DELETE FROM documents")
+    conn.commit()
+    calls: list[str] = []
+    http = make_http(
+        lambda request: httpx.Response(302, headers={"location": "https://x.com/i/web/status/1"}),
+        calls,
+    )
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
+
+    assert [c for c in calls if "x.com" in c] == []
+    assert api.sent == [(10, REFETCH_FAILED.format(id=item))]
+
+
+def test_dig_now_closes_when_the_refetched_body_cannot_be_saved_and_goes_on(
+    conn, config, monkeypatch
+) -> None:
+    # 取り直した本文を残せない(ロック競合など)ときは、その依頼を閉じて知らせ、後ろの依頼は続ける
+    import app.deepdive as deepdive
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(deepdive, "save_refetched_document", locked)
+    lost = add_item(conn, "https://ja.example/消えた", language="ja")
+    enqueue(conn, lost)
+    request_now(conn, config, lost)
+    conn.execute("DELETE FROM documents WHERE item_id = ?", (lost,))
+    kept = add_item(conn, "https://ja.example/残った", title="日本語の記事", language="ja")
+    enqueue(conn, kept)
+    request_now(conn, config, kept)
+    conn.commit()
+    http = make_http(
+        lambda request: httpx.Response(
+            200, html=ARTICLE_HTML, headers={"content-type": "text/html; charset=utf-8"}
+        )
+    )
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
+
+    assert queue_state(conn, lost)["now_requested_at"] is None
+    assert (10, REFETCH_FAILED.format(id=lost)) in api.sent
+    assert queue_state(conn, kept)["status"] == "done"  # 後ろの依頼は作った
+
+
 @pytest.mark.parametrize("status", [404, 200])
 def test_dig_now_closes_and_notifies_when_the_body_cannot_be_refetched(
     conn, config, status
