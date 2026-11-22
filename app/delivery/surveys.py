@@ -176,11 +176,15 @@ def proposal_keyboard(proposal_id: int, *, selected: str | None = None) -> dict:
 
 
 def proposal_text(position: int, section: str, line: str) -> str:
-    """関心プロファイルに足す案の本文。行は外部の本文に由来する LLM の文なので escape する。"""
+    """関心プロファイルに足す案の本文。行は外部の本文に由来する LLM の文なので escape する。
+
+    行は切らずに全文を出す(承認で足すのは、この行の写しそのもの。作るときに 1 行に潰して 60 字まで
+    に限っているので、escape しても Telegram の上限に届かない)。
+    """
     return "\n".join([
         f"📝 関心のメモに足す案(今週の仮説 {position})",
         f"「{SECTION_LABELS[section]}」の節に、次の 1 行を足します。",
-        f"- {escape_and_truncate(' '.join(line.split()), 200)}",
+        f"- {escape_text(line)}",
         "足すのは「✅ 足す」を押したときだけです。",
     ])
 

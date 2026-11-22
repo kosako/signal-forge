@@ -1871,9 +1871,14 @@ def _record_weekly_answer(
     if send_proposal:
         text += "。関心のメモに足す案を送ります"
     api.answer_callback_query(callback_id, text=text)
-    _edit_markup_best_effort(api, callback, weekly_keyboard(question_id, selected=value), logger)
-    if send_proposal:
-        _send_profile_proposal(conn, config, api, proposal, logger)
+    try:
+        _edit_markup_best_effort(
+            api, callback, weekly_keyboard(question_id, selected=value), logger
+        )
+    finally:
+        # 盤面を書き換えられなくても、記録した案は送る(盤面の失敗はこの後に投げ直す)
+        if send_proposal:
+            _send_profile_proposal(conn, config, api, proposal, logger)
 
 
 def _send_profile_proposal(

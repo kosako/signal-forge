@@ -940,6 +940,33 @@ def test_proposal_not_sent_is_sent_on_the_next_yes(conn, tmp_path) -> None:
     assert [p[4] for p in proposals(conn)] == [904]
 
 
+def test_proposal_shows_the_whole_line_it_will_add(conn, tmp_path) -> None:
+    # escape で長くなる行も切らずに出す(承認で足すのは、この行の写しそのもの)
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+    line = "&" * 60
+    conn.execute("UPDATE weekly_questions SET profile_line = ? WHERE id = ?", (line, up_q))
+    conn.commit()
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902))
+
+    assert [p[2] for p in proposals(conn)] == [line]
+    assert f"\n- {'&amp;' * 60}\n" in api.sent[3][1]
+
+
+def test_proposal_is_sent_even_when_the_buttons_cannot_be_updated(conn, tmp_path) -> None:
+    _, _, up_q, _ = answer_week(conn, tmp_path)
+
+    class BrokenEdit(FakeApi):
+        def edit_message_reply_markup(self, chat_id, message_id, reply_markup):
+            raise DeliveryError("Telegram editMessageReplyMarkup が失敗: HTTP 400: 盤面")
+
+    api = poll(conn, tmp_path, answer_button(f"w:{up_q}:y", message_id=902), api=BrokenEdit())
+
+    assert api.answered == [("cb1", "⭕ そう と記録しました。関心のメモに足す案を送ります")]
+    assert [p[4] for p in proposals(conn)] == [904]
+    assert api.sent[3][1].startswith("📝 関心のメモに足す案(今週の仮説 2)")
+
+
 def sent_proposal(conn, tmp_path) -> int:
     (tmp_path / "interest-profile.md").write_text(PROFILE, encoding="utf-8")
     _, _, up_q, _ = answer_week(conn, tmp_path)
