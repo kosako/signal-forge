@@ -20,7 +20,7 @@
  [Telegram 更新]───▶ │ ■ 受信デーモン  intel poll                    │
   (ボタン/URL/       │   (KeepAlive 常駐・long polling)             │
    夜アンケート)      │   → signals / items(manual) / 感想 / 深掘り  │
-                    │   内蔵タイマー: 夜アンケート送信・watchdog      │
+                    │   内蔵タイマー: 夜の一覧の送信・watchdog        │
                     └─────────────────────────────────────────────┘
 ```
 

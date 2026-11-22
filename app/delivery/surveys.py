@@ -1,5 +1,11 @@
-"""夜アンケート・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認と仮説の問い
+"""夜の未消化一覧・🔖追い掛け・watchdog・朝バッチ失敗通知・週 1 回の読んだのまとめ確認と仮説の問い
 (設計 04 §4 / 05 §1.2, §4)。
+
+夜アンケートの 2 問(巡回した?・読むのにかかった時間)は 2026-11-22 で送るのをやめた(GH#440 の
+3 本目)。巡回は日曜の夜の週の仮説の問いで確かめる
+([weekly].enabled のとき)。送った質問のボタンは受信デーモンが今までどおり
+受け付ける(q1_keyboard・q2_keyboard は ✓ の盤面に使う)。夜の送信の時刻と送信済みの state は、
+未消化一覧と追い掛けのために残す。
 
 - 起動は受信デーモン(intel poll)の内蔵タイマー(送信経路をポーラーに集約)。
   時刻は config([telegram].survey_time / watchdog_time。JST)
@@ -347,19 +353,11 @@ def send_evening_survey(
     logger: logging.Logger,
     now: datetime,
 ) -> None:
-    """質問1・質問2、続けて 🔖追い掛けを送る(設計 04 §4)。"""
+    """夜の未消化一覧、続けて 🔖追い掛けを送る(設計 04 §4)。
+
+    夜アンケートの 2 問は 2026-11-22 で送るのをやめた(GH#440 の 3 本目。モジュールの docstring)。
+    """
     chat_id = _require_chat_id(config)
-    date_compact = now.strftime("%Y%m%d")
-    api.send_message(
-        chat_id,
-        "📝 今日、自分から情報を探しに巡回した?\n(ダイジェストを読むのは含めない)",
-        reply_markup=q1_keyboard(date_compact),
-    )
-    api.send_message(
-        chat_id,
-        "📝 今朝のダイジェストを読むのにかかった時間は?\n(ざっくりでOK)",
-        reply_markup=q2_keyboard(date_compact),
-    )
     backlog = pending_dig_items(conn)
     # 明朝の予定(GH#349)。夜の時点のキューを朝の選定と同じ規則で並べる(読むだけ)
     plan = next_morning_plan(conn, config, (now + timedelta(days=1)).strftime("%Y-%m-%d"))
