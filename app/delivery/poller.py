@@ -29,7 +29,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from app.config import Config
@@ -37,6 +37,7 @@ from app.db import insert_item_with_dedup
 from app.delivery.answer_worker import AnswerWorker, DigNowWorker
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
+    PROPOSAL_CODES,
     READ_MIN_CHOICES,
     BacklogButtons,
     SentReadConfirm,
@@ -44,6 +45,8 @@ from app.delivery.surveys import (
     followup_keyboard,
     on_backlog,
     pending_dig_items,
+    proposal_keyboard,
+    proposal_text,
     q1_keyboard,
     q2_keyboard,
     read_confirm_keyboard,
@@ -98,7 +101,7 @@ from app.normalize import (
     normalize_text_for_hash,
     normalize_url,
 )
-from app.weekly import ANSWER_CODES, ANSWER_LABELS, latest_answer
+from app.weekly import ANSWER_CODES, ANSWER_LABELS, PROFILE_KINDS, latest_answer
 
 OFFSET_KEY = "getupdates_offset"
 RECONNECT_BACKOFF_S = 30  # 連続失敗時の再接続間隔(設計 05 §8)
@@ -463,7 +466,15 @@ def _handle_callback(
         # 週の仮説の問いへの答え(GH#440)。N は weekly_questions の id(ASCII の数字)
         if prefix == "w" and re.fullmatch(r"[0-9]{1,9}", arg) and code in ANSWER_CODES:
             _record_weekly_answer(
-                conn, config, api, callback, callback_id, int(arg), ANSWER_CODES[code], logger
+                conn, config, api, callback, callback_id, int(arg), ANSWER_CODES[code], logger,
+                now=now_fn(),
+            )
+            return
+        # 週の仮説の答えから送った、関心プロファイルに足す案(GH#440 の 2 本目)。N は案の id
+        if prefix == "p" and re.fullmatch(r"[0-9]{1,9}", arg) and code in PROPOSAL_CODES:
+            _record_profile_proposal(
+                conn, config, api, callback, callback_id, int(arg), PROPOSAL_CODES[code], logger,
+                now=now_fn(),
             )
             return
         # ヘッダの今の重点を外す(t)・戻す(u)。N は写しの番号(1 桁の ASCII の数字。GH#433)
@@ -1762,6 +1773,8 @@ def _record_weekly_answer(
     question_id: int,
     value: str,
     logger: logging.Logger,
+    *,
+    now: datetime,
 ) -> None:
     """週の仮説の問いのボタン(GH#440。設計 04 §3・§4)。
 
@@ -1769,7 +1782,14 @@ def _record_weekly_answer(
     chat にあることを確かめてから記録する(callback_data の番号だけを信じない)。答えは追記だけで、
     今の最新の答えと同じなら書かない(押し直し・再配達は記録済みとして答える)。確認と記録は 1 つの
     トランザクション。押した後は、選んだボタンに ✓ を付けた盤面に差し替える。
+
+    答えを使う(2 本目): 今の重点の問い(focus_topic_id)は、❌ ちがう を記録したら 🎯 外すと
+    同じく話題を外し、❌ ちがう から答えを直したら戻す(同じトランザクション)。関心プロファイルに
+    足す 1 行のある問いは、最新の答えが ⭕ そう なら案の行を作り、まだ送れていなければ answer の
+    後に送る(送れなかったら、もう一度 ⭕ そう を押したときに送り直す)。
     """
+    from app.focus import dismiss_topic, restore_topic
+
     message = callback.get("message")
     message_id = message.get("message_id") if isinstance(message, dict) else None
     chat = message.get("chat") if isinstance(message, dict) else None
@@ -1779,20 +1799,44 @@ def _record_weekly_answer(
         logger.warning("週の仮説の問いと結び付かないボタンを破棄", extra=log_extra)
         api.answer_callback_query(callback_id, text="⚠️ この問いには対応できません")
         return
+    focus_outcome: str | None = None
+    proposal = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             known = conn.execute(
-                "SELECT 1 FROM weekly_questions WHERE id = ? AND message_id = ?",
+                "SELECT kind, focus_topic_id, profile_line FROM weekly_questions "
+                "WHERE id = ? AND message_id = ?",
                 (question_id, message_id),
             ).fetchone()
             recorded = False
-            if known is not None and latest_answer(conn, question_id) != value:
-                conn.execute(
-                    "INSERT INTO weekly_answers (question_id, value) VALUES (?, ?)",
-                    (question_id, value),
-                )
-                recorded = True
+            if known is not None:
+                previous = latest_answer(conn, question_id)
+                if previous != value:
+                    conn.execute(
+                        "INSERT INTO weekly_answers (question_id, value) VALUES (?, ?)",
+                        (question_id, value),
+                    )
+                    recorded = True
+                topic_id = known["focus_topic_id"]
+                if recorded and topic_id is not None and value == "no":
+                    focus_outcome = dismiss_topic(conn, topic_id, now)
+                elif recorded and topic_id is not None and previous == "no":
+                    restored = restore_topic(conn, topic_id)
+                    focus_outcome = "restored" if restored == "restored" else None
+                section = PROFILE_KINDS.get(known["kind"])
+                if value == "yes" and known["profile_line"] and section is not None:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO weekly_profile_proposals "
+                        "(question_id, section, line) VALUES (?, ?, ?)",
+                        (question_id, section, known["profile_line"]),
+                    )
+                    proposal = conn.execute(
+                        "SELECT p.id, p.section, p.line, p.message_id, q.position "
+                        "FROM weekly_profile_proposals p "
+                        "JOIN weekly_questions q ON q.id = p.question_id WHERE p.question_id = ?",
+                        (question_id,),
+                    ).fetchone()
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1809,15 +1853,167 @@ def _record_weekly_answer(
         api.answer_callback_query(callback_id, text="⚠️ この問いには対応できません")
         return
     label = ANSWER_LABELS[value]
+    send_proposal = proposal is not None and proposal["message_id"] is None
     logger.info(
         "週の仮説の答えを記録" if recorded else "週の仮説の答えは記録済み",
-        extra={"stage": "poll", "extra": {"question_id": question_id, "value": value}},
+        extra={
+            "stage": "poll",
+            "extra": {"question_id": question_id, "value": value, "focus": focus_outcome},
+        },
     )
-    api.answer_callback_query(
-        callback_id,
-        text=f"{label} と記録しました" if recorded else f"{label} と記録してあります",
-    )
+    text = f"{label} と記録しました" if recorded else f"{label} と記録してあります"
+    if focus_outcome == "dismissed":
+        text = f"{label} と記録し、🎯 今の重点から外しました"
+    elif focus_outcome == "already":
+        text = f"{label} と記録しました(🎯 外し済みです)"
+    elif focus_outcome == "restored":
+        text = f"{label} と記録し、↩️ 今の重点の候補に戻しました(次の朝から重みで決めます)"
+    if send_proposal:
+        text += "。関心のメモに足す案を送ります"
+    api.answer_callback_query(callback_id, text=text)
     _edit_markup_best_effort(api, callback, weekly_keyboard(question_id, selected=value), logger)
+    if send_proposal:
+        _send_profile_proposal(conn, config, api, proposal, logger)
+
+
+def _send_profile_proposal(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    proposal: sqlite3.Row,
+    logger: logging.Logger,
+) -> None:
+    """関心プロファイルに足す案を 1 通送り、message_id を残す(GH#440 の 2 本目)。
+
+    送れなかったときはログだけ残して続ける(ほかの update の処理を止めない)。案の行は残るので、
+    もう一度 ⭕ そう を押したときに送り直す。記録の前に止まったときも同じ(無配信より二重送信)。
+    """
+    log_extra = {"stage": "poll", "extra": {"proposal_id": proposal["id"]}}
+    try:
+        message_id = api.send_message(
+            config.telegram.owner_chat_id,
+            proposal_text(proposal["position"], proposal["section"], proposal["line"]),
+            reply_markup=proposal_keyboard(proposal["id"]),
+        )
+    except DeliveryError as e:
+        logger.warning(f"関心のメモに足す案を送れなかった: {type(e).__name__}", extra=log_extra)
+        return
+    try:
+        conn.execute(
+            "UPDATE weekly_profile_proposals SET message_id = ?, "
+            "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND message_id IS NULL",
+            (message_id, proposal["id"]),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(
+            f"関心のメモに足す案の送信を記帳できなかった: {type(e).__name__}: {e}"
+            f"(message_id={message_id})",
+            extra=log_extra,
+        )
+        return
+    logger.info("関心のメモに足す案を送った", extra=log_extra)
+
+
+# 関心プロファイルに足す案のボタンの答え(GH#440 の 2 本目)。固定の文言だけ(案の行は入れない)
+_PROPOSAL_ANSWERS = {
+    ("applied", "added"): "✅ 関心のメモに足しました。次の朝の判定から使います",
+    ("applied", "exists"): "✅ 同じ行が関心のメモにもうあります",
+    ("applied", "already"): "✅ 足してあります",
+    ("declined", "declined"): "やめました。関心のメモは変えていません",
+    ("declined", "already"): "やめてあります",
+    ("declined", "applied"): "もう足してあります。外すときは関心のメモを直接直してください",
+}
+
+
+def _record_profile_proposal(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    proposal_id: int,
+    decision: str,
+    logger: logging.Logger,
+    *,
+    now: datetime,
+) -> None:
+    """関心プロファイルに足す案の「✅ 足す」「やめる」(GH#440 の 2 本目。設計 03 §4・04 §3)。
+
+    押されたメッセージが、その案として送ったメッセージ(weekly_profile_proposals.message_id)で
+    owner の chat にあることを確かめる。足すと、送ったときの写し(section・line)を関心プロファイルの
+    節の末尾に足し(app.analysis.profile.append_profile_line)、案を applied にする。file の書き換えは
+    案の状態の確認と同じトランザクションの中で行い、書けなければ状態を変えない。やめると declined に
+    する(file は変えない)。やめた後に足すことはできる。足した後のやめるは、file を戻さず、直し方を
+    答える。
+    """
+    from app.analysis.profile import ProfileError, append_profile_line
+
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    log_extra = {"stage": "poll", "extra": {"proposal_id": proposal_id}}
+    if chat_id != config.telegram.owner_chat_id or type(message_id) is not int:
+        logger.warning("関心のメモの案と結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ この案には対応できません")
+        return
+    stamp = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT section, line, status FROM weekly_profile_proposals "
+                "WHERE id = ? AND message_id = ?",
+                (proposal_id, message_id),
+            ).fetchone()
+            outcome = None
+            status = row["status"] if row is not None else None
+            if status is None:
+                pass
+            elif decision == "applied" and status == "applied":
+                outcome = "already"
+            elif decision == "applied":
+                outcome = append_profile_line(  # added・exists
+                    config.profile_path, row["section"], row["line"],
+                    today=now.astimezone(JST).strftime("%Y-%m-%d"),
+                )
+            elif status == "proposed":
+                outcome = "declined"
+            else:
+                outcome = "already" if status == "declined" else "applied"
+            if outcome in ("added", "exists", "declined"):
+                conn.execute(
+                    "UPDATE weekly_profile_proposals SET status = ?, decided_at = ? WHERE id = ?",
+                    (decision, stamp, proposal_id),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except (ProfileError, OSError) as e:
+        logger.error(f"関心のメモに足せなかった: {type(e).__name__}", extra=log_extra)
+        api.answer_callback_query(
+            callback_id, text="⚠️ 関心のメモに足せませんでした。file と節の見出しを確かめてください"
+        )
+        return
+    except sqlite3.Error as e:
+        logger.error(
+            f"関心のメモの案を記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    if row is None:
+        logger.warning("関心のメモの案と結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text="⚠️ この案には対応できません")
+        return
+    logger.info(f"関心のメモの案: {decision}({outcome})", extra=log_extra)
+    api.answer_callback_query(callback_id, text=_PROPOSAL_ANSWERS[(decision, outcome)])
+    selected = "applied" if decision == "applied" or outcome == "applied" else "declined"
+    _edit_markup_best_effort(
+        api, callback, proposal_keyboard(proposal_id, selected=selected), logger
+    )
 
 
 def _edit_markup_best_effort(

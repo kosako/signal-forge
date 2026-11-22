@@ -42,7 +42,13 @@ from app.dig import (
 from app.dig_take import dismissed_items, read_items
 from app.jst import JST, jst_day_bounds_utc, today_jst
 from app.source_health import X_FAILURE_ALERT, source_failure_alerts
-from app.weekly import ANSWER_CODES, ANSWER_LABELS, evidence_line
+from app.weekly import (
+    ANSWER_CODES,
+    ANSWER_LABELS,
+    SECTION_LABELS,
+    answer_effect,
+    evidence_line,
+)
 
 STATE_SURVEY_SENT = "survey_sent_date"
 STATE_WATCHDOG_NOTIFIED = "watchdog_notified_date"
@@ -149,6 +155,34 @@ def weekly_keyboard(question_id: int, *, selected: str | None = None) -> dict:
             for code, value in ANSWER_CODES.items()
         ]]
     }
+
+
+# 関心プロファイルに足す案のボタン(GH#440 の 2 本目)。a = 足す / x = やめる
+PROPOSAL_CODES = {"a": "applied", "x": "declined"}
+PROPOSAL_LABELS = {"applied": "✅ 足す", "declined": "やめる"}
+
+
+def proposal_keyboard(proposal_id: int, *, selected: str | None = None) -> dict:
+    """関心プロファイルに足す案(GH#440 の 2 本目)。selected は applied|declined(✓ 反映用)。"""
+    return {
+        "inline_keyboard": [[
+            {
+                "text": _mark(PROPOSAL_LABELS[status], selected == status),
+                "callback_data": f"p:{proposal_id}:{code}",
+            }
+            for code, status in PROPOSAL_CODES.items()
+        ]]
+    }
+
+
+def proposal_text(position: int, section: str, line: str) -> str:
+    """関心プロファイルに足す案の本文。行は外部の本文に由来する LLM の文なので escape する。"""
+    return "\n".join([
+        f"📝 関心のメモに足す案(今週の仮説 {position})",
+        f"「{SECTION_LABELS[section]}」の節に、次の 1 行を足します。",
+        f"- {escape_and_truncate(' '.join(line.split()), 200)}",
+        "足すのは「✅ 足す」を押したときだけです。",
+    ])
 
 
 def followup_keyboard(item_id: int, *, selected: str | None = None) -> dict:
@@ -480,6 +514,9 @@ def weekly_question_text(row: Mapping, total: int, *, first: bool) -> str:
     evidence = evidence_line(row["evidence_json"])
     if evidence:
         lines.append(escape_text(evidence))
+    effect = answer_effect(row)
+    if effect:
+        lines.append(effect)
     return "\n".join(lines)
 
 
