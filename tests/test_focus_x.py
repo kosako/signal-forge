@@ -84,8 +84,8 @@ def topic(
 def approved(conn, topic_id: int, *, slot: int = 2, replaced: str = SLOTS[1]) -> int:
     proposal_id = conn.execute(
         "INSERT INTO focus_x_slots (topic_id, activated_at, query, status, slot, replaced_query, "
-        "message_id, decided_at) VALUES (?, ?, ?, 'approved', ?, ?, 801, ?)",
-        (topic_id, ACTIVATED, QUERY, slot, replaced, ACTIVATED),
+        "message_id, shown_slots, decided_at) VALUES (?, ?, ?, 'approved', ?, ?, 801, ?, ?)",
+        (topic_id, ACTIVATED, QUERY, slot, replaced, json.dumps(list(SLOTS)), ACTIVATED),
     ).lastrowid
     conn.commit()
     return proposal_id
@@ -179,7 +179,7 @@ def test_next_proposal_asks_once_per_focus_entry_and_one_at_a_time(conn, tmp_pat
     first = next_proposal(conn, config, NOW)
     assert (first["topic_id"], first["query"], first["message_id"]) == (a, QUERY, None)
     assert next_proposal(conn, config, NOW)["id"] == first["id"]  # 送れていなければ送り直す
-    record_sent(conn, first["id"], 901)
+    record_sent(conn, first["id"], 901, SLOTS)
     assert next_proposal(conn, config, NOW) is None  # 答えを待つ間は次を出さない
 
     conn.execute("UPDATE focus_x_slots SET status = 'declined', decided_at = ? WHERE id = ?",
@@ -313,7 +313,7 @@ def press(code: str, proposal_id: int, *, message_id: int = 901, chat_id: int = 
 def sent_proposal(conn, config) -> int:
     topic(conn)
     row = next_proposal(conn, config, NOW)
-    record_sent(conn, row["id"], 901)
+    record_sent(conn, row["id"], 901, config.x_search.slots)
     return row["id"]
 
 
@@ -408,6 +408,73 @@ def test_button_not_tied_to_the_proposal_is_refused(
     assert api.answered == [("cb1", "⚠️ この案には対応できません")]
     assert statuses(conn)[0][1] == "proposed"
     assert api.edited == []
+
+
+def test_slots_changed_after_sending_are_not_approved_and_the_proposal_is_resent(
+    conn, tmp_path
+) -> None:
+    config = x_config(tmp_path)
+    proposal_id = sent_proposal(conn, config)
+    changed = x_config(tmp_path, slots=(SLOTS[0], '"mcp" OR "a2a"', SLOTS[2]))
+
+    api = poll(conn, changed, press("2", proposal_id))
+
+    assert api.answered == [
+        ("cb1", "⚠️ 案を送った後に枠の設定が変わりました。今の枠で案を送り直します")
+    ]
+    assert statuses(conn)[0][1] == "proposed"
+    assert effective_slots(conn, changed) == changed.x_search.slots
+    deliver_digest(conn)
+    api = FakeApi()
+    run_due_timers(conn, changed, api, logger, timer_now())  # 今の枠で送り直す
+    assert '2. "mcp" OR "a2a"' in api.sent[0][1]
+    new_message = conn.execute("SELECT message_id FROM focus_x_slots").fetchone()[0]
+
+    api = poll(conn, changed, press("2", proposal_id, message_id=new_message, update_id=2))
+    assert api.answered == [("cb2", "🔍 2 本目を入れ替えました。次の朝の検索から使います")]
+    assert effective_slots(conn, changed) == (SLOTS[0], QUERY, SLOTS[2])
+
+
+def test_unsent_proposal_of_a_topic_that_left_focus_is_not_sent(conn, tmp_path) -> None:
+    config = x_config(tmp_path)
+    a = topic(conn, "話題A")
+    assert next_proposal(conn, config, NOW)["topic_id"] == a  # 送れなかったまま
+    conn.execute("UPDATE focus_topics SET status = 'dismissed', dismissed_at = ? WHERE id = ?",
+                 (ACTIVATED, a))
+    b = topic(conn, "話題B", ("software factory",))
+
+    row = next_proposal(conn, config, NOW)
+
+    assert row["topic_id"] == b
+    assert statuses(conn) == [(a, "expired", None), (b, "proposed", None)]
+
+
+def test_old_decline_button_after_approving_answers_without_error(conn, tmp_path) -> None:
+    config = x_config(tmp_path)
+    proposal_id = sent_proposal(conn, config)
+
+    api = poll(conn, config, press("2", proposal_id), press("n", proposal_id, update_id=2))
+
+    assert api.answered == [
+        ("cb1", "🔍 2 本目を入れ替えました。次の朝の検索から使います"),
+        ("cb2", "🔍 2 本目と入れ替え中です。戻すときは「↩️ 元に戻す」を押してください"),
+    ]
+    assert statuses(conn)[0][1] == "approved"
+
+
+def test_proposal_shows_the_whole_query_it_will_send(conn, tmp_path) -> None:
+    config = x_config(tmp_path)
+    terms = ("&" * 40, "&" * 39 + "x", "&" * 38 + "y")  # escape すると 600 字を超える
+    topic(conn, "記号の話題", terms)
+    deliver_digest(conn)
+    api = FakeApi()
+
+    run_due_timers(conn, config, api, logger, timer_now())
+
+    query = conn.execute("SELECT query FROM focus_x_slots").fetchone()[0]
+    shown = query.replace("&", "&amp;")
+    assert len(shown) > 600
+    assert f"入れる検索: {shown}\n" in api.sent[0][1]  # 切らずに全文(承認する文と送る文が同じ)
 
 
 # --- 収集の合成点 ---

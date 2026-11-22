@@ -197,8 +197,9 @@ def proposal_text(position: int, section: str, line: str) -> str:
 
 # 今の重点で X の検索の枠を入れ替える案(GH#433 の 6 本目。設計 04 §3・§4)。
 # callback は x:{id}:{N|n|r}
-# 表示の上限(検索の文は送る文で 512 字まで。escape で長くなる分の余裕)
-FOCUS_X_QUERY_MAX_CHARS = 600
+# 案に並べる config の枠の表示の上限。入れる検索の文は切らない(承認する文と送る文を同じにする。
+# 検索の語は 40 字 × 3 個までなので、escape しても Telegram の上限に届かない)
+FOCUS_X_SLOT_MAX_CHARS = 300
 
 
 def focus_x_keyboard(
@@ -242,11 +243,11 @@ def focus_x_text(row: Mapping, slots: Sequence[str], activated_at: str | None) -
     lines = [
         "🔍 X の検索の枠を、今の重点で 1 本入れ替えますか?",
         f"「{name}」が{since}今の重点です。",
-        f"入れる検索: {escape_and_truncate(row['query'], FOCUS_X_QUERY_MAX_CHARS)}",
+        f"入れる検索: {escape_text(row['query'])}",
         "今の枠:",
     ]
     lines += [
-        f"{n}. {escape_and_truncate(slot, FOCUS_X_QUERY_MAX_CHARS)}"
+        f"{n}. {escape_and_truncate(slot, FOCUS_X_SLOT_MAX_CHARS)}"
         for n, slot in enumerate(slots, start=1)
     ]
     lines.append(
@@ -448,7 +449,7 @@ def send_focus_x_proposal(
         focus_x_text(row, slots, row["activated_at"]),
         reply_markup=focus_x_keyboard(row["id"], len(slots)),
     )
-    record_sent(conn, row["id"], message_id)
+    record_sent(conn, row["id"], message_id, slots)
     logger.info(
         "X の検索の枠を入れ替える案を送った",
         extra={"stage": "poll", "extra": {"proposal_id": row["id"], "topic_id": row["topic_id"]}},

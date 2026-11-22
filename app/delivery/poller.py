@@ -1569,6 +1569,7 @@ _FOCUS_X_ANSWERS = {
     "expired": "この話題はもう今の重点から外れています。入れ替えません",
     "not_approved": "↩️ 入れ替えていません",
     "no_slot": "⚠️ その番号の枠がありません",
+    "slots_changed": "⚠️ 案を送った後に枠の設定が変わりました。今の枠で案を送り直します",
     "missing": "⚠️ この案には対応できません",
 }
 _FOCUS_X_ALREADY = {
@@ -1577,6 +1578,7 @@ _FOCUS_X_ALREADY = {
     "reverted": "↩️ 元に戻してあります",
 }
 _FOCUS_X_CLOSED = {
+    "approved": "🔍 {slot} 本目と入れ替え中です。戻すときは「↩️ 元に戻す」を押してください",
     "declined": "入れないことにしてあります",
     "expired": "この話題はもう今の重点から外れています。入れ替えません",
     "reverted": "↩️ 元に戻してあります。この重点の間は入れ替えません",
@@ -1640,7 +1642,7 @@ def _record_focus_x(
     else:
         text = _FOCUS_X_ANSWERS[outcome]
     api.answer_callback_query(callback_id, text=text.format(slot=row["slot"]))
-    if outcome in ("no_slot", "not_approved"):
+    if outcome in ("no_slot", "not_approved", "slots_changed"):
         return
     _edit_markup_best_effort(
         api,

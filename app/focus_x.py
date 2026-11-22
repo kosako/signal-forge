@@ -19,6 +19,7 @@ ADR 0001 の追記・設計 02 §2・03 §4.1。
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Sequence
@@ -153,12 +154,21 @@ def next_proposal(
     if conn.execute("SELECT 1 FROM focus_x_slots WHERE status = 'approved'").fetchone():
         return None
     pending = conn.execute(
-        "SELECT id, message_id FROM focus_x_slots WHERE status = 'proposed'"
+        "SELECT f.id, f.message_id, f.activated_at, t.status AS topic_status, "
+        "t.activated_at AS topic_activated_at FROM focus_x_slots f "
+        "JOIN focus_topics t ON t.id = f.topic_id WHERE f.status = 'proposed'"
     ).fetchone()
     if pending is not None:
-        if pending["message_id"] is None:
-            return conn.execute(_PROPOSAL_SQL, (pending["id"],)).fetchone()
-        return None
+        stale = (
+            pending["topic_status"] != "active"
+            or pending["topic_activated_at"] != pending["activated_at"]
+        )
+        if not stale:
+            if pending["message_id"] is None:
+                return conn.execute(_PROPOSAL_SQL, (pending["id"],)).fetchone()
+            return None
+        # 送る前(送れなかった後)に話題が重点から外れた(🎯 外すを含む)。外れた話題の案は送らない
+        _expire(conn, pending["id"], now)
     from app.focus import active_focus
 
     for entry in active_focus(conn, config, now=now):
@@ -184,9 +194,22 @@ def next_proposal(
     return None
 
 
-def _terms(value: str | None) -> list[str]:
-    import json
+def _expire(conn: sqlite3.Connection, proposal_id: int, now: datetime) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE focus_x_slots SET status = 'expired', decided_at = ? "
+            "WHERE id = ? AND status = 'proposed'",
+            (_iso(now), proposal_id),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
+
+def _terms(value: str | None) -> list[str]:
     try:
         terms = json.loads(value or "[]")
     except ValueError:
@@ -219,13 +242,24 @@ def _insert_proposal(
     return proposal_id
 
 
-def record_sent(conn: sqlite3.Connection, proposal_id: int, message_id: int) -> None:
+def record_sent(
+    conn: sqlite3.Connection, proposal_id: int, message_id: int, slots: Sequence[str]
+) -> None:
+    """送った案の message_id と、案に並べた枠の写しを残す(承認のときに今の枠と比べる)。"""
     conn.execute(
-        "UPDATE focus_x_slots SET message_id = ?, sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
-        "WHERE id = ? AND message_id IS NULL",
-        (message_id, proposal_id),
+        "UPDATE focus_x_slots SET message_id = ?, shown_slots = ?, "
+        "sent_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND message_id IS NULL",
+        (message_id, json.dumps(list(slots), ensure_ascii=False), proposal_id),
     )
     conn.commit()
+
+
+def _shown_slots(row: sqlite3.Row) -> list[str] | None:
+    try:
+        slots = json.loads(row["shown_slots"] or "null")
+    except ValueError:
+        return None
+    return slots if isinstance(slots, list) else None
 
 
 def decide(
@@ -241,7 +275,8 @@ def decide(
     呼び出し側のトランザクションの中で使う。結果は approved(入れ替えた)・declined(入れない)・
     reverted(元に戻した)・expired(答える前に重点から外れていた)・already(同じ答えが記録済み)・
     closed(閉じた案への入れ替え・入れない)・not_approved
-    (入れ替えていない案の元に戻す)・no_slot(その番号の枠が無い)・missing(押されたメッセージと結び
+    (入れ替えていない案の元に戻す)・no_slot(その番号の枠が無い)・slots_changed(案を送った後に
+    config の枠が変わった。送り直す)・missing(押されたメッセージと結び
     付かない)。押されたメッセージが、その案として送ったメッセージであることを確かめる。
     """
     row = conn.execute(
@@ -291,6 +326,15 @@ def decide(
             outcome = "expired"
         elif not 1 <= slot <= len(slots):
             outcome = "no_slot"
+        elif _shown_slots(row) != list(slots):
+            # 案を送った後に config の枠が変わった。案に出した枠と違う文を入れ替えないよう承認せず、
+            # 今の枠で案を送り直す(内蔵タイマーが送れていない案として送る)
+            conn.execute(
+                "UPDATE focus_x_slots SET message_id = NULL, shown_slots = NULL, sent_at = NULL "
+                "WHERE id = ?",
+                (proposal_id,),
+            )
+            outcome = "slots_changed"
         else:
             conn.execute(
                 "UPDATE focus_x_slots SET status = 'approved', slot = ?, replaced_query = ?, "
