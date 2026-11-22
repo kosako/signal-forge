@@ -192,20 +192,26 @@ def _is_sufficient(text: str | None) -> bool:
     return text is not None and len(text) >= MIN_OK_CHARS
 
 
-def fetch_article_text(http: HttpClient, url: str) -> str | None:
+def fetch_article_text(
+    http: HttpClient, url: str, *, allow_url: Callable[[str], bool] | None = None
+) -> str | None:
     """記事の URL から本文を取り出す。取れなければ None(失敗の理由は返さない)。
 
     出来事の調査が、検索で見つけた報道の本文を取るのに使う(GH#415)。取り方(SSRF の守り・
-    リトライ・受信量の上限・文字コードの判定・本文の抽出)は記事の抽出と同じ。
+    リトライ・受信量の上限・文字コードの判定・本文の抽出)は記事の抽出と同じ。allow_url は、
+    最初の URL と転送先のどのホップも確かめる条件(HttpClient.get。今すぐの深掘りの取り直し。
+    GH#446)。
     """
-    text, _error = _fetch_and_extract(http, url)
+    text, _error = _fetch_and_extract(http, url, allow_url=allow_url)
     return text
 
 
-def _fetch_and_extract(http: HttpClient, url: str) -> tuple[str | None, str | None]:
+def _fetch_and_extract(
+    http: HttpClient, url: str, *, allow_url: Callable[[str], bool] | None = None
+) -> tuple[str | None, str | None]:
     """(抽出テキスト, エラー文字列)。失敗は握りつぶさず文字列で返して呼び出し側が記録する。"""
     try:
-        fetched = http.get(url)
+        fetched = http.get(url) if allow_url is None else http.get(url, allow_url=allow_url)
     except (RetryableError, FatalError) as e:
         return None, f"{type(e).__name__}: {e}"
     if fetched.response.status_code != 200:

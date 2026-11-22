@@ -1661,7 +1661,7 @@ def test_skip_buttons_only_on_plan_rows(conn, tmp_path) -> None:
     first = add_queued_bookmark(conn, "https://a/1", enqueued_at="2026-07-03T00:00:00Z")
     second = add_queued_bookmark(conn, "https://a/2", enqueued_at="2026-07-02T00:00:00Z")
     waiting = add_queued_bookmark(conn, "https://a/3", enqueued_at="2026-07-01T00:00:00Z")
-    no_body = add_item(conn, "https://a/no-body")
+    no_body = add_item(conn, "https://x.com/i/web/status/77")  # 取り直せない(GH#446)
     add_dig_reaction(conn, no_body, (jst_now() - timedelta(days=1)).strftime("%Y-%m-%d"))
 
     [(_, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
@@ -2019,7 +2019,9 @@ def test_now_buttons_on_rows_that_can_be_dug(conn, tmp_path) -> None:
     waiting = add_queued_bookmark(conn, "https://a/2", enqueued_at="2026-07-02T00:00:00Z")
     rows = {}
     for name in ("plain", "done", "passed", "no_body"):
-        rows[name] = add_item(conn, f"https://a/{name}", title=f"記事-{name}")
+        # 本文なしの行は、リンク先から取り直せない X の投稿(GH#446)
+        url = "https://x.com/i/web/status/5" if name == "no_body" else f"https://a/{name}"
+        rows[name] = add_item(conn, url, title=f"記事-{name}")
         add_dig_reaction(conn, rows[name], yesterday)
         if name != "no_body":
             add_body(conn, rows[name])
@@ -2160,7 +2162,9 @@ def test_now_button_refusals(conn, tmp_path, setup, answered) -> None:
             (item,),
         )
     else:
+        # 本文が消え、リンク先からも取り直せない(X の投稿そのもの。GH#446)
         conn.execute("DELETE FROM documents")
+        conn.execute("UPDATE items SET canonical_url = 'https://x.com/i/web/status/3'")
     columns = "item_id, status, angle, requested_at, updated_at, now_requested_at, now_started_at"
     before = [tuple(row) for row in conn.execute(f"SELECT {columns} FROM dig_queue")]
     worker = FakeWorker()
@@ -2953,7 +2957,8 @@ def test_backlog_buttons_only_on_plan_rows_and_the_newest_rows(conn, tmp_path) -
         for i in range(2)
     ]
     newest_first = [
-        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        add_bookmarked(conn, f"https://x.com/i/web/status/{100 + i}",
+                       f"2026-10-24T{23 - i:02d}:00:00Z")
         for i in range(17)
     ]
     config = config_with_cap(tmp_path, 2)
@@ -2965,8 +2970,12 @@ def test_backlog_buttons_only_on_plan_rows_and_the_newest_rows(conn, tmp_path) -
     assert len(markup["inline_keyboard"]) == 2 + DIG_BACKLOG_BUTTON_ROWS
     assert all(backlog_line(text, item) for item in newest_first[:15])  # 本文は今までどおり 15 件
     assert "(他 2 件)" in text
-    assert f"ボタンは上の {2 + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます" in text
-    assert text.index("ボタンは上の") < text.index(DIG_BACKLOG_READ_NOTE)
+    assert (
+        f"✅・👎 のボタンは上の {2 + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
+        "(⚡ は今すぐ掘れる行に付けます)"
+    ) in text
+    assert text.index("のボタンは上の") < text.index(DIG_BACKLOG_READ_NOTE)
+    assert "取り直して掘ります" not in text  # 取り直せる本文なしの行は無い
 
     below = newest_first[DIG_BACKLOG_BUTTON_ROWS]
     api = FakeApi([[backlog_press(f"b:{below}:x", message_id, markup, update_id=1)]])
@@ -2976,24 +2985,66 @@ def test_backlog_buttons_only_on_plan_rows_and_the_newest_rows(conn, tmp_path) -
     assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
 
 
+def test_now_button_also_on_lower_rows_and_on_bodies_that_can_be_refetched(
+    conn, tmp_path
+) -> None:
+    # ⚡ は上の 5 行より下でも、今すぐ掘れる行に付ける。本文が消えた記事も、リンク先から取り直せ
+    # れば付ける(GH#446)。✅・👎 は上の 5 行だけ。X の投稿そのものの本文なしの行には付けない
+    silence_watchdog(conn)
+    newest_first = [
+        add_bookmarked(conn, f"https://x.com/i/web/status/{100 + i}",
+                       f"2026-10-24T{23 - i:02d}:00:00Z")
+        for i in range(DIG_BACKLOG_BUTTON_ROWS + 3)
+    ]
+    top_refetch = add_bookmarked(conn, "https://example.com/top", "2026-10-25T00:00:00Z")
+    lower_body, lower_refetch, lower_x = newest_first[-3:]
+    add_body(conn, lower_body)
+    conn.execute("UPDATE items SET canonical_url = 'https://example.com/lower' WHERE id = ?",
+                 (lower_refetch,))
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+
+    rows = markup["inline_keyboard"]
+    assert rows[0] == [now_buttons(top_refetch)[0], dismiss_button(top_refetch)]
+    assert [now_buttons(lower_body)[0]] in rows
+    assert [now_buttons(lower_refetch)[0]] in rows
+    assert lower_x not in keyboard_ids(markup)
+    assert "⚠️ 本文なし " in backlog_line(text, lower_refetch)
+    assert "⚠️ 本文なしの行でも ⚡ があれば、リンク先から本文を取り直して掘ります" in text
+
+    # 取り直せる行の ⚡ は受け付け、dig-now を起動する(取り直すのは dig-now)
+    worker = FakeWorker()
+    api = FakeApi([[backlog_press(f"b:{lower_refetch}:n", message_id, markup, update_id=1)]])
+    poll_once(conn, config, api, logger, dig_now_worker=worker)
+    assert api.answered[0][1].startswith(f"⚡ {lower_refetch} を")
+    assert queue_row(conn, lower_refetch)["now_requested_at"] is not None
+    assert worker.kicks == 1
+
+    # ⚡ の無い行(X の投稿そのもの)の ⚡ は、偽っても受け付けない
+    forged = FakeApi([[backlog_press(f"b:{lower_x}:n", message_id, markup, update_id=2)]])
+    poll_once(conn, config, forged, logger, dig_now_worker=worker)
+    assert forged.answered == [("cb2", "⚠️ この一覧には対応できません")]
+
+
 @pytest.mark.parametrize("count", [DIG_BACKLOG_BUTTON_ROWS, DIG_BACKLOG_BUTTON_ROWS + 1])
 def test_backlog_button_note_only_when_some_rows_have_no_buttons(conn, tmp_path, count) -> None:
     # 予定が無くても同じ。どの行にもボタンがあるときは注記を足さない(GH#411)
     silence_watchdog(conn)
     newest_first = [
-        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        add_bookmarked(conn, f"https://x.com/i/web/status/{100 + i}",
+                       f"2026-10-24T{23 - i:02d}:00:00Z")
         for i in range(count)
     ]
 
     [(_, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
 
     assert keyboard_ids(markup) == newest_first[:DIG_BACKLOG_BUTTON_ROWS]
-    note = f"ボタンは上の {DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
+    note = f"✅・👎 のボタンは上の {DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
     assert (note in text) is (count > DIG_BACKLOG_BUTTON_ROWS)
     assert DIG_BACKLOG_READ_NOTE in text
 
 
-@pytest.mark.parametrize("code", ["n", "p", "x"])
+@pytest.mark.parametrize("code", ["p", "x"])
 def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, code) -> None:
     # ボタンの無い行(上の 5 件より下)の callback は、今すぐ・外す・不要のどれも、偽っても
     # 受け付けない(GH#411。Codex 指摘)。前の夜の一覧(この変更の前に送った 1 通)のように、
@@ -3001,7 +3052,8 @@ def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, co
     silence_watchdog(conn)
     add_queued_bookmark(conn, "https://a/plan", enqueued_at="2026-07-03T00:00:00Z")
     newest_first = [
-        add_bookmarked(conn, f"https://x/{i}", f"2026-10-24T{23 - i:02d}:00:00Z")
+        add_bookmarked(conn, f"https://x.com/i/web/status/{100 + i}",
+                       f"2026-10-24T{23 - i:02d}:00:00Z")
         for i in range(DIG_BACKLOG_BUTTON_ROWS + 1)
     ]
     below = newest_first[-1]
@@ -3010,7 +3062,9 @@ def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, co
     config = config_with_cap(tmp_path, 1)
     [(message_id, text, markup)] = sent_backlog(conn, config)
     assert "⏳ 待ち " in backlog_line(text, below)
-    assert below not in keyboard_ids(markup)
+    # 下の行は、今すぐ掘れるなら ⚡ だけ(GH#446)。外す・不要のボタンは無い
+    assert [now_buttons(below)[0]] in markup["inline_keyboard"]
+    assert f"b:{below}:{code}" not in json.dumps(markup)
     before = tuple(queue_row(conn, below))
     worker = FakeWorker()
 
@@ -3029,9 +3083,7 @@ def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, co
 
     assert old.answered[0][1] != "⚠️ この一覧には対応できません"
     after = queue_row(conn, below)
-    if code == "n":
-        assert after["now_requested_at"] is not None and worker.kicks == 1
-    elif code == "p":
+    if code == "p":
         assert after["status"] == "passed"
     else:
         assert [row[0] for row in conn.execute("SELECT item_id FROM dig_dismissals")] == [below]

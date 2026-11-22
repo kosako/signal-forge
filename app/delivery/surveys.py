@@ -44,6 +44,7 @@ from app.dig import (
     dug_on,
     items_with_cards,
     next_morning_plan,
+    refetchable_items,
 )
 from app.dig_take import dismissed_items, read_items
 from app.jst import JST, jst_day_bounds_utc, today_jst
@@ -753,6 +754,7 @@ def _dig_backlog_message(
         carded=items_with_cards(conn, [*planned_ids, *shown_ids]),
         read_marked=read_items(conn, [*planned_ids, *shown_ids]),
         dismissed=dismissed_items(conn, [*planned_ids, *shown_ids]),
+        refetchable=refetchable_items(conn, shown_ids),
     )
 
 
@@ -767,6 +769,7 @@ def _dig_backlog_text(
     carded: Collection[int] = (),
     read_marked: Collection[int] = (),
     dismissed: Collection[int] = (),
+    refetchable: Collection[int] = (),
 ) -> list[tuple[str, dict | None]]:
     """未消化 🔖 一覧(見出しは「まだ読んでいない記事」。GH#409)。新しい 🔖 順・上限超過分は
     件数だけ示す(GH#88)。
@@ -788,6 +791,9 @@ def _dig_backlog_text(
     行には今すぐを付けない。carded(深掘りカードを送ったことがある)の行には ✅ 読んだを、ボタンを
     付けるどの行にも 👎 不要を付ける(GH#409)。read_marked・dismissed(読んだ・不要にしてある)の
     行のボタンには ✓ を付ける(押すと取り消す)。ボタンの無い 1 通はボタンなし。
+    ⚡ 今すぐは、上の行より下でも、今すぐ掘れる行に付ける(GH#446。✅ と 👎 は上の行だけ)。今すぐ
+    掘れる = 状態が DIG_NOW_STATES、または本文が消えていても(no_body)リンク先から取り直せる
+    (refetchable。`intel dig-now` が取り直す)行で、今日もう掘っていないもの。
     """
     states = states or {}
     lines = [f"{DIG_BACKLOG_TITLE}({len(plan_rows) + len(rows)}件)"]
@@ -812,9 +818,23 @@ def _dig_backlog_text(
         notes.append("🗓 明朝 = キューからの予定。朝に新しい 🔖 が入ると入れ替わることがあります")
     if digest_fill > 0:
         notes.append(f"残り {digest_fill} 件は明朝のダイジェストの上位から選びます")
-    if with_buttons and len(rows[:DIG_BACKLOG_MAX_ITEMS]) > DIG_BACKLOG_BUTTON_ROWS:
-        # ボタンの無い行がある(GH#411)。予定の行は先頭に並ぶので、上から数えた行の数で言える
-        notes.append(f"ボタンは上の {len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます")
+    def now_ok(item_id: int) -> bool:
+        state = states.get(item_id)
+        return item_id not in dug_today and (
+            state in DIG_NOW_STATES or (state == "no_body" and item_id in refetchable)
+        )
+
+    shown = rows[:DIG_BACKLOG_MAX_ITEMS]
+    if with_buttons and len(shown) > DIG_BACKLOG_BUTTON_ROWS:
+        # ✅・👎 の無い行がある(GH#411)。予定の行は先頭に並ぶので、上から数えた行の数で言える
+        notes.append(
+            f"✅・👎 のボタンは上の {len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
+            "(⚡ は今すぐ掘れる行に付けます)"
+        )
+    if with_buttons and any(
+        states.get(row["item_id"]) == "no_body" and now_ok(row["item_id"]) for row in shown
+    ):
+        notes.append("⚠️ 本文なしの行でも ⚡ があれば、リンク先から本文を取り直して掘ります")
     if with_buttons:
         # 何をすると一覧から消えるか(GH#398・GH#409)。カードが届いただけでは消えない
         notes.append(DIG_BACKLOG_READ_NOTE)
@@ -842,11 +862,18 @@ def _dig_backlog_text(
             item_id = row["item_id"]
             buttons_at[index] = BacklogButtons(
                 item_id,
-                now=states.get(item_id) in DIG_NOW_STATES and item_id not in dug_today,
+                now=now_ok(item_id),
                 skip=False,
                 read=item_id in carded,
                 dismiss=True,
             )
+        # 上の行より下は、今すぐ掘れる行の ⚡ だけ(GH#446)
+        lower = rows[DIG_BACKLOG_BUTTON_ROWS:DIG_BACKLOG_MAX_ITEMS]
+        for index, row in enumerate(
+            lower, start=len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS + 1
+        ):
+            if now_ok(row["item_id"]):
+                buttons_at[index] = BacklogButtons(row["item_id"], now=True, skip=False)
     groups = pack_line_groups(
         lines,
         DIG_BACKLOG_TEXT_MAX_CHARS - visible_length(DIG_BACKLOG_CONTINUED) - 1,

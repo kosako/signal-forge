@@ -256,6 +256,7 @@ class HttpClient:
         *,
         headers: dict[str, str] | None = None,
         retries: int = MAX_RETRIES,
+        allow_url: Callable[[str], bool] | None = None,
     ) -> FetchedResponse:
         """リトライ+リダイレクト追跡付き GET。
 
@@ -265,10 +266,13 @@ class HttpClient:
         リトライせずに送出する(GH#203)。retries はリトライの回数(0〜MAX_RETRIES。既定は最大)。
         短い間隔の試し直しを断る先(GDELT は 429 の後の試し直しも数えて止める。GH#415)は 0 にする。
         0 なら 1 回だけ送り、transport エラー・429・5xx は待たずに RetryableError で送出する。
+        allow_url があれば、最初の URL と転送先のどのホップも、送る前にこれで確かめ、通らなければ
+        送らずに FatalError で送出する(今すぐの深掘りの取り直しが、X の投稿などへ転送されたときに
+        取りに行かないため。GH#446)。
         """
         if not 0 <= retries <= MAX_RETRIES:
             raise ValueError(f"retries は 0〜{MAX_RETRIES}: {retries}")
-        return self._fetch(url, headers, read_body=True, retries=retries)
+        return self._fetch(url, headers, read_body=True, retries=retries, allow_url=allow_url)
 
     def resolve_short_url(self, url: str) -> str:
         """既知短縮 URL の最終 URL 解決(u1 手順1 の resolver。設計 01 §4)。
@@ -286,13 +290,16 @@ class HttpClient:
         *,
         read_body: bool,
         retries: int = MAX_RETRIES,
+        allow_url: Callable[[str], bool] | None = None,
     ) -> FetchedResponse:
         """get の本体。read_body が偽なら本文を読まずに接続を閉じる(content は読めない)。"""
         deadline = _Deadline(self._clock() + FETCH_DEADLINE_S)
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                fetched = self._follow_redirects(url, headers, deadline, read_body=read_body)
+                fetched = self._follow_redirects(
+                    url, headers, deadline, read_body=read_body, allow_url=allow_url
+                )
             except (httpx.TransportError, httpx.TimeoutException, DnsResolutionError) as e:
                 # スリープ復帰直後などの一時的な名前解決の失敗も、transport エラーと
                 # 同じ回数・バックオフで再試行する(GH#188)
@@ -363,11 +370,19 @@ class HttpClient:
             deadline.extend(remaining)
 
     def _follow_redirects(
-        self, url: str, headers: dict[str, str] | None, deadline: _Deadline, *, read_body: bool
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        deadline: _Deadline,
+        *,
+        read_body: bool,
+        allow_url: Callable[[str], bool] | None = None,
     ) -> FetchedResponse:
         current = url
         permanently_moved = False
         for _ in range(MAX_REDIRECTS + 1):
+            if allow_url is not None and not allow_url(current):
+                raise FatalError(f"取りに行かない URL への取得・転送: {current}")
             # 1 分に 1 回の host は、転送先のホップもリトライも、送るたびに間を空ける(GH#424)
             domain = _slow_domain(current)
             if domain is not None:

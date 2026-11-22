@@ -25,8 +25,11 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from app.config import Config
+from app.http import is_slow_host
+from app.normalize import X_HOSTS
 
 # パス判定: 番号の直後の残りが「(助詞)+ パス語 (+軽い述語)」だけのとき除外。
 # 観点の文中に現れるパス語(「クリティカルパスの観点で」)は除外にしない
@@ -308,6 +311,81 @@ def has_material(body: str | None, config: Config) -> bool:
     return bool(body) and len(body) >= config.dig.min_body_chars
 
 
+def refetchable(url: str | None) -> bool:
+    """本文が消えた記事を、今すぐの深掘りのときにリンク先から取り直せるか(GH#446)。
+
+    http(s) の記事で、X の投稿そのもの(X_HOSTS。取り直すと X の API の費用がかかる)と、1 分に 1 回
+    しか受けない host(is_slow_host。GH#424)でないもの。取り直すのは `intel dig-now` だけで、受信
+    デーモンは外へ取りに行かない(app.deepdive)。
+    """
+    if not url:
+        return False
+    try:
+        parts = urlsplit(url)
+        # 大文字小文字と末尾のドット(`x.com.`)を揃えてから比べる。X の domain は subdomain も含めて
+        # 外す(X_HOSTS に無い別名の subdomain へ転送されても取りに行かない)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:  # 分解できない URL は取りに行かない
+        return False
+    x_domains = {h.removeprefix("www.").removeprefix("mobile.") for h in X_HOSTS}
+    is_x = host in X_HOSTS or any(
+        host == domain or host.endswith("." + domain) for domain in x_domains
+    )
+    return (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not is_x
+        and not is_slow_host(url)
+    )
+
+
+def refetchable_items(conn: sqlite3.Connection, item_ids: Iterable[int]) -> set[int]:
+    """item のうち、リンク先から本文を取り直せるもの(refetchable)。読むだけ。"""
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return set()
+    placeholders = ", ".join("?" for _ in ids)
+    return {
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id, canonical_url FROM items WHERE id IN ({placeholders})", ids
+        )
+        if refetchable(row["canonical_url"])
+    }
+
+
+def save_refetched_document(
+    conn: sqlite3.Connection, config: Config, item_id: int, text: str
+) -> None:
+    """取り直した本文を documents に残す(GH#446)。呼び出し側が commit する。
+
+    保存の期間は記事の抽出と同じ(X 由来の item は x_cache_ttl_days、ほかは cache_ttl_days。
+    app.extraction.extractor._insert_document)。消えた行は足し、残っている行は書き直す。
+    """
+    row = conn.execute(
+        "SELECT s.type FROM items i JOIN sources s ON s.id = i.source_id WHERE i.id = ?",
+        (item_id,),
+    ).fetchone()
+    ttl_days = (
+        config.retention.x_cache_ttl_days
+        if row is not None and row["type"] == "x"
+        else config.retention.cache_ttl_days
+    )
+    conn.execute(
+        """
+        INSERT INTO documents (item_id, extracted_text, extraction_status, extraction_error,
+                               extracted_at, expires_at)
+        VALUES (?, ?, 'ok', NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?))
+        ON CONFLICT (item_id) DO UPDATE SET
+          extracted_text = excluded.extracted_text, extraction_status = 'ok',
+          extraction_error = NULL, extracted_at = excluded.extracted_at,
+          expires_at = excluded.expires_at
+        """,
+        (item_id, text, f"+{ttl_days} days"),
+    )
+
+
 def items_with_material(
     conn: sqlite3.Connection, config: Config, item_ids: Iterable[int]
 ) -> set[int]:
@@ -435,7 +513,7 @@ NowRequestOutcome = Literal[
     "running",  # 作っている途中
     "done",  # 掘り終えている(掘り直さない。調べ直しはカードへのリプライ。GH#137)
     "dug_today",  # 今日もう掘った(同じ日に 2 回は掘らない。_DUG_ON_DAY)
-    "no_body",  # 本文が無い(材料不足。has_material)
+    "no_body",  # 本文が無く、リンク先から取り直せもしない(has_material・refetchable)
     "no_item",  # item が無い(偽造か壊れた data)
 ]
 
@@ -500,7 +578,7 @@ def request_dig_now(
     受付の順序の印を残す(apply_instructions と同じ。GH#235)。
     """
     item = conn.execute(
-        "SELECT d.extracted_text FROM items i "
+        "SELECT d.extracted_text, i.canonical_url FROM items i "
         "LEFT JOIN documents d ON d.item_id = i.id WHERE i.id = ?",
         (item_id,),
     ).fetchone()
@@ -527,7 +605,8 @@ def request_dig_now(
         return "running" if queue["now_started_at"] is not None else "pending"
     if dug_on(conn, item_id, day):
         return "dug_today"
-    if not has_material(item["extracted_text"], config):
+    # 本文が消えた記事も、リンク先から取り直せるなら受け付ける(`intel dig-now` が取り直す。GH#446)
+    if not has_material(item["extracted_text"], config) and not refetchable(item["canonical_url"]):
         return "no_body"
     if queue is None:
         conn.execute(

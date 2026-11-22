@@ -371,7 +371,9 @@ def test_now_request_revives_passed_row(conn, config) -> None:
 )
 def test_now_request_refusals_write_nothing(conn, config, setup, outcome) -> None:
     body = {"no_body": None, "short_body": "短い"}.get(setup, BODY)
-    item = add_item_with_body(conn, "https://a/1", body)
+    # 本文の無い記事のうち断るのは、リンク先から取り直せない X の投稿そのもの(GH#446)
+    url = "https://x.com/i/web/status/1" if setup.endswith("body") else "https://a/1"
+    item = add_item_with_body(conn, url, body)
     enqueue_bookmark(conn, item)
     if setup == "done":
         conn.execute("UPDATE dig_queue SET status = 'done'")
@@ -396,6 +398,41 @@ def test_now_request_refusals_write_nothing(conn, config, setup, outcome) -> Non
     # 受け付け済み・作成中と答えた callback は id を残し、再配達を新しい依頼にしない
     kept = queue_row(conn, item)["now_callback_id"]
     assert kept == ("cb-x" if outcome in ("pending", "running") else None)
+
+
+@pytest.mark.parametrize("body", [None, "短い"])
+def test_now_request_accepts_an_article_whose_body_can_be_refetched(conn, config, body) -> None:
+    # 本文が消えた(短い)記事も、リンク先が X の外なら受け付ける。取り直すのは dig-now(GH#446)
+    item = add_item_with_body(conn, "https://example.com/article", body)
+
+    assert press_now(conn, config, item) == "accepted"
+    assert queue_row(conn, item)["now_requested_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://example.com/a", True),
+        ("http://example.com/a", True),
+        ("https://x.com/i/web/status/1", False),
+        ("https://twitter.com/a/status/1", False),
+        ("https://mobile.twitter.com/a/status/1", False),
+        ("http://x.com./i/web/status/1", False),  # 末尾のドット
+        ("https://X.COM/i/web/status/1", False),
+        ("https://m.twitter.com/a/status/1", False),  # X_HOSTS に無い subdomain
+        ("https://mobile.x.com/i/web/status/1", False),
+        ("https://www.reddit.com./r/x/comments/1", False),
+        ("https://notx.com/a", True),  # 名前が似ているだけの別の domain
+        ("https://www.reddit.com/r/x/comments/1", False),  # 1 分に 1 回しか受けない host
+        ("ftp://example.com/a", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_refetchable_excludes_x_posts_and_slow_hosts(url, expected) -> None:
+    from app.dig import refetchable
+
+    assert refetchable(url) is expected
 
 
 def test_now_request_for_missing_item(conn, config) -> None:
