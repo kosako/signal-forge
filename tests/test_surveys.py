@@ -24,6 +24,8 @@ from app.delivery.surveys import (
     BacklogButtons,
     backlog_keyboard,
     pending_dig_items,
+    q1_keyboard,
+    q2_keyboard,
     read_confirm_keyboard,
 )
 from app.delivery.telegram import DeliveryError
@@ -115,24 +117,32 @@ def test_survey_sent_once_at_time(conn, tmp_path) -> None:
     run_due_timers(conn, config, api, logger, now)
     run_due_timers(conn, config, api, logger, now)  # 同日2回目は送らない
 
-    texts = [t for _, t in api.sent]
-    assert len(texts) == 2  # 質問1 + 質問2(追い掛け対象なし)
-    assert "巡回した?" in texts[0]
-    assert "ダイジェストを読むのにかかった時間" in texts[1]
+    # 夜アンケートの 2 問は送らない(GH#440 の 3 本目)。未消化一覧も追い掛けも無い夜は何も送らない
+    assert api.sent == []
     assert get_state(conn, STATE_SURVEY_SENT) == now.strftime("%Y-%m-%d")
 
 
-def test_survey_callback_data_carries_date(conn, tmp_path) -> None:
-    api = FakeApi()  # reply_markup を送った順に記録する
-    now = jst_now("21:30")
-    run_due_timers(conn, make_config(tmp_path), api, logger, now)
+def test_evening_sends_the_backlog_without_the_two_questions(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    item_id = add_item(conn, "https://a/backlog", title="未読の記事")
+    add_dig_reaction(conn, item_id, (jst_now("21:30") - timedelta(days=3)).strftime("%Y-%m-%d"))
+    api = FakeApi()
 
-    date_compact = now.strftime("%Y%m%d")
-    q1_buttons = api.markups[0]["inline_keyboard"][0]
+    run_due_timers(conn, make_config(tmp_path), api, logger, jst_now("21:30"))
+
+    texts = [t for _, t in api.sent]
+    assert len(texts) == 1 and "未読の記事" in texts[0]
+    assert not any("巡回した?" in t or "かかった時間" in t for t in texts)
+
+
+def test_survey_callback_data_carries_date() -> None:
+    # 2026-11-22 までに送った質問のボタンは今も受け付ける。盤面の形は変えない
+    date_compact = "20261122"
+    q1_buttons = q1_keyboard(date_compact)["inline_keyboard"][0]
     assert [b["callback_data"] for b in q1_buttons] == [
         f"q1:{date_compact}:y", f"q1:{date_compact}:n"
     ]
-    q2_buttons = api.markups[1]["inline_keyboard"][0]
+    q2_buttons = q2_keyboard(date_compact)["inline_keyboard"][0]
     assert [b["callback_data"] for b in q2_buttons] == [
         f"q2:{date_compact}:5", f"q2:{date_compact}:10", f"q2:{date_compact}:15",
         f"q2:{date_compact}:20", f"q2:{date_compact}:30",
@@ -944,7 +954,9 @@ def test_run_poller_fires_timers_each_cycle(conn, tmp_path) -> None:
         conn, make_config(tmp_path), api, logger,
         should_stop=should_stop, now_fn=lambda: jst_now("21:30"),
     )
-    assert [t for _, t in api.sent if "巡回した?" in t]  # タイマー経由で送信された
+    # タイマーが動いた(夜の送信の state と、朝の未生成を知らせる watchdog)
+    assert get_state(conn, STATE_SURVEY_SENT) == jst_now("21:30").strftime("%Y-%m-%d")
+    assert [t for _, t in api.sent if "watchdog" in t]
     assert api.sent[0][0] == CHAT_ID
 
 

@@ -253,6 +253,15 @@ def test_collect_stats_counts_this_week_against_last_week(conn, tmp_path) -> Non
     assert not any(text.startswith("今の重点") for text in stats.values())  # 重点が off
 
 
+def test_collect_stats_leaves_out_the_nightly_answers_when_none(conn, tmp_path) -> None:
+    # 夜の質問は 2026-11-22 で終えた。答えの無い週に「未回答 7 日」と出さない(GH#440 の 3 本目)
+    busy_week(conn)
+
+    texts = [m.text for m in collect_stats(conn, weekly_config(tmp_path), SUNDAY_MORNING)]
+
+    assert not any("夜の質問" in text for text in texts)
+
+
 def test_collect_stats_lists_focus_topics_when_enabled(conn, tmp_path) -> None:
     conn.execute(
         "INSERT INTO focus_topics (name, terms, status, activated_at) "
@@ -379,7 +388,7 @@ def test_llm_does_not_judge_focus_topics() -> None:
     assert '"focus"' not in schema and "profile_line" in schema
     with pytest.raises(ValidationError):
         HypothesisDraft(kind="focus", question="重点は合っている?", evidence=["k1"])
-    assert PROMPT_VERSION == "weekly-v002"
+    assert PROMPT_VERSION == "weekly-v003"
 
 
 def test_prompt_fences_untrusted_text_and_keeps_profile_outside(conn, tmp_path) -> None:

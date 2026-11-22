@@ -334,7 +334,7 @@ collect と extraction は DB 経由でのみ受け渡す(設計 00 §3)ため�
 | kind | value | item_id | signal_date の帰属 |
 |---|---|---|---|
 | `reaction` | `useful`(👍)/ `dig`(🔖)/ `known`(✅)/ `noise`(👎) | 必須 | そのアイテムを配信した digest_date |
-| `survey_patrol` | `yes` / `no`(巡回した?) | NULL | 質問対象日。翌日 12:00 JST までの遅延回答も対象日に帰属 |
+| `survey_patrol` | `yes` / `no`(巡回した?) | NULL | 質問対象日。翌日 12:00 JST までの遅延回答も対象日に帰属(夜アンケートは 2026-11-22 で送るのをやめたので、その日までの質問の答えだけ。GH#440) |
 | `survey_read_min` | 分数の整数文字列 | NULL | 同上 |
 | `followup_dig` | `yes` / `no`(深掘りした?) | 必須(🔖済みアイテム。take の記録では 🔖 の無い深掘りアイテムも) | 🔖 の reaction と同じ日(そのアイテムを配信した digest_date。KPI 06 の帰属)。**MVP で送信・記録する**(🔖 を押した翌日の夜に追い掛け1通。押した日は reaction の created_at を JST に直した日付で決め、配信日の signal_date では決めない。過去の digest に後から付けた 🔖 も追い掛けるため。GH#226。設計 04 §4。フェーズ2境界の「50%深掘り」判定に必要)。深掘りカードへの take(GH#106)と、カードの ✅ 読んだ(GH#398)でも `yes` を記録する(読んだを取り消すと `no`)。🔖 の無いアイテムは take の日・押した日(KPI 06 の分子には入れない) |
 

@@ -1,4 +1,5 @@
 -- 読了時間の分布(夜アンケート質問2。10〜15分仮説との乖離を見る)
+-- 夜アンケートは 2026-11-22 で送るのをやめた(GH#440)。この集計はその日までの記録
 WITH latest AS (
   SELECT signal_date, value,
          row_number() OVER (PARTITION BY signal_date

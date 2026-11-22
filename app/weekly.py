@@ -43,7 +43,7 @@ from app.config import Config
 from app.jst import JST
 from app.prompting import fill_template, sanitize
 
-PROMPT_VERSION = "weekly-v002"
+PROMPT_VERSION = "weekly-v003"
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / f"{PROMPT_VERSION}.md"
 
 WEEKDAY = 6  # datetime.weekday() の日曜。作る朝と送る夜
@@ -430,10 +430,13 @@ def collect_stats(conn: sqlite3.Connection, config: Config, now: datetime) -> li
     )
     yes = sum(1 for value in answers.values() if value == "yes")
     no = sum(1 for value in answers.values() if value == "no")
-    lines.append(
-        f"夜の質問「今日、自分から情報を探しに巡回した?」の答え(直近 {WINDOW_DAYS} 日): "
-        f"はい {yes} 日・いいえ {no} 日・未回答 {WINDOW_DAYS - yes - no} 日"
-    )
+    # 夜の質問は 2026-11-22 で送るのをやめた(GH#440 の 3 本目)。答えのある週だけ出す(答えの
+    # 無い週に「未回答 7 日」と出すと、巡回をやめたように読める)
+    if yes or no:
+        lines.append(
+            f"夜の質問「今日、自分から情報を探しに巡回した?」の答え(直近 {WINDOW_DAYS} 日): "
+            f"はい {yes} 日・いいえ {no} 日・未回答 {WINDOW_DAYS - yes - no} 日"
+        )
 
     if config.focus.enabled:
         topics = conn.execute(

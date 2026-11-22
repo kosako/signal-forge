@@ -16,8 +16,8 @@ sqlite3 -header -column ~/.local/share/intel/intel.db < scripts/kpi/01-daily-kpi
 | # | ファイル | 出すもの | 週次レビューの項目 |
 |---|---------|---------|------------------|
 | 01 | `01-daily-kpi.sql` | 日次 KPI(👍∨🔖≥3)・反応率・無効日判定 | §6-1, 2 |
-| 02 | `02-patrol-replacement.sql` | 巡回代替日(質問1の最新回答) | §6-3 |
-| 03 | `03-read-minutes.sql` | 読了時間の分布(質問2) | §6-4 |
+| 02 | `02-patrol-replacement.sql` | 巡回代替日(質問1の最新回答。2026-11-22 までの記録) | §6-3 |
+| 03 | `03-read-minutes.sql` | 読了時間の分布(質問2。2026-11-22 までの記録) | §6-4 |
 | 04 | `04-source-category-rates.sql` | ソース別・カテゴリ別 👍∨🔖 率 | §6-5 |
 | 05 | `05-spot-check.sql` | 👍校正スポットチェック(7日前の👍から無作為3件) | §6-7 |
 | 06 | `06-phase2-boundary.sql` | 🔖累計・深掘り実施率・フェーズ2境界判定(2026-07-19 の PROPOSAL §フェーズ2境界の改訂で進出済み。現在は参考値) | 最終判定 |
@@ -29,6 +29,7 @@ sqlite3 -header -column ~/.local/share/intel/intel.db < scripts/kpi/01-daily-kpi
 
 - 反応の KPI(01/07/08)は**配信済み digest を母集団**にしており、反応ゼロの配信日も
   反応率 0% の無効日として SQL 内で判定される(手動補正は不要)。
+- 夜アンケートの 2 問は 2026-11-22 で送るのをやめた(GH#440)。02・03 はその日までの記録の集計で、以降の巡回は週の仮説の巡回の問いの答え(`uv run intel weekly`)で見る。
 - **夜アンケート未回答の日**は 02 に現れない。暦日と突き合わせ、未回答日は
   **代替できなかった日**として数える(PROPOSAL の fail-closed 定義)。
 
