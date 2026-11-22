@@ -15,12 +15,13 @@ app = typer.Typer(
 )
 
 
-def _build_connectors(config, env: dict[str, str], http, conn) -> dict:
+def _build_connectors(config, env: dict[str, str], http, conn, logger=None) -> dict:
     """有効なソース種別のコネクタを組み立てる(合成点)。X は config で有効なときだけ配線。
 
     import は実行時(他コマンドの --help を httpx 等の重い依存に触れさせない)。
     X の日次の読取上限は同じ日の実行で共有するので、台帳(conn の collect_runs)から当日の
     読取数を出してコネクタに渡す(GH#178)。collect の直前に組み立てること。
+    検索の枠は、今の重点で人が承認した 1 本があれば差し替えたもの(GH#433 の 6 本目)。
     """
     from app.connectors.rss import RssConnector
 
@@ -34,9 +35,10 @@ def _build_connectors(config, env: dict[str, str], http, conn) -> dict:
             search = None
             if config.x_search.slots:  # slots 空 = 検索無効(設計 02 §2)
                 from app.connectors.x_search import build_x_search_connector
+                from app.focus_x import effective_slots
 
                 search = build_x_search_connector(
-                    config.x_search.slots,
+                    effective_slots(conn, config, logger),
                     config.x_search.daily_read_cap,
                     config.x.unit_price_usd,
                     env,
@@ -73,7 +75,7 @@ def collect(
     http = HttpClient()
     collect_all(
         conn,
-        _build_connectors(config, env, http, conn),
+        _build_connectors(config, env, http, conn, logger),
         logger,
         resolve_short=http.resolve_short_url,
         limits=config.collect,
@@ -672,7 +674,7 @@ def run(
         conn,
         config,
         env,
-        _build_connectors(config, env, http, conn),
+        _build_connectors(config, env, http, conn, logger),
         http,
         lambda: create_engine(config.llm.engine),
         logger,

@@ -21,7 +21,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
 
 from app import source_health
@@ -195,6 +195,68 @@ def proposal_text(position: int, section: str, line: str) -> str:
     ])
 
 
+# 今の重点で X の検索の枠を入れ替える案(GH#433 の 6 本目。設計 04 §3・§4)。
+# callback は x:{id}:{N|n|r}
+# 案に並べる config の枠の表示の上限。入れる検索の文は切らない(承認する文と送る文を同じにする。
+# 検索の語は 40 字 × 3 個までなので、escape しても Telegram の上限に届かない)
+FOCUS_X_SLOT_MAX_CHARS = 300
+
+
+def focus_x_keyboard(
+    proposal_id: int,
+    slot_count: int,
+    *,
+    status: str = "proposed",
+    slot: int | None = None,
+) -> dict:
+    """案のボタン。status は台帳の状態(proposed・approved・declined・reverted・expired)。"""
+    if status == "approved":
+        rows = [[
+            {"text": f"✓ {slot} と入れ替え中", "callback_data": f"x:{proposal_id}:{slot}"},
+            {"text": "↩️ 元に戻す", "callback_data": f"x:{proposal_id}:r"},
+        ]]
+    elif status == "declined":
+        rows = [[{"text": "入れない ✓", "callback_data": f"x:{proposal_id}:n"}]]
+    elif status == "reverted":
+        rows = [[{"text": "↩️ 元に戻した ✓", "callback_data": f"x:{proposal_id}:r"}]]
+    elif status == "expired":
+        rows = [[{"text": "重点から外れました", "callback_data": f"x:{proposal_id}:n"}]]
+    else:
+        rows = [
+            [
+                {"text": f"{n} と入れ替える", "callback_data": f"x:{proposal_id}:{n}"}
+                for n in range(1, slot_count + 1)
+            ],
+            [{"text": "入れない", "callback_data": f"x:{proposal_id}:n"}],
+        ]
+    return {"inline_keyboard": rows}
+
+
+def focus_x_text(row: Mapping, slots: Sequence[str], activated_at: str | None) -> str:
+    """案の 1 通の本文。話題の名前と検索の文は外部の本文に由来するので escape する。"""
+    since = ""
+    if activated_at:
+        day = datetime.strptime(activated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        day = day.astimezone(JST)
+        since = f" {day.month}/{day.day} から"
+    name = escape_and_truncate(" ".join(str(row["topic_name"]).split()), 60)
+    lines = [
+        "🔍 X の検索の枠を、今の重点で 1 本入れ替えますか?",
+        f"「{name}」が{since}今の重点です。",
+        f"入れる検索: {escape_text(row['query'])}",
+        "今の枠:",
+    ]
+    lines += [
+        f"{n}. {escape_and_truncate(slot, FOCUS_X_SLOT_MAX_CHARS)}"
+        for n, slot in enumerate(slots, start=1)
+    ]
+    lines.append(
+        "入れ替える枠の番号を押してください。重点から外れたら、次の朝から元の枠に戻します。"
+        "1 日に読む件数は変わりません。"
+    )
+    return "\n".join(lines)
+
+
 def followup_keyboard(item_id: int, *, selected: str | None = None) -> dict:
     """🔖追い掛け(深掘りした?)。selected は y|n。"""
     return {
@@ -344,6 +406,54 @@ def run_due_timers(
         and send_weekly_questions(conn, config, api, logger, today)
     ):
         set_state(conn, STATE_WEEKLY_SENT, today)
+    # 今の重点で X の検索の枠を入れ替える案(GH#433 の 6 本目)。その日の朝のダイジェストを送った後に
+    # 1 通。案があるかは毎周期確かめる(台帳の行が送った印。送れなければ次の周期に送り直す)
+    if (
+        config.focus.enabled
+        and config.x.enabled
+        and config.x_search.slots
+        and _digest_sent(conn, today)
+    ):
+        send_focus_x_proposal(conn, config, api, logger, now)
+
+
+def _digest_sent(conn: sqlite3.Connection, day: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM digests WHERE digest_date = ? AND delivery_status = 'sent'", (day,)
+        ).fetchone()
+        is not None
+    )
+
+
+def send_focus_x_proposal(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    logger: logging.Logger,
+    now: datetime,
+) -> None:
+    """X の検索の枠を入れ替える案があれば 1 通送り、message_id を台帳に残す(GH#433 の 6 本目)。
+
+    送れなかったときは投げる(内蔵タイマーの失敗として次の周期に試し直す。台帳の行は残るので、
+    同じ案を送り直す)。記録の前に止まった分も次の周期に送り直す(無配信より二重送信)。
+    """
+    from app.focus_x import next_proposal, record_sent
+
+    row = next_proposal(conn, config, now)
+    if row is None:
+        return
+    slots = config.x_search.slots
+    message_id = api.send_message(
+        _require_chat_id(config),
+        focus_x_text(row, slots, row["activated_at"]),
+        reply_markup=focus_x_keyboard(row["id"], len(slots)),
+    )
+    record_sent(conn, row["id"], message_id, slots)
+    logger.info(
+        "X の検索の枠を入れ替える案を送った",
+        extra={"stage": "poll", "extra": {"proposal_id": row["id"], "topic_id": row["topic_id"]}},
+    )
 
 
 def send_evening_survey(

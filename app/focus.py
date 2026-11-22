@@ -140,6 +140,7 @@ class FocusRunResult:
     llm_failed: bool = False
     activated: list[int] = field(default_factory=list)  # 重点に入った話題の id
     deactivated: list[int] = field(default_factory=list)  # 重点から外れた話題の id
+    x_reverted: int = 0  # 重点から外れて、元の枠に戻した X の検索の枠(GH#433 の 6 本目)
 
 
 def run_focus(
@@ -176,6 +177,10 @@ def run_focus(
                 conn, signals, drafts, allowed, run_id=run_id
             )
     result.activated, result.deactivated = refresh_status(conn, config, now)
+    from app.focus_x import revert_stale
+
+    # 重点から外れた話題で入れ替えていた X の検索の枠を閉じる(差し替えは収集が毎回確かめる)
+    result.x_reverted = len(revert_stale(conn, now)[0])
     logger.info(
         "今の重点を更新",
         extra={
@@ -186,6 +191,7 @@ def run_focus(
                 "new_topics": result.new_topics,
                 "activated": len(result.activated),
                 "deactivated": len(result.deactivated),
+                "x_reverted": result.x_reverted,
                 "llm_failed": result.llm_failed,
             },
         },
@@ -787,6 +793,12 @@ def render_focus(conn: sqlite3.Connection, config: Config, *, now: datetime | No
         lines.append("")
         lines.append("■ 外した話題")
         lines.extend(_topic_lines(dismissed))
+    if config.x.enabled and config.x_search.slots:
+        from app.focus_x import render_state
+
+        lines.append("")
+        lines.append("■ X の検索の枠(承認した 1 本を入れ替える)")
+        lines.extend(render_state(conn, config))
     total, unassigned = conn.execute(
         "SELECT count(*), coalesce(sum(topic_id IS NULL), 0) FROM focus_evidence"
     ).fetchone()
