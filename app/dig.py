@@ -320,12 +320,21 @@ def refetchable(url: str | None) -> bool:
     """
     if not url:
         return False
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(url)
+        # 大文字小文字と末尾のドット(`x.com.`)を揃えてから比べる。X の domain は subdomain も含めて
+        # 外す(X_HOSTS に無い別名の subdomain へ転送されても取りに行かない)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:  # 分解できない URL は取りに行かない
+        return False
+    x_domains = {h.removeprefix("www.").removeprefix("mobile.") for h in X_HOSTS}
+    is_x = host in X_HOSTS or any(
+        host == domain or host.endswith("." + domain) for domain in x_domains
+    )
     return (
         parts.scheme in ("http", "https")
         and bool(host)
-        and host not in X_HOSTS
+        and not is_x
         and not is_slow_host(url)
     )
 

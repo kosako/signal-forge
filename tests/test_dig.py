@@ -417,6 +417,12 @@ def test_now_request_accepts_an_article_whose_body_can_be_refetched(conn, config
         ("https://x.com/i/web/status/1", False),
         ("https://twitter.com/a/status/1", False),
         ("https://mobile.twitter.com/a/status/1", False),
+        ("http://x.com./i/web/status/1", False),  # 末尾のドット
+        ("https://X.COM/i/web/status/1", False),
+        ("https://m.twitter.com/a/status/1", False),  # X_HOSTS に無い subdomain
+        ("https://mobile.x.com/i/web/status/1", False),
+        ("https://www.reddit.com./r/x/comments/1", False),
+        ("https://notx.com/a", True),  # 名前が似ているだけの別の domain
         ("https://www.reddit.com/r/x/comments/1", False),  # 1 分に 1 回しか受けない host
         ("ftp://example.com/a", False),
         ("", False),

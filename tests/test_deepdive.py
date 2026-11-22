@@ -3113,7 +3113,10 @@ REFETCH_FAILED = (
 )
 
 
-def test_dig_now_does_not_follow_a_redirect_to_an_x_post(conn, config) -> None:
+@pytest.mark.parametrize(
+    "location", ["https://x.com/i/web/status/1", "http://x.com./i/web/status/1"]
+)
+def test_dig_now_does_not_follow_a_redirect_to_an_x_post(conn, config, location) -> None:
     # 取り直しの転送先も確かめる。X の投稿へ転送されたら取りに行かずに閉じて知らせる(GH#446)
     item = add_item(conn, "https://ja.example/記事", language="ja")
     enqueue(conn, item)
@@ -3122,7 +3125,7 @@ def test_dig_now_does_not_follow_a_redirect_to_an_x_post(conn, config) -> None:
     conn.commit()
     calls: list[str] = []
     http = make_http(
-        lambda request: httpx.Response(302, headers={"location": "https://x.com/i/web/status/1"}),
+        lambda request: httpx.Response(302, headers={"location": location}),
         calls,
     )
     api = FakeApi()
@@ -3130,6 +3133,7 @@ def test_dig_now_does_not_follow_a_redirect_to_an_x_post(conn, config) -> None:
     assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
 
     assert [c for c in calls if "x.com" in c] == []
+    assert len(calls) == 1  # 最初の記事の URL だけを送った
     assert api.sent == [(10, REFETCH_FAILED.format(id=item))]
 
 
