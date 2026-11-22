@@ -59,6 +59,7 @@ from app.language import looks_japanese
 from app.prompting import load_writing_guide
 from app.vault_guard import VaultGuard
 from tests.test_delivery import telegram_text_error
+from tests.test_extraction import make_http
 
 logger = logging.getLogger("test-deepdive")
 
@@ -3054,18 +3055,81 @@ def test_dig_now_closes_request_for_item_dug_today(conn, config) -> None:
 
 
 def test_dig_now_without_body_closes_and_notifies(conn, config) -> None:
-    item = add_item(conn, "https://ja.example/記事", language="ja")
+    # リンク先から取り直せない X の投稿そのもの(GH#446)は、取りに行かずに閉じて知らせる
+    item = add_item(conn, "https://x.com/i/web/status/42", language="ja")
     enqueue(conn, item)
     request_now(conn, config, item)
     conn.execute("DELETE FROM documents")  # 受け付けた後に purge で消えた
     api = FakeApi()
+    calls: list[str] = []
+    http = make_http(lambda request: httpx.Response(500), calls)
 
-    assert run_dig_now(conn, config, make_factory({}), api, logger) is True
+    assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
 
+    assert calls == []
     assert queue_state(conn, item)["now_requested_at"] is None
     assert api.sent == [
         (10, f"⚠️ {item} は本文が無いため、今すぐの深掘りを作れませんでした")
     ]
+
+
+ARTICLE_HTML = f"<html><body><article><h1>記事</h1><p>{BODY}</p></article></body></html>"
+
+
+def test_dig_now_refetches_a_lost_body_and_digs(conn, config) -> None:
+    # 本文が保存の期間を過ぎて消えた記事は、リンク先から取り直して掘る(GH#446)
+    item = add_item(conn, "https://ja.example/記事", title="日本語の記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute("DELETE FROM documents")
+    conn.commit()
+    calls: list[str] = []
+    http = make_http(
+        lambda request: httpx.Response(
+            200, html=ARTICLE_HTML, headers={"content-type": "text/html; charset=utf-8"}
+        ),
+        calls,
+    )
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
+
+    assert len(calls) == 1
+    document = conn.execute(
+        "SELECT extracted_text, extraction_status, expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', "
+        "'now') AS alive FROM documents WHERE item_id = ?",
+        (item,),
+    ).fetchone()
+    assert BODY in document["extracted_text"]
+    assert (document["extraction_status"], document["alive"]) == ("ok", 1)
+    row = queue_state(conn, item)
+    assert (row["status"], row["now_requested_at"]) == ("done", None)
+    [(_, card)] = api.sent
+    assert "⚡ 今すぐの依頼" in card
+
+
+@pytest.mark.parametrize("status", [404, 200])
+def test_dig_now_closes_and_notifies_when_the_body_cannot_be_refetched(
+    conn, config, status
+) -> None:
+    item = add_item(conn, "https://ja.example/記事", language="ja")
+    enqueue(conn, item)
+    request_now(conn, config, item)
+    conn.execute("DELETE FROM documents")
+    conn.commit()
+    short = "<html><body><p>短い</p></body></html>"  # 200 でも材料に足りない
+    http = make_http(lambda request: httpx.Response(status, html=short))
+    api = FakeApi()
+
+    assert run_dig_now(conn, config, make_factory({}), api, logger, http=http) is True
+
+    assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM dig_results").fetchone()[0] == 0
+    assert queue_state(conn, item)["now_requested_at"] is None
+    assert api.sent == [(
+        10,
+        f"⚠️ {item} は本文をリンク先から取り直せなかったため、今すぐの深掘りを作れませんでした",
+    )]
 
 
 def test_dig_now_does_nothing_while_dig_lock_held(conn, config, tmp_path) -> None:

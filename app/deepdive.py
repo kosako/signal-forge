@@ -62,7 +62,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
@@ -96,6 +96,8 @@ from app.dig import (
     has_now_requests,
     has_unsent_cards,
     interrupted_now_requests,
+    refetchable,
+    save_refetched_document,
     select_from_queue,
 )
 from app.dig_take import is_dismissed, is_read
@@ -525,9 +527,44 @@ def run_dig_now(
         )
 
 
+def _refetch_body(
+    conn: sqlite3.Connection,
+    config: Config,
+    http: HttpClient,
+    candidate: DigCandidate,
+    day: str,
+    logger: logging.Logger,
+    log_extra: dict,
+) -> DigCandidate | None:
+    """本文が消えた記事の本文を、リンク先から取り直す(GH#446)。取れなければ None。
+
+    取り方は記事の抽出・出来事の調査と同じ(app.extraction.extractor.fetch_article_text。SSRF の
+    守り・受信量の上限・文字コードの判定)。材料が足りれば documents に残し(保存の期間は抽出と
+    同じ)、本文と取り直した日を入れた候補を返す。ログには失敗の種類だけを書き、本文は書かない。
+    """
+    from app.extraction.extractor import fetch_article_text
+
+    try:
+        text = fetch_article_text(http, candidate.canonical_url)
+    except Exception as e:  # 取り直しは付加の手順。失敗しても dig-now 全体は止めない
+        logger.warning(f"本文を取り直せなかった: {type(e).__name__}", extra=log_extra)
+        return None
+    if not has_material(text, config):
+        logger.warning("取り直した本文が短すぎるか、取れなかった", extra=log_extra)
+        return None
+    assert text is not None
+    save_refetched_document(conn, config, candidate.item_id, text)
+    conn.commit()
+    logger.info("本文をリンク先から取り直した", extra=log_extra)
+    return replace(candidate, body=text, fetched_date=day)
+
+
 # 今すぐの依頼を作れなかったときの知らせ(GH#388)。固定の文言だけにし、外部由来の本文を入れない
 _NOW_FAILED = "⚠️ {item_id} の今すぐの深掘りを作れませんでした。明朝の深掘りに回します"
 _NOW_NO_BODY = "⚠️ {item_id} は本文が無いため、今すぐの深掘りを作れませんでした"
+_NOW_REFETCH_FAILED = (
+    "⚠️ {item_id} は本文をリンク先から取り直せなかったため、今すぐの深掘りを作れませんでした"
+)
 
 
 def _run_dig_now_locked(
@@ -594,6 +631,21 @@ def _run_dig_now_locked(
             )
             logger.info("今日もう掘った item の今すぐの依頼を、作らずに閉じた", extra=log_extra)
             continue
+        if not has_material(candidate.body, config) and refetchable(candidate.canonical_url):
+            # 本文が保存の期間を過ぎて消えた記事は、リンク先から取り直して掘る(GH#446)
+            if http is None:
+                http = HttpClient()
+            refetched = _refetch_body(conn, config, http, candidate, day, logger, log_extra)
+            if refetched is None:
+                close_now_request(
+                    conn, candidate.item_id, candidate.now_started_at, to_morning=False
+                )
+                _notify_now(
+                    config, api, logger, run_id,
+                    _NOW_REFETCH_FAILED.format(item_id=candidate.item_id),
+                )
+                continue
+            candidate = refetched
         if not has_material(candidate.body, config):
             close_now_request(
                 conn, candidate.item_id, candidate.now_started_at, to_morning=False

@@ -2288,6 +2288,9 @@ def test_digest_now_button_refused_when_dig_is_off(conn, tmp_path) -> None:
 
 def test_digest_now_button_without_body_answers_and_writes_nothing(conn, tmp_path) -> None:
     [item] = add_digest_item_messages(conn, body=None)
+    # 本文の無い記事のうち断るのは、リンク先から取り直せない X の投稿そのもの(GH#446)
+    conn.execute("UPDATE items SET canonical_url = 'https://x.com/i/web/status/9' WHERE id = ?",
+                 (item,))
     worker = FakeWorker()
     api = FakeApi([[digest_now_press(item)]])
 
