@@ -42,6 +42,7 @@ from app.delivery.surveys import (
     BacklogButtons,
     SentReadConfirm,
     backlog_keyboard,
+    focus_x_keyboard,
     followup_keyboard,
     on_backlog,
     pending_dig_items,
@@ -475,6 +476,13 @@ def _handle_callback(
             _record_profile_proposal(
                 conn, config, api, callback, callback_id, int(arg), PROPOSAL_CODES[code], logger,
                 now=now_fn(),
+            )
+            return
+        # 今の重点で X の検索の枠を入れ替える案(GH#433 の 6 本目)。N は案の id。3 つ目は入れ替える
+        # 枠の番号(1〜3)・入れない(n)・元に戻す(r)
+        if prefix == "x" and re.fullmatch(r"[0-9]{1,9}", arg) and re.fullmatch(r"[1-3nr]", code):
+            _record_focus_x(
+                conn, config, api, callback, callback_id, int(arg), code, logger, now=now_fn()
             )
             return
         # ヘッダの今の重点を外す(t)・戻す(u)。N は写しの番号(1 桁の ASCII の数字。GH#433)
@@ -1550,6 +1558,98 @@ def _record_focus_toggle(
     )
     if keyboard is not None:
         _edit_markup_best_effort(api, callback, keyboard, logger)
+
+
+# X の検索の枠の案のボタンの答え(GH#433 の 6 本目)。固定の文言と番号だけ(話題の名前と検索の文は
+# 入れない)
+_FOCUS_X_ANSWERS = {
+    "approved": "🔍 {slot} 本目を入れ替えました。次の朝の検索から使います",
+    "declined": "入れないことにしました。この重点の間はもう聞きません",
+    "reverted": "↩️ 元の枠に戻しました。次の朝の検索から元に戻ります",
+    "expired": "この話題はもう今の重点から外れています。入れ替えません",
+    "not_approved": "↩️ 入れ替えていません",
+    "no_slot": "⚠️ その番号の枠がありません",
+    "missing": "⚠️ この案には対応できません",
+}
+_FOCUS_X_ALREADY = {
+    "approved": "🔍 {slot} 本目と入れ替え中です。戻すときは「↩️ 元に戻す」を押してください",
+    "declined": "入れないことにしてあります",
+    "reverted": "↩️ 元に戻してあります",
+}
+_FOCUS_X_CLOSED = {
+    "declined": "入れないことにしてあります",
+    "expired": "この話題はもう今の重点から外れています。入れ替えません",
+    "reverted": "↩️ 元に戻してあります。この重点の間は入れ替えません",
+}
+
+
+def _record_focus_x(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    proposal_id: int,
+    code: str,
+    logger: logging.Logger,
+    *,
+    now: datetime,
+) -> None:
+    """X の検索の枠を入れ替える案のボタン(GH#433 の 6 本目。設計 03 §4.1・04 §3)。
+
+    押されたメッセージが、その案として送ったメッセージ(focus_x_slots.message_id)で owner の chat に
+    あることを確かめてから記録する(callback_data の番号だけを信じない)。確認と記録は 1 つの
+    トランザクション(app.focus_x.decide)。押した後は、今の状態のボタンに差し替える。
+    """
+    from app.focus_x import decide
+
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    log_extra = {"stage": "poll", "extra": {"proposal_id": proposal_id}}
+    if chat_id != config.telegram.owner_chat_id or type(message_id) is not int:
+        logger.warning("X の検索の枠の案と結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text=_FOCUS_X_ANSWERS["missing"])
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcome, row = decide(conn, config, proposal_id, message_id, code, now)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"X の検索の枠の案を記帳できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(f"X の検索の枠の案: {outcome}", extra=log_extra)
+    if row is None:
+        logger.warning("X の検索の枠の案と結び付かないボタンを破棄", extra=log_extra)
+        api.answer_callback_query(callback_id, text=_FOCUS_X_ANSWERS["missing"])
+        return
+    status = row["status"]
+    if outcome == "already":
+        text = _FOCUS_X_ALREADY[status]
+    elif outcome == "closed":
+        text = _FOCUS_X_CLOSED[status]
+    else:
+        text = _FOCUS_X_ANSWERS[outcome]
+    api.answer_callback_query(callback_id, text=text.format(slot=row["slot"]))
+    if outcome in ("no_slot", "not_approved"):
+        return
+    _edit_markup_best_effort(
+        api,
+        callback,
+        focus_x_keyboard(
+            proposal_id, len(config.x_search.slots), status=status, slot=row["slot"]
+        ),
+        logger,
+    )
 
 
 def _accept_dig_now(
