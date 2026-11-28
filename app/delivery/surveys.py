@@ -79,6 +79,12 @@ DIG_BACKLOG_CONTINUED = f"{DIG_BACKLOG_TITLE}(続き)"
 # 設計 06 §2・04 §3)。1 通のボタンの数の上限は、Telegram の inline keyboard の上限(約 100)に
 # 余裕を残す。超えるなら行の単位で次の 1 通に分ける
 DIG_BACKLOG_MAX_BUTTONS = 50
+# 古い記事の枠(GH#449)。新しい側の DIG_BACKLOG_MAX_ITEMS 行に入らない未読を、古い順に毎晩この数ずつ
+# 出す。押さなかった記事は次の夜に次の分へ回し、一巡したら古い側の先頭に戻る(勝手には外さない)
+DIG_BACKLOG_OLD_ROWS = 5
+# 前の夜に出した古い記事の最後の 1 件(`<marked_at>\t<item_id>`)。次の夜はこの次から出す
+STATE_BACKLOG_OLD_CURSOR = "dig_backlog_old_cursor"
+DIG_BACKLOG_OLD_BULK = "b:0:z"  # 「古い記事をまとめて不要」のボタンの callback_data
 # 行のボタンを付ける行の数(明朝の予定の行は数えずに必ず付ける。GH#411)。15 行すべてに付けると
 # ボタンが縦に 15 段以上並び、多すぎる(ユーザーのフィードバック 2026-11-13)。付けるのは新しい順の
 # 上から。下の行は、上の行が一覧から外れると次の夜から上がってくる
@@ -476,7 +482,8 @@ def send_evening_survey(
     # 0件で予定も無い日は送らない(GH#88・GH#349)。長ければ行の単位で複数通に分ける(GH#349)。
     # 行のボタン(明朝の予定の skip = GH#349、今すぐ = GH#388)は、その行を載せた 1 通に付ける
     today = now.strftime("%Y-%m-%d")
-    for text, keyboard in _dig_backlog_message(conn, config, backlog, plan, today):
+    messages, old_cursor = _dig_backlog_message(conn, config, backlog, plan, today)
+    for text, keyboard, old_item_ids in messages:
         try:
             message_id = api.send_message(chat_id, text, reply_markup=keyboard)
         except DeliveryError as e:
@@ -488,12 +495,16 @@ def send_evening_survey(
         # リプライ先の認識用台帳(GH#104)。過去の一覧へのリプライも有効にするため
         # 蓄積する(REPLACE は getUpdates 再配達等での同一 id 再送に対する冪等)。複数通に
         # 分けたときは、どの 1 通へのリプライも指定として受け付ける
+        # 古い記事の枠を載せた 1 通は、載せた item を残す(まとめて不要の対象。GH#449)
         conn.execute(
-            "INSERT OR REPLACE INTO dig_backlog_messages (message_id, sent_date) "
-            "VALUES (?, ?)",
-            (message_id, today),
+            "INSERT OR REPLACE INTO dig_backlog_messages (message_id, sent_date, old_item_ids) "
+            "VALUES (?, ?, ?)",
+            (message_id, today, json.dumps(list(old_item_ids)) if old_item_ids else None),
         )
         conn.commit()
+    if backlog_failure is None and old_cursor is not None:
+        # 古い記事の枠を送れたら、次の夜は続きから出す(送れなかった夜は同じ分をもう一度)
+        set_state(conn, STATE_BACKLOG_OLD_CURSOR, old_cursor)
     followups = _followup_targets(conn, (now - timedelta(days=1)).strftime("%Y-%m-%d"))
     for row in followups:
         api.send_message(
@@ -704,13 +715,50 @@ def _linked_title(row: Mapping, budget: int) -> str:
     return f'<a href="{escape_attr(row["canonical_url"])}">{title}</a>'
 
 
+class BacklogMessage(NamedTuple):
+    """夜の一覧の 1 通。old_item_ids はその 1 通の古い記事の枠に載せた item(GH#449)。"""
+
+    text: str
+    keyboard: dict | None
+    old_item_ids: tuple[int, ...] = ()
+
+
+def old_cursor_value(row: Mapping) -> str:
+    return f"{row['marked_at']}\t{row['item_id']}"
+
+
+def pick_old_rows(
+    pool: Sequence[Mapping], cursor: str | None, limit: int = DIG_BACKLOG_OLD_ROWS
+) -> list[Mapping]:
+    """古い記事の枠に出す行(GH#449)。pool は新しい側の行に入らない未読(新しい 🔖 順)。
+
+    古い順に並べ、前の夜に出した最後の 1 件(cursor)より後ろから limit 件を選ぶ。足りなければ古い側の
+    先頭に戻って埋める(一巡)。cursor の記事が一覧から消えていても、🔖 の時刻と id の順で次が決まる。
+    """
+    oldest_first = sorted(pool, key=lambda r: (r["marked_at"], r["item_id"]))
+    after = oldest_first
+    if cursor:
+        marked_at, _, item_id = cursor.partition("\t")
+        key = (marked_at, int(item_id) if item_id.isdigit() else -1)
+        after = [r for r in oldest_first if (r["marked_at"], r["item_id"]) > key]
+    picked = list(after[:limit])
+    picked_ids = {r["item_id"] for r in picked}
+    for row in oldest_first:
+        if len(picked) >= limit:
+            break
+        if row["item_id"] not in picked_ids:
+            picked.append(row)
+            picked_ids.add(row["item_id"])
+    return picked
+
+
 def _dig_backlog_message(
     conn: sqlite3.Connection,
     config: Config,
     backlog: list[sqlite3.Row],
     plan: Sequence[DigCandidate],
     today: str,
-) -> list[tuple[str, dict | None]]:
+) -> tuple[list[BacklogMessage], str | None]:
     """未消化一覧の本文とボタン(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
 
     today は一覧を送る日(JST)。今日もう掘った item には今すぐのボタンを付けない(同じ日に 2 回は
@@ -725,9 +773,9 @@ def _dig_backlog_message(
     キューにあるので、一覧へのリプライで指定できる(poller の valid_ids は queue_item_ids を含む)。
     """
     if config.dig.daily_cap <= 0:
-        return _dig_backlog_text(backlog) if backlog else []
+        return (_dig_backlog_text(backlog) if backlog else []), None
     if not backlog and not plan:
-        return []
+        return [], None
     by_id = {row["item_id"]: row for row in backlog}
     planned_ids = {candidate.item_id for candidate in plan}
     plan_rows: list[Mapping] = [
@@ -741,21 +789,27 @@ def _dig_backlog_message(
         for candidate in plan
     ]
     rest = [row for row in backlog if row["item_id"] not in planned_ids]
+    # 古い記事の枠(GH#449): 新しい側の行に入らない未読から、前の夜の続きを古い順に選ぶ
+    old_pool = rest[DIG_BACKLOG_MAX_ITEMS:]
+    old_rows = pick_old_rows(old_pool, get_state(conn, STATE_BACKLOG_OLD_CURSOR))
     shown_ids = [row["item_id"] for row in rest[:DIG_BACKLOG_MAX_ITEMS]]
-    return _dig_backlog_text(
+    old_ids = [row["item_id"] for row in old_rows]
+    all_ids = [*planned_ids, *shown_ids, *old_ids]
+    messages = _dig_backlog_text(
         rest,
         plan_rows=plan_rows,
-        states=dig_states(conn, config, shown_ids, planned_ids),
+        old_rows=old_rows,
+        old_total=len(old_pool),
+        states=dig_states(conn, config, [*shown_ids, *old_ids], planned_ids),
         digest_fill=config.dig.daily_cap - len(plan),
         with_buttons=True,
-        dug_today={
-            item_id for item_id in [*planned_ids, *shown_ids] if dug_on(conn, item_id, today)
-        },
-        carded=items_with_cards(conn, [*planned_ids, *shown_ids]),
-        read_marked=read_items(conn, [*planned_ids, *shown_ids]),
-        dismissed=dismissed_items(conn, [*planned_ids, *shown_ids]),
-        refetchable=refetchable_items(conn, shown_ids),
+        dug_today={item_id for item_id in all_ids if dug_on(conn, item_id, today)},
+        carded=items_with_cards(conn, all_ids),
+        read_marked=read_items(conn, all_ids),
+        dismissed=dismissed_items(conn, all_ids),
+        refetchable=refetchable_items(conn, [*shown_ids, *old_ids]),
     )
+    return messages, (old_cursor_value(old_rows[-1]) if old_rows else None)
 
 
 def _dig_backlog_text(
@@ -770,7 +824,9 @@ def _dig_backlog_text(
     read_marked: Collection[int] = (),
     dismissed: Collection[int] = (),
     refetchable: Collection[int] = (),
-) -> list[tuple[str, dict | None]]:
+    old_rows: Sequence[Mapping] = (),
+    old_total: int = 0,
+) -> list[BacklogMessage]:
     """未消化 🔖 一覧(見出しは「まだ読んでいない記事」。GH#409)。新しい 🔖 順・上限超過分は
     件数だけ示す(GH#88)。
 
@@ -794,6 +850,9 @@ def _dig_backlog_text(
     ⚡ 今すぐは、上の行より下でも、今すぐ掘れる行に付ける(GH#446。✅ と 👎 は上の行だけ)。今すぐ
     掘れる = 状態が DIG_NOW_STATES、または本文が消えていても(no_body)リンク先から取り直せる
     (refetchable。`intel dig-now` が取り直す)行で、今日もう掘っていないもの。
+    old_rows があれば、新しい側の行の後に「🗂 古い記事」の枠を置く(GH#449。old_total は新しい側の
+    行に入らない未読の数)。枠の行には ⚡ 今すぐ(掘れる行)・✅ 読んだ・👎 不要を付け、枠の最後の行を
+    載せた 1 通に「👎 古い記事 N 件をまとめて不要」(DIG_BACKLOG_OLD_BULK)を足す。
     """
     states = states or {}
     lines = [f"{DIG_BACKLOG_TITLE}({len(plan_rows) + len(rows)}件)"]
@@ -811,6 +870,21 @@ def _dig_backlog_text(
         )
     if len(rows) > DIG_BACKLOG_MAX_ITEMS:
         lines.append(f"(他 {len(rows) - DIG_BACKLOG_MAX_ITEMS} 件)")
+    # 古い記事の枠(GH#449)。見出しは空行で区切る
+    old_start = len(lines) + 1
+    if old_rows:
+        lines.append(
+            f"\n🗂 古い記事({old_total} 件のうち、古い順に {len(old_rows)} 件。"
+            f"毎晩 {DIG_BACKLOG_OLD_ROWS} 件ずつ入れ替わります)"
+        )
+        for row in old_rows:
+            state = states.get(row["item_id"])
+            label = DIG_STATE_MARKS.get(state) if state is not None else None
+            mark = f"{label} " if label is not None else ""
+            lines.append(
+                f"{row['item_id']}. {mark}{_linked_title(row, DIG_BACKLOG_TITLE_MAX_CHARS)}"
+                f"(🔖 {_jst_month_day(row['marked_at'])})"
+            )
     # 夜の予定は確約ではない(GH#349。設計 06 §2)。② は新しい順なので、朝の x_signals 段が
     # 取り込む新しい 🔖 が押し出しうる。③ は朝の digest で決まるので件数だけ示す
     notes = []
@@ -874,14 +948,29 @@ def _dig_backlog_text(
         ):
             if now_ok(row["item_id"]):
                 buttons_at[index] = BacklogButtons(row["item_id"], now=True, skip=False)
+        # 古い記事の枠の行(GH#449)
+        for index, row in enumerate(old_rows, start=old_start):
+            item_id = row["item_id"]
+            buttons_at[index] = BacklogButtons(
+                item_id,
+                now=now_ok(item_id),
+                skip=False,
+                read=item_id in carded,
+                dismiss=True,
+            )
+    old_indexes = set(range(old_start, old_start + len(old_rows))) if with_buttons else set()
+    bulk_at = old_start + len(old_rows) - 1 if old_indexes else None
+    counted = {index: buttons.count for index, buttons in buttons_at.items()}
+    if bulk_at is not None:
+        counted[bulk_at] += 1  # まとめて不要のボタンも、その 1 通のボタンの数に入れる
     groups = pack_line_groups(
         lines,
         DIG_BACKLOG_TEXT_MAX_CHARS - visible_length(DIG_BACKLOG_CONTINUED) - 1,
         measure=visible_length,
-        counted={index: buttons.count for index, buttons in buttons_at.items()},
+        counted=counted,
         max_counted=DIG_BACKLOG_MAX_BUTTONS,
     )
-    messages: list[tuple[str, dict | None]] = []
+    messages: list[BacklogMessage] = []
     for position, group in enumerate(groups):
         text = "\n".join(lines[index] for index in group)
         if position > 0:
@@ -891,8 +980,37 @@ def _dig_backlog_text(
         keyboard = (
             backlog_keyboard(buttons, read=read_marked, dismissed=dismissed) if buttons else None
         )
-        messages.append((text, keyboard))
+        old_ids = tuple(
+            row["item_id"]
+            for index, row in enumerate(old_rows, start=old_start)
+            if index in group and index in old_indexes
+        )
+        if keyboard is not None and bulk_at in group and old_ids:
+            keyboard["inline_keyboard"].append(
+                [old_bulk_button(len(old_ids), done=all(
+                    i in dismissed or i in read_marked for i in old_ids
+                ))]
+            )
+        messages.append(BacklogMessage(text, keyboard, old_ids if bulk_at in group else ()))
     return messages
+
+
+def old_bulk_button(count: int, *, done: bool = False) -> dict:
+    """古い記事の枠の「まとめて不要」(GH#449)。枠の記事がすべて不要か読んだなら ✓ を付ける。"""
+    return {
+        "text": _mark(f"👎 古い記事 {count} 件をまとめて不要", done),
+        "callback_data": DIG_BACKLOG_OLD_BULK,
+    }
+
+
+def _jst_month_day(stamp: str) -> str:
+    """UTC の 'YYYY-MM-DDTHH:MM:SS…' を JST の 'M/D' にする(古い記事の 🔖 の日付。GH#449)。"""
+    try:
+        moment = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return "?"
+    day = moment.astimezone(JST)
+    return f"{day.month}/{day.day}"
 
 
 def notify_run_failure(

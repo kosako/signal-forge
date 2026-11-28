@@ -16,6 +16,7 @@ from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
     DIG_BACKLOG_BUTTON_ROWS,
     DIG_BACKLOG_READ_NOTE,
+    STATE_BACKLOG_OLD_CURSOR,
     STATE_READ_CONFIRM_SENT,
     STATE_RUN_FAILURE_NOTIFIED,
     STATE_SOURCE_REPORT_SENT,
@@ -23,7 +24,9 @@ from app.delivery.surveys import (
     STATE_WATCHDOG_NOTIFIED,
     BacklogButtons,
     backlog_keyboard,
+    old_bulk_button,
     pending_dig_items,
+    pick_old_rows,
     q1_keyboard,
     q2_keyboard,
     read_confirm_keyboard,
@@ -403,8 +406,10 @@ def test_dig_backlog_caps_at_max_items(conn, tmp_path) -> None:
 
     backlog = next(t for _, t in api.sent if "まだ読んでいない記事" in t)
     assert "(17件)" in backlog
-    assert backlog.count("<a href=") == 15
+    # 新しい側 15 件 + 古い記事の枠に、15 件に入らない 2 件(GH#449)
+    assert backlog.count("<a href=") == 15 + 2
     assert "(他 2 件)" in backlog
+    assert "🗂 古い記事(2 件のうち、古い順に 2 件。毎晩 5 件ずつ入れ替わります)" in backlog
 
 
 # --- 内蔵タイマー: watchdog ---
@@ -1240,7 +1245,8 @@ def test_dig_backlog_plan_rows_on_top_and_not_counted_in_limit(conn, tmp_path) -
     lines = backlog.splitlines()
     assert lines[0] == "🔖 まだ読んでいない記事(17件)"
     assert lines[1].startswith(f"{planned}. 🗓 明朝 ")
-    assert backlog.count("<a href=") == 16  # 予定 1 + 残りの上限 15
+    # 予定 1 + 残りの上限 15 + 古い記事の枠 1(GH#449)
+    assert backlog.count("<a href=") == 16 + 1
     assert sum(line.startswith(f"{planned}. ") for line in lines) == 1  # 残りの行に重ねない
     assert "(他 1 件)" in backlog
 
@@ -2966,8 +2972,10 @@ def test_backlog_buttons_only_on_plan_rows_and_the_newest_rows(conn, tmp_path) -
     [(message_id, text, markup)] = sent_backlog(conn, config)
 
     assert planned_ids_in(text) == planned
-    assert keyboard_ids(markup) == planned + newest_first[:DIG_BACKLOG_BUTTON_ROWS]
-    assert len(markup["inline_keyboard"]) == 2 + DIG_BACKLOG_BUTTON_ROWS
+    # 予定の行・上の 5 行・古い記事の枠(15 件に入らない 2 件を古い順に。GH#449)・まとめて不要
+    old = list(reversed(newest_first[15:]))
+    assert keyboard_ids(markup) == planned + newest_first[:DIG_BACKLOG_BUTTON_ROWS] + old + [0]
+    assert markup["inline_keyboard"][-1] == [old_bulk_button(2)]
     assert all(backlog_line(text, item) for item in newest_first[:15])  # 本文は今までどおり 15 件
     assert "(他 2 件)" in text
     assert (
@@ -3087,3 +3095,151 @@ def test_backlog_presses_need_the_button_on_the_pressed_board(conn, tmp_path, co
         assert after["status"] == "passed"
     else:
         assert [row[0] for row in conn.execute("SELECT item_id FROM dig_dismissals")] == [below]
+
+
+# --- 古い記事の枠(GH#449) ---
+
+
+def old_backlog(conn, count: int) -> list[int]:
+    """🔖 の新しい順に count 件の未読(X の投稿そのもの。本文なし・取り直せない)。
+
+    古いほど前の日付。
+    """
+    return [
+        add_bookmarked(conn, f"https://x.com/i/web/status/{500 + i}",
+                       f"2026-{7 + i // 28:02d}-{1 + i % 28:02d}T00:00:00Z")
+        for i in reversed(range(count))
+    ]  # 新しい順(i が大きいほど新しい)
+
+
+def test_old_rows_rotate_oldest_first_and_wrap_around() -> None:
+    pool = [
+        {"item_id": i, "marked_at": f"2026-07-{i:02d}T00:00:00Z"} for i in range(12, 0, -1)
+    ]  # 新しい順の 12 件
+    first = pick_old_rows(pool, None)
+    assert [r["item_id"] for r in first] == [1, 2, 3, 4, 5]
+    cursor = f"{first[-1]['marked_at']}\t{first[-1]['item_id']}"
+    second = pick_old_rows(pool, cursor)
+    assert [r["item_id"] for r in second] == [6, 7, 8, 9, 10]
+    third = pick_old_rows(pool, f"{second[-1]['marked_at']}\t{second[-1]['item_id']}")
+    assert [r["item_id"] for r in third] == [11, 12, 1, 2, 3]  # 一巡したら古い側の先頭へ
+    # 前の夜の最後の記事が一覧から消えていても、時刻と id の順で次が決まる
+    gone = [r for r in pool if r["item_id"] != 5]
+    assert [r["item_id"] for r in pick_old_rows(gone, cursor)] == [6, 7, 8, 9, 10]
+    assert pick_old_rows([], cursor) == []
+    assert [r["item_id"] for r in pick_old_rows(pool[:3], None)] == [10, 11, 12]
+
+
+def test_old_section_lists_the_oldest_with_buttons_and_moves_on_next_night(
+    conn, tmp_path
+) -> None:
+    silence_watchdog(conn)
+    newest_first = old_backlog(conn, 15 + 8)
+    oldest_first = list(reversed(newest_first[15:]))
+    config = config_with_cap(tmp_path, 2)
+
+    [(message_id, text, markup)] = sent_backlog(conn, config)
+
+    assert "🗂 古い記事(8 件のうち、古い順に 5 件。毎晩 5 件ずつ入れ替わります)" in text
+    for item in oldest_first[:5]:
+        assert "(🔖 " in backlog_line(text, item)
+    assert keyboard_ids(markup)[-6:] == oldest_first[:5] + [0]
+    assert [dismiss_button(oldest_first[0])] in markup["inline_keyboard"]
+    assert markup["inline_keyboard"][-1] == [old_bulk_button(5)]
+    stored = conn.execute(
+        "SELECT old_item_ids FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+    ).fetchone()[0]
+    assert json.loads(stored) == oldest_first[:5]
+    assert get_state(conn, STATE_BACKLOG_OLD_CURSOR).endswith(f"\t{oldest_first[4]}")
+
+    set_state(conn, STATE_SURVEY_SENT, "")  # 次の夜
+    [(_, text2, markup2)] = sent_backlog(conn, config)
+    # 押さなかった記事は回し、次の 3 件と一巡した先頭の 2 件
+    assert keyboard_ids(markup2)[-6:] == oldest_first[5:] + oldest_first[:2] + [0]
+    assert "古い順に 5 件" in text2
+
+
+def test_old_section_absent_when_everything_fits_in_the_newest_rows(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    old_backlog(conn, 15)
+
+    [(message_id, text, markup)] = sent_backlog(conn, config_with_cap(tmp_path, 2))
+
+    assert "🗂 古い記事" not in text
+    assert 0 not in keyboard_ids(markup)
+    assert conn.execute(
+        "SELECT old_item_ids FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+    ).fetchone()[0] is None
+    assert get_state(conn, STATE_BACKLOG_OLD_CURSOR) is None
+
+
+def test_bulk_dismiss_marks_only_the_old_rows_of_the_pressed_message(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    newest_first = old_backlog(conn, 15 + 6)
+    oldest_first = list(reversed(newest_first[15:]))
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    already = oldest_first[1]
+    conn.execute("INSERT INTO dig_dismissals (item_id) VALUES (?)", (already,))
+    read_after = oldest_first[2]  # 一覧を送った後に、カードなどで読んだにした
+    conn.execute(
+        "INSERT INTO signals (kind, item_id, value, signal_date) "
+        "VALUES ('followup_dig', ?, 'yes', '2026-11-28')",
+        (read_after,),
+    )
+    conn.commit()
+
+    api = FakeApi([
+        [backlog_press("b:0:z", message_id, markup, update_id=1)],
+        [backlog_press("b:0:z", message_id, markup, update_id=2)],  # 押し直し
+    ])
+    poll_once(conn, config, api, logger)
+    poll_once(conn, config, api, logger)
+
+    dismissed = {row[0] for row in conn.execute("SELECT item_id FROM dig_dismissals")}
+    # 枠の 5 件のうち、読んだにした記事は不要にしない(6 件目と新しい側は残る)
+    assert dismissed == set(oldest_first[:5]) - {read_after}
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 4
+    assert api.answered == [
+        ("cb1", "👎 古い記事 3 件を不要にしました(夜の一覧に載りません)"),
+        ("cb2", "👎 古い記事はどれも不要か読んだにしてあります"),
+    ]
+    assert api.edited[0][2]["inline_keyboard"][-1] == [old_bulk_button(5, done=True)]
+    for item in set(oldest_first[:5]) - {read_after}:
+        assert [dismiss_button(item, dismissed=True)] in api.edited[0][2]["inline_keyboard"]
+
+
+@pytest.mark.parametrize("case", ["no_old_section", "not_on_board", "other_chat"])
+def test_bulk_dismiss_not_tied_to_an_old_section_is_refused(conn, tmp_path, case) -> None:
+    silence_watchdog(conn)
+    old_backlog(conn, 15 if case == "no_old_section" else 15 + 3)
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+    board = markup
+    if case == "not_on_board":
+        board = {"inline_keyboard": markup["inline_keyboard"][:-1]}  # まとめて不要の段を外す
+    update = backlog_press("b:0:z", message_id, board, update_id=1)
+    if case == "other_chat":
+        update["callback_query"]["message"]["chat"]["id"] = CHAT_ID + 1
+
+    api = FakeApi([[update]])
+    poll_once(conn, config, api, logger)
+
+    assert api.answered == [("cb1", "⚠️ この一覧には対応できません")]
+    assert conn.execute("SELECT count(*) FROM dig_dismissals").fetchone()[0] == 0
+
+
+def test_row_dismiss_in_the_old_section_keeps_the_bulk_button(conn, tmp_path) -> None:
+    silence_watchdog(conn)
+    newest_first = old_backlog(conn, 15 + 3)
+    oldest = newest_first[-1]
+    config = config_with_cap(tmp_path, 2)
+    [(message_id, _, markup)] = sent_backlog(conn, config)
+
+    api = FakeApi([[backlog_press(f"b:{oldest}:x", message_id, markup, update_id=1)]])
+    poll_once(conn, config, api, logger)
+
+    assert api.answered[0][1].startswith(f"👎 {oldest} を不要にしました")
+    board = api.edited[0][2]["inline_keyboard"]
+    assert [dismiss_button(oldest, dismissed=True)] in board
+    assert board[-1] == [old_bulk_button(3)]  # まとめて不要の段は残る(まだ全部ではない)

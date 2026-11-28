@@ -37,6 +37,7 @@ from app.db import insert_item_with_dedup
 from app.delivery.answer_worker import AnswerWorker, DigNowWorker
 from app.delivery.state import get_state, set_state
 from app.delivery.surveys import (
+    DIG_BACKLOG_OLD_BULK,
     PROPOSAL_CODES,
     READ_MIN_CHOICES,
     BacklogButtons,
@@ -44,6 +45,7 @@ from app.delivery.surveys import (
     backlog_keyboard,
     focus_x_keyboard,
     followup_keyboard,
+    old_bulk_button,
     on_backlog,
     pending_dig_items,
     proposal_keyboard,
@@ -432,6 +434,10 @@ def _handle_callback(
                 conn, config, api, callback, callback_id, int(arg), _BACKLOG_READ_CODES[code],
                 logger, now_fn(),
             )
+            return
+        # 古い記事の枠の「まとめて不要」(GH#449)。対象は押した 1 通の台帳の old_item_ids
+        if prefix == "b" and arg == "0" and code == "z":
+            _record_backlog_old_bulk(conn, config, api, callback, callback_id, logger)
             return
         if prefix == "b" and arg.isdigit() and code in _BACKLOG_DISMISS_CODES:
             _record_backlog_dismiss(
@@ -1275,6 +1281,92 @@ def _record_backlog_dismiss(
     _refresh_backlog_board(conn, api, callback, logger)
 
 
+def _old_item_ids(conn: sqlite3.Connection, callback: dict) -> list[int]:
+    """押された一覧の 1 通に載せた古い記事の枠の item(台帳 dig_backlog_messages.old_item_ids)。"""
+    message = callback.get("message")
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    if type(message_id) is not int:
+        return []
+    row = conn.execute(
+        "SELECT old_item_ids FROM dig_backlog_messages WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    try:
+        ids = json.loads(row["old_item_ids"]) if row is not None and row["old_item_ids"] else []
+    except ValueError:
+        return []
+    return [i for i in ids if type(i) is int] if isinstance(ids, list) else []
+
+
+def _has_old_bulk(callback: dict) -> bool:
+    """押された 1 通の盤面に、古い記事の「まとめて不要」のボタンがあるか(GH#449)。"""
+    message = callback.get("message")
+    markup = message.get("reply_markup") if isinstance(message, dict) else None
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    return any(
+        isinstance(button, dict) and button.get("callback_data") == DIG_BACKLOG_OLD_BULK
+        for buttons in (rows if isinstance(rows, list) else [])
+        for button in (buttons if isinstance(buttons, list) else [])
+    )
+
+
+def _record_backlog_old_bulk(
+    conn: sqlite3.Connection,
+    config: Config,
+    api: TelegramApi,
+    callback: dict,
+    callback_id: str,
+    logger: logging.Logger,
+) -> None:
+    """古い記事の枠の「👎 古い記事 N 件をまとめて不要」(GH#449。設計 06 §2)。
+
+    押されたメッセージが未消化一覧で、その 1 通の盤面にこのボタンがあり、台帳にその 1 通の古い
+    記事(old_item_ids)があることを確かめる。対象は、その 1 通に載せた古い記事のうち、まだ不要にも
+    読んだにもしていない記事だけ(行の 👎 不要と同じ mark_dismissed と dismiss_from_queue。記録は
+    1 つのトランザクション)。再配達・二重押しで同じ記事を 2 回書かない。押した後は盤面を作り直す。
+    """
+    item_ids = _old_item_ids(conn, callback)
+    if not (_is_backlog_message(conn, config, callback) and _has_old_bulk(callback) and item_ids):
+        logger.warning(
+            "未消化一覧と結び付かないまとめて不要のボタンを破棄", extra={"stage": "poll"}
+        )
+        api.answer_callback_query(callback_id, text="⚠️ この一覧には対応できません")
+        return
+    log_extra = {"stage": "poll", "extra": {"items": len(item_ids)}}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            written = 0
+            for item_id in item_ids:
+                if is_read(conn, item_id) or item_id in dismissed_items(conn, [item_id]):
+                    continue
+                if mark_dismissed(conn, item_id, None, True):
+                    dismiss_from_queue(conn, item_id)
+                    written += 1
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as e:
+        logger.error(
+            f"古い記事のまとめて不要を記録できなかった: {type(e).__name__}: {e}", extra=log_extra
+        )
+        api.answer_callback_query(callback_id, text="⚠️ 記録失敗、もう一度")
+        return
+    logger.info(
+        "古い記事のまとめて不要を記録した", extra={**log_extra, "extra": {"written": written}}
+    )
+    api.answer_callback_query(
+        callback_id,
+        text=(
+            f"👎 古い記事 {written} 件を不要にしました(夜の一覧に載りません)"
+            if written
+            else "👎 古い記事はどれも不要か読んだにしてあります"
+        ),
+    )
+    _refresh_backlog_board(conn, api, callback, logger)
+
+
 # 今すぐのボタンの answer(GH#388。設計 04 §3)。受け付けたときだけ `intel dig-now` を起動する
 _NOW_ANSWERS: dict[NowRequestOutcome, str] = {
     "accepted": "⚡ {item_id} を今すぐ掘ります。数分でカードが届きます",
@@ -1784,18 +1876,21 @@ def _refresh_backlog_board(
         )
         for item_id, found in kinds.items()
     ]
-    _edit_markup_best_effort(
-        api,
-        callback,
-        backlog_keyboard(
-            board,
-            passed=passed,
-            now_marked=dig_now_marked(conn, item_ids),
-            read=read_items(conn, item_ids),
-            dismissed=dismissed_items(conn, item_ids),
-        ),
-        logger,
+    keyboard = backlog_keyboard(
+        board,
+        passed=passed,
+        now_marked=dig_now_marked(conn, item_ids),
+        read=read_items(conn, item_ids),
+        dismissed=dismissed_items(conn, item_ids),
     )
+    # 古い記事の「まとめて不要」は、押した 1 通にあれば最後の段に残す(GH#449)
+    old_ids = _old_item_ids(conn, callback) if _has_old_bulk(callback) else []
+    if old_ids:
+        handled = read_items(conn, old_ids) | dismissed_items(conn, old_ids)
+        keyboard["inline_keyboard"].append(
+            [old_bulk_button(len(old_ids), done=all(i in handled for i in old_ids))]
+        )
+    _edit_markup_best_effort(api, callback, keyboard, logger)
 
 
 def _record_followup(
