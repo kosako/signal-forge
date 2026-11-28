@@ -738,12 +738,22 @@ def old_rows_count(old_total: int, max_rows: int) -> int:
     return min(max_rows, -(-old_total // DIG_BACKLOG_OLD_PER)) if old_total > 0 else 0
 
 
+_CURSOR_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
 def _parse_old_cursor(cursor: str | None) -> tuple[str, int] | None:
     """前の夜の最後の 1 件(`<marked_at>\t<item_id>`)。読めなければ None(古い側の先頭から選ぶ)。"""
     if not cursor:
         return None
     marked_at, sep, item_id = cursor.partition("\t")
-    if not sep or not marked_at or not re.fullmatch(r"[0-9]{1,18}", item_id):
+    # 時刻は台帳の 🔖 の時刻の形(UTC の 'YYYY-MM-DDTHH:MM:SSZ')だけを受け、実在する日時かも確かめる
+    if not sep or not _CURSOR_TIME.fullmatch(marked_at) or not re.fullmatch(
+        r"[0-9]{1,18}", item_id
+    ):
+        return None
+    try:
+        datetime.strptime(marked_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
         return None
     return marked_at, int(item_id)
 

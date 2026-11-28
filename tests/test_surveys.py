@@ -3126,7 +3126,11 @@ def test_old_rows_rotate_oldest_first_and_wrap_around() -> None:
     assert pick_old_rows([], cursor, 5) == []
     assert [r["item_id"] for r in pick_old_rows(pool[:3], None, 5)] == [10, 11, 12]
     # 壊れた cursor は読まずに古い側の先頭から(一覧を止めない。Codex 指摘)
-    for broken in ["2026-07-05T00:00:00Z\t²", "x", "\t5", "2026-07-05T00:00:00Z\t-1", ""]:
+    for broken in [
+        "2026-07-05T00:00:00Z\t²", "x", "\t5", "2026-07-05T00:00:00Z\t-1", "",
+        "2026-07-05Tbroken\t5", "2026-07-05 00:00:00\t5", "2026-02-30T00:00:00Z\t5",
+        "２０２６-07-05T00:00:00Z\t5",
+    ]:
         assert [r["item_id"] for r in pick_old_rows(pool, broken, 2)] == [1, 2]
 
 
