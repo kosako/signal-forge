@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime, time, timedelta
@@ -79,9 +80,11 @@ DIG_BACKLOG_CONTINUED = f"{DIG_BACKLOG_TITLE}(続き)"
 # 設計 06 §2・04 §3)。1 通のボタンの数の上限は、Telegram の inline keyboard の上限(約 100)に
 # 余裕を残す。超えるなら行の単位で次の 1 通に分ける
 DIG_BACKLOG_MAX_BUTTONS = 50
-# 古い記事の枠(GH#449)。新しい側の DIG_BACKLOG_MAX_ITEMS 行に入らない未読を、古い順に毎晩この数ずつ
-# 出す。押さなかった記事は次の夜に次の分へ回し、一巡したら古い側の先頭に戻る(勝手には外さない)
-DIG_BACKLOG_OLD_ROWS = 5
+# 古い記事の枠(GH#449)。新しい側の DIG_BACKLOG_MAX_ITEMS 行に入らず、🔖 から
+# [dig].backlog_old_min_days を過ぎた未読を、古い順に毎晩出す。数は対象 DIG_BACKLOG_OLD_PER 件に
+# つき 1 件(切り上げ)で、[dig].backlog_old_max_rows まで。押さなかった記事は次の夜に次の分へ回し、
+# 一巡したら古い側の先頭に戻る(勝手には外さない)
+DIG_BACKLOG_OLD_PER = 5
 # 前の夜に出した古い記事の最後の 1 件(`<marked_at>\t<item_id>`)。次の夜はこの次から出す
 STATE_BACKLOG_OLD_CURSOR = "dig_backlog_old_cursor"
 DIG_BACKLOG_OLD_BULK = "b:0:z"  # 「古い記事をまとめて不要」のボタンの callback_data
@@ -482,7 +485,7 @@ def send_evening_survey(
     # 0件で予定も無い日は送らない(GH#88・GH#349)。長ければ行の単位で複数通に分ける(GH#349)。
     # 行のボタン(明朝の予定の skip = GH#349、今すぐ = GH#388)は、その行を載せた 1 通に付ける
     today = now.strftime("%Y-%m-%d")
-    messages, old_cursor = _dig_backlog_message(conn, config, backlog, plan, today)
+    messages, old_cursor = _dig_backlog_message(conn, config, backlog, plan, today, now)
     for text, keyboard, old_item_ids in messages:
         try:
             message_id = api.send_message(chat_id, text, reply_markup=keyboard)
@@ -727,9 +730,25 @@ def old_cursor_value(row: Mapping) -> str:
     return f"{row['marked_at']}\t{row['item_id']}"
 
 
-def pick_old_rows(
-    pool: Sequence[Mapping], cursor: str | None, limit: int = DIG_BACKLOG_OLD_ROWS
-) -> list[Mapping]:
+def old_rows_count(old_total: int, max_rows: int) -> int:
+    """古い記事の枠に出す数(GH#449)。
+
+    対象 DIG_BACKLOG_OLD_PER 件につき 1 件(切り上げ)で、max_rows まで。対象が無ければ 0。
+    """
+    return min(max_rows, -(-old_total // DIG_BACKLOG_OLD_PER)) if old_total > 0 else 0
+
+
+def _parse_old_cursor(cursor: str | None) -> tuple[str, int] | None:
+    """前の夜の最後の 1 件(`<marked_at>\t<item_id>`)。読めなければ None(古い側の先頭から選ぶ)。"""
+    if not cursor:
+        return None
+    marked_at, sep, item_id = cursor.partition("\t")
+    if not sep or not marked_at or not re.fullmatch(r"[0-9]{1,18}", item_id):
+        return None
+    return marked_at, int(item_id)
+
+
+def pick_old_rows(pool: Sequence[Mapping], cursor: str | None, limit: int) -> list[Mapping]:
     """古い記事の枠に出す行(GH#449)。pool は新しい側の行に入らない未読(新しい 🔖 順)。
 
     古い順に並べ、前の夜に出した最後の 1 件(cursor)より後ろから limit 件を選ぶ。足りなければ古い側の
@@ -737,9 +756,8 @@ def pick_old_rows(
     """
     oldest_first = sorted(pool, key=lambda r: (r["marked_at"], r["item_id"]))
     after = oldest_first
-    if cursor:
-        marked_at, _, item_id = cursor.partition("\t")
-        key = (marked_at, int(item_id) if item_id.isdigit() else -1)
+    key = _parse_old_cursor(cursor)  # 壊れた値は読まずに先頭から(一覧を止めない)
+    if key is not None:
         after = [r for r in oldest_first if (r["marked_at"], r["item_id"]) > key]
     picked = list(after[:limit])
     picked_ids = {r["item_id"] for r in picked}
@@ -758,6 +776,7 @@ def _dig_backlog_message(
     backlog: list[sqlite3.Row],
     plan: Sequence[DigCandidate],
     today: str,
+    now: datetime | None = None,
 ) -> tuple[list[BacklogMessage], str | None]:
     """未消化一覧の本文とボタン(1 通以上)。空 = 送らない(🔖 の一覧が 0 件で、明朝の予定も無い日)。
 
@@ -789,9 +808,19 @@ def _dig_backlog_message(
         for candidate in plan
     ]
     rest = [row for row in backlog if row["item_id"] not in planned_ids]
-    # 古い記事の枠(GH#449): 新しい側の行に入らない未読から、前の夜の続きを古い順に選ぶ
-    old_pool = rest[DIG_BACKLOG_MAX_ITEMS:]
-    old_rows = pick_old_rows(old_pool, get_state(conn, STATE_BACKLOG_OLD_CURSOR))
+    # 古い記事の枠(GH#449): 新しい側の行に入らず、🔖 から backlog_old_min_days を過ぎた未読から、
+    # 前の夜の続きを古い順に選ぶ。数は溜まり具合で決める(old_rows_count)
+    cutoff = ((now or datetime.now(UTC)) - timedelta(days=config.dig.backlog_old_min_days))
+    cutoff_stamp = cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old_pool = [
+        row for row in rest[DIG_BACKLOG_MAX_ITEMS:]
+        if (row["marked_at"] or "")[:20] < cutoff_stamp
+    ]
+    old_rows = pick_old_rows(
+        old_pool,
+        get_state(conn, STATE_BACKLOG_OLD_CURSOR),
+        old_rows_count(len(old_pool), config.dig.backlog_old_max_rows),
+    )
     shown_ids = [row["item_id"] for row in rest[:DIG_BACKLOG_MAX_ITEMS]]
     old_ids = [row["item_id"] for row in old_rows]
     all_ids = [*planned_ids, *shown_ids, *old_ids]
@@ -800,6 +829,7 @@ def _dig_backlog_message(
         plan_rows=plan_rows,
         old_rows=old_rows,
         old_total=len(old_pool),
+        old_min_days=config.dig.backlog_old_min_days,
         states=dig_states(conn, config, [*shown_ids, *old_ids], planned_ids),
         digest_fill=config.dig.daily_cap - len(plan),
         with_buttons=True,
@@ -826,6 +856,7 @@ def _dig_backlog_text(
     refetchable: Collection[int] = (),
     old_rows: Sequence[Mapping] = (),
     old_total: int = 0,
+    old_min_days: int = 0,
 ) -> list[BacklogMessage]:
     """未消化 🔖 一覧(見出しは「まだ読んでいない記事」。GH#409)。新しい 🔖 順・上限超過分は
     件数だけ示す(GH#88)。
@@ -874,8 +905,8 @@ def _dig_backlog_text(
     old_start = len(lines) + 1
     if old_rows:
         lines.append(
-            f"\n🗂 古い記事({old_total} 件のうち、古い順に {len(old_rows)} 件。"
-            f"毎晩 {DIG_BACKLOG_OLD_ROWS} 件ずつ入れ替わります)"
+            f"\n🗂 古い記事(🔖 から {old_min_days} 日を過ぎた {old_total} 件のうち、古い順に "
+            f"{len(old_rows)} 件。毎晩入れ替わります)"
         )
         for row in old_rows:
             state = states.get(row["item_id"])
@@ -901,10 +932,10 @@ def _dig_backlog_text(
     shown = rows[:DIG_BACKLOG_MAX_ITEMS]
     if with_buttons and len(shown) > DIG_BACKLOG_BUTTON_ROWS:
         # ✅・👎 の無い行がある(GH#411)。予定の行は先頭に並ぶので、上から数えた行の数で言える
-        notes.append(
-            f"✅・👎 のボタンは上の {len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS} 行にだけ付けます"
-            "(⚡ は今すぐ掘れる行に付けます)"
-        )
+        rows_at = f"上の {len(plan_rows) + DIG_BACKLOG_BUTTON_ROWS} 行"
+        if old_rows:
+            rows_at += "と古い記事の行"  # 古い記事の枠の行にも ✅・👎 を付ける(GH#449)
+        notes.append(f"✅・👎 のボタンは{rows_at}にだけ付けます(⚡ は今すぐ掘れる行に付けます)")
     if with_buttons and any(
         states.get(row["item_id"]) == "no_body" and now_ok(row["item_id"]) for row in shown
     ):

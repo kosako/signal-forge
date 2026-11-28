@@ -630,3 +630,23 @@ def test_focus_defaults_and_validation(tmp_path: Path) -> None:
     ):
         with pytest.raises(ConfigError, match=key):
             load_config(write_config(tmp_path, body))
+
+
+@pytest.mark.parametrize(
+    ("toml", "match"),
+    [
+        ("[dig]\nbacklog_old_max_rows = 11\n", "backlog_old_max_rows は 10 以下"),
+        ("[dig]\nbacklog_old_max_rows = -1\n", "backlog_old_max_rows は 0 以上"),
+        ("[dig]\nbacklog_old_min_days = -1\n", "backlog_old_min_days は 0 以上"),
+    ],
+)
+def test_dig_backlog_old_limits_are_validated(tmp_path, toml, match) -> None:
+    (tmp_path / "config.toml").write_text(toml, encoding="utf-8")
+    with pytest.raises(ConfigError, match=match):
+        load_config(tmp_path)
+
+
+def test_dig_backlog_old_defaults(tmp_path) -> None:
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    dig = load_config(tmp_path).dig
+    assert (dig.backlog_old_min_days, dig.backlog_old_max_rows) == (30, 5)

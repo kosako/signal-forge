@@ -20,6 +20,7 @@ _LLM_ENGINES = ("codex-cli", "claude-cli", "anthropic-api")
 
 # X 検索(search/recent)の契約値。コネクタ(connectors/x_search.py)と検証の両方が参照する
 # (コネクタ側に置くと config が httpx 依存を吸ってしまうため、軽い側=ここに置く)
+DIG_BACKLOG_OLD_MAX_ROWS = 10  # [dig].backlog_old_max_rows の上限(GH#449)
 X_SEARCH_MAX_SLOTS = 3  # 3スロット固定・入れ替え式(ADR 0001。増やさない設計の担保)
 X_SEARCH_MIN_PAGE = 10  # search/recent の max_results 下限(X API v2 仕様)
 X_SEARCH_MAX_PAGE = 100  # 同じく上限(出来事の調査の [investigate].x_posts の検査に使う)
@@ -143,6 +144,10 @@ class DigConfig:
     review: bool = False
     # レビューの API 費用の月の上限(UTC の暦月 = doctor #9 の当月)。達したらその月はレビューを省く
     review_monthly_cap_usd: float = 10.0
+    # 夜の一覧の古い記事の枠(GH#449)。新しい側の行に入らず、🔖 からこの日数を過ぎた未読を対象にし、
+    # 対象 5 件につき 1 件(切り上げ)を、backlog_old_max_rows 件まで出す。0 件なら枠は出ない
+    backlog_old_min_days: int = 30
+    backlog_old_max_rows: int = 5  # 0〜10。0 = 古い記事の枠を出さない
 
 
 @dataclass(frozen=True)
@@ -622,6 +627,8 @@ def _validate(path: Path, config: Config) -> None:
         ("x_signals", "daily_read_cap", config.x_signals.daily_read_cap),
         ("dig", "daily_cap", config.dig.daily_cap),
         ("dig", "answer_daily_cap", config.dig.answer_daily_cap),
+        ("dig", "backlog_old_min_days", config.dig.backlog_old_min_days),
+        ("dig", "backlog_old_max_rows", config.dig.backlog_old_max_rows),
         ("investigate", "news_articles", config.investigate.news_articles),
         ("ranking", "min_score", config.ranking.min_score),
         ("ranking", "negative_penalty", config.ranking.negative_penalty),
@@ -635,6 +642,12 @@ def _validate(path: Path, config: Config) -> None:
     for section, key, value in nonnegatives:
         if value < 0:
             raise ConfigError(f"{path}: [{section}].{key} は 0 以上であること: {value}")
+    if config.dig.backlog_old_max_rows > DIG_BACKLOG_OLD_MAX_ROWS:
+        # 1 通のボタンの数と長さに余裕を残す(古い記事の行は 1 行に最大 3 個のボタン)
+        raise ConfigError(
+            f"{path}: [dig].backlog_old_max_rows は {DIG_BACKLOG_OLD_MAX_ROWS} 以下であること: "
+            f"{config.dig.backlog_old_max_rows}"
+        )
     for section, key, value in positives:
         if value <= 0:
             raise ConfigError(f"{path}: [{section}].{key} は正の整数であること: {value}")
