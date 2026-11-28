@@ -3130,6 +3130,7 @@ def test_old_rows_rotate_oldest_first_and_wrap_around() -> None:
         "2026-07-05T00:00:00Z\t²", "x", "\t5", "2026-07-05T00:00:00Z\t-1", "",
         "2026-07-05Tbroken\t5", "2026-07-05 00:00:00\t5", "2026-02-30T00:00:00Z\t5",
         "２０２６-07-05T00:00:00Z\t5",
+        "2026-07-05T0:00:00Z\t5",  # 日時としては読めるが桁が揃わず、文字列の順を誤る
     ]:
         assert [r["item_id"] for r in pick_old_rows(pool, broken, 2)] == [1, 2]
 
